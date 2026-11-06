@@ -1,0 +1,17 @@
+[package]
+name = "vipera-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vipera-backend-cpu.workspace = true
+vipera-core.workspace = true
+vipera-errors.workspace = true
+vipera-runtime.workspace = true
+vipera-sampler.workspace = true
+vipera-tokenizer.workspace = true
+
+[lints]
+workspace = true

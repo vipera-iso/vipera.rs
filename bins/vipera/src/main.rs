@@ -7,8 +7,6 @@
 
 use std::io::{Read, Write};
 
-mod json;
-mod serve;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -21,6 +19,7 @@ use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, KvCache, KvConfig, Stage, peak_resident_bytes,
 };
 use vipera_sampler::{Sampler, SamplerConfig};
+use vipera_server::serve;
 use vipera_tokenizer::{ChatMessage, Tokenizer, chat};
 use vipera_traits::{HardwareProbe, HardwareProfile};
 

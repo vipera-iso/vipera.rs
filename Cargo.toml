@@ -9,6 +9,7 @@ members = [
     "crates/vipera-runtime",
     "crates/vipera-backend-cpu",
     "crates/vipera-core",
+    "crates/vipera-server",
     "bins/vipera",
 ]
 
@@ -26,6 +27,7 @@ vipera-tokenizer = { path = "crates/vipera-tokenizer" }
 vipera-sampler = { path = "crates/vipera-sampler" }
 vipera-runtime = { path = "crates/vipera-runtime" }
 vipera-backend-cpu = { path = "crates/vipera-backend-cpu" }
+vipera-server = { path = "crates/vipera-server" }
 vipera-core = { path = "crates/vipera-core" }
 
 [workspace.lints.rust]

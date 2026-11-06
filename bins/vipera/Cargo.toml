@@ -13,6 +13,7 @@ vipera-backend-cpu.workspace = true
 vipera-sampler.workspace = true
 vipera-tokenizer.workspace = true
 vipera-traits.workspace = true
+vipera-server.workspace = true
 
 [lints]
 workspace = true

@@ -21,7 +21,7 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
 ## Layout
 
 ```text
-Cargo.toml                    workspace: 8 library crates, 1 binary
+Cargo.toml                    workspace: 9 library crates, 1 binary
 crates/
   vipera-errors/              error type and exit-code mapping
   vipera-traits/              the interfaces a backend and an algorithm implement
@@ -31,7 +31,8 @@ crates/
   vipera-sampler/             RNG and sampling policies
   vipera-runtime/             pipeline, sequences, KV cache, engine
   vipera-backend-cpu/         quantized kernels, scalar reference, AVX2
-bins/vipera/                  the `vipera` command and its HTTP server
+  vipera-server/              HTTP server and JSON, behind `vipera serve`
+bins/vipera/                  the `vipera` command (argument parsing only)
 scripts/                      parity checks against llama.cpp
 specs/001-vipera-rs-engine/   spec, plan, tasks, CLI and HTTP contracts
 ```

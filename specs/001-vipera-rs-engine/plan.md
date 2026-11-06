@@ -99,7 +99,8 @@ specs/001-vipera-rs-engine/
 │   ├── vipera-runtime/            # slice 4
 │   ├── vipera-backend-cpu/        # slice 4b
 │   ├── vipera-sampler/            # slice 3
-│   └── vipera-tokenizer/          # slice 3
+│   ├── vipera-tokenizer/          # slice 3
+│   └── vipera-server/             # slice 5 (HTTP surface, streaming, metrics)
 ├── bins/vipera/                   # model-info, plan, profile, tokenize, sample, verify, generate, serve
 ├── scripts/                       # parity-tokenize.sh
 └── specs/001-vipera-rs-engine/    # spec, plan, tasks, contracts
