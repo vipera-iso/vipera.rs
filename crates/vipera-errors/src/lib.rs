@@ -3,6 +3,8 @@
 //! One enum, `Display` + `std::error::Error`, and an exit code the CLI maps directly. Library code
 //! never panics; callers decide whether an error is fatal.
 
+#![warn(missing_docs)]
+
 use std::fmt;
 
 /// Every failure the engine can report, with the file offset when the failure came from reading a model.

@@ -13,13 +13,24 @@ use std::fmt::Write as _;
 /// The deepest nesting accepted; enough for any chat request, shallow enough to be safe.
 const MAX_DEPTH: usize = 64;
 
+/// One JSON value, as parsed from a request body.
+///
+/// Objects keep their entries in document order and allow duplicate keys; [`Json::get`] returns the
+/// first match. Order matters here because responses are written in the order the contract lists
+/// their fields, and nothing in the chat schema depends on sorting.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
+    /// The `null` literal.
     Null,
+    /// `true` or `false`.
     Bool(bool),
+    /// Any number; fractions and exponents were already folded into an `f64`.
     Number(f64),
+    /// A string with escapes decoded and the surrounding quotes removed.
     String(String),
+    /// An ordered list of values.
     Array(Vec<Json>),
+    /// Key/value pairs in document order, duplicate keys included.
     Object(Vec<(String, Json)>),
 }
 
@@ -39,6 +50,9 @@ impl Json {
         Ok(value)
     }
 
+    /// The value under `key`, when this is an object that has one.
+    ///
+    /// Duplicate keys resolve to the first occurrence. Anything that is not an object is `None`.
     pub fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(entries) => entries
@@ -49,6 +63,7 @@ impl Json {
         }
     }
 
+    /// This value as a string slice, when it is a string.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Json::String(value) => Some(value),
@@ -56,6 +71,7 @@ impl Json {
         }
     }
 
+    /// This value as an `f64`, when it is a number.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Number(value) => Some(*value),
@@ -63,6 +79,7 @@ impl Json {
         }
     }
 
+    /// This value as a `bool`, when it is a boolean.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Json::Bool(value) => Some(*value),
@@ -70,6 +87,7 @@ impl Json {
         }
     }
 
+    /// This value as a slice, when it is an array.
     pub fn as_array(&self) -> Option<&[Json]> {
         match self {
             Json::Array(items) => Some(items),

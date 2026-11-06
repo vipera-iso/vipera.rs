@@ -55,6 +55,7 @@ name = "vipera-sampler"
 version = "0.1.0"
 dependencies = [
  "vipera-errors",
+ "vipera-traits",
 ]
 
 [[package]]

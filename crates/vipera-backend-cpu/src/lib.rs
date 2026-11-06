@@ -9,7 +9,10 @@
 //! KV cache. On x86-64 with AVX2 the hot dots run through `simd`, which the tests hold to the scalar
 //! result; every other CPU falls back to the same portable code. A model outside that is refused by name instead of being run approximately.
 
+#![warn(missing_docs)]
+
 pub mod model;
+mod pool;
 pub mod quant;
 #[cfg(target_arch = "x86_64")]
 pub mod simd;

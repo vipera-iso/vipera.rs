@@ -1,9 +1,16 @@
 //! Contracts shared across crates.
 //!
-//! Slice 2 needs one contract: how the engine learns what hardware it is running on. Backend and
-//! tensor traits arrive with the backends themselves, so this crate stays small on purpose.
+//! Two so far: how the engine learns what hardware it is running on, and what a sampling strategy
+//! has to look like so a build can list the ones it has. Backend and tensor traits arrive with the
+//! backends themselves, so this crate stays small on purpose.
+
+#![warn(missing_docs)]
+
+pub mod sampler;
 
 use std::fmt;
+
+pub use sampler::{LogitPenalty, NoPenalty, Random, Registry, SampleError, SampleRequest, Sampler};
 
 /// Kind of compute device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
