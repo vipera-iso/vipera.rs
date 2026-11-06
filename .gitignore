@@ -2,6 +2,7 @@
 # Everything else in this home directory belongs to other projects and is not part of it.
 /*
 !/.gitignore
+!/.github/
 !/vipera.rs/
 !/specs/
 
