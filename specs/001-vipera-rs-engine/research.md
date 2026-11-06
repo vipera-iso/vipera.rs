@@ -5,8 +5,8 @@ enters the workspace through an entry here (see `CONSTRAINTS.md`, agent rule 2).
 
 ## R1. Workspace layout
 
-**Decision**: one Cargo workspace at `vipera.rs/`, one crate per concern, `crates/*` for libraries and
-`bins/vipera` for the CLI.
+**Decision**: one Cargo workspace at the repository root, one crate per concern, `crates/*` for
+libraries and `bins/vipera` for the CLI.
 
 **Rationale**: spec FR-018 requires adding an algorithm or backend without editing core code. Crate
 boundaries make that a build-system fact instead of a code-review convention, and they let the CUDA

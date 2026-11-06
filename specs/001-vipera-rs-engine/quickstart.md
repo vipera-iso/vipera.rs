@@ -1,7 +1,8 @@
 # Quickstart — vipera.rs Phase 1
 
 How to prove each slice works. Nothing here needs a GPU, and every command is expected to work on a
-clean checkout of this repository.
+clean checkout of this repository; every command
+runs from the repository root.
 
 ## Prerequisites
 
@@ -11,7 +12,6 @@ clean checkout of this repository.
 ## Slice 1 — model introspection (delivered)
 
 ```bash
-cd vipera.rs
 cargo test --workspace        # unit + integration; no GPU, no network
 cargo clippy --workspace --all-targets
 ```
@@ -63,7 +63,6 @@ cargo run -q -p vipera -- model-info /tmp/does-not-exist.gguf
 ## Slice 2 — hardware profile and placement plan (delivered)
 
 ```bash
-cd vipera.rs
 cargo test --workspace
 cargo run -q -p vipera -- plan /tmp/plan.gguf --ctx 512
 cargo run -q -p vipera -- plan /tmp/plan.gguf --ctx 512 --kv-type q8_0 --json
@@ -115,7 +114,6 @@ LD_LIBRARY_PATH=. ./llama-server -m ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_
 
 # terminal B
 nvidia-smi --query-gpu=memory.used --format=csv,noheader
-cd vipera.rs
 cargo run -q -p vipera -- plan ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf --ctx 2048 --json
 ```
 
@@ -138,7 +136,6 @@ Two things the measurement changed:
 ## Slice 3 — tokenizer and sampler (delivered)
 
 ```bash
-cd vipera.rs
 cargo test -p vipera-tokenizer -p vipera-sampler
 ```
 
@@ -189,7 +186,7 @@ build does not recognise (including Gemma) exit 2 instead of being approximated.
 ## `vipera profile` (delivered)
 
 ```bash
-cd vipera.rs && cargo run -q -p vipera -- profile --json
+cargo run -q -p vipera -- profile --json
 ```
 
 Prints `hardware_fingerprint`, `cpu_cores_physical`, `ram_total_bytes`, and one object per device.
@@ -199,7 +196,6 @@ byte count does not.
 ## Slice 4 — runtime and `verify` (delivered)
 
 ```bash
-cd vipera.rs
 cargo test -p vipera-runtime
 cargo run -q -p vipera -- verify ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf --ctx 2048 --cpu
 ```
@@ -336,7 +332,7 @@ real binary and checks health, the 401, a completion, the `[DONE]` terminator an
 ## Slice 6 — conformance (GGUF part delivered)
 
 ```bash
-cd vipera.rs && cargo test -p vipera-core --test conformance
+cargo test -p vipera-core --test conformance
 ```
 
 The shared suite lives in `crates/vipera-conformance`. Every future algorithm and backend runs its

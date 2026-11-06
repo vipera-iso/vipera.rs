@@ -3,8 +3,16 @@
 /*
 !/.gitignore
 !/.github/
-!/vipera.rs/
+!/Cargo.toml
+!/Cargo.lock
+!/rust-toolchain.toml
+!/crates/
+!/bins/
+!/scripts/
+# Only the engine's own script is part of the repository; this home directory has others.
+/scripts/*
+!/scripts/parity-tokenize.sh
 !/specs/
 
 # Build output is large and reproducible.
-vipera.rs/target/
+/target/

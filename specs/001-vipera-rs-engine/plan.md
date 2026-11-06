@@ -12,9 +12,9 @@ streaming, keep conversation context across turns with rollback, and operate it 
 metrics, auth, and rate limits. Six algorithms and two backends ship with a shared conformance
 suite, and every new algorithm or backend is added without editing core code.
 
-The engine lives in its own workspace at `vipera.rs/` in this repository, beside the existing
-`vipera.cpp/` and the Python `vipera-opt` planner. The specification, plan, and tasks stay under
-`specs/001-vipera-rs-engine/` so Spec Kit remains the single traceability surface.
+The engine is the Cargo workspace at the repository root. The specification, plan, and tasks stay
+under `specs/001-vipera-rs-engine/` so Spec Kit remains the single traceability surface; the
+`vipera.cpp/` tree and the Python `vipera-opt` planner are separate and not part of this repository.
 
 ## Technical Context
 
@@ -83,23 +83,26 @@ specs/001-vipera-rs-engine/
 └── spec.md
 ```
 
-### Source Code (workspace root `vipera.rs/`)
+### Source Code (repository root)
 
 ```text
-vipera.rs/
-├── Cargo.toml                     # workspace, members added per slice
+.
+├── Cargo.toml                     # workspace: library crates under crates/, the CLI under bins/
+├── Cargo.lock
 ├── rust-toolchain.toml
-└── crates/
-    ├── vipera-errors/             # slice 1
-    ├── vipera-core/               # slice 1 (gguf), planner + kv_cache later
-    ├── vipera-traits/             # slice 2
-    ├── vipera-config/             # slice 2
-    ├── vipera-runtime/            # slice 4
-    ├── vipera-backend-cpu/        # slice 4b
-    ├── vipera-sampler/            # slice 3
-    ├── vipera-tokenizer/          # slice 3
-    └── vipera-telemetry/          # slice 5
-└── bins/vipera/                   # model-info, plan, profile, tokenize, sample, verify, generate
+├── .github/workflows/ci.yml       # fmt, clippy -D warnings, workspace tests
+├── crates/
+│   ├── vipera-errors/             # slice 1
+│   ├── vipera-core/               # slice 1 (gguf), planner + kv_cache later
+│   ├── vipera-traits/             # slice 2
+│   ├── vipera-conformance/        # slice 2
+│   ├── vipera-runtime/            # slice 4
+│   ├── vipera-backend-cpu/        # slice 4b
+│   ├── vipera-sampler/            # slice 3
+│   └── vipera-tokenizer/          # slice 3
+├── bins/vipera/                   # model-info, plan, profile, tokenize, sample, verify, generate, serve
+├── scripts/                       # parity-tokenize.sh
+└── specs/001-vipera-rs-engine/    # spec, plan, tasks, contracts
 ```
 
 **Structure Decision**: a Cargo workspace, one crate per concern, because the spec's extensibility

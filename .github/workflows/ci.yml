@@ -1,8 +1,7 @@
 name: ci
 
 # The gate this repository actually holds: format, lint, test, in that order, on every push and pull
-# request. It runs from `vipera.rs/` because the workspace lives one level below the repository root,
-# next to the specifications.
+# request.
 on:
   push:
     branches: [main]
@@ -19,9 +18,6 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: vipera.rs
     env:
       # The integration tests skip themselves with a printed reason when no model is present; this
       # keeps that reason visible in the job log instead of buried in a captured test harness.
