@@ -402,14 +402,7 @@ pub fn matvec(
     }
     let sums = x_sums(x);
     let product = rows.saturating_mul(cols);
-    let threads = if product >= PARALLEL_MIN_PRODUCT {
-        thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .min(rows.max(1))
-    } else {
-        1
-    };
+    let threads = thread_budget(rows, product);
 
     if threads <= 1 {
         fill_rows(ty, data, stride, 0, x, &sums, out);
@@ -429,6 +422,33 @@ pub fn matvec(
 
 /// Multiply-adds below this stay on the calling thread: a spawn costs more than the work saves.
 const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
+
+/// Threads to split one `matvec` across, capped by the rows there are to fill.
+///
+/// `VIPERA_THREADS` overrides the detected count. Hyper-threading reports twice the physical cores,
+/// and these kernels are memory-bound enough that the sibling threads do not always pay for their
+/// spawn, so being able to pin the count is worth one `std::env` read per process. The override is
+/// parsed once and cached; a value of `0` or nonsense falls back to the detected count.
+fn thread_budget(rows: usize, product: usize) -> usize {
+    if product < PARALLEL_MIN_PRODUCT {
+        return 1;
+    }
+    static REQUESTED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let requested = *REQUESTED.get_or_init(|| {
+        std::env::var("VIPERA_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    });
+    requested
+        .or_else(|| {
+            thread::available_parallelism()
+                .ok()
+                .map(|count| count.get())
+        })
+        .unwrap_or(1)
+        .min(rows.max(1))
+}
 
 fn fill_rows(
     ty: GgmlType,
