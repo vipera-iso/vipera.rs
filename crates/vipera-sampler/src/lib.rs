@@ -144,7 +144,17 @@ impl Sampler {
         }
 
         let scale = 1.0 / self.config.temperature;
-        let mut weights = top_candidates(logits, &penalty, self.config.top_k);
+        // `top_k` of 0 turns the cut off, and top-p alone can still keep a large share of the
+        // vocabulary. Take a generous bounded head first and sort every logit only when the cut
+        // really falls beyond it: for a peaked distribution the answer is inside a few hundred
+        // entries, and sorting 151936 to find that is the whole cost of this stage.
+        let uncut = self.config.top_k == 0;
+        let bound = if uncut {
+            NO_CUT_CANDIDATES
+        } else {
+            self.config.top_k
+        };
+        let mut weights = top_candidates(logits, &penalty, bound);
         if weights.is_empty() {
             return Err(ViperaError::invalid_argument(
                 "every logit is NaN or infinite",
@@ -175,16 +185,20 @@ impl Sampler {
         // `top_p` is compared against a share of the full mass, which is what the old division by
         // `total` did; keeping the weights unnormalized saves a division per candidate.
         let target_mass = self.config.top_p * total;
-        let mut cumulative = 0.0;
-        let mut kept = weights.len();
-        for (index, (_, weight)) in weights.iter().enumerate() {
-            cumulative += weight;
-            if cumulative >= target_mass {
-                kept = index + 1;
-                break;
+        let mut cut = mass_cut(&weights, target_mass);
+
+        // The bounded head did not reach the cut, so the exact answer needs the tail too. This is
+        // the only case that still sorts every logit, and it is the only case where it cannot be
+        // avoided: top-p is defined over the whole distribution.
+        if uncut && cut.is_none() && weights.len() < logits.len() {
+            weights = top_candidates(logits, &penalty, 0);
+            for (_, weight) in weights.iter_mut() {
+                *weight = (*weight * scale - peak).exp();
             }
+            cut = mass_cut(&weights, target_mass);
         }
-        weights.truncate(kept);
+
+        weights.truncate(cut.unwrap_or(weights.len()));
 
         let threshold = self.config.min_p * weights[0].1;
         weights.retain(|(_, weight)| *weight >= threshold);
@@ -202,6 +216,25 @@ impl Sampler {
         Ok(weights[weights.len() - 1].0)
     }
 }
+
+/// How many of the leading candidates `target` mass needs, or `None` when the whole set falls short.
+fn mass_cut(weights: &[(u32, f32)], target: f32) -> Option<usize> {
+    let mut cumulative = 0.0;
+    for (index, (_, weight)) in weights.iter().enumerate() {
+        cumulative += weight;
+        if cumulative >= target {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+/// How many candidates the no-cut path keeps before deciding it has to sort the vocabulary.
+///
+/// 4096 is far more than top-p ever keeps on a language model — the head that reaches 0.95 of the
+/// mass is usually under a hundred tokens — while staying small enough that the bounded selection
+/// and the sort of the head together cost less than a millisecond.
+const NO_CUT_CANDIDATES: usize = 4096;
 
 /// Descending by logit, then ascending by id, so the order is total and reproducible.
 fn by_probability(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
@@ -399,6 +432,29 @@ mod tests {
         // Greedy reads the same maximum in one pass, with no vector and no sort.
         let mut greedy = sampler(0.0, 0, 1.0, 0.0, 1.0);
         assert_eq!(greedy.sample(&logits, &[]).unwrap(), 123_456);
+    }
+
+    #[test]
+    fn without_top_k_top_p_cuts_the_head_of_a_long_vector() {
+        let mut logits = vec![-20.0_f32; 200_000];
+        logits[1] = 10.0;
+        logits[199_999] = 9.9;
+        let mut s = sampler(1.0, 0, 0.5, 0.0, 1.0);
+        for _ in 0..100 {
+            assert_eq!(s.sample(&logits, &[]).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn without_top_k_a_flat_distribution_reaches_past_the_bounded_head() {
+        // Equal logits put half the mass in the first 100000 ids, far beyond the 4096 candidates the
+        // bounded head holds, so the whole vocabulary has to be ordered before the cut.
+        let logits = vec![0.0_f32; 200_000];
+        let mut s = sampler(1.0, 0, 0.5, 0.0, 1.0);
+        for _ in 0..50 {
+            let id = s.sample(&logits, &[]).unwrap();
+            assert!(id < 100_000, "id {id} came from beyond the top-p half");
+        }
     }
 
     #[test]
