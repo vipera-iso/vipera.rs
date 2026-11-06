@@ -27,7 +27,7 @@ jobs:
       # keeps that reason visible in the job log instead of buried in a captured test harness.
       RUST_BACKTRACE: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Toolchain components
         run: rustup component add rustfmt clippy
