@@ -77,14 +77,17 @@ The server is single-conversation and serialized behind one engine; there is no 
 
 ## Measured
 
-On the machine this was developed on, Qwen2.5-1.5B-Instruct Q4_K_M, 12 tokens at temperature 0:
+On the machine this was developed on, Qwen2.5-1.5B-Instruct Q4_K_M, at temperature 0:
 
 | | |
 |---|---|
-| Time to first token | 1.64 s |
-| Compute for 12 tokens | 3.56 s (≈ 3.2 tok/s) |
+| Compute for 12 tokens | 1.64-1.73 s (6.1-6.5 tok/s, three runs) |
+| Compute for 24 tokens | 2.89-3.25 s (6.4-7.2 tok/s) |
 | KV cache at `--ctx 2048`, `f16` | 58.7 MB |
 | Same cache at `q8_0` | 31.2 MB (53%) |
+
+Time to first token is not in this table because the streaming path does not stamp it; the earlier
+1.64 s figure was read from a run that no longer exists and is not repeated here.
 
 Numbers are machine-bound, not a benchmark claim; `generate --json` is how they were read.
 
@@ -96,6 +99,9 @@ Numbers are machine-bound, not a benchmark claim; `generate --json` is how they 
 - **Server**: no rate limiting, no request logging, no concurrent conversations.
 - **llama.cpp parity**: the tokenizer and continuation checks skip unless `llama-server` is
   installed; they are the intended proof of numeric agreement.
+- **Speed**: 6-7 tok/s on this class of CPU, not the 10 tok/s goal. Q4_K activations are multiplied
+  as `i8`, so outputs agree with the `f32` path on the checked prompts but are not bit-identical to
+  it.
 
 ## License
 

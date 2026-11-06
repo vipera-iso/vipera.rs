@@ -48,23 +48,36 @@ fn unsupported(ty: GgmlType) -> ViperaError {
     ))
 }
 
-/// Half-precision bits to `f32`.
+/// Half-precision bits to `f32`, by moving bits rather than multiplying by a power.
+///
+/// This is on the hot path: a Q4_K block calls it twice and a Q6_K block once, so 12 to 14 calls
+/// per `matvec` row. The obvious implementation, `(1024 + mantissa) * 2f32.powi(exponent - 25)`,
+/// passes a runtime exponent to `powi`, which compiles to the `__powisf2` compiler-rt helper — a
+/// loop — and not to a multiply. That cost showed up as the Q4_K kernel measuring 1.67 GB/s
+/// single-threaded with the nibble arithmetic accounting for a fraction of the time.
+///
+/// Subnormal inputs are normalized by shifting the mantissa left until its top bit reaches the
+/// explicit-bit position, which is why they cost a `leading_zeros` instead of a special case.
 pub fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 1;
-    let exponent = i32::from((bits >> 10) & 0x1f);
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from((bits >> 10) & 0x1f);
     let mantissa = u32::from(bits & 0x3ff);
-    let magnitude = if exponent == 0 {
-        mantissa as f32 * 2f32.powi(-24)
-    } else if exponent == 0x1f {
+    let out = if exponent == 0 {
         if mantissa == 0 {
-            f32::INFINITY
+            sign
         } else {
-            f32::NAN
+            // Value is `mantissa * 2^-24`; put the leading bit at 2^10 and count the shift down.
+            let shift = mantissa.leading_zeros() - 21;
+            let normalized = (mantissa << shift) & 0x3ff;
+            sign | ((113 - shift) << 23) | (normalized << 13)
         }
+    } else if exponent == 0x1f {
+        // Infinity when the mantissa is zero, otherwise a NaN; both keep the exponent all ones.
+        sign | 0x7f80_0000 | (mantissa << 13)
     } else {
-        (1024.0 + mantissa as f32) * 2f32.powi(exponent - 25)
+        sign | ((exponent + 112) << 23) | (mantissa << 13)
     };
-    if sign == 1 { -magnitude } else { magnitude }
+    f32::from_bits(out)
 }
 
 /// `f32` to half-precision bits, rounding to nearest with the low bits dropped.
@@ -125,6 +138,59 @@ pub(crate) fn x_sums(x: &[f32]) -> Vec<f32> {
         .iter()
         .map(|chunk| chunk.iter().sum())
         .collect()
+}
+
+/// `x` rounded to `i8`, one scale per 32 values.
+///
+/// The AVX2 Q4_K kernel multiplies weights by `i8` for a reason that is arithmetic, not taste:
+/// `_mm256_maddubs_epi16` turns 32 unsigned weights and 32 signed activations into 16 pair sums in
+/// one instruction, where the `f32` path needs four widen-multiply-add rounds for the same 32
+/// weights. The cost is that `x` gains a quantization error of at most `0.5/127` of its largest
+/// magnitude in each 32-value group.
+///
+/// The scales are per 32 values because a Q4_K sub-block is 32 values wide: one scale per Q4_K
+/// sub-block means the kernel multiplies by a single constant instead of feeding the scale through
+/// the integer part.
+pub(crate) struct QuantizedX {
+    /// The rounded values, `32` per group, in row order.
+    pub(crate) q: Vec<i8>,
+    /// One scale per 32-value group; a group of zeros gets scale `0`.
+    pub(crate) d: Vec<f32>,
+}
+
+impl QuantizedX {
+    /// Quantize `x` in groups of 32. A trailing partial group is ignored, and every caller in this
+    /// module passes a length that is a whole number of groups.
+    pub(crate) fn new(x: &[f32]) -> Self {
+        let mut q = Vec::with_capacity(x.len());
+        let mut d = Vec::with_capacity(x.len() / 32);
+        for group in x.as_chunks::<32>().0 {
+            let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+            if largest == 0.0 {
+                d.push(0.0);
+                q.extend(std::iter::repeat_n(0, 32));
+                continue;
+            }
+            let scale = largest / 127.0;
+            d.push(scale);
+            for value in group {
+                q.push((value / scale).round().clamp(-127.0, 127.0) as i8);
+            }
+        }
+        Self { q, d }
+    }
+
+    /// The dot this struct stands for, evaluated in `f32` against the original `x`.
+    ///
+    /// Used by tests to bound what quantizing the activation costs; the kernels never call it.
+    #[cfg(test)]
+    pub(crate) fn dequantized(&self) -> Vec<f32> {
+        self.q
+            .iter()
+            .enumerate()
+            .map(|(at, value)| f32::from(*value) * self.d[at / 32])
+            .collect()
+    }
 }
 
 /// Dot product of one Q4_K row with `x`.
@@ -237,12 +303,27 @@ pub(crate) fn dot_scalar(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> f
 ///
 /// Only the AVX2 module is allowed to use `unsafe`, and it re-checks the CPU itself, so this stays a
 /// safe function and a CPU without AVX2 simply takes the portable path.
-fn dot(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
+fn dot(ty: GgmlType, row: &[u8], activation: Activation<'_>) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if let Some(value) = crate::simd::try_dot(ty, row, x, sums) {
+    if let Some(value) = crate::simd::try_dot(ty, row, activation.x, activation.sums, activation.q)
+    {
         return value;
     }
-    dot_scalar(ty, row, x, sums)
+    dot_scalar(ty, row, activation.x, activation.sums)
+}
+
+/// The activation vector, with the state `matvec` derives from it once per call.
+///
+/// Bundling the three slices keeps the per-row plumbing to one argument, and makes it obvious that
+/// the quantized copy and the sums always come from the same `x`.
+#[derive(Clone, Copy)]
+struct Activation<'a> {
+    /// The `cols` values being multiplied.
+    x: &'a [f32],
+    /// Sums of `x` over every 16 values, for the minimum term.
+    sums: &'a [f32],
+    /// `x` rounded to `i8`; only built for Q4_K rows.
+    q: Option<&'a QuantizedX>,
 }
 
 /// Dequantize one row into `out`.
@@ -400,21 +481,29 @@ pub fn matvec(
             format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
         ));
     }
+    // One quantization of the activation, shared by every row. Only Q4_K uses it; building it for
+    // the other formats would be a wasted pass over `x`.
+    let xq = (ty == GgmlType::Q4K).then(|| QuantizedX::new(x));
     let sums = x_sums(x);
     let product = rows.saturating_mul(cols);
     let threads = thread_budget(rows, product);
 
+    let activation = Activation {
+        x,
+        sums: &sums,
+        q: xq.as_ref(),
+    };
+
     if threads <= 1 {
-        fill_rows(ty, data, stride, 0, x, &sums, out);
+        fill_rows(ty, data, stride, 0, activation, out);
         return Ok(());
     }
 
     let per_thread = rows.div_ceil(threads);
-    let sums_slice: &[f32] = &sums;
     thread::scope(|scope| {
         for (chunk, slice) in out.chunks_mut(per_thread).enumerate() {
             let first_row = chunk * per_thread;
-            scope.spawn(move || fill_rows(ty, data, stride, first_row, x, sums_slice, slice));
+            scope.spawn(move || fill_rows(ty, data, stride, first_row, activation, slice));
         }
     });
     Ok(())
@@ -455,13 +544,12 @@ fn fill_rows(
     data: &[u8],
     stride: usize,
     first_row: usize,
-    x: &[f32],
-    sums: &[f32],
+    activation: Activation<'_>,
     out: &mut [f32],
 ) {
     for (offset, slot) in out.iter_mut().enumerate() {
         let start = (first_row + offset) * stride;
-        *slot = dot(ty, &data[start..start + stride], x, sums);
+        *slot = dot(ty, &data[start..start + stride], activation);
     }
 }
 
@@ -480,6 +568,29 @@ mod tests {
             assert_eq!(f16_to_f32(bits), value, "{value} did not round trip");
         }
         assert_eq!(f16_to_f32(f32_to_f16(1.000_1)), 1.0);
+    }
+
+    #[test]
+    fn half_precision_covers_subnormals_and_the_special_values() {
+        // The small scales of a real file land in the subnormal range, where the bit manipulation
+        // has to agree with the arithmetic definition `mantissa * 2^-24`.
+        for mantissa in [1_u16, 2, 512, 1023] {
+            let expected = f64::from(mantissa) * 2f64.powi(-24);
+            let actual = f64::from(f16_to_f32(mantissa));
+            assert!(
+                (actual - expected).abs() <= expected * 1e-6,
+                "subnormal {mantissa}: {actual} vs {expected}"
+            );
+            assert_eq!(f16_to_f32(mantissa | 0x8000), -f16_to_f32(mantissa));
+        }
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x8000).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7e00).is_nan());
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x7bff), 65504.0, "the largest finite half");
     }
 
     #[test]
@@ -565,6 +676,25 @@ mod tests {
         assert_eq!(out[32], 31.0);
         assert_eq!(out[64], 16.0, "group 3 uses the high nibble of ql[0]");
         assert_eq!(out[96], 16.0);
+    }
+
+    #[test]
+    fn quantizing_an_activation_keeps_each_value_within_half_a_step() {
+        let mut x: Vec<f32> = (0..256).map(|at| (at as f32 - 128.0) / 37.0).collect();
+        let quantized = QuantizedX::new(&x);
+        assert_eq!(quantized.d.len(), 8);
+        for (at, (original, restored)) in x.iter().zip(quantized.dequantized()).enumerate() {
+            let step = quantized.d[at / 32];
+            assert!(
+                (original - restored).abs() <= step * 0.5 + 1e-6,
+                "value {at}: {original} became {restored} with step {step}"
+            );
+        }
+        // A group of zeros keeps zero rather than dividing by a zero scale.
+        x[32..64].fill(0.0);
+        let zeros = QuantizedX::new(&x);
+        assert_eq!(zeros.d[1], 0.0);
+        assert!(zeros.q[32..64].iter().all(|value| *value == 0));
     }
 
     #[test]
