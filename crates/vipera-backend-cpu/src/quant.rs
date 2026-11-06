@@ -317,13 +317,42 @@ fn dot(ty: GgmlType, row: &[u8], activation: Activation<'_>) -> f32 {
 /// Bundling the three slices keeps the per-row plumbing to one argument, and makes it obvious that
 /// the quantized copy and the sums always come from the same `x`.
 #[derive(Clone, Copy)]
-struct Activation<'a> {
+pub(crate) struct Activation<'a> {
     /// The `cols` values being multiplied.
     x: &'a [f32],
     /// Sums of `x` over every 16 values, for the minimum term.
     sums: &'a [f32],
     /// `x` rounded to `i8`; only built for Q4_K rows.
     q: Option<&'a QuantizedX>,
+}
+
+/// The same state, copied so a worker thread can own it.
+///
+/// A pool of workers outlives one `matvec`, and its jobs cannot borrow the caller's scratch
+/// buffers, so the activation travels by value. For this model that is a few kilobytes per call
+/// against a tensor read of megabytes.
+pub(crate) struct OwnedActivation {
+    x: Vec<f32>,
+    sums: Vec<f32>,
+    q: Option<QuantizedX>,
+}
+
+impl OwnedActivation {
+    pub(crate) fn new(ty: GgmlType, x: &[f32]) -> Self {
+        Self {
+            x: x.to_vec(),
+            sums: x_sums(x),
+            q: (ty == GgmlType::Q4K).then(|| QuantizedX::new(x)),
+        }
+    }
+
+    pub(crate) fn borrowed(&self) -> Activation<'_> {
+        Activation {
+            x: &self.x,
+            sums: &self.sums,
+            q: self.q.as_ref(),
+        }
+    }
 }
 
 /// Dequantize one row into `out`.
@@ -464,23 +493,7 @@ pub fn matvec(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
-    if x.len() != cols || out.len() != rows {
-        return Err(ViperaError::internal(format!(
-            "matvec expected a {cols}-value input and {rows} outputs, got {} and {}",
-            x.len(),
-            out.len()
-        )));
-    }
-    let stride = row_bytes(ty, cols)?;
-    let needed = stride
-        .checked_mul(rows)
-        .ok_or_else(|| ViperaError::invalid_argument("tensor size overflows"))?;
-    if data.len() < needed {
-        return Err(ViperaError::parse(
-            data.len() as u64,
-            format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
-        ));
-    }
+    let stride = checked_stride(ty, data, cols, rows, x, out)?;
     // One quantization of the activation, shared by every row. Only Q4_K uses it; building it for
     // the other formats would be a wasted pass over `x`.
     let xq = (ty == GgmlType::Q4K).then(|| QuantizedX::new(x));
@@ -509,6 +522,54 @@ pub fn matvec(
     Ok(())
 }
 
+/// Validate the shapes of a matvec call and return the bytes one row occupies.
+fn checked_stride(
+    ty: GgmlType,
+    data: &[u8],
+    cols: usize,
+    rows: usize,
+    x: &[f32],
+    out: &[f32],
+) -> Result<usize, ViperaError> {
+    if x.len() != cols || out.len() != rows {
+        return Err(ViperaError::internal(format!(
+            "matvec expected a {cols}-value input and {rows} outputs, got {} and {}",
+            x.len(),
+            out.len()
+        )));
+    }
+    let stride = row_bytes(ty, cols)?;
+    let needed = stride
+        .checked_mul(rows)
+        .ok_or_else(|| ViperaError::invalid_argument("tensor size overflows"))?;
+    if data.len() < needed {
+        return Err(ViperaError::parse(
+            data.len() as u64,
+            format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
+        ));
+    }
+    Ok(stride)
+}
+
+/// The same product, using threads that already exist.
+///
+/// The rows are handed to [`crate::pool::Pool`] rather than to freshly spawned threads; `data` is
+/// tied to the pool's lifetime because a worker holds it for as long as the pool lives.
+pub(crate) fn matvec_pooled<'d>(
+    pool: &crate::pool::Pool<'d>,
+    ty: GgmlType,
+    data: &'d [u8],
+    cols: usize,
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let stride = checked_stride(ty, data, cols, rows, x, out)?;
+    let threads = thread_budget(rows, rows.saturating_mul(cols));
+    let activation = std::sync::Arc::new(OwnedActivation::new(ty, x));
+    pool.fill(ty, data, stride, threads, &activation, out)
+}
+
 /// Multiply-adds below this stay on the calling thread: a spawn costs more than the work saves.
 const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
 
@@ -518,7 +579,7 @@ const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
 /// and these kernels are memory-bound enough that the sibling threads do not always pay for their
 /// spawn, so being able to pin the count is worth one `std::env` read per process. The override is
 /// parsed once and cached; a value of `0` or nonsense falls back to the detected count.
-fn thread_budget(rows: usize, product: usize) -> usize {
+pub(crate) fn thread_budget(rows: usize, product: usize) -> usize {
     if product < PARALLEL_MIN_PRODUCT {
         return 1;
     }
@@ -539,7 +600,7 @@ fn thread_budget(rows: usize, product: usize) -> usize {
         .min(rows.max(1))
 }
 
-fn fill_rows(
+pub(crate) fn fill_rows(
     ty: GgmlType,
     data: &[u8],
     stride: usize,
@@ -706,6 +767,30 @@ mod tests {
         let mut out = vec![0.0; 2];
         matvec(GgmlType::F32, &data, 3, 2, &[1.0, 1.0, 1.0], &mut out).expect("matvec");
         assert_eq!(out, vec![6.0, 15.0]);
+    }
+
+    #[test]
+    fn a_pooled_matvec_matches_the_spawned_one() {
+        // Four chunks over eight rows, so every reply has to land in the right slice.
+        const ROWS: usize = 8;
+        let stride = row_bytes(GgmlType::Q4K, 512).expect("stride");
+        let mut data = vec![0u8; stride * ROWS];
+        for (at, byte) in data.iter_mut().enumerate() {
+            *byte = (at.wrapping_mul(37) % 251) as u8;
+        }
+        let x: Vec<f32> = (0..512).map(|at| ((at % 13) as f32 - 6.0) / 7.0).collect();
+
+        let mut spawned = vec![0.0_f32; ROWS];
+        matvec(GgmlType::Q4K, &data, 512, ROWS, &x, &mut spawned).expect("matvec");
+
+        thread::scope(|scope| {
+            let pool = crate::pool::Pool::new(scope, 4);
+            let activation = std::sync::Arc::new(OwnedActivation::new(GgmlType::Q4K, &x));
+            let mut pooled = vec![0.0_f32; ROWS];
+            pool.fill(GgmlType::Q4K, &data, stride, 4, &activation, &mut pooled)
+                .expect("pooled matvec");
+            assert_eq!(pooled, spawned, "a reused worker must give the same rows");
+        });
     }
 
     #[test]

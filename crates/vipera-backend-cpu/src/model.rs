@@ -10,12 +10,14 @@
 //! overrunning.
 
 use std::path::Path;
+use std::thread;
 
 use vipera_core::gguf::{GgmlType, GgufFile, TensorInfo, Value};
 use vipera_core::planner::KvCacheType;
 use vipera_errors::ViperaError;
 use vipera_runtime::{ForwardContext, ForwardPass};
 
+use crate::pool::Pool;
 use crate::quant::{self, f16_to_f32, f32_to_f16};
 
 /// The numbers a forward pass needs, read from the file rather than assumed.
@@ -204,8 +206,14 @@ impl Tensor {
         &file[self.start..self.start + self.len]
     }
 
-    fn matvec(&self, file: &[u8], x: &[f32], out: &mut [f32]) -> Result<(), ViperaError> {
-        quant::matvec(self.ty, self.data(file), self.cols, self.rows, x, out)
+    fn matvec<'d>(
+        &self,
+        pool: &Pool<'d>,
+        file: &'d [u8],
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<(), ViperaError> {
+        quant::matvec_pooled(pool, self.ty, self.data(file), self.cols, self.rows, x, out)
     }
 
     fn read_row(&self, file: &[u8], row: usize, out: &mut [f32]) -> Result<(), ViperaError> {
@@ -410,57 +418,66 @@ impl CpuBackend {
             head_dim: config.head_dim,
         };
 
-        for (offset, token) in context.new_tokens.iter().enumerate() {
-            let position = context.first_position as usize + offset;
-            let row = usize::try_from(*token)
-                .map_err(|_| ViperaError::invalid_argument("token id does not fit this build"))?;
-            if row >= config.vocab {
-                return Err(ViperaError::invalid_argument(format!(
-                    "token {row} is outside the vocabulary of {}",
-                    config.vocab
-                )));
-            }
-            tok_embd.read_row(bytes, row, x)?;
-
-            for (index, layer) in layers.iter().enumerate() {
-                rms_norm(x, &layer.attn_norm, config.rms_eps, h);
-                layer.wq.matvec(bytes, h, q)?;
-                add_assign(q, &layer.bq);
-                layer.wk.matvec(bytes, h, k)?;
-                add_assign(k, &layer.bk);
-                layer.wv.matvec(bytes, h, v)?;
-                add_assign(v, &layer.bv);
-
-                rope(q, position, shape.heads, shape.head_dim, config.rope_base);
-                rope(
-                    k,
-                    position,
-                    shape.kv_heads,
-                    shape.head_dim,
-                    config.rope_base,
-                );
-                kv.write(position, index, shape, k, v)?;
-
-                kv.load_layer(index, shape, position + 1, k_all, v_all)?;
-                attention(q, k_all, v_all, position + 1, shape, scores, attn);
-
-                layer.wo.matvec(bytes, attn, h)?;
-                add_assign(x, h);
-
-                rms_norm(x, &layer.ffn_norm, config.rms_eps, h);
-                layer.wg.matvec(bytes, h, gate)?;
-                layer.wu.matvec(bytes, h, up)?;
-                for (value, gate) in up.iter_mut().zip(gate.iter()) {
-                    *value *= silu(*gate);
+        // The bytes are borrowed for the whole pass so the pool's workers can hold them; the
+        // scratch buffers stay mutable because they are separate fields.
+        let file: &[u8] = bytes;
+        let threads =
+            quant::thread_budget(config.vocab, config.hidden.saturating_mul(config.vocab));
+        thread::scope(|scope| {
+            let pool = Pool::new(scope, threads);
+            for (offset, token) in context.new_tokens.iter().enumerate() {
+                let position = context.first_position as usize + offset;
+                let row = usize::try_from(*token).map_err(|_| {
+                    ViperaError::invalid_argument("token id does not fit this build")
+                })?;
+                if row >= config.vocab {
+                    return Err(ViperaError::invalid_argument(format!(
+                        "token {row} is outside the vocabulary of {}",
+                        config.vocab
+                    )));
                 }
-                layer.wd.matvec(bytes, up, h)?;
-                add_assign(x, h);
-            }
-        }
+                tok_embd.read_row(file, row, x)?;
 
-        rms_norm(x, output_norm, config.rms_eps, h);
-        output.matvec(bytes, h, logits)?;
-        Ok(logits.clone())
+                for (index, layer) in layers.iter().enumerate() {
+                    rms_norm(x, &layer.attn_norm, config.rms_eps, h);
+                    layer.wq.matvec(&pool, file, h, q)?;
+                    add_assign(q, &layer.bq);
+                    layer.wk.matvec(&pool, file, h, k)?;
+                    add_assign(k, &layer.bk);
+                    layer.wv.matvec(&pool, file, h, v)?;
+                    add_assign(v, &layer.bv);
+
+                    rope(q, position, shape.heads, shape.head_dim, config.rope_base);
+                    rope(
+                        k,
+                        position,
+                        shape.kv_heads,
+                        shape.head_dim,
+                        config.rope_base,
+                    );
+                    kv.write(position, index, shape, k, v)?;
+
+                    kv.load_layer(index, shape, position + 1, k_all, v_all)?;
+                    attention(q, k_all, v_all, position + 1, shape, scores, attn);
+
+                    layer.wo.matvec(&pool, file, attn, h)?;
+                    add_assign(x, h);
+
+                    rms_norm(x, &layer.ffn_norm, config.rms_eps, h);
+                    layer.wg.matvec(&pool, file, h, gate)?;
+                    layer.wu.matvec(&pool, file, h, up)?;
+                    for (value, gate) in up.iter_mut().zip(gate.iter()) {
+                        *value *= silu(*gate);
+                    }
+                    layer.wd.matvec(&pool, file, up, h)?;
+                    add_assign(x, h);
+                }
+            }
+
+            rms_norm(x, output_norm, config.rms_eps, h);
+            output.matvec(&pool, file, h, logits)?;
+            Ok(logits.clone())
+        })
     }
 }
 
