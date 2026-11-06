@@ -11,9 +11,14 @@
 
 pub mod rng;
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::fmt;
 
 use vipera_errors::ViperaError;
+use vipera_traits::{
+    LogitPenalty, Random, Registry, SampleError, SampleRequest, Sampler as Strategy,
+};
 
 pub use rng::Rng;
 
@@ -74,20 +79,171 @@ impl SamplerConfig {
     }
 }
 
-/// Stateful sampler: holds the config and the generator.
-#[derive(Debug, Clone)]
+/// Every sampling strategy this build has, in the order help text should list them.
+///
+/// Adding one is a new [`Strategy`] implementation plus an entry here; a [`Sampler`] finds it by
+/// name, so nothing else that samples has to change.
+pub static SAMPLERS: Registry = Registry::new(&[&Greedy, &Temperature]);
+
+/// Greedy decoding: the best penalized logit, ties to the lowest id.
+///
+/// One pass, no allocation, and no randomness; it is in the registry so a caller can ask for it by
+/// name instead of relying on `temperature == 0`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Greedy;
+
+impl Strategy for Greedy {
+    fn name(&self) -> &'static str {
+        "greedy"
+    }
+
+    fn draw(&self, request: &SampleRequest<'_>, _rng: &mut dyn Random) -> Result<u32, SampleError> {
+        let mut best: Option<(u32, f32)> = None;
+        for (id, logit) in request.logits.iter().enumerate() {
+            if !logit.is_finite() {
+                continue;
+            }
+            let value = request.penalty.apply(id, *logit);
+            let better = match best {
+                None => true,
+                Some((best_id, best_value)) => {
+                    value > best_value || (value == best_value && (id as u32) < best_id)
+                }
+            };
+            if better {
+                best = Some((id as u32, value));
+            }
+        }
+        best.map_or(Err(SampleError::NoFiniteLogits), |(id, _)| Ok(id))
+    }
+}
+
+/// Temperature sampling: penalize, keep a bounded head, cut by mass, draw one.
+///
+/// The softmax denominator is the mass of every finite logit, in logit order; only the candidates
+/// come from the bounded selection, which is what keeps the per-token cost off the whole
+/// vocabulary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Temperature;
+
+impl Strategy for Temperature {
+    fn name(&self) -> &'static str {
+        "temperature"
+    }
+
+    fn draw(&self, request: &SampleRequest<'_>, rng: &mut dyn Random) -> Result<u32, SampleError> {
+        let logits = request.logits;
+        let penalty = request.penalty;
+        let scale = 1.0 / request.temperature;
+        // `top_k` of 0 turns the cut off, and top-p alone can still keep a large share of the
+        // vocabulary. Take a generous bounded head first and sort every logit only when the cut
+        // really falls beyond it: for a peaked distribution the answer is inside a few hundred
+        // entries, and sorting 151936 to find that is the whole cost of this stage.
+        let uncut = request.top_k == 0;
+        let bound = if uncut {
+            NO_CUT_CANDIDATES
+        } else {
+            request.top_k
+        };
+        let mut weights = top_candidates(logits, penalty, bound);
+        if weights.is_empty() {
+            return Err(SampleError::NoFiniteLogits);
+        }
+
+        // The softmax denominator is still the mass of every finite logit, in logit order, which is
+        // what the earlier version summed after it had allocated and sorted the whole vector. Only
+        // the candidates come from the bounded selection now.
+        let peak = weights[0].1 * scale;
+        let mut total = 0.0_f32;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                total += (penalty.apply(id, *logit) * scale - peak).exp();
+            }
+        }
+        // `NaN` compares false against everything, so it is caught by the finiteness check.
+        if total <= 0.0 || !total.is_finite() {
+            return Err(SampleError::NoMass);
+        }
+
+        for (_, weight) in weights.iter_mut() {
+            *weight = (*weight * scale - peak).exp();
+        }
+
+        // `top_p` is compared against a share of the full mass, which is what the old division by
+        // `total` did; keeping the weights unnormalized saves a division per candidate.
+        let target_mass = request.top_p * total;
+        let mut cut = mass_cut(&weights, target_mass);
+
+        // The bounded head did not reach the cut, so the exact answer needs the tail too. This is
+        // the only case that still sorts every logit, and it is the only case where it cannot be
+        // avoided: top-p is defined over the whole distribution.
+        if uncut && cut.is_none() && weights.len() < logits.len() {
+            weights = top_candidates(logits, penalty, 0);
+            for (_, weight) in weights.iter_mut() {
+                *weight = (*weight * scale - peak).exp();
+            }
+            cut = mass_cut(&weights, target_mass);
+        }
+
+        weights.truncate(cut.unwrap_or(weights.len()));
+
+        let threshold = request.min_p * weights[0].1;
+        weights.retain(|(_, weight)| *weight >= threshold);
+
+        let mass: f32 = weights.iter().map(|(_, weight)| *weight).sum();
+        let target = rng.next_f64() * f64::from(mass);
+        let mut running = 0.0f64;
+        for (id, weight) in &weights {
+            running += f64::from(*weight);
+            if target < running {
+                return Ok(*id);
+            }
+        }
+        // Only reachable through floating-point rounding at the last candidate.
+        weights
+            .last()
+            .map_or(Err(SampleError::NoMass), |(id, _)| Ok(*id))
+    }
+}
+
+/// Stateful sampler: holds the config, the generator, and the strategy they resolve to.
+#[derive(Clone)]
 pub struct Sampler {
     config: SamplerConfig,
     rng: Rng,
+    /// Resolved once at construction, from [`SAMPLERS`], so a build without the named strategy
+    /// fails here rather than per token.
+    strategy: &'static dyn Strategy,
+}
+
+impl fmt::Debug for Sampler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sampler")
+            .field("config", &self.config)
+            .field("strategy", &self.strategy.name())
+            .finish()
+    }
 }
 
 impl Sampler {
     /// Build a sampler, rejecting an invalid config.
     pub fn new(config: SamplerConfig) -> Result<Self, ViperaError> {
         config.validate()?;
+        // A temperature of 0 asks for greedy and skips every filter; anything else filters and
+        // draws. The name is resolved against the registry so this build's list is the one truth
+        // about which strategies exist.
+        let name = if config.temperature == 0.0 {
+            "greedy"
+        } else {
+            "temperature"
+        };
+        let strategy = SAMPLERS.find(name).ok_or_else(|| {
+            ViperaError::internal(format!("this build has no {name} sampling strategy"))
+        })?;
         Ok(Self {
             rng: Rng::from_seed(config.seed),
             config,
+            strategy,
         })
     }
 
@@ -113,96 +269,275 @@ impl Sampler {
             ));
         }
 
-        let mut scored: Vec<(u32, f32)> = logits
-            .iter()
-            .enumerate()
-            .filter(|(_, logit)| logit.is_finite())
-            .map(|(id, logit)| (id as u32, *logit))
-            .collect();
-        if scored.is_empty() {
-            return Err(ViperaError::invalid_argument(
-                "every logit is NaN or infinite",
-            ));
-        }
-
-        let penalty = self.config.repetition_penalty;
-        if penalty != 1.0 {
-            for &id in recent {
-                if let Some(entry) = scored.iter_mut().find(|(candidate, _)| *candidate == id) {
-                    entry.1 = if entry.1 > 0.0 {
-                        entry.1 / penalty
-                    } else {
-                        entry.1 * penalty
-                    };
+        let penalty = RepetitionPenalty::new(recent, self.config.repetition_penalty);
+        let request = SampleRequest {
+            logits,
+            penalty: &penalty,
+            temperature: self.config.temperature,
+            top_k: self.config.top_k,
+            top_p: self.config.top_p,
+            min_p: self.config.min_p,
+        };
+        let strategy = self.strategy;
+        strategy
+            .draw(&request, &mut self.rng)
+            .map_err(|error| match error {
+                SampleError::NoFiniteLogits => {
+                    ViperaError::invalid_argument("every logit is NaN or infinite")
                 }
-            }
-        }
-
-        sort_by_probability(&mut scored);
-        if self.config.temperature == 0.0 {
-            return Ok(scored[0].0);
-        }
-
-        let scale = 1.0 / self.config.temperature;
-        let peak = scored[0].1 * scale;
-        let mut candidates: Vec<(u32, f32)> = scored
-            .iter()
-            .map(|(id, logit)| (*id, (logit * scale - peak).exp()))
-            .collect();
-        let total: f32 = candidates.iter().map(|(_, weight)| weight).sum();
-        // `NaN` compares false against everything, so it is caught by the finiteness check.
-        if total <= 0.0 || !total.is_finite() {
-            return Err(ViperaError::internal(
-                "softmax produced no usable probability mass",
-            ));
-        }
-        for (_, weight) in candidates.iter_mut() {
-            *weight /= total;
-        }
-
-        if self.config.top_k > 0 && candidates.len() > self.config.top_k {
-            candidates.truncate(self.config.top_k);
-        }
-
-        let mut cumulative = 0.0;
-        let mut keep = candidates.len();
-        for (index, (_, weight)) in candidates.iter().enumerate() {
-            cumulative += weight;
-            if cumulative >= self.config.top_p {
-                keep = index + 1;
-                break;
-            }
-        }
-        candidates.truncate(keep);
-
-        let threshold = self.config.min_p * candidates[0].1;
-        candidates.retain(|(_, weight)| *weight >= threshold);
-
-        let total: f32 = candidates.iter().map(|(_, weight)| weight).sum();
-        let target = self.rng.next_f64() * f64::from(total);
-        let mut running = 0.0f64;
-        for (id, weight) in &candidates {
-            running += f64::from(*weight);
-            if target < running {
-                return Ok(*id);
-            }
-        }
-        // Only reachable through floating-point rounding at the last candidate.
-        Ok(candidates[candidates.len() - 1].0)
+                SampleError::NoMass => {
+                    ViperaError::internal("softmax produced no usable probability mass")
+                }
+            })
     }
 }
 
-fn sort_by_probability(scored: &mut [(u32, f32)]) {
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+/// How many of the leading candidates `target` mass needs, or `None` when the whole set falls short.
+fn mass_cut(weights: &[(u32, f32)], target: f32) -> Option<usize> {
+    let mut cumulative = 0.0;
+    for (index, (_, weight)) in weights.iter().enumerate() {
+        cumulative += weight;
+        if cumulative >= target {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+/// How many candidates the no-cut path keeps before deciding it has to sort the vocabulary.
+///
+/// 4096 is far more than top-p ever keeps on a language model — the head that reaches 0.95 of the
+/// mass is usually under a hundred tokens — while staying small enough that the bounded selection
+/// and the sort of the head together cost less than a millisecond.
+const NO_CUT_CANDIDATES: usize = 4096;
+
+/// Descending by logit, then ascending by id, so the order is total and reproducible.
+fn by_probability(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
+    b.1.partial_cmp(&a.1)
+        .unwrap_or(Ordering::Equal)
+        .then(a.0.cmp(&b.0))
+}
+
+/// One logit with the ordering the sampler ranks by: higher first, ties to the lower id.
+///
+/// `Ord` rather than a comparator closure because the bounded selection below compares this key
+/// once per logit, and a closure passed through a generic comes out cheaper than one through a
+/// function pointer.
+struct Ranked {
+    value: f32,
+    id: u32,
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.value
+            .total_cmp(&other.value)
+            .then(other.id.cmp(&self.id))
+    }
+}
+
+/// The `top_k` best finite logits, best first, with the repetition penalty already applied.
+///
+/// `top_k` of 0 means no cut and falls back to sorting every logit, which is the honest reading of
+/// that setting. Otherwise a heap of exactly `k` entries walks the vector once: each logit costs
+/// one comparison against the worst kept entry, and an entry leaves the heap only when a better one
+/// arrives, so the heap operations are `O(k log n)` in total instead of `O(n)`.
+fn top_candidates(logits: &[f32], penalty: &dyn LogitPenalty, top_k: usize) -> Vec<(u32, f32)> {
+    if top_k == 0 || top_k >= logits.len() {
+        let mut all: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
+            .map(|(id, logit)| (id as u32, penalty.apply(id, *logit)))
+            .collect();
+        all.sort_unstable_by(by_probability);
+        return all;
+    }
+
+    let mut heap: BinaryHeap<Reverse<Ranked>> = BinaryHeap::with_capacity(top_k + 1);
+    for (id, logit) in logits.iter().enumerate() {
+        if !logit.is_finite() {
+            continue;
+        }
+        let ranked = Ranked {
+            value: penalty.apply(id, *logit),
+            id: id as u32,
+        };
+        if heap.len() < top_k {
+            heap.push(Reverse(ranked));
+        } else if heap.peek().is_some_and(|Reverse(worst)| ranked > *worst) {
+            heap.pop();
+            heap.push(Reverse(ranked));
+        }
+    }
+    let mut best: Vec<(u32, f32)> = heap
+        .into_iter()
+        .map(|Reverse(ranked)| (ranked.id, ranked.value))
+        .collect();
+    best.sort_unstable_by(by_probability);
+    best
+}
+
+/// The repetition penalty, applied in one binary search per logit.
+///
+/// The obvious loop over `recent` costs a scan of the whole logit vector per recent id, which is
+/// tens of scans per token once the context is long. Sorting the handful of recent ids once turns
+/// that into a `log n` lookup on the single pass that already visits every logit.
+struct RepetitionPenalty {
+    /// The penalized ids, sorted and deduplicated; empty when the penalty is disabled.
+    ids: Vec<u32>,
+    factor: f32,
+}
+
+impl LogitPenalty for RepetitionPenalty {
+    fn apply(&self, id: usize, logit: f32) -> f32 {
+        // The inherent method below, so the arithmetic exists once.
+        RepetitionPenalty::apply(self, id, logit)
+    }
+}
+
+impl Random for Rng {
+    fn next_f64(&mut self) -> f64 {
+        Rng::next_f64(self)
+    }
+}
+
+impl RepetitionPenalty {
+    fn new(recent: &[u32], factor: f32) -> Self {
+        if factor == 1.0 || recent.is_empty() {
+            return Self {
+                ids: Vec::new(),
+                factor,
+            };
+        }
+        let mut ids = recent.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        Self { ids, factor }
+    }
+
+    fn apply(&self, id: usize, logit: f32) -> f32 {
+        if self.ids.is_empty() || self.ids.binary_search(&(id as u32)).is_err() {
+            return logit;
+        }
+        if logit > 0.0 {
+            logit / self.factor
+        } else {
+            logit * self.factor
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strategy that exists only in this test, to prove the registry needs no change for a new
+    /// policy: it is looked up and drawn from exactly like the ones the build ships.
+    #[derive(Debug)]
+    struct Lowest;
+
+    impl Strategy for Lowest {
+        fn name(&self) -> &'static str {
+            "lowest"
+        }
+
+        fn draw(
+            &self,
+            request: &SampleRequest<'_>,
+            _rng: &mut dyn Random,
+        ) -> Result<u32, SampleError> {
+            request
+                .logits
+                .iter()
+                .enumerate()
+                .min_by(|left, right| left.1.total_cmp(right.1))
+                .map_or(Err(SampleError::NoFiniteLogits), |(id, _)| Ok(id as u32))
+        }
+    }
+
+    static TEST_ONLY: Registry = Registry::new(&[&Lowest]);
+
+    fn request<'a>(logits: &'a [f32], penalty: &'a RepetitionPenalty) -> SampleRequest<'a> {
+        SampleRequest {
+            logits,
+            penalty,
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.95,
+            min_p: 0.05,
+        }
+    }
+
+    #[test]
+    fn a_strategy_that_only_exists_in_a_test_is_found_by_the_same_lookup() {
+        let found = TEST_ONLY.find("lowest").expect("the test lists it");
+        assert_eq!(found.name(), "lowest");
+        let penalty = RepetitionPenalty::new(&[], 1.0);
+        let logits = [1.0_f32, -2.0, 3.0];
+        assert_eq!(
+            found.draw(&request(&logits, &penalty), &mut Rng::from_seed(0)),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn the_registry_names_both_strategies_the_build_ships() {
+        assert_eq!(
+            SAMPLERS.names().collect::<Vec<_>>(),
+            vec!["greedy", "temperature"]
+        );
+        assert_eq!(SAMPLERS.len(), 2);
+    }
+
+    #[test]
+    fn the_registry_draws_the_same_token_as_a_configured_sampler() {
+        let logits: Vec<f32> = (0..512).map(|at| ((at * 7) % 23) as f32 / 5.0).collect();
+        for temperature in [0.0_f32, 0.8] {
+            let config = SamplerConfig {
+                temperature,
+                seed: 99,
+                ..SamplerConfig::default()
+            };
+            let mut sampler = Sampler::new(config).expect("config is valid");
+            let expected = sampler.sample(&logits, &[]).expect("a token");
+
+            let name = if temperature == 0.0 {
+                "greedy"
+            } else {
+                "temperature"
+            };
+            let strategy = SAMPLERS.find(name).expect("the build ships it");
+            let penalty = RepetitionPenalty::new(&[], config.repetition_penalty);
+            let request = SampleRequest {
+                logits: &logits,
+                penalty: &penalty,
+                temperature: config.temperature,
+                top_k: config.top_k,
+                top_p: config.top_p,
+                min_p: config.min_p,
+            };
+            assert_eq!(
+                strategy.draw(&request, &mut Rng::from_seed(config.seed)),
+                Ok(expected),
+                "{name} disagreed with the sampler the engine uses"
+            );
+        }
+    }
 
     fn sampler(temperature: f32, top_k: usize, top_p: f32, min_p: f32, penalty: f32) -> Sampler {
         Sampler::new(SamplerConfig {
@@ -260,6 +595,47 @@ mod tests {
         let mut s = sampler(0.0, 0, 1.0, 0.0, 2.0);
         assert_eq!(s.sample(&[5.0, 4.0], &[]).unwrap(), 0);
         assert_eq!(s.sample(&[5.0, 4.0], &[0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_long_logit_vector_is_cut_to_its_head() {
+        // 200000 entries is the size of a real vocabulary, and the size at which selecting the
+        // candidates costs less than sorting all of them.
+        let mut logits = vec![-10.0_f32; 200_000];
+        logits[123_456] = 8.0;
+        logits[7] = 7.0;
+
+        let mut ranked = sampler(1.0, 2, 1.0, 0.0, 1.0);
+        for _ in 0..100 {
+            assert!(matches!(ranked.sample(&logits, &[]).unwrap(), 123_456 | 7));
+        }
+
+        // Greedy reads the same maximum in one pass, with no vector and no sort.
+        let mut greedy = sampler(0.0, 0, 1.0, 0.0, 1.0);
+        assert_eq!(greedy.sample(&logits, &[]).unwrap(), 123_456);
+    }
+
+    #[test]
+    fn without_top_k_top_p_cuts_the_head_of_a_long_vector() {
+        let mut logits = vec![-20.0_f32; 200_000];
+        logits[1] = 10.0;
+        logits[199_999] = 9.9;
+        let mut s = sampler(1.0, 0, 0.5, 0.0, 1.0);
+        for _ in 0..100 {
+            assert_eq!(s.sample(&logits, &[]).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn without_top_k_a_flat_distribution_reaches_past_the_bounded_head() {
+        // Equal logits put half the mass in the first 100000 ids, far beyond the 4096 candidates the
+        // bounded head holds, so the whole vocabulary has to be ordered before the cut.
+        let logits = vec![0.0_f32; 200_000];
+        let mut s = sampler(1.0, 0, 0.5, 0.0, 1.0);
+        for _ in 0..50 {
+            let id = s.sample(&logits, &[]).unwrap();
+            assert!(id < 100_000, "id {id} came from beyond the top-p half");
+        }
     }
 
     #[test]

@@ -48,23 +48,36 @@ fn unsupported(ty: GgmlType) -> ViperaError {
     ))
 }
 
-/// Half-precision bits to `f32`.
+/// Half-precision bits to `f32`, by moving bits rather than multiplying by a power.
+///
+/// This is on the hot path: a Q4_K block calls it twice and a Q6_K block once, so 12 to 14 calls
+/// per `matvec` row. The obvious implementation, `(1024 + mantissa) * 2f32.powi(exponent - 25)`,
+/// passes a runtime exponent to `powi`, which compiles to the `__powisf2` compiler-rt helper — a
+/// loop — and not to a multiply. That cost showed up as the Q4_K kernel measuring 1.67 GB/s
+/// single-threaded with the nibble arithmetic accounting for a fraction of the time.
+///
+/// Subnormal inputs are normalized by shifting the mantissa left until its top bit reaches the
+/// explicit-bit position, which is why they cost a `leading_zeros` instead of a special case.
 pub fn f16_to_f32(bits: u16) -> f32 {
-    let sign = (bits >> 15) & 1;
-    let exponent = i32::from((bits >> 10) & 0x1f);
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from((bits >> 10) & 0x1f);
     let mantissa = u32::from(bits & 0x3ff);
-    let magnitude = if exponent == 0 {
-        mantissa as f32 * 2f32.powi(-24)
-    } else if exponent == 0x1f {
+    let out = if exponent == 0 {
         if mantissa == 0 {
-            f32::INFINITY
+            sign
         } else {
-            f32::NAN
+            // Value is `mantissa * 2^-24`; put the leading bit at 2^10 and count the shift down.
+            let shift = mantissa.leading_zeros() - 21;
+            let normalized = (mantissa << shift) & 0x3ff;
+            sign | ((113 - shift) << 23) | (normalized << 13)
         }
+    } else if exponent == 0x1f {
+        // Infinity when the mantissa is zero, otherwise a NaN; both keep the exponent all ones.
+        sign | 0x7f80_0000 | (mantissa << 13)
     } else {
-        (1024.0 + mantissa as f32) * 2f32.powi(exponent - 25)
+        sign | ((exponent + 112) << 23) | (mantissa << 13)
     };
-    if sign == 1 { -magnitude } else { magnitude }
+    f32::from_bits(out)
 }
 
 /// `f32` to half-precision bits, rounding to nearest with the low bits dropped.
@@ -125,6 +138,59 @@ pub(crate) fn x_sums(x: &[f32]) -> Vec<f32> {
         .iter()
         .map(|chunk| chunk.iter().sum())
         .collect()
+}
+
+/// `x` rounded to `i8`, one scale per 32 values.
+///
+/// The AVX2 Q4_K kernel multiplies weights by `i8` for a reason that is arithmetic, not taste:
+/// `_mm256_maddubs_epi16` turns 32 unsigned weights and 32 signed activations into 16 pair sums in
+/// one instruction, where the `f32` path needs four widen-multiply-add rounds for the same 32
+/// weights. The cost is that `x` gains a quantization error of at most `0.5/127` of its largest
+/// magnitude in each 32-value group.
+///
+/// The scales are per 32 values because a Q4_K sub-block is 32 values wide: one scale per Q4_K
+/// sub-block means the kernel multiplies by a single constant instead of feeding the scale through
+/// the integer part.
+pub(crate) struct QuantizedX {
+    /// The rounded values, `32` per group, in row order.
+    pub(crate) q: Vec<i8>,
+    /// One scale per 32-value group; a group of zeros gets scale `0`.
+    pub(crate) d: Vec<f32>,
+}
+
+impl QuantizedX {
+    /// Quantize `x` in groups of 32. A trailing partial group is ignored, and every caller in this
+    /// module passes a length that is a whole number of groups.
+    pub(crate) fn new(x: &[f32]) -> Self {
+        let mut q = Vec::with_capacity(x.len());
+        let mut d = Vec::with_capacity(x.len() / 32);
+        for group in x.as_chunks::<32>().0 {
+            let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+            if largest == 0.0 {
+                d.push(0.0);
+                q.extend(std::iter::repeat_n(0, 32));
+                continue;
+            }
+            let scale = largest / 127.0;
+            d.push(scale);
+            for value in group {
+                q.push((value / scale).round().clamp(-127.0, 127.0) as i8);
+            }
+        }
+        Self { q, d }
+    }
+
+    /// The dot this struct stands for, evaluated in `f32` against the original `x`.
+    ///
+    /// Used by tests to bound what quantizing the activation costs; the kernels never call it.
+    #[cfg(test)]
+    pub(crate) fn dequantized(&self) -> Vec<f32> {
+        self.q
+            .iter()
+            .enumerate()
+            .map(|(at, value)| f32::from(*value) * self.d[at / 32])
+            .collect()
+    }
 }
 
 /// Dot product of one Q4_K row with `x`.
@@ -237,12 +303,56 @@ pub(crate) fn dot_scalar(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> f
 ///
 /// Only the AVX2 module is allowed to use `unsafe`, and it re-checks the CPU itself, so this stays a
 /// safe function and a CPU without AVX2 simply takes the portable path.
-fn dot(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
+fn dot(ty: GgmlType, row: &[u8], activation: Activation<'_>) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if let Some(value) = crate::simd::try_dot(ty, row, x, sums) {
+    if let Some(value) = crate::simd::try_dot(ty, row, activation.x, activation.sums, activation.q)
+    {
         return value;
     }
-    dot_scalar(ty, row, x, sums)
+    dot_scalar(ty, row, activation.x, activation.sums)
+}
+
+/// The activation vector, with the state `matvec` derives from it once per call.
+///
+/// Bundling the three slices keeps the per-row plumbing to one argument, and makes it obvious that
+/// the quantized copy and the sums always come from the same `x`.
+#[derive(Clone, Copy)]
+pub(crate) struct Activation<'a> {
+    /// The `cols` values being multiplied.
+    x: &'a [f32],
+    /// Sums of `x` over every 16 values, for the minimum term.
+    sums: &'a [f32],
+    /// `x` rounded to `i8`; only built for Q4_K rows.
+    q: Option<&'a QuantizedX>,
+}
+
+/// The same state, copied so a worker thread can own it.
+///
+/// A pool of workers outlives one `matvec`, and its jobs cannot borrow the caller's scratch
+/// buffers, so the activation travels by value. For this model that is a few kilobytes per call
+/// against a tensor read of megabytes.
+pub(crate) struct OwnedActivation {
+    x: Vec<f32>,
+    sums: Vec<f32>,
+    q: Option<QuantizedX>,
+}
+
+impl OwnedActivation {
+    pub(crate) fn new(ty: GgmlType, x: &[f32]) -> Self {
+        Self {
+            x: x.to_vec(),
+            sums: x_sums(x),
+            q: (ty == GgmlType::Q4K).then(|| QuantizedX::new(x)),
+        }
+    }
+
+    pub(crate) fn borrowed(&self) -> Activation<'_> {
+        Activation {
+            x: &self.x,
+            sums: &self.sums,
+            q: self.q.as_ref(),
+        }
+    }
 }
 
 /// Dequantize one row into `out`.
@@ -383,6 +493,44 @@ pub fn matvec(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
+    let stride = checked_stride(ty, data, cols, rows, x, out)?;
+    // One quantization of the activation, shared by every row. Only Q4_K uses it; building it for
+    // the other formats would be a wasted pass over `x`.
+    let xq = (ty == GgmlType::Q4K).then(|| QuantizedX::new(x));
+    let sums = x_sums(x);
+    let product = rows.saturating_mul(cols);
+    let threads = thread_budget(rows, product);
+
+    let activation = Activation {
+        x,
+        sums: &sums,
+        q: xq.as_ref(),
+    };
+
+    if threads <= 1 {
+        fill_rows(ty, data, stride, 0, activation, out);
+        return Ok(());
+    }
+
+    let per_thread = rows.div_ceil(threads);
+    thread::scope(|scope| {
+        for (chunk, slice) in out.chunks_mut(per_thread).enumerate() {
+            let first_row = chunk * per_thread;
+            scope.spawn(move || fill_rows(ty, data, stride, first_row, activation, slice));
+        }
+    });
+    Ok(())
+}
+
+/// Validate the shapes of a matvec call and return the bytes one row occupies.
+fn checked_stride(
+    ty: GgmlType,
+    data: &[u8],
+    cols: usize,
+    rows: usize,
+    x: &[f32],
+    out: &[f32],
+) -> Result<usize, ViperaError> {
     if x.len() != cols || out.len() != rows {
         return Err(ViperaError::internal(format!(
             "matvec expected a {cols}-value input and {rows} outputs, got {} and {}",
@@ -400,48 +548,69 @@ pub fn matvec(
             format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
         ));
     }
-    let sums = x_sums(x);
-    let product = rows.saturating_mul(cols);
-    let threads = if product >= PARALLEL_MIN_PRODUCT {
-        thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(1)
-            .min(rows.max(1))
-    } else {
-        1
-    };
+    Ok(stride)
+}
 
-    if threads <= 1 {
-        fill_rows(ty, data, stride, 0, x, &sums, out);
-        return Ok(());
-    }
-
-    let per_thread = rows.div_ceil(threads);
-    let sums_slice: &[f32] = &sums;
-    thread::scope(|scope| {
-        for (chunk, slice) in out.chunks_mut(per_thread).enumerate() {
-            let first_row = chunk * per_thread;
-            scope.spawn(move || fill_rows(ty, data, stride, first_row, x, sums_slice, slice));
-        }
-    });
-    Ok(())
+/// The same product, using threads that already exist.
+///
+/// The rows are handed to [`crate::pool::Pool`] rather than to freshly spawned threads; `data` is
+/// tied to the pool's lifetime because a worker holds it for as long as the pool lives.
+pub(crate) fn matvec_pooled<'d>(
+    pool: &crate::pool::Pool<'d>,
+    ty: GgmlType,
+    data: &'d [u8],
+    cols: usize,
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let stride = checked_stride(ty, data, cols, rows, x, out)?;
+    let threads = thread_budget(rows, rows.saturating_mul(cols));
+    let activation = std::sync::Arc::new(OwnedActivation::new(ty, x));
+    pool.fill(ty, data, stride, threads, &activation, out)
 }
 
 /// Multiply-adds below this stay on the calling thread: a spawn costs more than the work saves.
 const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
 
-fn fill_rows(
+/// Threads to split one `matvec` across, capped by the rows there are to fill.
+///
+/// `VIPERA_THREADS` overrides the detected count. Hyper-threading reports twice the physical cores,
+/// and these kernels are memory-bound enough that the sibling threads do not always pay for their
+/// spawn, so being able to pin the count is worth one `std::env` read per process. The override is
+/// parsed once and cached; a value of `0` or nonsense falls back to the detected count.
+pub(crate) fn thread_budget(rows: usize, product: usize) -> usize {
+    if product < PARALLEL_MIN_PRODUCT {
+        return 1;
+    }
+    static REQUESTED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let requested = *REQUESTED.get_or_init(|| {
+        std::env::var("VIPERA_THREADS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    });
+    requested
+        .or_else(|| {
+            thread::available_parallelism()
+                .ok()
+                .map(|count| count.get())
+        })
+        .unwrap_or(1)
+        .min(rows.max(1))
+}
+
+pub(crate) fn fill_rows(
     ty: GgmlType,
     data: &[u8],
     stride: usize,
     first_row: usize,
-    x: &[f32],
-    sums: &[f32],
+    activation: Activation<'_>,
     out: &mut [f32],
 ) {
     for (offset, slot) in out.iter_mut().enumerate() {
         let start = (first_row + offset) * stride;
-        *slot = dot(ty, &data[start..start + stride], x, sums);
+        *slot = dot(ty, &data[start..start + stride], activation);
     }
 }
 
@@ -460,6 +629,29 @@ mod tests {
             assert_eq!(f16_to_f32(bits), value, "{value} did not round trip");
         }
         assert_eq!(f16_to_f32(f32_to_f16(1.000_1)), 1.0);
+    }
+
+    #[test]
+    fn half_precision_covers_subnormals_and_the_special_values() {
+        // The small scales of a real file land in the subnormal range, where the bit manipulation
+        // has to agree with the arithmetic definition `mantissa * 2^-24`.
+        for mantissa in [1_u16, 2, 512, 1023] {
+            let expected = f64::from(mantissa) * 2f64.powi(-24);
+            let actual = f64::from(f16_to_f32(mantissa));
+            assert!(
+                (actual - expected).abs() <= expected * 1e-6,
+                "subnormal {mantissa}: {actual} vs {expected}"
+            );
+            assert_eq!(f16_to_f32(mantissa | 0x8000), -f16_to_f32(mantissa));
+        }
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert_eq!(f16_to_f32(0x8000).to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(f16_to_f32(0x7c00), f32::INFINITY);
+        assert_eq!(f16_to_f32(0xfc00), f32::NEG_INFINITY);
+        assert!(f16_to_f32(0x7e00).is_nan());
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x7bff), 65504.0, "the largest finite half");
     }
 
     #[test]
@@ -548,6 +740,25 @@ mod tests {
     }
 
     #[test]
+    fn quantizing_an_activation_keeps_each_value_within_half_a_step() {
+        let mut x: Vec<f32> = (0..256).map(|at| (at as f32 - 128.0) / 37.0).collect();
+        let quantized = QuantizedX::new(&x);
+        assert_eq!(quantized.d.len(), 8);
+        for (at, (original, restored)) in x.iter().zip(quantized.dequantized()).enumerate() {
+            let step = quantized.d[at / 32];
+            assert!(
+                (original - restored).abs() <= step * 0.5 + 1e-6,
+                "value {at}: {original} became {restored} with step {step}"
+            );
+        }
+        // A group of zeros keeps zero rather than dividing by a zero scale.
+        x[32..64].fill(0.0);
+        let zeros = QuantizedX::new(&x);
+        assert_eq!(zeros.d[1], 0.0);
+        assert!(zeros.q[32..64].iter().all(|value| *value == 0));
+    }
+
+    #[test]
     fn matvec_matches_a_hand_computed_product() {
         let mut data = Vec::new();
         for value in [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
@@ -556,6 +767,30 @@ mod tests {
         let mut out = vec![0.0; 2];
         matvec(GgmlType::F32, &data, 3, 2, &[1.0, 1.0, 1.0], &mut out).expect("matvec");
         assert_eq!(out, vec![6.0, 15.0]);
+    }
+
+    #[test]
+    fn a_pooled_matvec_matches_the_spawned_one() {
+        // Four chunks over eight rows, so every reply has to land in the right slice.
+        const ROWS: usize = 8;
+        let stride = row_bytes(GgmlType::Q4K, 512).expect("stride");
+        let mut data = vec![0u8; stride * ROWS];
+        for (at, byte) in data.iter_mut().enumerate() {
+            *byte = (at.wrapping_mul(37) % 251) as u8;
+        }
+        let x: Vec<f32> = (0..512).map(|at| ((at % 13) as f32 - 6.0) / 7.0).collect();
+
+        let mut spawned = vec![0.0_f32; ROWS];
+        matvec(GgmlType::Q4K, &data, 512, ROWS, &x, &mut spawned).expect("matvec");
+
+        thread::scope(|scope| {
+            let pool = crate::pool::Pool::new(scope, 4);
+            let activation = std::sync::Arc::new(OwnedActivation::new(GgmlType::Q4K, &x));
+            let mut pooled = vec![0.0_f32; ROWS];
+            pool.fill(GgmlType::Q4K, &data, stride, 4, &activation, &mut pooled)
+                .expect("pooled matvec");
+            assert_eq!(pooled, spawned, "a reused worker must give the same rows");
+        });
     }
 
     #[test]
@@ -576,6 +811,70 @@ mod tests {
     fn unknown_formats_are_named_in_the_error() {
         let error = row_bytes(GgmlType::Bf16, 32).expect_err("bf16 is not implemented");
         assert!(error.to_string().contains("BF16"), "{error}");
+    }
+
+    /// Measurement, not a correctness check: the same tensors, read by the spawn-per-call path and
+    /// then by the pool a forward pass reuses, at the shapes the Qwen2.5-1.5B file uses. The
+    /// difference is what the thread startup cost, so the pooled column is the kernel's own
+    /// bandwidth. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn pooled_matvec_throughput_by_tensor_type() {
+        fn measure(label: &str, ty: GgmlType, cols: usize, rows: usize, iterations: u32) {
+            let stride = row_bytes(ty, cols).expect("stride");
+            // Deterministic bytes, so two runs measure the same data; all zeroes would let the FP
+            // units cut corners.
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut byte = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            };
+            let data: Vec<u8> = (0..stride * rows).map(|_| byte()).collect();
+            let x: Vec<f32> = (0..cols).map(|at| (at % 17) as f32 / 17.0 - 0.5).collect();
+            let mut out = vec![0.0_f32; rows];
+
+            // One warm-up call per path: the first pass also faults in the allocation.
+            matvec(ty, &data, cols, rows, &x, &mut out).expect("shapes are consistent");
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                matvec(ty, &data, cols, rows, &x, &mut out).expect("shapes are consistent");
+            }
+            let spawned = started.elapsed().as_secs_f64();
+
+            thread::scope(|scope| {
+                let pool = crate::pool::Pool::new(scope, thread_budget(rows, rows * cols));
+                matvec_pooled(&pool, ty, &data, cols, rows, &x, &mut out)
+                    .expect("shapes are consistent");
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    matvec_pooled(&pool, ty, &data, cols, rows, &x, &mut out)
+                        .expect("shapes are consistent");
+                }
+                let pooled = started.elapsed().as_secs_f64();
+
+                let calls = f64::from(iterations);
+                let megabytes = (stride * rows) as f64 / 1e6;
+                println!(
+                    "{label:>18}: {rows}x{cols} {ty:?}, {megabytes:>6.1} MB per call, \
+                     spawned {:>6.1} ms/call {:>5.2} GB/s, pooled {:>6.1} ms/call {:>5.2} GB/s",
+                    spawned * 1000.0 / calls,
+                    megabytes / 1e3 * calls / spawned,
+                    pooled * 1000.0 / calls,
+                    megabytes / 1e3 * calls / pooled,
+                );
+            });
+        }
+
+        measure("wq (Q4_K)", GgmlType::Q4K, 1536, 1536, 200);
+        measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 60);
+        measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 60);
+        measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 8);
     }
 
     #[test]

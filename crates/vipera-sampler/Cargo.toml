@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+vipera-traits.workspace = true
 vipera-errors.workspace = true
 
 [lints]
