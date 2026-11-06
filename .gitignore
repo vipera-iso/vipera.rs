@@ -1,0 +1,9 @@
+# This repository is the engine workspace and its specifications.
+# Everything else in this home directory belongs to other projects and is not part of it.
+/*
+!/.gitignore
+!/vipera.rs/
+!/specs/
+
+# Build output is large and reproducible.
+vipera.rs/target/

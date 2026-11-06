@@ -1,0 +1,13 @@
+[package]
+name = "vipera-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vipera-errors.workspace = true
+vipera-sampler.workspace = true
+
+[lints]
+workspace = true

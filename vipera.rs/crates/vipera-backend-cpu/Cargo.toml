@@ -1,0 +1,21 @@
+[package]
+name = "vipera-backend-cpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vipera-core.workspace = true
+vipera-errors.workspace = true
+vipera-runtime.workspace = true
+
+# The workspace forbids `unsafe` everywhere. This crate opts out of that inheritance on purpose: the
+# AVX2 kernels in `src/simd.rs` cannot be written without it, and `forbid` cannot be narrowed. The
+# crate keeps the same bar by denying `unsafe_code` and allowing it in that one module, whose kernels
+# are checked against the scalar implementations by tests.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
