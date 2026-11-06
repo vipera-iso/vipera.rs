@@ -98,4 +98,9 @@ Numbers are machine-bound, not a benchmark claim; `generate --json` is how they 
 
 ## License
 
-Declared as `MIT OR Apache-2.0` in `Cargo.toml`; license files are not committed yet.
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT license ([`LICENSE-MIT`](LICENSE-MIT))
+
+at your option, matching the `MIT OR Apache-2.0` declaration in `Cargo.toml`.
