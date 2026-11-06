@@ -57,6 +57,12 @@ pub fn try_dot(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> Option<f32>
 }
 
 #[inline]
+/// Horizontal sum of the eight lanes of `value`.
+///
+/// # Safety
+///
+/// The CPU must support AVX2. Both callers already satisfy that: `dot_nibbles` carries the same
+/// `#[target_feature]`, and `try_dot` checked `available()` before entering the block.
 #[target_feature(enable = "avx2")]
 unsafe fn hsum(value: __m256) -> f32 {
     let high = _mm256_extractf128_ps(value, 1);
@@ -75,6 +81,9 @@ unsafe fn hsum(value: __m256) -> f32 {
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_nibbles(q: *const u8, x: *const f32, high: bool) -> f32 {
+    // SAFETY: the caller guarantees 32 readable bytes at `q`, 32 readable floats at `x`, and AVX2
+    // support. The four 8-byte loads touch `q + 0..32` and the four vector loads touch `x + 0..32`
+    // floats, so neither pointer leaves those bounds.
     unsafe {
         let mut acc = _mm256_setzero_ps();
         let mask = _mm256_set1_epi32(0x0f);
@@ -100,6 +109,10 @@ unsafe fn dot_nibbles(q: *const u8, x: *const f32, high: bool) -> f32 {
 ///
 /// See the module documentation.
 pub unsafe fn q4k_dot(row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
+    // SAFETY: the module documentation is the contract: `row` is whole 144-byte blocks, `x` holds
+    // 256 floats per block, `sums` holds 16 entries per block, and the CPU has AVX2. Every read
+    // stays inside those bounds, including `from_raw_parts(block + 4, 12)`, which covers exactly
+    // the 12 scale/min bytes a Q4_K block reserves for them.
     unsafe {
         let mut total = 0.0_f32;
         let blocks = row.len() / 144;
@@ -183,6 +196,8 @@ mod tests {
                 }
             }
             let expected = crate::quant::q4k_dot(&row, &x, &sums);
+            // SAFETY: `row` is whole blocks, `x` and `sums` are sized for them, and the test
+            // returned early unless `available()` saw AVX2 on this CPU.
             let actual = unsafe { q4k_dot(&row, &x, &sums) };
             assert!(
                 close(actual, expected),

@@ -8,6 +8,8 @@
 //! and backend — writing their cases before an implementation exists would pin semantics nobody has
 //! implemented yet.
 
+#![warn(missing_docs)]
+
 use std::fmt;
 
 /// What a case expects the implementation to do.

@@ -10,6 +10,8 @@
 //! refuses the rest: a template decides the prompt text a model was trained on, and an approximated
 //! template is worse than a refusal.
 
+#![warn(missing_docs)]
+
 pub mod bpe;
 pub mod chat;
 pub mod vocab;

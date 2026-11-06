@@ -129,7 +129,6 @@ impl<F: ForwardPass> Engine<F> {
         self.sequences.get(&id)
     }
 
-    /// Live counters.
     /// Replace the sampler configuration used by every later turn.
     ///
     /// A server takes the sampling knobs from each request, so the knobs have to be settable on a
@@ -138,6 +137,7 @@ impl<F: ForwardPass> Engine<F> {
         self.config.sampler = sampler;
     }
 
+    /// Live counters: live sequences, KV blocks used and free, KV bytes, and generation totals.
     pub fn stats(&self) -> RuntimeStats {
         RuntimeStats {
             sequences: self.sequences.len(),

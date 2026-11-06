@@ -7,6 +7,8 @@
 //! Policies apply in a fixed order: repetition penalty, temperature, top-k, top-p, min-p. A
 //! temperature of `0` means greedy and skips every other filter, matching the CLI contract.
 
+#![warn(missing_docs)]
+
 pub mod rng;
 
 use std::cmp::Ordering;

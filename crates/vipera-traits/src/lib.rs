@@ -3,6 +3,8 @@
 //! Slice 2 needs one contract: how the engine learns what hardware it is running on. Backend and
 //! tensor traits arrive with the backends themselves, so this crate stays small on purpose.
 
+#![warn(missing_docs)]
+
 use std::fmt;
 
 /// Kind of compute device.

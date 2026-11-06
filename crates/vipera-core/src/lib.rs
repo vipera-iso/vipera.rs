@@ -3,6 +3,8 @@
 //! Nothing in this crate loads weights or talks to a GPU, so every function here is testable on any
 //! machine.
 
+#![warn(missing_docs)]
+
 pub mod gguf;
 pub mod hardware;
 pub mod planner;

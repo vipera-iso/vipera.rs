@@ -8,6 +8,8 @@
 //! into: `vipera-backend-cpu` reads GGUF weights and writes K/V into this crate's paged buffer, while
 //! the tests here drive the loop with a deterministic model and need neither weights nor a device.
 
+#![warn(missing_docs)]
+
 pub mod engine;
 pub mod kv;
 pub mod memory;

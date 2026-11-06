@@ -34,6 +34,10 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Request line plus headers must fit here; anything larger is not a chat request.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 
+/// Run `vipera serve`: parse `args`, load the model, and serve until a signal arrives.
+///
+/// `args` are the flags after the subcommand. Returns the process exit code, which is `0` after a
+/// clean shutdown; a bad flag or a model that fails to load comes back as the error instead.
 pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let mut path: Option<&str> = None;
     let mut host = "127.0.0.1".to_owned();

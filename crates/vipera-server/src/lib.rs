@@ -7,6 +7,8 @@
 //! The binary stays thin — it owns argument parsing for the other commands and calls
 //! [`serve::command`] for this one.
 
+#![warn(missing_docs)]
+
 pub mod json;
 pub mod serve;
 
