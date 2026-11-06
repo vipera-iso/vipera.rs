@@ -813,6 +813,70 @@ mod tests {
         assert!(error.to_string().contains("BF16"), "{error}");
     }
 
+    /// Measurement, not a correctness check: the same tensors, read by the spawn-per-call path and
+    /// then by the pool a forward pass reuses, at the shapes the Qwen2.5-1.5B file uses. The
+    /// difference is what the thread startup cost, so the pooled column is the kernel's own
+    /// bandwidth. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn pooled_matvec_throughput_by_tensor_type() {
+        fn measure(label: &str, ty: GgmlType, cols: usize, rows: usize, iterations: u32) {
+            let stride = row_bytes(ty, cols).expect("stride");
+            // Deterministic bytes, so two runs measure the same data; all zeroes would let the FP
+            // units cut corners.
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut byte = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            };
+            let data: Vec<u8> = (0..stride * rows).map(|_| byte()).collect();
+            let x: Vec<f32> = (0..cols).map(|at| (at % 17) as f32 / 17.0 - 0.5).collect();
+            let mut out = vec![0.0_f32; rows];
+
+            // One warm-up call per path: the first pass also faults in the allocation.
+            matvec(ty, &data, cols, rows, &x, &mut out).expect("shapes are consistent");
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                matvec(ty, &data, cols, rows, &x, &mut out).expect("shapes are consistent");
+            }
+            let spawned = started.elapsed().as_secs_f64();
+
+            thread::scope(|scope| {
+                let pool = crate::pool::Pool::new(scope, thread_budget(rows, rows * cols));
+                matvec_pooled(&pool, ty, &data, cols, rows, &x, &mut out)
+                    .expect("shapes are consistent");
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    matvec_pooled(&pool, ty, &data, cols, rows, &x, &mut out)
+                        .expect("shapes are consistent");
+                }
+                let pooled = started.elapsed().as_secs_f64();
+
+                let calls = f64::from(iterations);
+                let megabytes = (stride * rows) as f64 / 1e6;
+                println!(
+                    "{label:>18}: {rows}x{cols} {ty:?}, {megabytes:>6.1} MB per call, \
+                     spawned {:>6.1} ms/call {:>5.2} GB/s, pooled {:>6.1} ms/call {:>5.2} GB/s",
+                    spawned * 1000.0 / calls,
+                    megabytes / 1e3 * calls / spawned,
+                    pooled * 1000.0 / calls,
+                    megabytes / 1e3 * calls / pooled,
+                );
+            });
+        }
+
+        measure("wq (Q4_K)", GgmlType::Q4K, 1536, 1536, 200);
+        measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 60);
+        measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 60);
+        measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 8);
+    }
+
     #[test]
     fn dequantize_fills_every_row() {
         let mut data = Vec::new();
