@@ -33,8 +33,9 @@
 //! 14.5-16.6 GB/s, Q6_K `ffn_down` 8.3-13.7 GB/s. End to end, 12 tokens of Qwen2.5-1.5B Q4_K_M went
 //! from 3.56 s of compute to 1.64-1.73 s, which is 6.1-6.5 tok/s against 3.2 before these changes
 //! and 2.57 in the first measurement of this engine. The 10 tok/s target is still not met: the
-//! remaining gap is spread over streaming the other 470 MB of weights from RAM, the sampling stage
-//! (~19 ms per token over a 151936-entry logit vector) and per-`matvec` thread setup.
+//! remaining gap is streaming the other 470 MB of weights from RAM and per-`matvec` thread setup.
+//! Sampling used to be part of it — 19 ms per token spent sorting a 151936-entry logit vector — but
+//! that path now takes 0.3 ms greedy and 1.3 ms with top-k/top-p/min-p over the same vocabulary.
 //!
 //! # Safety
 //!

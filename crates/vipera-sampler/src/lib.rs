@@ -11,7 +11,8 @@
 
 pub mod rng;
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 use vipera_errors::ViperaError;
 
@@ -113,91 +114,211 @@ impl Sampler {
             ));
         }
 
-        let mut scored: Vec<(u32, f32)> = logits
-            .iter()
-            .enumerate()
-            .filter(|(_, logit)| logit.is_finite())
-            .map(|(id, logit)| (id as u32, *logit))
-            .collect();
-        if scored.is_empty() {
+        let penalty = RepetitionPenalty::new(recent, self.config.repetition_penalty);
+
+        // Greedy needs one pass and no allocation: the argmax over the penalized logits, ties to
+        // the lowest id. Sorting 151936 entries to read the first one is what this avoids.
+        if self.config.temperature == 0.0 {
+            let mut best: Option<(u32, f32)> = None;
+            for (id, logit) in logits.iter().enumerate() {
+                if !logit.is_finite() {
+                    continue;
+                }
+                let value = penalty.apply(id, *logit);
+                let better = match best {
+                    None => true,
+                    Some((best_id, best_value)) => {
+                        value > best_value || (value == best_value && (id as u32) < best_id)
+                    }
+                };
+                if better {
+                    best = Some((id as u32, value));
+                }
+            }
+            let Some((best_id, _)) = best else {
+                return Err(ViperaError::invalid_argument(
+                    "every logit is NaN or infinite",
+                ));
+            };
+            return Ok(best_id);
+        }
+
+        let scale = 1.0 / self.config.temperature;
+        let mut weights = top_candidates(logits, &penalty, self.config.top_k);
+        if weights.is_empty() {
             return Err(ViperaError::invalid_argument(
                 "every logit is NaN or infinite",
             ));
         }
 
-        let penalty = self.config.repetition_penalty;
-        if penalty != 1.0 {
-            for &id in recent {
-                if let Some(entry) = scored.iter_mut().find(|(candidate, _)| *candidate == id) {
-                    entry.1 = if entry.1 > 0.0 {
-                        entry.1 / penalty
-                    } else {
-                        entry.1 * penalty
-                    };
-                }
+        // The softmax denominator is still the mass of every finite logit, in logit order, which is
+        // what the earlier version summed after it had allocated and sorted the whole vector. Only
+        // the candidates come from the bounded selection now.
+        let peak = weights[0].1 * scale;
+        let mut total = 0.0_f32;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                total += (penalty.apply(id, *logit) * scale - peak).exp();
             }
         }
-
-        sort_by_probability(&mut scored);
-        if self.config.temperature == 0.0 {
-            return Ok(scored[0].0);
-        }
-
-        let scale = 1.0 / self.config.temperature;
-        let peak = scored[0].1 * scale;
-        let mut candidates: Vec<(u32, f32)> = scored
-            .iter()
-            .map(|(id, logit)| (*id, (logit * scale - peak).exp()))
-            .collect();
-        let total: f32 = candidates.iter().map(|(_, weight)| weight).sum();
         // `NaN` compares false against everything, so it is caught by the finiteness check.
         if total <= 0.0 || !total.is_finite() {
             return Err(ViperaError::internal(
                 "softmax produced no usable probability mass",
             ));
         }
-        for (_, weight) in candidates.iter_mut() {
-            *weight /= total;
+
+        for (_, weight) in weights.iter_mut() {
+            *weight = (*weight * scale - peak).exp();
         }
 
-        if self.config.top_k > 0 && candidates.len() > self.config.top_k {
-            candidates.truncate(self.config.top_k);
-        }
-
+        // `top_p` is compared against a share of the full mass, which is what the old division by
+        // `total` did; keeping the weights unnormalized saves a division per candidate.
+        let target_mass = self.config.top_p * total;
         let mut cumulative = 0.0;
-        let mut keep = candidates.len();
-        for (index, (_, weight)) in candidates.iter().enumerate() {
+        let mut kept = weights.len();
+        for (index, (_, weight)) in weights.iter().enumerate() {
             cumulative += weight;
-            if cumulative >= self.config.top_p {
-                keep = index + 1;
+            if cumulative >= target_mass {
+                kept = index + 1;
                 break;
             }
         }
-        candidates.truncate(keep);
+        weights.truncate(kept);
 
-        let threshold = self.config.min_p * candidates[0].1;
-        candidates.retain(|(_, weight)| *weight >= threshold);
+        let threshold = self.config.min_p * weights[0].1;
+        weights.retain(|(_, weight)| *weight >= threshold);
 
-        let total: f32 = candidates.iter().map(|(_, weight)| weight).sum();
-        let target = self.rng.next_f64() * f64::from(total);
+        let mass: f32 = weights.iter().map(|(_, weight)| *weight).sum();
+        let target = self.rng.next_f64() * f64::from(mass);
         let mut running = 0.0f64;
-        for (id, weight) in &candidates {
+        for (id, weight) in &weights {
             running += f64::from(*weight);
             if target < running {
                 return Ok(*id);
             }
         }
         // Only reachable through floating-point rounding at the last candidate.
-        Ok(candidates[candidates.len() - 1].0)
+        Ok(weights[weights.len() - 1].0)
     }
 }
 
-fn sort_by_probability(scored: &mut [(u32, f32)]) {
-    scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+/// Descending by logit, then ascending by id, so the order is total and reproducible.
+fn by_probability(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
+    b.1.partial_cmp(&a.1)
+        .unwrap_or(Ordering::Equal)
+        .then(a.0.cmp(&b.0))
+}
+
+/// One logit with the ordering the sampler ranks by: higher first, ties to the lower id.
+///
+/// `Ord` rather than a comparator closure because the bounded selection below compares this key
+/// once per logit, and a closure passed through a generic comes out cheaper than one through a
+/// function pointer.
+struct Ranked {
+    value: f32,
+    id: u32,
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.value
+            .total_cmp(&other.value)
+            .then(other.id.cmp(&self.id))
+    }
+}
+
+/// The `top_k` best finite logits, best first, with the repetition penalty already applied.
+///
+/// `top_k` of 0 means no cut and falls back to sorting every logit, which is the honest reading of
+/// that setting. Otherwise a heap of exactly `k` entries walks the vector once: each logit costs
+/// one comparison against the worst kept entry, and an entry leaves the heap only when a better one
+/// arrives, so the heap operations are `O(k log n)` in total instead of `O(n)`.
+fn top_candidates(logits: &[f32], penalty: &RepetitionPenalty, top_k: usize) -> Vec<(u32, f32)> {
+    if top_k == 0 || top_k >= logits.len() {
+        let mut all: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .filter(|(_, logit)| logit.is_finite())
+            .map(|(id, logit)| (id as u32, penalty.apply(id, *logit)))
+            .collect();
+        all.sort_unstable_by(by_probability);
+        return all;
+    }
+
+    let mut heap: BinaryHeap<Reverse<Ranked>> = BinaryHeap::with_capacity(top_k + 1);
+    for (id, logit) in logits.iter().enumerate() {
+        if !logit.is_finite() {
+            continue;
+        }
+        let ranked = Ranked {
+            value: penalty.apply(id, *logit),
+            id: id as u32,
+        };
+        if heap.len() < top_k {
+            heap.push(Reverse(ranked));
+        } else if heap.peek().is_some_and(|Reverse(worst)| ranked > *worst) {
+            heap.pop();
+            heap.push(Reverse(ranked));
+        }
+    }
+    let mut best: Vec<(u32, f32)> = heap
+        .into_iter()
+        .map(|Reverse(ranked)| (ranked.id, ranked.value))
+        .collect();
+    best.sort_unstable_by(by_probability);
+    best
+}
+
+/// The repetition penalty, applied in one binary search per logit.
+///
+/// The obvious loop over `recent` costs a scan of the whole logit vector per recent id, which is
+/// tens of scans per token once the context is long. Sorting the handful of recent ids once turns
+/// that into a `log n` lookup on the single pass that already visits every logit.
+struct RepetitionPenalty {
+    /// The penalized ids, sorted and deduplicated; empty when the penalty is disabled.
+    ids: Vec<u32>,
+    factor: f32,
+}
+
+impl RepetitionPenalty {
+    fn new(recent: &[u32], factor: f32) -> Self {
+        if factor == 1.0 || recent.is_empty() {
+            return Self {
+                ids: Vec::new(),
+                factor,
+            };
+        }
+        let mut ids = recent.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        Self { ids, factor }
+    }
+
+    fn apply(&self, id: usize, logit: f32) -> f32 {
+        if self.ids.is_empty() || self.ids.binary_search(&(id as u32)).is_err() {
+            return logit;
+        }
+        if logit > 0.0 {
+            logit / self.factor
+        } else {
+            logit * self.factor
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +381,24 @@ mod tests {
         let mut s = sampler(0.0, 0, 1.0, 0.0, 2.0);
         assert_eq!(s.sample(&[5.0, 4.0], &[]).unwrap(), 0);
         assert_eq!(s.sample(&[5.0, 4.0], &[0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_long_logit_vector_is_cut_to_its_head() {
+        // 200000 entries is the size of a real vocabulary, and the size at which selecting the
+        // candidates costs less than sorting all of them.
+        let mut logits = vec![-10.0_f32; 200_000];
+        logits[123_456] = 8.0;
+        logits[7] = 7.0;
+
+        let mut ranked = sampler(1.0, 2, 1.0, 0.0, 1.0);
+        for _ in 0..100 {
+            assert!(matches!(ranked.sample(&logits, &[]).unwrap(), 123_456 | 7));
+        }
+
+        // Greedy reads the same maximum in one pass, with no vector and no sort.
+        let mut greedy = sampler(0.0, 0, 1.0, 0.0, 1.0);
+        assert_eq!(greedy.sample(&logits, &[]).unwrap(), 123_456);
     }
 
     #[test]
