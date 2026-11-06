@@ -10,6 +10,13 @@
 //!
 //! Timing only reads bytes, so the contents do not need to be a valid quantization; a cheap LCG
 //! fills them with something that is not all zeroes (which would let the FP units cut corners).
+//!
+//! This measures the spawn-per-call path. The pooled path a forward pass uses, measured against it
+//! on the same data, is `quant::tests::pooled_matvec_throughput_by_tensor_type`:
+//!
+//! ```text
+//! cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture
+//! ```
 
 use std::time::Instant;
 

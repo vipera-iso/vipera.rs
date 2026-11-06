@@ -81,8 +81,8 @@ On the machine this was developed on, Qwen2.5-1.5B-Instruct Q4_K_M, at temperatu
 
 | | |
 |---|---|
-| Compute for 12 tokens | 1.64-1.73 s (6.1-6.5 tok/s, three runs) |
-| Compute for 24 tokens | 2.89-3.25 s (6.4-7.2 tok/s) |
+| Compute for 12 tokens | 0.98-1.03 s (11.7-12.2 tok/s, three runs) |
+| Compute for 24 tokens | 1.76-1.83 s (13.1-13.6 tok/s, three runs) |
 | KV cache at `--ctx 2048`, `f16` | 58.7 MB |
 | Same cache at `q8_0` | 31.2 MB (53%) |
 
@@ -99,9 +99,10 @@ Numbers are machine-bound, not a benchmark claim; `generate --json` is how they 
 - **Server**: no rate limiting, no request logging, no concurrent conversations.
 - **llama.cpp parity**: the tokenizer and continuation checks skip unless `llama-server` is
   installed; they are the intended proof of numeric agreement.
-- **Speed**: 6-7 tok/s on this class of CPU, not the 10 tok/s goal. Q4_K activations are multiplied
-  as `i8`, so outputs agree with the `f32` path on the checked prompts but are not bit-identical to
-  it.
+- **Speed**: 12-13 tok/s greedy on this class of CPU. Reusing a thread pool across a token's
+  matvecs, instead of spawning four threads per matvec, was worth about 11%: 11.9-12.1 tok/s before
+  it, 13.1-13.6 after, same 24-token run. Q4_K activations are multiplied as `i8`, so outputs agree
+  with the `f32` path on the checked prompts but are not bit-identical to it.
 
 ## License
 

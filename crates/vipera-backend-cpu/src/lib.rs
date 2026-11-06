@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod model;
+mod pool;
 pub mod quant;
 #[cfg(target_arch = "x86_64")]
 pub mod simd;

@@ -317,13 +317,42 @@ fn dot(ty: GgmlType, row: &[u8], activation: Activation<'_>) -> f32 {
 /// Bundling the three slices keeps the per-row plumbing to one argument, and makes it obvious that
 /// the quantized copy and the sums always come from the same `x`.
 #[derive(Clone, Copy)]
-struct Activation<'a> {
+pub(crate) struct Activation<'a> {
     /// The `cols` values being multiplied.
     x: &'a [f32],
     /// Sums of `x` over every 16 values, for the minimum term.
     sums: &'a [f32],
     /// `x` rounded to `i8`; only built for Q4_K rows.
     q: Option<&'a QuantizedX>,
+}
+
+/// The same state, copied so a worker thread can own it.
+///
+/// A pool of workers outlives one `matvec`, and its jobs cannot borrow the caller's scratch
+/// buffers, so the activation travels by value. For this model that is a few kilobytes per call
+/// against a tensor read of megabytes.
+pub(crate) struct OwnedActivation {
+    x: Vec<f32>,
+    sums: Vec<f32>,
+    q: Option<QuantizedX>,
+}
+
+impl OwnedActivation {
+    pub(crate) fn new(ty: GgmlType, x: &[f32]) -> Self {
+        Self {
+            x: x.to_vec(),
+            sums: x_sums(x),
+            q: (ty == GgmlType::Q4K).then(|| QuantizedX::new(x)),
+        }
+    }
+
+    pub(crate) fn borrowed(&self) -> Activation<'_> {
+        Activation {
+            x: &self.x,
+            sums: &self.sums,
+            q: self.q.as_ref(),
+        }
+    }
 }
 
 /// Dequantize one row into `out`.
@@ -464,23 +493,7 @@ pub fn matvec(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
-    if x.len() != cols || out.len() != rows {
-        return Err(ViperaError::internal(format!(
-            "matvec expected a {cols}-value input and {rows} outputs, got {} and {}",
-            x.len(),
-            out.len()
-        )));
-    }
-    let stride = row_bytes(ty, cols)?;
-    let needed = stride
-        .checked_mul(rows)
-        .ok_or_else(|| ViperaError::invalid_argument("tensor size overflows"))?;
-    if data.len() < needed {
-        return Err(ViperaError::parse(
-            data.len() as u64,
-            format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
-        ));
-    }
+    let stride = checked_stride(ty, data, cols, rows, x, out)?;
     // One quantization of the activation, shared by every row. Only Q4_K uses it; building it for
     // the other formats would be a wasted pass over `x`.
     let xq = (ty == GgmlType::Q4K).then(|| QuantizedX::new(x));
@@ -509,6 +522,54 @@ pub fn matvec(
     Ok(())
 }
 
+/// Validate the shapes of a matvec call and return the bytes one row occupies.
+fn checked_stride(
+    ty: GgmlType,
+    data: &[u8],
+    cols: usize,
+    rows: usize,
+    x: &[f32],
+    out: &[f32],
+) -> Result<usize, ViperaError> {
+    if x.len() != cols || out.len() != rows {
+        return Err(ViperaError::internal(format!(
+            "matvec expected a {cols}-value input and {rows} outputs, got {} and {}",
+            x.len(),
+            out.len()
+        )));
+    }
+    let stride = row_bytes(ty, cols)?;
+    let needed = stride
+        .checked_mul(rows)
+        .ok_or_else(|| ViperaError::invalid_argument("tensor size overflows"))?;
+    if data.len() < needed {
+        return Err(ViperaError::parse(
+            data.len() as u64,
+            format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
+        ));
+    }
+    Ok(stride)
+}
+
+/// The same product, using threads that already exist.
+///
+/// The rows are handed to [`crate::pool::Pool`] rather than to freshly spawned threads; `data` is
+/// tied to the pool's lifetime because a worker holds it for as long as the pool lives.
+pub(crate) fn matvec_pooled<'d>(
+    pool: &crate::pool::Pool<'d>,
+    ty: GgmlType,
+    data: &'d [u8],
+    cols: usize,
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let stride = checked_stride(ty, data, cols, rows, x, out)?;
+    let threads = thread_budget(rows, rows.saturating_mul(cols));
+    let activation = std::sync::Arc::new(OwnedActivation::new(ty, x));
+    pool.fill(ty, data, stride, threads, &activation, out)
+}
+
 /// Multiply-adds below this stay on the calling thread: a spawn costs more than the work saves.
 const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
 
@@ -518,7 +579,7 @@ const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
 /// and these kernels are memory-bound enough that the sibling threads do not always pay for their
 /// spawn, so being able to pin the count is worth one `std::env` read per process. The override is
 /// parsed once and cached; a value of `0` or nonsense falls back to the detected count.
-fn thread_budget(rows: usize, product: usize) -> usize {
+pub(crate) fn thread_budget(rows: usize, product: usize) -> usize {
     if product < PARALLEL_MIN_PRODUCT {
         return 1;
     }
@@ -539,7 +600,7 @@ fn thread_budget(rows: usize, product: usize) -> usize {
         .min(rows.max(1))
 }
 
-fn fill_rows(
+pub(crate) fn fill_rows(
     ty: GgmlType,
     data: &[u8],
     stride: usize,
@@ -709,6 +770,30 @@ mod tests {
     }
 
     #[test]
+    fn a_pooled_matvec_matches_the_spawned_one() {
+        // Four chunks over eight rows, so every reply has to land in the right slice.
+        const ROWS: usize = 8;
+        let stride = row_bytes(GgmlType::Q4K, 512).expect("stride");
+        let mut data = vec![0u8; stride * ROWS];
+        for (at, byte) in data.iter_mut().enumerate() {
+            *byte = (at.wrapping_mul(37) % 251) as u8;
+        }
+        let x: Vec<f32> = (0..512).map(|at| ((at % 13) as f32 - 6.0) / 7.0).collect();
+
+        let mut spawned = vec![0.0_f32; ROWS];
+        matvec(GgmlType::Q4K, &data, 512, ROWS, &x, &mut spawned).expect("matvec");
+
+        thread::scope(|scope| {
+            let pool = crate::pool::Pool::new(scope, 4);
+            let activation = std::sync::Arc::new(OwnedActivation::new(GgmlType::Q4K, &x));
+            let mut pooled = vec![0.0_f32; ROWS];
+            pool.fill(GgmlType::Q4K, &data, stride, 4, &activation, &mut pooled)
+                .expect("pooled matvec");
+            assert_eq!(pooled, spawned, "a reused worker must give the same rows");
+        });
+    }
+
+    #[test]
     fn a_short_row_is_refused_instead_of_padded() {
         let error = matvec(
             GgmlType::Q4K,
@@ -726,6 +811,70 @@ mod tests {
     fn unknown_formats_are_named_in_the_error() {
         let error = row_bytes(GgmlType::Bf16, 32).expect_err("bf16 is not implemented");
         assert!(error.to_string().contains("BF16"), "{error}");
+    }
+
+    /// Measurement, not a correctness check: the same tensors, read by the spawn-per-call path and
+    /// then by the pool a forward pass reuses, at the shapes the Qwen2.5-1.5B file uses. The
+    /// difference is what the thread startup cost, so the pooled column is the kernel's own
+    /// bandwidth. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn pooled_matvec_throughput_by_tensor_type() {
+        fn measure(label: &str, ty: GgmlType, cols: usize, rows: usize, iterations: u32) {
+            let stride = row_bytes(ty, cols).expect("stride");
+            // Deterministic bytes, so two runs measure the same data; all zeroes would let the FP
+            // units cut corners.
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut byte = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            };
+            let data: Vec<u8> = (0..stride * rows).map(|_| byte()).collect();
+            let x: Vec<f32> = (0..cols).map(|at| (at % 17) as f32 / 17.0 - 0.5).collect();
+            let mut out = vec![0.0_f32; rows];
+
+            // One warm-up call per path: the first pass also faults in the allocation.
+            matvec(ty, &data, cols, rows, &x, &mut out).expect("shapes are consistent");
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                matvec(ty, &data, cols, rows, &x, &mut out).expect("shapes are consistent");
+            }
+            let spawned = started.elapsed().as_secs_f64();
+
+            thread::scope(|scope| {
+                let pool = crate::pool::Pool::new(scope, thread_budget(rows, rows * cols));
+                matvec_pooled(&pool, ty, &data, cols, rows, &x, &mut out)
+                    .expect("shapes are consistent");
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    matvec_pooled(&pool, ty, &data, cols, rows, &x, &mut out)
+                        .expect("shapes are consistent");
+                }
+                let pooled = started.elapsed().as_secs_f64();
+
+                let calls = f64::from(iterations);
+                let megabytes = (stride * rows) as f64 / 1e6;
+                println!(
+                    "{label:>18}: {rows}x{cols} {ty:?}, {megabytes:>6.1} MB per call, \
+                     spawned {:>6.1} ms/call {:>5.2} GB/s, pooled {:>6.1} ms/call {:>5.2} GB/s",
+                    spawned * 1000.0 / calls,
+                    megabytes / 1e3 * calls / spawned,
+                    pooled * 1000.0 / calls,
+                    megabytes / 1e3 * calls / pooled,
+                );
+            });
+        }
+
+        measure("wq (Q4_K)", GgmlType::Q4K, 1536, 1536, 200);
+        measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 60);
+        measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 60);
+        measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 8);
     }
 
     #[test]
