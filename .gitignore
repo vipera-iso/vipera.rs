@@ -17,6 +17,13 @@
 /scripts/*
 !/scripts/parity-tokenize.sh
 !/specs/
+# Design notes for the engine itself live beside the specs. Only this directory is part of the
+# repository; the other trees under docs/ (benchmark output, graph dumps, scratch notes) are not.
+!/docs/
+/docs/*
+!/docs/design/
+/docs/design/*
+!/docs/design/*.md
 
 # Build output is large and reproducible.
 /target/
