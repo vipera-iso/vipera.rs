@@ -1,9 +1,12 @@
 //! `vipera serve` — the HTTP surface from `contracts/http-chat.md`.
 //!
-//! One model, one generation at a time: the engine is single-sequence by design, so requests queue on
-//! a mutex instead of interleaving into a half-correct batch. Everything else is the contract's shape:
-//! OpenAI-compatible request and response bodies, `text/event-stream` for `stream: true`, the frozen
-//! error envelope, `GET /v1/models`, `/health`, `/ready` and `/metrics`.
+//! One model, one stepping thread: the engine is not `Sync` (it owns the weights and the KV cache), so
+//! exactly one thread calls [`Engine::step`]. Handlers keep the engine lock only long enough to attach
+//! their sampler and queue a turn, then wait on a channel; the scheduler batches whatever is queued
+//! into one forward pass, which is what makes four concurrent requests one batch rather than four
+//! queueing turns. Everything else is the contract's shape: OpenAI-compatible request and response
+//! bodies, `text/event-stream` for `stream: true`, the frozen error envelope, `GET /v1/models`,
+//! `/health`, `/ready` and `/metrics`.
 //!
 //! No HTTP crate and no JSON crate: a chat endpoint is a request line, headers, one JSON body and one
 //! response, and the project keeps its dependency list empty on purpose (`research.md`, R3).
@@ -13,17 +16,20 @@
 //! per-key rate limiting (`429`) is not implemented, and a client that disconnects mid-stream still
 //! lets the current turn finish before the connection is dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use vipera_backend_cpu::CpuBackend;
 use vipera_core::gguf::GgufFile;
 use vipera_core::planner::KvCacheType;
 use vipera_errors::ViperaError;
-use vipera_runtime::{DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, KvCache, KvConfig};
+use vipera_runtime::{
+    DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, Generation, KvCache, KvConfig, StepReport,
+};
 use vipera_sampler::SamplerConfig;
 use vipera_tokenizer::{ChatMessage, Tokenizer};
 
@@ -159,7 +165,8 @@ fn next_number<T: std::str::FromStr>(
 
 /// The loaded model plus everything the handlers share.
 struct Served {
-    engine: Mutex<Engine<CpuBackend>>,
+    engine: Arc<Mutex<Engine<CpuBackend>>>,
+    router: Arc<Router>,
     tokenizer: Tokenizer,
     model: String,
     context_length: usize,
@@ -210,23 +217,170 @@ impl Served {
             kv,
             backend,
             EngineConfig {
-                eos,
+                // The scheduler filters stop tokens out of the batch before it posts them, so it
+                // needs its own copy.
+                eos: eos.clone(),
                 sampler: SamplerConfig {
                     temperature: 0.7,
                     ..SamplerConfig::default()
                 },
                 recent_window: 128,
+                max_batch: 4,
             },
         );
 
+        let engine = Arc::new(Mutex::new(engine));
+        let router = Arc::new(Router::new());
+        {
+            let engine = Arc::clone(&engine);
+            let router = Arc::clone(&router);
+            std::thread::spawn(move || schedule(engine, router, eos));
+        }
+
         Ok(Served {
-            engine: Mutex::new(engine),
+            engine,
+            router,
             tokenizer,
             model,
             context_length: usize::try_from(context_length).unwrap_or(usize::MAX),
             api_key,
             metrics: Mutex::new(Metrics::default()),
         })
+    }
+}
+
+/// What a handler receives from the scheduler: one token, the end of its turn, or a failure.
+enum Event {
+    Token(u32),
+    Finished(Box<Generation>),
+    Failed(String),
+}
+
+/// Hand-off between request handlers and the one thread that steps the engine.
+///
+/// The engine is not `Sync` (it owns the weights and the KV cache), so exactly one thread touches it.
+/// A handler takes the engine lock only to attach its sampler and queue its turn, then waits on its
+/// own channel; the scheduler batches whatever is queued into one forward pass and posts each token
+/// to the handler that owns it.
+struct Router {
+    routes: Mutex<HashMap<u64, mpsc::Sender<Event>>>,
+    /// Whether a turn was queued since the scheduler last looked.
+    pending: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl Router {
+    fn new() -> Router {
+        Router {
+            routes: Mutex::new(HashMap::new()),
+            pending: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Point `sequence`'s tokens at `sender`. Called before the turn is queued, so a step can never
+    /// draw a token for a sequence nobody is listening to.
+    fn register(&self, sequence: u64, sender: mpsc::Sender<Event>) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.insert(sequence, sender);
+        }
+    }
+
+    /// Drop a route: the handler already has its generation, or the client is gone.
+    fn unregister(&self, sequence: u64) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.remove(&sequence);
+        }
+    }
+
+    /// Tell the scheduler that a turn was queued.
+    fn wake(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = true;
+        }
+        self.wake.notify_one();
+    }
+
+    /// Block until a turn is queued. The flag is checked under the lock, so a queue that fills
+    /// between stepping and waiting cannot be missed.
+    fn wait_for_work(&self) {
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !*pending {
+            pending = match self.wake.wait(pending) {
+                Ok(pending) => pending,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+        }
+        *pending = false;
+    }
+
+    /// Post the step's tokens and finished turns to their handlers. A finished turn's route is
+    /// removed here, because nothing more will arrive for it.
+    fn dispatch(&self, report: StepReport, eos: &[u32]) {
+        let Ok(mut routes) = self.routes.lock() else {
+            return;
+        };
+        for (sequence, token) in report.tokens {
+            if eos.contains(&token) {
+                continue;
+            }
+            if let Some(sender) = routes.get(&sequence) {
+                let _ = sender.send(Event::Token(token));
+            }
+        }
+        for generation in report.finished {
+            if let Some(sender) = routes.remove(&generation.sequence_id) {
+                let _ = sender.send(Event::Finished(Box::new(generation)));
+            }
+        }
+    }
+
+    /// Fail every waiting handler: a step that returned an error left no tokens to hand out.
+    fn fail(&self, message: &str) {
+        let Ok(mut routes) = self.routes.lock() else {
+            return;
+        };
+        for (_, sender) in routes.drain() {
+            let _ = sender.send(Event::Failed(message.to_owned()));
+        }
+    }
+}
+
+/// Step the engine while turns are queued, and post each token to the handler that asked for it.
+///
+/// One step is one forward pass over every turn the engine can batch (up to `max_batch`), so four
+/// concurrent requests share one read of the weights. When nothing is queued the thread sleeps on
+/// [`Router::wake`] instead of spinning.
+fn schedule(engine: Arc<Mutex<Engine<CpuBackend>>>, router: Arc<Router>, eos: Vec<u32>) {
+    loop {
+        router.wait_for_work();
+        loop {
+            let report = {
+                let mut engine = match engine.lock() {
+                    Ok(engine) => engine,
+                    Err(_) => {
+                        router.fail("engine lock was poisoned");
+                        return;
+                    }
+                };
+                if !engine.has_work() {
+                    break;
+                }
+                engine.step()
+            };
+            match report {
+                Ok(report) => router.dispatch(report, &eos),
+                // The failed pass took its entries with it; the handlers still waiting are told, and
+                // the scheduler goes back to sleep until new work arrives.
+                Err(error) => {
+                    router.fail(&error.to_string());
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -388,23 +542,40 @@ fn chat(
 
     let id = format!("chatcmpl-{}", request_id());
     let created = now_seconds();
-    let mut engine = match served.engine.lock() {
-        Ok(engine) => engine,
-        Err(_) => {
-            respond_error(stream, 500, "internal_error", "engine lock was poisoned")?;
-            return Ok(500);
-        }
-    };
-    engine.set_sampler(sampler);
-
-    let sequence = match engine.admit(&ids, max_tokens) {
-        Ok(sequence) => sequence,
-        Err(error) => {
+    let (sender, receiver) = mpsc::channel();
+    let sequence = {
+        // The lock is held only long enough to attach this request's sampler and queue its turn. The
+        // scheduler does the work, so other requests can join the same forward pass instead of
+        // queueing behind this one.
+        let mut engine = match served.engine.lock() {
+            Ok(engine) => engine,
+            Err(_) => {
+                respond_error(stream, 500, "internal_error", "engine lock was poisoned")?;
+                return Ok(500);
+            }
+        };
+        engine.set_sampler(sampler);
+        let sequence = match engine.admit(&ids, max_tokens) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                let (status, code) = map_engine_error(&error);
+                respond_error(stream, status, code, &error.to_string())?;
+                return Ok(status);
+            }
+        };
+        // The route goes in before the turn is queued: a step that starts the moment after `enqueue`
+        // must already have somewhere to send the first token.
+        served.router.register(sequence, sender);
+        if let Err(error) = engine.enqueue(sequence) {
+            served.router.unregister(sequence);
+            let _ = engine.release(sequence);
             let (status, code) = map_engine_error(&error);
             respond_error(stream, status, code, &error.to_string())?;
             return Ok(status);
         }
+        sequence
     };
+    served.router.wake();
 
     if streaming {
         stream.set_nodelay(true).ok();
@@ -417,25 +588,36 @@ fn chat(
         let mut shown = String::new();
         let mut first = true;
         let mut disconnected = false;
-        let generated = engine.generate_with(sequence, &mut |token| {
-            if disconnected {
-                return;
-            }
+        let mut finished: Option<Generation> = None;
+        let mut failure: Option<String> = None;
+        for event in receiver {
+            let token = match event {
+                Event::Token(token) => token,
+                Event::Finished(generation) => {
+                    finished = Some(*generation);
+                    break;
+                }
+                Event::Failed(message) => {
+                    failure = Some(message);
+                    break;
+                }
+            };
             seen.push(token);
             let Ok(text) = served.tokenizer.decode(&seen) else {
-                return;
+                continue;
             };
             if !text.starts_with(shown.as_str()) {
-                return;
+                continue;
             }
             let delta = &text[shown.len()..];
             if delta.is_empty() {
-                return;
+                continue;
             }
             let frame = chunk(&id, created, &served.model, Some(delta), None);
             if sse(stream, &frame).is_err() {
+                // The client is gone: stop the turn instead of generating into a dead socket.
                 disconnected = true;
-                return;
+                break;
             }
             if first {
                 first = false;
@@ -447,56 +629,85 @@ fn chat(
             if let Ok(mut metrics) = served.metrics.lock() {
                 metrics.tokens_generated(1);
             }
-        });
-        let _ = engine.release(sequence);
-
-        let finished = match generated {
-            Ok(generation) => generation,
-            Err(error) => {
-                let _ = sse(
-                    stream,
-                    &format!(r#"{{"error":{}}}"#, quote(&error.to_string())),
-                );
-                let _ = sse(stream, "[DONE]");
-                return Ok(200);
-            }
-        };
-        if !disconnected {
-            // Anything held back because it was not a complete string yet.
-            if let Ok(text) = served.tokenizer.decode(&finished.tokens)
-                && text.starts_with(shown.as_str())
-                && text.len() > shown.len()
-            {
-                let _ = sse(
-                    stream,
-                    &chunk(
-                        &id,
-                        created,
-                        &served.model,
-                        Some(&text[shown.len()..]),
-                        None,
-                    ),
-                );
-            }
-            let reason = finish_reason(&finished.finish);
-            let final_frame = chunk(&id, created, &served.model, None, Some(reason));
-            let _ = sse(stream, &final_frame);
-            let _ = sse(stream, "[DONE]");
         }
+        if disconnected && let Ok(mut engine) = served.engine.lock() {
+            let _ = engine.cancel(sequence);
+        }
+        served.router.unregister(sequence);
+        if let Ok(mut engine) = served.engine.lock() {
+            let _ = engine.release(sequence);
+        }
+        if disconnected {
+            let _ = stream.flush();
+            return Ok(200);
+        }
+        if let Some(message) = failure {
+            let _ = sse(stream, &format!(r#"{{"error":{}}}"#, quote(&message)));
+            let _ = sse(stream, "[DONE]");
+            let _ = stream.flush();
+            return Ok(200);
+        }
+        let Some(finished) = finished else {
+            let _ = stream.flush();
+            return Ok(200);
+        };
+        // Anything held back because it was not a complete string yet.
+        if let Ok(text) = served.tokenizer.decode(&finished.tokens)
+            && text.starts_with(shown.as_str())
+            && text.len() > shown.len()
+        {
+            let _ = sse(
+                stream,
+                &chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    Some(&text[shown.len()..]),
+                    None,
+                ),
+            );
+        }
+        let reason = finish_reason(&finished.finish);
+        let final_frame = chunk(&id, created, &served.model, None, Some(reason));
+        let _ = sse(stream, &final_frame);
+        let _ = sse(stream, "[DONE]");
         let _ = stream.flush();
         return Ok(200);
     }
 
-    let generation = match engine.generate(sequence) {
-        Ok(generation) => generation,
-        Err(error) => {
-            let _ = engine.release(sequence);
-            let (status, code) = map_engine_error(&error);
-            respond_error(stream, status, code, &error.to_string())?;
-            return Ok(status);
+    let mut finished: Option<Generation> = None;
+    let mut failure: Option<String> = None;
+    for event in receiver {
+        match event {
+            // A non-streaming caller only needs the generation; the tokens are in it.
+            Event::Token(_) => {}
+            Event::Finished(generation) => {
+                finished = Some(*generation);
+                break;
+            }
+            Event::Failed(message) => {
+                failure = Some(message);
+                break;
+            }
         }
+    }
+    served.router.unregister(sequence);
+    if let Ok(mut engine) = served.engine.lock() {
+        let _ = engine.release(sequence);
+    }
+    if let Some(message) = failure {
+        respond_error(stream, 500, "internal_error", &message)?;
+        return Ok(500);
+    }
+    let Some(generation) = finished else {
+        respond_error(
+            stream,
+            500,
+            "internal_error",
+            "the turn ended without a generation",
+        )?;
+        return Ok(500);
     };
-    let _ = engine.release(sequence);
     let text = served
         .tokenizer
         .decode(&generation.tokens)

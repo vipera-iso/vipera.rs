@@ -617,6 +617,8 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
             eos,
             sampler,
             recent_window: 128,
+            // One request at a time keeps the CLI's tokens exactly what they were before batching.
+            max_batch: 1,
         },
     );
 

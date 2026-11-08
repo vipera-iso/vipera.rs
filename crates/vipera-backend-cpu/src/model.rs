@@ -15,10 +15,17 @@ use std::thread;
 use vipera_core::gguf::{GgmlType, GgufFile, TensorInfo, Value};
 use vipera_core::planner::KvCacheType;
 use vipera_errors::ViperaError;
-use vipera_runtime::{ForwardContext, ForwardPass};
+use vipera_runtime::{BatchContext, BatchEntry, ForwardContext, ForwardPass};
 
 use crate::pool::Pool;
 use crate::quant::{self, f16_to_f32, f32_to_f16};
+
+/// The most sequences one batched step computes at once.
+///
+/// The const-generic kernels keep one accumulator per entry in registers, so the batch size is a
+/// compile-time choice rather than a runtime one; eight is where the design note stops measuring and
+/// where the scratch buffers stay a few megabytes.
+const MAX_BATCH: usize = 8;
 
 /// The numbers a forward pass needs, read from the file rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -163,9 +170,7 @@ impl KvLayout {
     fn decode(self, source: &[u8], values: &mut [f32]) -> Result<(), ViperaError> {
         match self {
             Self::F16 => {
-                for (value, chunk) in values.iter_mut().zip(source.as_chunks::<2>().0.iter()) {
-                    *value = f16_to_f32(u16::from_le_bytes(*chunk));
-                }
+                crate::simd::half_to_float(source, values);
                 Ok(())
             }
             Self::Q8_0 => {
@@ -208,12 +213,31 @@ impl Tensor {
 
     fn matvec<'d>(
         &self,
-        pool: &Pool<'d>,
+        pool: &Pool<'d, 1>,
         file: &'d [u8],
         x: &[f32],
         out: &mut [f32],
     ) -> Result<(), ViperaError> {
         quant::matvec_pooled(pool, self.ty, self.data(file), self.cols, self.rows, x, out)
+    }
+
+    /// The same product for `B` activations, reading each row once for all of them.
+    fn matvec_batch<'d, const B: usize>(
+        &self,
+        pool: &Pool<'d, B>,
+        file: &'d [u8],
+        activations: &[&[f32]; B],
+        out: &mut [f32],
+    ) -> Result<(), ViperaError> {
+        quant::matvec_pooled_batch(
+            pool,
+            self.ty,
+            self.data(file),
+            self.cols,
+            self.rows,
+            activations,
+            out,
+        )
     }
 
     fn read_row(&self, file: &[u8], row: usize, out: &mut [f32]) -> Result<(), ViperaError> {
@@ -237,6 +261,47 @@ struct Layer {
     wd: Tensor,
 }
 
+/// Scratch for a batched step, sized for [`MAX_BATCH`] entries when the model is loaded.
+///
+/// One flat buffer per stage, token-major: entry `e`'s row of width `w` starts at `e * w`. Reusing
+/// them for the life of the model keeps a decode step free of allocation.
+#[derive(Debug)]
+struct BatchScratch {
+    x: Vec<f32>,
+    h: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    logits: Vec<f32>,
+    k_all: Vec<f32>,
+    v_all: Vec<f32>,
+    scores: Vec<f32>,
+}
+
+impl BatchScratch {
+    fn new(config: ModelConfig) -> Self {
+        let query = config.heads * config.head_dim;
+        let kv = config.kv_heads * config.head_dim;
+        Self {
+            x: vec![0.0; MAX_BATCH * config.hidden],
+            h: vec![0.0; MAX_BATCH * config.hidden],
+            q: vec![0.0; MAX_BATCH * query],
+            k: vec![0.0; MAX_BATCH * kv],
+            v: vec![0.0; MAX_BATCH * kv],
+            attn: vec![0.0; MAX_BATCH * config.hidden],
+            gate: vec![0.0; MAX_BATCH * config.ffn],
+            up: vec![0.0; MAX_BATCH * config.ffn],
+            logits: vec![0.0; MAX_BATCH * config.vocab],
+            k_all: Vec::new(),
+            v_all: Vec::new(),
+            scores: Vec::new(),
+        }
+    }
+}
+
 /// Qwen2/Llama weights plus the scratch buffers a forward pass reuses.
 pub struct CpuBackend {
     bytes: Vec<u8>,
@@ -257,6 +322,7 @@ pub struct CpuBackend {
     k_all: Vec<f32>,
     v_all: Vec<f32>,
     logits: Vec<f32>,
+    batch: BatchScratch,
 }
 
 impl CpuBackend {
@@ -352,6 +418,7 @@ impl CpuBackend {
             k_all: Vec::new(),
             v_all: Vec::new(),
             logits: vec![0.0; config.vocab],
+            batch: BatchScratch::new(config),
         })
     }
 
@@ -481,9 +548,302 @@ impl CpuBackend {
     }
 }
 
+impl CpuBackend {
+    /// A batched decode step, one new token per sequence.
+    ///
+    /// Anything that is not a single new token per context — a prefill, or a draft run — falls back
+    /// to [`Self::run`] one sequence at a time. Prefill stays sequential on purpose: it is
+    /// compute-heavy, and mixing it into a decode batch complicates every kernel for little gain on a
+    /// machine whose decode step is bandwidth-bound.
+    fn run_batch(
+        &mut self,
+        batch: &mut BatchContext<'_, '_>,
+    ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        let size = batch.entries.len();
+        if size == 0 {
+            return Err(ViperaError::invalid_argument(
+                "a batched step needs at least one sequence",
+            ));
+        }
+        if batch
+            .entries
+            .iter()
+            .any(|entry| entry.new_tokens.len() != 1)
+        {
+            return batch
+                .entries
+                .iter()
+                .map(|entry| {
+                    let mut context = entry.context(&mut *batch.kv);
+                    self.run(&mut context)
+                })
+                .collect();
+        }
+        match size {
+            1 => self.run_batch_n(batch.kv, exactly::<1, _>(batch.entries)?),
+            2 => self.run_batch_n(batch.kv, exactly::<2, _>(batch.entries)?),
+            3 => self.run_batch_n(batch.kv, exactly::<3, _>(batch.entries)?),
+            4 => self.run_batch_n(batch.kv, exactly::<4, _>(batch.entries)?),
+            5 => self.run_batch_n(batch.kv, exactly::<5, _>(batch.entries)?),
+            6 => self.run_batch_n(batch.kv, exactly::<6, _>(batch.entries)?),
+            7 => self.run_batch_n(batch.kv, exactly::<7, _>(batch.entries)?),
+            8 => self.run_batch_n(batch.kv, exactly::<8, _>(batch.entries)?),
+            other => Err(ViperaError::invalid_argument(format!(
+                "this backend batches up to {MAX_BATCH} sequences, not {other}"
+            ))),
+        }
+    }
+
+    /// One decode step for `B` sequences, reading each weight tensor once for all of them.
+    ///
+    /// Each entry's arithmetic is the same as its own single-sequence pass, so entry `e`'s logits are
+    /// bit-identical to what [`Self::logits`] returns for that context alone.
+    fn run_batch_n<const B: usize>(
+        &mut self,
+        kv: &mut [u8],
+        contexts: &mut [BatchEntry<'_>; B],
+    ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        let config = self.config;
+        let mut positions = [0_usize; B];
+        let mut tokens = [0_u32; B];
+        for (entry, context) in contexts.iter().enumerate() {
+            if context.new_tokens.len() != 1 {
+                return Err(ViperaError::invalid_argument(format!(
+                    "a batched decode step takes one token per sequence, entry {entry} has {}",
+                    context.new_tokens.len()
+                )));
+            }
+            let last = context.first_position as usize + 1;
+            let blocks = last.div_ceil(context.tokens_per_block as usize);
+            if blocks > context.block_table.len() {
+                return Err(ViperaError::internal(format!(
+                    "{blocks} KV blocks are needed for {last} positions but sequence {entry} has {}",
+                    context.block_table.len()
+                )));
+            }
+            if kv.len()
+                < blocks * context.bytes_per_token as usize * context.tokens_per_block as usize
+            {
+                return Err(ViperaError::internal(
+                    "the KV buffer is smaller than its own block table implies",
+                ));
+            }
+            positions[entry] = last - 1;
+            tokens[entry] = context.new_tokens[0];
+        }
+
+        let Self {
+            bytes,
+            tok_embd,
+            output,
+            output_norm,
+            layers,
+            batch,
+            ..
+        } = self;
+        let hidden = config.hidden;
+        let ffn = config.ffn;
+        let query = config.heads * config.head_dim;
+        let kv_width = config.kv_heads * config.head_dim;
+        let vocab = config.vocab;
+        let epsilon = config.rms_eps;
+        let shape = AttnShape {
+            heads: config.heads,
+            kv_heads: config.kv_heads,
+            head_dim: config.head_dim,
+        };
+        let file: &[u8] = bytes;
+        let threads = quant::thread_budget(vocab, hidden.saturating_mul(vocab).saturating_mul(B));
+
+        thread::scope(|scope| {
+            let pool = Pool::new(scope, threads);
+
+            for (entry, token) in tokens.iter().enumerate() {
+                let row = usize::try_from(*token).map_err(|_| {
+                    ViperaError::invalid_argument("token id does not fit this build")
+                })?;
+                if row >= vocab {
+                    return Err(ViperaError::invalid_argument(format!(
+                        "token {row} is outside the vocabulary of {vocab}"
+                    )));
+                }
+                tok_embd.read_row(file, row, &mut batch.x[entry * hidden..][..hidden])?;
+            }
+
+            for (index, layer) in layers.iter().enumerate() {
+                for entry in 0..B {
+                    rms_norm(
+                        &batch.x[entry * hidden..][..hidden],
+                        &layer.attn_norm,
+                        epsilon,
+                        &mut batch.h[entry * hidden..][..hidden],
+                    );
+                }
+                let activations = rows::<B>(&batch.h, hidden);
+                layer
+                    .wq
+                    .matvec_batch::<B>(&pool, file, &activations, &mut batch.q[..B * query])?;
+                layer.wk.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &activations,
+                    &mut batch.k[..B * kv_width],
+                )?;
+                layer.wv.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &activations,
+                    &mut batch.v[..B * kv_width],
+                )?;
+                for entry in 0..B {
+                    add_assign(&mut batch.q[entry * query..][..query], &layer.bq);
+                    add_assign(&mut batch.k[entry * kv_width..][..kv_width], &layer.bk);
+                    add_assign(&mut batch.v[entry * kv_width..][..kv_width], &layer.bv);
+                }
+
+                for entry in 0..B {
+                    let position = positions[entry];
+                    rope(
+                        &mut batch.q[entry * query..][..query],
+                        position,
+                        shape.heads,
+                        shape.head_dim,
+                        config.rope_base,
+                    );
+                    rope(
+                        &mut batch.k[entry * kv_width..][..kv_width],
+                        position,
+                        shape.kv_heads,
+                        shape.head_dim,
+                        config.rope_base,
+                    );
+                    let context = &contexts[entry];
+                    let mut kv = KvView {
+                        storage: &mut *kv,
+                        table: context.block_table,
+                        tokens_per_block: context.tokens_per_block as usize,
+                        bytes_per_token: context.bytes_per_token as usize,
+                        layout: config.kv_layout(context.bytes_per_token as usize)?,
+                    };
+                    kv.write(
+                        position,
+                        index,
+                        shape,
+                        &batch.k[entry * kv_width..][..kv_width],
+                        &batch.v[entry * kv_width..][..kv_width],
+                    )?;
+                    kv.load_layer(
+                        index,
+                        shape,
+                        position + 1,
+                        &mut batch.k_all,
+                        &mut batch.v_all,
+                    )?;
+                    attention(
+                        &batch.q[entry * query..][..query],
+                        &batch.k_all,
+                        &batch.v_all,
+                        position + 1,
+                        shape,
+                        &mut batch.scores,
+                        &mut batch.attn[entry * hidden..][..hidden],
+                    );
+                }
+
+                layer.wo.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &rows::<B>(&batch.attn, hidden),
+                    &mut batch.h[..B * hidden],
+                )?;
+                for entry in 0..B {
+                    add_assign(
+                        &mut batch.x[entry * hidden..][..hidden],
+                        &batch.h[entry * hidden..][..hidden],
+                    );
+                }
+
+                for entry in 0..B {
+                    rms_norm(
+                        &batch.x[entry * hidden..][..hidden],
+                        &layer.ffn_norm,
+                        epsilon,
+                        &mut batch.h[entry * hidden..][..hidden],
+                    );
+                }
+                let activations = rows::<B>(&batch.h, hidden);
+                layer.wg.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &activations,
+                    &mut batch.gate[..B * ffn],
+                )?;
+                layer
+                    .wu
+                    .matvec_batch::<B>(&pool, file, &activations, &mut batch.up[..B * ffn])?;
+                for (value, gate) in batch.up[..B * ffn].iter_mut().zip(&batch.gate[..B * ffn]) {
+                    *value *= silu(*gate);
+                }
+                layer.wd.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &rows::<B>(&batch.up, ffn),
+                    &mut batch.h[..B * hidden],
+                )?;
+                for entry in 0..B {
+                    add_assign(
+                        &mut batch.x[entry * hidden..][..hidden],
+                        &batch.h[entry * hidden..][..hidden],
+                    );
+                }
+            }
+
+            for entry in 0..B {
+                rms_norm(
+                    &batch.x[entry * hidden..][..hidden],
+                    output_norm,
+                    epsilon,
+                    &mut batch.h[entry * hidden..][..hidden],
+                );
+            }
+            output.matvec_batch::<B>(
+                &pool,
+                file,
+                &rows::<B>(&batch.h, hidden),
+                &mut batch.logits[..B * vocab],
+            )?;
+            Ok((0..B)
+                .map(|entry| batch.logits[entry * vocab..][..vocab].to_vec())
+                .collect())
+        })
+    }
+}
+
+/// `B` rows of `width` values out of one flat, token-major buffer.
+fn rows<const B: usize>(data: &[f32], width: usize) -> [&[f32]; B] {
+    std::array::from_fn(|entry| &data[entry * width..][..width])
+}
+
+/// A mutable array of exactly `B` entries, or an error naming the batch it was given.
+fn exactly<const B: usize, T>(slice: &mut [T]) -> Result<&mut [T; B], ViperaError> {
+    let len = slice.len();
+    slice.try_into().map_err(|_| {
+        ViperaError::invalid_argument(format!(
+            "this backend batches up to {MAX_BATCH} sequences, not {len}"
+        ))
+    })
+}
+
 impl ForwardPass for CpuBackend {
     fn logits(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
         self.run(context)
+    }
+
+    fn logits_batch(
+        &mut self,
+        batch: &mut BatchContext<'_, '_>,
+    ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        self.run_batch(batch)
     }
 }
 
@@ -616,22 +976,42 @@ impl KvView<'_> {
         let layer_bytes = self.layout.bytes_per_row(width);
         k_all.resize(positions * width, 0.0);
         v_all.resize(positions * width, 0.0);
-        for position in 0..positions {
-            let base = self.slot(position)? + layer * 2 * layer_bytes;
-            let end = base + 2 * layer_bytes;
-            if end > self.storage.len() {
-                return Err(ViperaError::internal(
-                    "KV read would fall outside the cache buffer",
-                ));
+        // Positions inside one block are a fixed distance apart, so the block table is consulted once
+        // per block instead of once per position: at 1024 positions that was a division and a
+        // bounds-checked lookup for every row of every layer.
+        let per_block = self.tokens_per_block.max(1);
+        let mut position = 0;
+        while position < positions {
+            let slot = position / per_block;
+            // The table holds the physical block, which is not the index whenever two sequences share
+            // one buffer.
+            let block = *self
+                .table
+                .get(slot)
+                .ok_or_else(|| ViperaError::internal("position has no KV block"))?
+                as usize;
+            let in_block = (per_block - position % per_block).min(positions - position);
+            let mut base = (block * per_block + position % per_block) * self.bytes_per_token
+                + layer * 2 * layer_bytes;
+            for offset in 0..in_block {
+                let end = base + 2 * layer_bytes;
+                if end > self.storage.len() {
+                    return Err(ViperaError::internal(
+                        "KV read would fall outside the cache buffer",
+                    ));
+                }
+                let at = (position + offset) * width;
+                self.layout.decode(
+                    &self.storage[base..base + layer_bytes],
+                    &mut k_all[at..][..width],
+                )?;
+                self.layout.decode(
+                    &self.storage[base + layer_bytes..end],
+                    &mut v_all[at..][..width],
+                )?;
+                base += self.bytes_per_token;
             }
-            self.layout.decode(
-                &self.storage[base..base + layer_bytes],
-                &mut k_all[position * width..][..width],
-            )?;
-            self.layout.decode(
-                &self.storage[base + layer_bytes..end],
-                &mut v_all[position * width..][..width],
-            )?;
+            position += in_block;
         }
         Ok(())
     }
@@ -657,6 +1037,9 @@ fn attention(
     let head_dim = shape.head_dim;
     let group = shape.heads / shape.kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
+    // The score dot runs in eight lanes unless the exact tokens were asked for; the value
+    // accumulation is eight lanes either way, because it changes no rounding.
+    let sequential = quant::exact_dot_requested();
     scores.resize(positions, 0.0);
     for head in 0..shape.heads {
         let kv_head = head / group;
@@ -664,27 +1047,29 @@ fn attention(
         let mut best = f32::NEG_INFINITY;
         for (position, score) in scores.iter_mut().enumerate().take(positions) {
             let base = (position * shape.kv_heads + kv_head) * head_dim;
-            let mut dot = 0.0_f32;
-            for (q, k) in query.iter().zip(&k_all[base..base + head_dim]) {
-                dot += q * k;
-            }
+            let key = &k_all[base..base + head_dim];
+            let dot = if sequential {
+                query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
+            } else {
+                crate::simd::dot_f32(query, key)
+            };
             *score = dot * scale;
             best = best.max(*score);
         }
-        let mut total = 0.0_f32;
-        for score in scores.iter_mut().take(positions) {
+        let window = &mut scores[..positions];
+        for score in window.iter_mut() {
             *score = (*score - best).exp();
+        }
+        let mut total = 0.0_f32;
+        for score in window.iter() {
             total += *score;
         }
         let inverse = 1.0 / total;
         let output = &mut out[head * head_dim..(head + 1) * head_dim];
         output.fill(0.0);
         for (position, weight) in scores.iter().take(positions).enumerate() {
-            let weight = weight * inverse;
             let base = (position * shape.kv_heads + kv_head) * head_dim;
-            for (value, v) in output.iter_mut().zip(&v_all[base..base + head_dim]) {
-                *value += weight * v;
-            }
+            crate::simd::axpy_f32(output, weight * inverse, &v_all[base..base + head_dim]);
         }
     }
 }
@@ -809,6 +1194,72 @@ mod tests {
         let mut at_zero = [2.0, 5.0];
         rope(&mut at_zero, 0, 1, 2, 10_000.0);
         assert_eq!(at_zero, [2.0, 5.0], "position zero is the identity");
+    }
+
+    /// Measurement: what `attention` costs on its own, split into the score dot, the softmax and the
+    /// value accumulation. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib attention_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn attention_cost_per_position() {
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let round = |positions: usize| {
+            let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+                .map(|at| (at % 17) as f32 * 0.01)
+                .collect();
+            let k: Vec<f32> = (0..positions * shape.kv_heads * shape.head_dim)
+                .map(|at| (at % 13) as f32 * 0.02)
+                .collect();
+            let v: Vec<f32> = (0..positions * shape.kv_heads * shape.head_dim)
+                .map(|at| (at % 11) as f32 * 0.03)
+                .collect();
+            let mut scores = Vec::new();
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            let rounds = 200_u32;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                attention(&q, &k, &v, positions, shape, &mut scores, &mut out);
+            }
+            started.elapsed().as_secs_f64() / f64::from(rounds) * 1e3
+        };
+        // The score dot alone, at the same shape and count: heads * positions dots of 128 values.
+        let dot_round = |positions: usize| -> f64 {
+            let q: Vec<f32> = (0..shape.head_dim)
+                .map(|at| (at % 17) as f32 * 0.01)
+                .collect();
+            let k: Vec<f32> = (0..positions * shape.kv_heads * shape.head_dim)
+                .map(|at| (at % 13) as f32 * 0.02)
+                .collect();
+            let rounds = 20_u32;
+            let started = std::time::Instant::now();
+            let mut sink = 0.0_f32;
+            for _ in 0..rounds {
+                for head in 0..shape.heads {
+                    let kv_head = head % shape.kv_heads;
+                    for position in 0..positions {
+                        let base = (position * shape.kv_heads + kv_head) * shape.head_dim;
+                        sink += crate::simd::dot_f32(&q, &k[base..base + shape.head_dim]);
+                    }
+                }
+            }
+            let elapsed = started.elapsed().as_secs_f64() / f64::from(rounds) * 1e3;
+            assert!(sink.is_finite());
+            elapsed
+        };
+        for positions in [32_usize, 256, 1024] {
+            println!(
+                "positions {positions:>5}: attention {:.2} ms, score dots only {:.2} ms",
+                round(positions),
+                dot_round(positions)
+            );
+        }
     }
 
     #[test]

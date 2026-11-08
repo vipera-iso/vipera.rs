@@ -6,16 +6,22 @@
 //! from a restored point recomputes only what the rewind invalidated (FR-010). Blocks are released on
 //! cancel, failure, and explicit release (FR-011).
 //!
+//! A turn is not a closed loop of its own: [`Engine::step`] moves every running turn forward by one
+//! unit of work, and the turns that need a forward pass in the same step share one batched call. A
+//! single-request turn is a batch of one, so its forward passes, its tokens, and its timings are the
+//! same as they were when a turn ran alone.
+//!
 //! Every request returns the stage timings and one structured log line (FR-022).
 
-use std::collections::BTreeMap;
-use std::time::Instant;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::time::{Duration, Instant};
 
 use vipera_errors::ViperaError;
 use vipera_sampler::{Sampler, SamplerConfig};
 
 use crate::kv::KvCache;
-use crate::pipeline::{ForwardContext, ForwardPass, RequestLog, Stage, StageTimings};
+use crate::pipeline::{BatchContext, BatchEntry, ForwardPass, RequestLog, Stage, StageTimings};
 use crate::sequence::{FinishReason, Sequence};
 
 /// Runtime knobs that are not per-request.
@@ -27,6 +33,8 @@ pub struct EngineConfig {
     pub sampler: SamplerConfig,
     /// How many recent tokens the repetition penalty sees.
     pub recent_window: usize,
+    /// Turns one step drives at once. Beyond this, requests wait their turn in the queue.
+    pub max_batch: usize,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +46,7 @@ impl Default for EngineConfig {
                 ..SamplerConfig::default()
             },
             recent_window: 64,
+            max_batch: 4,
         }
     }
 }
@@ -95,6 +104,56 @@ struct Counters {
     failed: u64,
 }
 
+/// What a turn must do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Prompt tokens have no KV state yet: compute the next stretch, up to one block.
+    Prefill,
+    /// The last retained token needs a forward pass before it can be sampled from.
+    Decode,
+    /// Logits for the last position are in hand: draw one token from them.
+    Sample,
+}
+
+/// One sequence's progress through the turn it is running.
+struct Turn {
+    id: u64,
+    phase: Phase,
+    sampler: Sampler,
+    /// Logits for the last computed position; only meaningful in [`Phase::Sample`].
+    logits: Vec<f32>,
+    /// Tokens this turn produced, in order, stop token included.
+    generated: Vec<u32>,
+    /// Prompt tokens served from the retained context instead of being recomputed.
+    reused: usize,
+    /// Tokens this turn added to the context, reused prefix excluded.
+    prompt_tokens: usize,
+    /// Tokens that went through the forward pass in this turn.
+    processed: u64,
+    timings: StageTimings,
+}
+
+/// The sampler does not format itself, and it is noise in a debug dump of the engine.
+impl fmt::Debug for Turn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Turn")
+            .field("id", &self.id)
+            .field("phase", &self.phase)
+            .field("generated", &self.generated.len())
+            .field("processed", &self.processed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What one step did.
+#[derive(Debug, Clone, Default)]
+pub struct StepReport {
+    /// Tokens drawn this step, in the order they were drawn, as `(sequence, token)`.
+    pub tokens: Vec<(u64, u32)>,
+    /// Turns that ended this step, with their generations.
+    pub finished: Vec<Generation>,
+}
+
 /// Sequences, KV blocks, and the model behind them.
 #[derive(Debug)]
 pub struct Engine<F: ForwardPass> {
@@ -102,6 +161,10 @@ pub struct Engine<F: ForwardPass> {
     forward: F,
     config: EngineConfig,
     sequences: BTreeMap<u64, Sequence>,
+    /// Turns waiting for a slot in the batch, oldest request first.
+    waiting: VecDeque<Turn>,
+    /// Turns running this step loop, by sequence id, which is also the order their draws happen in.
+    turns: BTreeMap<u64, Turn>,
     next_sequence: u64,
     counters: Counters,
 }
@@ -114,6 +177,8 @@ impl<F: ForwardPass> Engine<F> {
             forward,
             config,
             sequences: BTreeMap::new(),
+            waiting: VecDeque::new(),
+            turns: BTreeMap::new(),
             next_sequence: 0,
             counters: Counters::default(),
         }
@@ -186,6 +251,11 @@ impl<F: ForwardPass> Engine<F> {
     /// Returns how many leading tokens were already resident. The cache is cut back to the common
     /// prefix, so the new suffix is computed on top of KV state that is still valid.
     pub fn append_prompt(&mut self, id: u64, tokens: &[u32]) -> Result<usize, ViperaError> {
+        if self.is_active(id) {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {id} is still generating; wait for its turn to end"
+            )));
+        }
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
@@ -220,78 +290,361 @@ impl<F: ForwardPass> Engine<F> {
 
     /// Generate while handing each token to `on_token` as it is produced, so a caller can show text
     /// before the turn ends. Stop tokens are not passed on: they end the turn rather than appear in it.
+    ///
+    /// This is the scheduler's first client: the turn joins the queue and the engine is stepped until
+    /// it ends, so anything already running runs alongside it instead of waiting for it.
     pub fn generate_with(
         &mut self,
         id: u64,
         on_token: &mut dyn FnMut(u32),
     ) -> Result<Generation, ViperaError> {
-        let (outcome, timings, generated, reused, prompt_tokens) = {
-            let Engine {
-                kv,
-                forward,
-                config,
-                sequences,
-                ..
-            } = self;
-            let sequence = sequences.get_mut(&id).ok_or_else(|| {
-                ViperaError::invalid_argument(format!("sequence {id} does not exist"))
-            })?;
-            if !sequence.is_usable() {
-                return Err(ViperaError::invalid_argument(format!(
-                    "sequence {id} is {} and cannot generate",
-                    sequence.state().as_str()
+        self.enqueue(id)?;
+        loop {
+            let report = self.step()?;
+            for (sequence, token) in &report.tokens {
+                if *sequence == id && !self.config.eos.contains(token) {
+                    (on_token)(*token);
+                }
+            }
+            if let Some(generation) = report
+                .finished
+                .into_iter()
+                .find(|generation| generation.sequence_id == id)
+            {
+                return Ok(generation);
+            }
+            if !self.is_active(id) {
+                return Err(ViperaError::internal(format!(
+                    "sequence {id} left the batch without finishing its turn"
                 )));
             }
+        }
+    }
 
-            let reused = sequence.take_reused();
-            let prompt_tokens = sequence.len().saturating_sub(reused);
-            let mut sampler = Sampler::new(config.sampler)?;
-            let mut timings = StageTimings::new();
-            let mut generated = Vec::new();
-            let mut output = TurnOutput {
-                timings: &mut timings,
-                generated: &mut generated,
-                on_token,
-            };
-            let outcome = run_turn(kv, forward, sequence, &mut sampler, &mut output, config);
-            (outcome, timings, generated, reused, prompt_tokens)
+    /// Whether any turn is running or waiting for a batch slot.
+    ///
+    /// A scheduler that owns the engine uses this to stop stepping when nothing is queued, and to
+    /// tell an empty engine apart from one that still owes tokens.
+    pub fn has_work(&self) -> bool {
+        !self.turns.is_empty() || !self.waiting.is_empty()
+    }
+
+    /// Queue an admitted sequence for the next step, starting a new turn on it.
+    ///
+    /// Reuse is resolved here rather than in the step, so the turn knows its prompt size and its
+    /// sampler before it gets a slot.
+    pub fn enqueue(&mut self, id: u64) -> Result<(), ViperaError> {
+        if self.is_active(id) {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {id} is already generating"
+            )));
+        }
+        let sampler = Sampler::new(self.config.sampler)?;
+        let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
+            ViperaError::invalid_argument(format!("sequence {id} does not exist"))
+        })?;
+        if !sequence.is_usable() {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {id} is {} and cannot generate",
+                sequence.state().as_str()
+            )));
+        }
+        if sequence.is_empty() {
+            return Err(ViperaError::internal(
+                "cannot generate from a sequence with no tokens",
+            ));
+        }
+
+        let reused = sequence.take_reused();
+        let prompt_tokens = sequence.len().saturating_sub(reused);
+        // Nothing new to prefill, as after a restore or a repeated turn: sampling still needs the
+        // logits of the last retained token, so the turn starts by computing that one position.
+        let phase = if sequence.processed() < sequence.len() {
+            Phase::Prefill
+        } else {
+            Phase::Decode
         };
+        sequence.begin_prefill();
+        self.waiting.push_back(Turn {
+            id,
+            phase,
+            sampler,
+            logits: Vec::new(),
+            generated: Vec::new(),
+            reused,
+            prompt_tokens,
+            processed: 0,
+            timings: StageTimings::new(),
+        });
+        Ok(())
+    }
 
-        match outcome {
-            Ok((finish, processed)) => {
-                let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
-                    ViperaError::internal("sequence disappeared during generation")
-                })?;
-                sequence.finish(finish);
-                let log = RequestLog {
-                    event: "generation",
-                    sequence: id,
-                    prompt_tokens,
-                    reused_tokens: reused,
-                    generated_tokens: generated.len(),
-                    finish: finish.as_str(),
-                    timings,
-                };
-                self.counters.generations = self.counters.generations.saturating_add(1);
-                Ok(Generation {
-                    sequence_id: id,
-                    tokens: generated,
-                    finish,
-                    reused_tokens: reused,
-                    processed_tokens: processed,
-                    timings,
-                    log_line: log.to_json(),
-                })
-            }
-            Err(error) => {
-                if let Some(sequence) = self.sequences.get_mut(&id) {
-                    sequence.fail();
-                }
-                self.kv.release(id);
-                self.counters.failed = self.counters.failed.saturating_add(1);
-                Err(error)
+    /// Drive every running sequence forward by one unit of work.
+    ///
+    /// The order is fixed and independent of arrival: queued turns join oldest first, prompt chunks are
+    /// computed before decode steps, forward passes go in sequence id order, and draws follow them in
+    /// the same order. A sequence's tokens therefore depend only on its own prompt and seed, never on
+    /// what else happens to be in the batch.
+    pub fn step(&mut self) -> Result<StepReport, ViperaError> {
+        let mut report = StepReport::default();
+        self.admit_waiting();
+
+        // A sequence cancelled or released between steps takes its turn with it.
+        let running: Vec<u64> = self.turns.keys().copied().collect();
+        for id in &running {
+            if !self.sequences.get(id).is_some_and(Sequence::is_usable) {
+                self.turns.remove(id);
             }
         }
+
+        // One kind of forward pass per step. A prompt chunk is more than one token, and a batch that
+        // mixes chunks with decode steps makes the backend compute every entry on its own, so decode
+        // steps wait for a step that holds only decode steps. A chunk is at most one block, so the
+        // wait is bounded.
+        let prefill: Vec<u64> = self
+            .turns
+            .iter()
+            .filter(|(_, turn)| turn.phase == Phase::Prefill)
+            .map(|(id, _)| *id)
+            .collect();
+        let batch: Vec<u64> = if prefill.is_empty() {
+            self.turns
+                .iter()
+                .filter(|(_, turn)| turn.phase == Phase::Decode)
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            prefill
+        };
+        if !batch.is_empty()
+            && let Err(error) = self.forward(&batch)
+        {
+            // The call that failed took its entries with it; the others keep their turns.
+            for id in &batch {
+                self.fail(*id);
+            }
+            return Err(error);
+        }
+
+        // One draw per turn that has logits, in id order.
+        let ready: Vec<u64> = self
+            .turns
+            .iter()
+            .filter(|(_, turn)| turn.phase == Phase::Sample)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ready {
+            if let Err(error) = self.sample(id, &mut report) {
+                self.fail(id);
+                return Err(error);
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// One batched forward pass over `ids`, recording each turn's timings, logits, and progress.
+    fn forward(&mut self, ids: &[u64]) -> Result<(), ViperaError> {
+        let Engine {
+            kv,
+            forward,
+            sequences,
+            turns,
+            ..
+        } = self;
+        let tokens_per_block = kv.config().tokens_per_block as usize;
+
+        // What each turn computes this step: its next prompt chunk, or the last retained position.
+        let mut ranges = Vec::with_capacity(ids.len());
+        for id in ids {
+            let sequence = sequences
+                .get_mut(id)
+                .ok_or_else(|| ViperaError::internal("a running turn lost its sequence"))?;
+            let turn = turns
+                .get_mut(id)
+                .ok_or_else(|| ViperaError::internal("a running turn lost its state"))?;
+            let (start, end) = match turn.phase {
+                Phase::Prefill => {
+                    let start = sequence.processed();
+                    (start, (start + tokens_per_block).min(sequence.len()))
+                }
+                Phase::Decode => (sequence.len() - 1, sequence.len()),
+                Phase::Sample => {
+                    return Err(ViperaError::internal(
+                        "a turn whose logits are in hand needs no forward pass",
+                    ));
+                }
+            };
+            let started = Instant::now();
+            kv.reserve(*id, end as u64)?;
+            turn.timings.record(Stage::Allocate, started.elapsed());
+            // Identity strategies until their algorithms land: nothing is compressed, no draft tokens
+            // are produced, and every requested position is computed.
+            for stage in [Stage::Compress, Stage::Speculative, Stage::Sparse] {
+                turn.timings.record(stage, Duration::ZERO);
+            }
+            ranges.push((start, end));
+        }
+
+        // One table copy per entry: a table cannot stay borrowed from the cache while the cache's
+        // storage is borrowed mutably, and a table is one id per block at most.
+        let mut tables = Vec::with_capacity(ids.len());
+        for id in ids {
+            tables.push(kv.table(*id).unwrap_or(&[]).to_vec());
+        }
+
+        let (logits, elapsed) = {
+            let mut entries = Vec::with_capacity(ids.len());
+            for (entry, id) in ids.iter().enumerate() {
+                let sequence = sequences
+                    .get(id)
+                    .ok_or_else(|| ViperaError::internal("a running turn lost its sequence"))?;
+                let (start, end) = ranges[entry];
+                let first_position = u32::try_from(start)
+                    .map_err(|_| ViperaError::internal("sequence position exceeds 32 bits"))?;
+                entries.push(BatchEntry {
+                    tokens: sequence.tokens(),
+                    new_tokens: &sequence.tokens()[start..end],
+                    first_position,
+                    block_table: &tables[entry],
+                    tokens_per_block: tokens_per_block as u64,
+                    bytes_per_token: kv.config().bytes_per_token,
+                });
+            }
+            let started = Instant::now();
+            let logits = forward.logits_batch(&mut BatchContext {
+                kv: kv.storage_mut(),
+                entries: &mut entries,
+            });
+            (logits, started.elapsed())
+        };
+
+        let mut logits = logits?;
+        if logits.len() != ids.len() {
+            return Err(ViperaError::internal(format!(
+                "the batched forward pass returned {} results for {} sequences",
+                logits.len(),
+                ids.len()
+            )));
+        }
+        for (entry, id) in ids.iter().enumerate() {
+            let (start, end) = ranges[entry];
+            let sequence = sequences
+                .get_mut(id)
+                .ok_or_else(|| ViperaError::internal("a running turn lost its sequence"))?;
+            let turn = turns
+                .get_mut(id)
+                .ok_or_else(|| ViperaError::internal("a running turn lost its state"))?;
+            // Every entry that shared the call is charged the call's wall time: that is what the
+            // caller of the step waited for, and a batch of one is exactly its own cost.
+            turn.timings.record(Stage::Compute, elapsed);
+            turn.timings.record(Stage::Verify, Duration::ZERO);
+            turn.processed += (end - start) as u64;
+            turn.logits = std::mem::take(&mut logits[entry]);
+            sequence.set_processed(end);
+            turn.phase = if sequence.processed() == sequence.len() {
+                Phase::Sample
+            } else {
+                Phase::Prefill
+            };
+        }
+        Ok(())
+    }
+
+    /// Draw one token for `id`, and decide what its turn does next.
+    fn sample(&mut self, id: u64, report: &mut StepReport) -> Result<(), ViperaError> {
+        let Engine {
+            kv,
+            config,
+            sequences,
+            turns,
+            counters,
+            ..
+        } = self;
+        let capacity = kv.config().capacity_tokens();
+        let sequence = sequences
+            .get_mut(&id)
+            .ok_or_else(|| ViperaError::internal("a sampling turn lost its sequence"))?;
+        let turn = turns
+            .get_mut(&id)
+            .ok_or_else(|| ViperaError::internal("a sampling turn lost its state"))?;
+
+        // The cache cannot hold another position: end the turn instead of overrunning it.
+        if sequence.len() as u64 >= capacity {
+            let generation = end_turn(sequence, turn, FinishReason::Length);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+            return Ok(());
+        }
+
+        let recent_start = sequence.len().saturating_sub(config.recent_window);
+        let started = Instant::now();
+        let token = turn
+            .sampler
+            .sample(&turn.logits, &sequence.tokens()[recent_start..])?;
+        turn.timings.record(Stage::Sample, started.elapsed());
+        sequence.begin_decode();
+        sequence.push_generated(token);
+        turn.generated.push(token);
+        report.tokens.push((id, token));
+
+        let finish = if config.eos.contains(&token) {
+            Some(FinishReason::EndOfSequence)
+        } else if turn.generated.len() as u64 >= u64::from(sequence.max_new_tokens()) {
+            Some(FinishReason::Length)
+        } else {
+            None
+        };
+        match finish {
+            Some(reason) => {
+                let generation = end_turn(sequence, turn, reason);
+                counters.generations = counters.generations.saturating_add(1);
+                turns.remove(&id);
+                report.finished.push(generation);
+            }
+            None => turn.phase = Phase::Decode,
+        }
+        Ok(())
+    }
+
+    /// Abandon a turn: its sequence failed, its blocks go back, and the turn leaves the batch.
+    fn fail(&mut self, id: u64) {
+        self.turns.remove(&id);
+        if let Some(sequence) = self.sequences.get_mut(&id) {
+            sequence.fail();
+        }
+        self.kv.release(id);
+        self.counters.failed = self.counters.failed.saturating_add(1);
+    }
+
+    /// Move queued turns into the running set, oldest request first, up to `max_batch`.
+    fn admit_waiting(&mut self) {
+        let limit = self.config.max_batch.max(1);
+        while self.turns.len() < limit {
+            let Some(turn) = self.waiting.pop_front() else {
+                return;
+            };
+            if !self
+                .sequences
+                .get(&turn.id)
+                .is_some_and(Sequence::is_usable)
+            {
+                continue;
+            }
+            self.turns.insert(turn.id, turn);
+        }
+    }
+
+    /// Whether a sequence has a turn queued or running.
+    fn is_active(&self, id: u64) -> bool {
+        self.turns.contains_key(&id) || self.waiting.iter().any(|turn| turn.id == id)
+    }
+
+    /// Take a sequence's turn out of the batch, whether it was running or still queued.
+    fn drop_turn(&mut self, id: u64) {
+        self.turns.remove(&id);
+        self.waiting.retain(|turn| turn.id != id);
     }
 
     /// Record a restorable point at the current end of the context.
@@ -321,11 +674,15 @@ impl<F: ForwardPass> Engine<F> {
     }
 
     /// Cancel a turn and release its context.
+    ///
+    /// The turn leaves the batch here, which is the step boundary: nothing is in flight between
+    /// steps, so a cancelled sequence's blocks are free before the next step starts.
     pub fn cancel(&mut self, id: u64) -> Result<u64, ViperaError> {
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
         sequence.cancel();
+        self.drop_turn(id);
         Ok(self.kv.release(id))
     }
 
@@ -337,6 +694,7 @@ impl<F: ForwardPass> Engine<F> {
             )));
         }
         let blocks = self.kv.release(id);
+        self.drop_turn(id);
         self.sequences.remove(&id);
         Ok(Released {
             blocks,
@@ -345,143 +703,37 @@ impl<F: ForwardPass> Engine<F> {
     }
 }
 
-/// What a turn produces, and where each token goes as it is produced.
-struct TurnOutput<'a> {
-    timings: &'a mut StageTimings,
-    generated: &'a mut Vec<u32>,
-    on_token: &'a mut dyn FnMut(u32),
-}
-
-/// One turn: prefill what is new, then decode until a stop condition.
-fn run_turn<F: ForwardPass>(
-    kv: &mut KvCache,
-    forward: &mut F,
-    sequence: &mut Sequence,
-    sampler: &mut Sampler,
-    output: &mut TurnOutput<'_>,
-    config: &EngineConfig,
-) -> Result<(FinishReason, u64), ViperaError> {
-    let tokens_per_block = kv.config().tokens_per_block as usize;
-    let capacity = kv.config().capacity_tokens();
-    let mut processed = 0u64;
-
-    sequence.begin_prefill();
-    let mut logits: Option<Vec<f32>> = None;
-    while sequence.processed() < sequence.len() {
-        let start = sequence.processed();
-        let end = (start + tokens_per_block).min(sequence.len());
-        logits = Some(compute(kv, forward, sequence, start, end, output.timings)?);
-        processed += (end - start) as u64;
-        sequence.set_processed(end);
-    }
-
-    if logits.is_none() {
-        // Nothing new to prefill, as after a restore or a repeated turn. Sampling still needs the
-        // logits of the last retained token, so that one position is recomputed.
-        if sequence.is_empty() {
-            return Err(ViperaError::internal(
-                "cannot generate from a sequence with no tokens",
-            ));
-        }
-        let last = sequence.len() - 1;
-        logits = Some(compute(
-            kv,
-            forward,
-            sequence,
-            last,
-            last + 1,
-            output.timings,
-        )?);
-        processed += 1;
-    }
-    let mut logits = logits.ok_or_else(|| ViperaError::internal("prefill produced no logits"))?;
-
-    sequence.begin_decode();
-    loop {
-        if output.generated.len() as u64 >= u64::from(sequence.max_new_tokens()) {
-            return Ok((FinishReason::Length, processed));
-        }
-        if sequence.len() as u64 >= capacity {
-            // The cache cannot hold another position: stop the turn instead of overrunning it.
-            return Ok((FinishReason::Length, processed));
-        }
-
-        let recent_start = sequence.len().saturating_sub(config.recent_window);
-        let started = Instant::now();
-        let token = sampler.sample(&logits, &sequence.tokens()[recent_start..])?;
-        output.timings.record(Stage::Sample, started.elapsed());
-
-        sequence.push_generated(token);
-        output.generated.push(token);
-        if config.eos.contains(&token) {
-            return Ok((FinishReason::EndOfSequence, processed));
-        }
-        (output.on_token)(token);
-        if output.generated.len() as u64 >= u64::from(sequence.max_new_tokens()) {
-            return Ok((FinishReason::Length, processed));
-        }
-
-        let position = sequence.len() - 1;
-        logits = compute(
-            kv,
-            forward,
-            sequence,
-            position,
-            position + 1,
-            output.timings,
-        )?;
-        sequence.set_processed(sequence.len());
-        processed += 1;
-    }
-}
-
-/// Steps 1 to 6 of the pipeline for one chunk of positions, returning step 5's logits.
-fn compute<F: ForwardPass>(
-    kv: &mut KvCache,
-    forward: &mut F,
-    sequence: &Sequence,
-    start: usize,
-    end: usize,
-    timings: &mut StageTimings,
-) -> Result<Vec<f32>, ViperaError> {
-    let started = Instant::now();
-    kv.reserve(sequence.id(), end as u64)?;
-    timings.record(Stage::Allocate, started.elapsed());
-
-    // Identity strategies until their algorithms land: nothing is compressed, no draft tokens are
-    // produced, every requested position is computed, and there is no draft to verify.
-    for stage in [Stage::Compress, Stage::Speculative, Stage::Sparse] {
-        let started = Instant::now();
-        timings.record(stage, started.elapsed());
-    }
-
-    let first_position = u32::try_from(start)
-        .map_err(|_| ViperaError::internal("sequence position exceeds 32 bits"))?;
-    let block_table = kv.table(sequence.id()).unwrap_or(&[]).to_vec();
-    let config = kv.config();
-    let mut context = ForwardContext {
-        tokens: sequence.tokens(),
-        new_tokens: &sequence.tokens()[start..end],
-        first_position,
-        block_table: &block_table,
-        kv: kv.storage_mut(),
-        tokens_per_block: config.tokens_per_block,
-        bytes_per_token: config.bytes_per_token,
+/// End a turn: mark the sequence finished and build the generation its caller receives.
+fn end_turn(sequence: &mut Sequence, turn: &mut Turn, reason: FinishReason) -> Generation {
+    sequence.finish(reason);
+    let log = RequestLog {
+        event: "generation",
+        sequence: turn.id,
+        prompt_tokens: turn.prompt_tokens,
+        reused_tokens: turn.reused,
+        generated_tokens: turn.generated.len(),
+        finish: reason.as_str(),
+        timings: turn.timings,
     };
-    let started = Instant::now();
-    let logits = forward.logits(&mut context)?;
-    timings.record(Stage::Compute, started.elapsed());
-
-    let started = Instant::now();
-    timings.record(Stage::Verify, started.elapsed());
-
-    Ok(logits)
+    Generation {
+        sequence_id: turn.id,
+        tokens: std::mem::take(&mut turn.generated),
+        finish: reason,
+        reused_tokens: turn.reused,
+        processed_tokens: turn.processed,
+        timings: turn.timings,
+        log_line: log.to_json(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::kv::KvConfig;
+    use crate::pipeline::ForwardContext;
     use crate::sequence::SequenceState;
 
     /// Deterministic model: the favoured token depends only on the last token and the position.
@@ -565,8 +817,71 @@ mod tests {
     }
 
     fn engine_with(config: EngineConfig, forward: ToyForward, blocks: u64) -> Engine<ToyForward> {
+        engine_with_forward(config, forward, blocks)
+    }
+
+    fn engine_with_forward<F: ForwardPass>(
+        config: EngineConfig,
+        forward: F,
+        blocks: u64,
+    ) -> Engine<F> {
         let kv = KvCache::new(KvConfig::new(8, 4, blocks).expect("geometry")).expect("cache");
         Engine::new(kv, forward, config)
+    }
+
+    /// Answers like [`ToyForward`], and records how many entries each batched call carried.
+    struct RecordingForward {
+        inner: ToyForward,
+        batches: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl RecordingForward {
+        fn new(vocab: usize) -> (Self, Rc<RefCell<Vec<usize>>>) {
+            let batches = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    inner: ToyForward::new(vocab),
+                    batches: Rc::clone(&batches),
+                },
+                batches,
+            )
+        }
+    }
+
+    impl ForwardPass for RecordingForward {
+        fn logits(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+            self.inner.logits(context)
+        }
+
+        fn logits_batch(
+            &mut self,
+            batch: &mut BatchContext<'_, '_>,
+        ) -> Result<Vec<Vec<f32>>, ViperaError> {
+            self.batches.borrow_mut().push(batch.entries.len());
+            let mut results = Vec::with_capacity(batch.entries.len());
+            for entry in batch.entries.iter() {
+                let mut context = entry.context(&mut *batch.kv);
+                results.push(self.inner.logits(&mut context)?);
+            }
+            Ok(results)
+        }
+    }
+
+    /// Step until nothing is queued or running, collecting tokens in the order they were drawn.
+    fn drain<F: ForwardPass>(engine: &mut Engine<F>) -> (BTreeMap<u64, Vec<u32>>, Vec<Generation>) {
+        let mut tokens: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        let mut finished = Vec::new();
+        for _ in 0..1000 {
+            let report = engine.step().expect("a step");
+            for (id, token) in report.tokens {
+                tokens.entry(id).or_default().push(token);
+            }
+            finished.extend(report.finished);
+            if engine.turns.is_empty() && engine.waiting.is_empty() {
+                return (tokens, finished);
+            }
+        }
+        panic!("the scheduler never ran out of work");
     }
 
     #[test]
@@ -813,5 +1128,136 @@ mod tests {
         assert!(engine.admit(&[1], 0).is_err());
         assert!(engine.append_prompt(99, &[1]).is_err());
         assert!(engine.generate(99).is_err());
+    }
+
+    #[test]
+    fn two_sequences_in_one_step_produce_the_tokens_they_produce_alone() {
+        let prompts: [&[u32]; 2] = [&[1, 2, 3], &[7, 8]];
+        let alone: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|prompt| {
+                let mut engine = engine_with(greedy(), ToyForward::new(32), 64);
+                let id = engine.admit(prompt, 3).unwrap();
+                engine.generate(id).unwrap().tokens
+            })
+            .collect();
+
+        let (forward, batches) = RecordingForward::new(32);
+        let mut config = greedy();
+        config.max_batch = 2;
+        let mut engine = engine_with_forward(config, forward, 64);
+        let ids: Vec<u64> = prompts
+            .iter()
+            .map(|prompt| engine.admit(prompt, 3).unwrap())
+            .collect();
+        for id in &ids {
+            engine.enqueue(*id).unwrap();
+        }
+        let (tokens, finished) = drain(&mut engine);
+
+        assert_eq!(finished.len(), 2, "both turns ended");
+        for (entry, id) in ids.iter().enumerate() {
+            assert_eq!(
+                tokens[id], alone[entry],
+                "sequence {id} changed once another sequence shared its step"
+            );
+        }
+        assert!(
+            batches.borrow().contains(&2),
+            "no step carried both sequences: {:?}",
+            batches.borrow()
+        );
+    }
+
+    #[test]
+    fn a_request_that_arrives_mid_turn_joins_the_batch() {
+        let (forward, batches) = RecordingForward::new(32);
+        let mut config = greedy();
+        config.max_batch = 2;
+        let mut engine = engine_with_forward(config, forward, 64);
+
+        let first = engine.admit(&[1, 2, 3], 3).unwrap();
+        engine.enqueue(first).unwrap();
+        let opening = engine.step().unwrap();
+        assert_eq!(opening.tokens.len(), 1, "the first turn prefills and draws");
+        assert_eq!(opening.tokens[0].0, first);
+
+        let second = engine.admit(&[4, 5], 3).unwrap();
+        engine.enqueue(second).unwrap();
+        let (_, finished) = drain(&mut engine);
+
+        assert_eq!(finished.len(), 2, "both turns ended");
+        assert!(
+            finished
+                .iter()
+                .all(|generation| generation.tokens.len() == 3),
+            "each turn kept its own budget"
+        );
+        assert!(
+            batches.borrow().contains(&2),
+            "the late arrival never shared a step: {:?}",
+            batches.borrow()
+        );
+    }
+
+    #[test]
+    fn cancelling_at_a_step_boundary_frees_the_blocks_and_ends_the_turn() {
+        let mut engine = engine_with(greedy(), ToyForward::new(32), 16);
+        let id = engine.admit(&[1, 2, 3], 8).unwrap();
+        engine.enqueue(id).unwrap();
+        let opening = engine.step().unwrap();
+        assert_eq!(opening.tokens.len(), 1);
+        assert!(engine.stats().kv_used_blocks > 0);
+
+        let freed = engine.cancel(id).unwrap();
+        assert!(freed > 0);
+        assert_eq!(engine.stats().kv_used_blocks, 0);
+
+        let report = engine.step().unwrap();
+        assert!(report.tokens.is_empty(), "a cancelled turn draws nothing");
+        assert!(report.finished.is_empty());
+        assert_eq!(engine.stats().failed, 0, "a cancel is not a failure");
+        assert_eq!(
+            engine.sequence(id).unwrap().state(),
+            SequenceState::Cancelled
+        );
+    }
+
+    #[test]
+    fn arrival_order_does_not_change_a_sequence_tokens() {
+        let prompts: [&[u32]; 2] = [&[1, 2, 3], &[9, 8, 7, 6]];
+        let sampled = || EngineConfig {
+            sampler: SamplerConfig {
+                temperature: 0.8,
+                top_k: 40,
+                seed: 7,
+                ..SamplerConfig::default()
+            },
+            // One turn at a time, so the enqueue order decides which one runs first.
+            max_batch: 1,
+            ..EngineConfig::default()
+        };
+        let run = |order: [usize; 2]| {
+            let mut engine = engine_with(sampled(), ToyForward::new(32), 64);
+            let ids: Vec<u64> = prompts
+                .iter()
+                .map(|prompt| engine.admit(prompt, 3).unwrap())
+                .collect();
+            for entry in order {
+                engine.enqueue(ids[entry]).unwrap();
+            }
+            let (_, finished) = drain(&mut engine);
+            let per_sequence: BTreeMap<u64, Vec<u32>> = finished
+                .into_iter()
+                .map(|generation| (generation.sequence_id, generation.tokens))
+                .collect();
+            per_sequence
+        };
+
+        assert_eq!(
+            run([0, 1]),
+            run([1, 0]),
+            "scheduling order changed a sequence's tokens"
+        );
     }
 }

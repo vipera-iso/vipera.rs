@@ -127,16 +127,19 @@ pub(crate) fn q4k_scale_min(scales: &[u8], j: usize) -> (u8, u8) {
     }
 }
 
-/// Sums of `x` over every 16 values.
+/// Sums of `x` over every 32 values: the eight Q4_K sub-block sums of each 256-value block.
 ///
-/// Every k-quant scale is constant inside 16 or 32 values, so the minimum term
-/// `-dmin * m * Σx` needs only these sums: computing them once per matvec removes one multiply and
-/// one subtract from every weight, which is where most of the time went.
+/// A k-quant minimum is constant inside one 32-value sub-block, so the term `-dmin * m * Σx` needs
+/// only these sums: computing them once per matvec removes one multiply and one subtract from every
+/// weight, and one add per sub-block from every row. Each sum is the pair of 16-value partial sums
+/// added in the order the kernels used before, so the value is unchanged to the bit.
 pub(crate) fn x_sums(x: &[f32]) -> Vec<f32> {
     x.as_chunks::<16>()
         .0
+        .as_chunks::<2>()
+        .0
         .iter()
-        .map(|chunk| chunk.iter().sum())
+        .map(|pair| pair[0].iter().sum::<f32>() + pair[1].iter().sum::<f32>())
         .collect()
 }
 
@@ -156,6 +159,33 @@ pub(crate) struct QuantizedX {
     pub(crate) q: Vec<i8>,
     /// One scale per 32-value group; a group of zeros gets scale `0`.
     pub(crate) d: Vec<f32>,
+}
+
+/// Whether this format's dot reads an `i8` activation.
+///
+/// `VIPERA_EXACT_DOT=1` takes Q6_K back off that path, which restores the `f32` kernel and with it
+/// the tokens the engine produced before the q8 kernel existed. Q4_K has had no `f32` kernel since
+/// its own quantization landed, so the switch does not apply to it.
+fn quantizes(ty: GgmlType) -> bool {
+    match ty {
+        GgmlType::Q4K => true,
+        GgmlType::Q6K => !exact_dot_requested(),
+        _ => false,
+    }
+}
+
+/// Whether `VIPERA_EXACT_DOT` asked for the pre-q8 Q6_K kernel, and for the sequential attention
+/// score dot, so the tokens before either change can still be reproduced.
+pub(crate) fn exact_dot_requested() -> bool {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXACT.get_or_init(|| {
+        std::env::var("VIPERA_EXACT_DOT")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
 }
 
 impl QuantizedX {
@@ -204,7 +234,7 @@ pub(crate) fn q4k_dot(row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
         let d = read_f16(block, 0);
         let dmin = read_f16(block, 2);
         let scales = &block[4..16];
-        let sums = &sums[b * 16..b * 16 + 16];
+        let sums = &sums[b * 8..b * 8 + 8];
         for (j, (q, x64)) in blocks::<32>(&block[16..144])
             .iter()
             .zip(xb.as_slice().as_chunks::<64>().0)
@@ -225,8 +255,8 @@ pub(crate) fn q4k_dot(row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
             for (byte, value) in q.iter().zip(high) {
                 a1 += f32::from(byte >> 4) * value;
             }
-            let sum0 = sums[4 * j] + sums[4 * j + 1];
-            let sum1 = sums[4 * j + 2] + sums[4 * j + 3];
+            let sum0 = sums[2 * j];
+            let sum1 = sums[2 * j + 1];
             sum += (d0 * a0 - m0 * sum0) + (d1 * a1 - m1 * sum1);
         }
     }
@@ -263,10 +293,67 @@ pub(crate) fn q6k_dot(row: &[u8], x: &[f32], _sums: &[f32]) -> f32 {
     sum
 }
 
+/// Dot product of one Q6_K row against an `i8` activation.
+///
+/// The same six-bit unpacking as [`q6k_dot`], but each 16-value group is summed in integers: the
+/// unsigned level `q` (0..63) against the activation byte, with `32 * sum(xq)` subtracted for the
+/// `-32` offset of the six-bit levels. Every product fits `i16` and every group sum fits `i32`, so
+/// the integer side is exact; the float side is one multiply per 16 values.
+pub(crate) fn q6k_dot_q8(row: &[u8], xq: &QuantizedX) -> f32 {
+    let mut total = 0.0_f32;
+    for ((block, q), dxs) in blocks::<210>(row)
+        .iter()
+        .zip(xq.q.as_chunks::<256>().0)
+        .zip(xq.d.as_chunks::<8>().0)
+    {
+        let d = read_f16(block, 208);
+        let scales = &block[192..208];
+        let mut accumulator = [0.0_f32; 16];
+        for half in 0..2 {
+            let ql = &block[half * 64..half * 64 + 64];
+            let qh = &block[128 + half * 32..128 + half * 32 + 32];
+            let values = &q[half * 128..half * 128 + 128];
+            for run in 0..4 {
+                // `run` picks one of the four 32-value runs of a half: the first two take the low
+                // nibbles of the two `ql` planes, the last two their high nibbles, and the two high
+                // bits of `qh` move up by two for each run.
+                let (high_nibble, offset) = if run < 2 {
+                    (false, run * 32)
+                } else {
+                    (true, (run - 2) * 32)
+                };
+                let shift = run * 2;
+                let dx = dxs[half * 4 + run];
+                for sub in 0..2 {
+                    let mut sum = 0_i32;
+                    for l in sub * 16..sub * 16 + 16 {
+                        let byte = ql[offset + l];
+                        let level = if high_nibble { byte >> 4 } else { byte & 0x0f };
+                        let high = (qh[l] >> shift) & 0x03;
+                        let q6 = i32::from(level) | (i32::from(high) << 4);
+                        sum += (q6 - 32) * i32::from(values[run * 32 + l]);
+                    }
+                    let scale = d * f32::from(scales[half * 8 + run * 2 + sub] as i8) * dx;
+                    accumulator[half * 8 + run * 2 + sub] += scale * sum as f32;
+                }
+            }
+        }
+        total += accumulator.iter().sum::<f32>();
+    }
+    total
+}
+
 /// Dot product of one row with `x` in portable Rust, for any supported format.
 ///
 /// This is the reference the AVX2 kernels are checked against, and the path taken on CPUs without it.
-pub(crate) fn dot_scalar(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
+/// `xq`, when present, is the quantization of `x`; the formats with an integer kernel read it.
+pub(crate) fn dot_scalar(
+    ty: GgmlType,
+    row: &[u8],
+    x: &[f32],
+    sums: &[f32],
+    xq: Option<&QuantizedX>,
+) -> f32 {
     match ty {
         GgmlType::F32 => blocks::<4>(row)
             .iter()
@@ -291,7 +378,10 @@ pub(crate) fn dot_scalar(ty: GgmlType, row: &[u8], x: &[f32], sums: &[f32]) -> f
             sum
         }
         GgmlType::Q4K => q4k_dot(row, x, sums),
-        GgmlType::Q6K => q6k_dot(row, x, sums),
+        GgmlType::Q6K => match xq {
+            Some(xq) => q6k_dot_q8(row, xq),
+            None => q6k_dot(row, x, sums),
+        },
         other => {
             let _ = other;
             0.0
@@ -309,7 +399,34 @@ fn dot(ty: GgmlType, row: &[u8], activation: Activation<'_>) -> f32 {
     {
         return value;
     }
-    dot_scalar(ty, row, activation.x, activation.sums)
+    dot_scalar(ty, row, activation.x, activation.sums, activation.q)
+}
+
+/// Dot products of one row with `B` activations, sharing the row read.
+///
+/// This is [`dot`] for a batch: the AVX2 module replaces it when the CPU has it, and every other
+/// format or CPU takes one [`dot_scalar`] per entry. Each entry's arithmetic is the same as its own
+/// single call, in the same order, so a batch reproduces the unbatched results exactly.
+fn dot_batch<const B: usize>(
+    ty: GgmlType,
+    row: &[u8],
+    activation: &BatchActivation<'_, B>,
+    out: &mut [f32; B],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::simd::try_dot_batch(ty, row, activation, out) {
+        return;
+    }
+    let quantized = activation.quantized();
+    for (entry, out) in out.iter_mut().enumerate() {
+        *out = dot_scalar(
+            ty,
+            row,
+            activation.x[entry],
+            activation.sums[entry],
+            quantized.map(|xs| xs[entry]),
+        );
+    }
 }
 
 /// The activation vector, with the state `matvec` derives from it once per call.
@@ -320,7 +437,7 @@ fn dot(ty: GgmlType, row: &[u8], activation: Activation<'_>) -> f32 {
 pub(crate) struct Activation<'a> {
     /// The `cols` values being multiplied.
     x: &'a [f32],
-    /// Sums of `x` over every 16 values, for the minimum term.
+    /// Sums of `x` over every 32 values, for the minimum term.
     sums: &'a [f32],
     /// `x` rounded to `i8`; only built for Q4_K rows.
     q: Option<&'a QuantizedX>,
@@ -342,16 +459,65 @@ impl OwnedActivation {
         Self {
             x: x.to_vec(),
             sums: x_sums(x),
-            q: (ty == GgmlType::Q4K).then(|| QuantizedX::new(x)),
+            q: quantizes(ty).then(|| QuantizedX::new(x)),
         }
     }
 
-    pub(crate) fn borrowed(&self) -> Activation<'_> {
-        Activation {
-            x: &self.x,
-            sums: &self.sums,
-            q: self.q.as_ref(),
+    /// The activation `x`, as the batched kernels read it.
+    pub(crate) fn x(&self) -> &[f32] {
+        &self.x
+    }
+
+    /// The 32-value sums of `x`.
+    pub(crate) fn sums(&self) -> &[f32] {
+        &self.sums
+    }
+
+    /// `x` rounded to `i8`, when this activation was built for Q4_K.
+    pub(crate) fn quantized(&self) -> Option<&QuantizedX> {
+        self.q.as_ref()
+    }
+}
+
+/// `B` activations borrowed together, so one row read serves all of them.
+///
+/// Built once per batched matvec rather than once per row: rebuilding it inside the row loop would
+/// put an allocation back into the very place the batched kernel exists to remove.
+pub(crate) struct BatchActivation<'a, const B: usize> {
+    x: [&'a [f32]; B],
+    sums: [&'a [f32]; B],
+    /// Present only when every entry was quantized, which is the Q4_K case.
+    q: Option<[&'a QuantizedX; B]>,
+}
+
+impl<'a, const B: usize> BatchActivation<'a, B> {
+    /// Borrow the pieces of `B` owned activations that came from the same format.
+    pub(crate) fn new(activations: &'a [OwnedActivation; B]) -> Self {
+        let q = activations
+            .iter()
+            .map(OwnedActivation::quantized)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|every| every.try_into().ok());
+        Self {
+            x: std::array::from_fn(|entry| activations[entry].x()),
+            sums: std::array::from_fn(|entry| activations[entry].sums()),
+            q,
         }
+    }
+
+    /// The activations themselves.
+    pub(crate) fn x(&self) -> &[&'a [f32]; B] {
+        &self.x
+    }
+
+    /// The 32-value sums of each activation.
+    pub(crate) fn sums(&self) -> &[&'a [f32]; B] {
+        &self.sums
+    }
+
+    /// The quantized activations, when every entry has one.
+    pub(crate) fn quantized(&self) -> Option<&[&'a QuantizedX; B]> {
+        self.q.as_ref()
     }
 }
 
@@ -494,9 +660,9 @@ pub fn matvec(
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
     let stride = checked_stride(ty, data, cols, rows, x, out)?;
-    // One quantization of the activation, shared by every row. Only Q4_K uses it; building it for
-    // the other formats would be a wasted pass over `x`.
-    let xq = (ty == GgmlType::Q4K).then(|| QuantizedX::new(x));
+    // One quantization of the activation, shared by every row. Only the formats with an integer
+    // kernel use it; building it for the others would be a wasted pass over `x`.
+    let xq = quantizes(ty).then(|| QuantizedX::new(x));
     let sums = x_sums(x);
     let product = rows.saturating_mul(cols);
     let threads = thread_budget(rows, product);
@@ -556,7 +722,7 @@ fn checked_stride(
 /// The rows are handed to [`crate::pool::Pool`] rather than to freshly spawned threads; `data` is
 /// tied to the pool's lifetime because a worker holds it for as long as the pool lives.
 pub(crate) fn matvec_pooled<'d>(
-    pool: &crate::pool::Pool<'d>,
+    pool: &crate::pool::Pool<'d, 1>,
     ty: GgmlType,
     data: &'d [u8],
     cols: usize,
@@ -564,10 +730,56 @@ pub(crate) fn matvec_pooled<'d>(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
-    let stride = checked_stride(ty, data, cols, rows, x, out)?;
-    let threads = thread_budget(rows, rows.saturating_mul(cols));
-    let activation = std::sync::Arc::new(OwnedActivation::new(ty, x));
-    pool.fill(ty, data, stride, threads, &activation, out)
+    matvec_pooled_batch(pool, ty, data, cols, rows, &[x], out)
+}
+
+/// [`matvec_pooled`] for `B` activations, reading each row once for all of them.
+///
+/// `out` holds `B * rows` values, token-major: entry `entry`'s `rows` results start at
+/// `entry * rows`.
+pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
+    pool: &crate::pool::Pool<'d, B>,
+    ty: GgmlType,
+    data: &'d [u8],
+    cols: usize,
+    rows: usize,
+    activations: &[&[f32]; B],
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let stride = row_bytes(ty, cols)?;
+    for (entry, x) in activations.iter().enumerate() {
+        if x.len() != cols {
+            return Err(ViperaError::internal(format!(
+                "batch entry {entry} has {} values, expected {cols}",
+                x.len()
+            )));
+        }
+    }
+    if out.len() != B.saturating_mul(rows) {
+        return Err(ViperaError::internal(format!(
+            "a {B}-entry batch of {rows} rows needs {} outputs, got {}",
+            B.saturating_mul(rows),
+            out.len()
+        )));
+    }
+    let needed = stride
+        .checked_mul(rows)
+        .ok_or_else(|| ViperaError::invalid_argument("tensor size overflows"))?;
+    if data.len() < needed {
+        return Err(ViperaError::parse(
+            data.len() as u64,
+            format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
+        ));
+    }
+    let owned: std::sync::Arc<[OwnedActivation; B]> =
+        std::sync::Arc::new(std::array::from_fn(|entry| {
+            OwnedActivation::new(ty, activations[entry])
+        }));
+    let threads = thread_budget(
+        rows.saturating_mul(B),
+        rows.saturating_mul(cols).saturating_mul(B),
+    );
+    pool.fill_batch(ty, data, stride, threads, &owned, out)
 }
 
 /// Multiply-adds below this stay on the calling thread: a spawn costs more than the work saves.
@@ -611,6 +823,31 @@ pub(crate) fn fill_rows(
     for (offset, slot) in out.iter_mut().enumerate() {
         let start = (first_row + offset) * stride;
         *slot = dot(ty, &data[start..start + stride], activation);
+    }
+}
+
+/// Fill rows four at a time, returning how many rows were written.
+///
+/// Four rows share one activation read and keep four weight streams in flight, which is what lifts a
+/// single thread from about 9 GB/s to about 16 GB/s on an i5-11300H. Each row still accumulates in
+/// its own order, so the values are bit-identical to the single-row path; formats or CPUs without a
+/// four-row kernel simply get `0` and the caller fills every row one at a time.
+pub(crate) fn fill_rows_batch<const B: usize>(
+    ty: GgmlType,
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    activation: &BatchActivation<'_, B>,
+    out: &mut [f32],
+) {
+    let count = out.len() / B;
+    let mut row = [0.0_f32; B];
+    for offset in 0..count {
+        let start = (first_row + offset) * stride;
+        dot_batch(ty, &data[start..start + stride], activation, &mut row);
+        for (entry, value) in row.iter().enumerate() {
+            out[entry * count + offset] = *value;
+        }
     }
 }
 
@@ -785,9 +1022,8 @@ mod tests {
 
         thread::scope(|scope| {
             let pool = crate::pool::Pool::new(scope, 4);
-            let activation = std::sync::Arc::new(OwnedActivation::new(GgmlType::Q4K, &x));
             let mut pooled = vec![0.0_f32; ROWS];
-            pool.fill(GgmlType::Q4K, &data, stride, 4, &activation, &mut pooled)
+            matvec_pooled(&pool, GgmlType::Q4K, &data, 512, ROWS, &x, &mut pooled)
                 .expect("pooled matvec");
             assert_eq!(pooled, spawned, "a reused worker must give the same rows");
         });
@@ -875,6 +1111,120 @@ mod tests {
         measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 60);
         measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 60);
         measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 8);
+    }
+
+    /// Measurement, not a correctness check: what one weight read shared by `B` activations buys at
+    /// the kernel level. Each line is a batch of `B` entries, its time, and the throughput relative
+    /// to running the same `B` entries one at a time; the design note's gate is a factor of two at
+    /// `B = 4`. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn pooled_matvec_batch_throughput() {
+        /// Seconds per call for a batch of `B` activations.
+        fn per_call<const B: usize>(
+            ty: GgmlType,
+            data: &[u8],
+            cols: usize,
+            rows: usize,
+            activations: &[&[f32]; B],
+            iterations: u32,
+        ) -> f64 {
+            let mut out = vec![0.0_f32; B * rows];
+            thread::scope(|scope| {
+                let pool = crate::pool::Pool::new(scope, thread_budget(rows, rows * cols * B));
+                // One warm-up call: the first pass also faults in the allocation.
+                matvec_pooled_batch(&pool, ty, data, cols, rows, activations, &mut out)
+                    .expect("shapes are consistent");
+                let started = std::time::Instant::now();
+                for _ in 0..iterations {
+                    matvec_pooled_batch(&pool, ty, data, cols, rows, activations, &mut out)
+                        .expect("shapes are consistent");
+                }
+                started.elapsed().as_secs_f64() / f64::from(iterations)
+            })
+        }
+
+        /// The fastest of three rounds: a single round on a shared machine measures the scheduler
+        /// as much as the kernel.
+        fn best<const B: usize>(
+            ty: GgmlType,
+            data: &[u8],
+            cols: usize,
+            rows: usize,
+            activations: &[&[f32]; B],
+            iterations: u32,
+        ) -> f64 {
+            (0..3).fold(f64::INFINITY, |best, _| {
+                best.min(per_call::<B>(ty, data, cols, rows, activations, iterations))
+            })
+        }
+
+        fn measure(label: &str, ty: GgmlType, cols: usize, rows: usize, iterations: u32) {
+            let stride = row_bytes(ty, cols).expect("stride");
+            // Deterministic bytes, so two runs measure the same data; all zeroes would let the FP
+            // units cut corners.
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let mut byte = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            };
+            let data: Vec<u8> = (0..stride * rows).map(|_| byte()).collect();
+            // One activation per entry, each a different vector so nothing is cached between them.
+            let xs: Vec<Vec<f32>> = (0..8)
+                .map(|entry| {
+                    (0..cols)
+                        .map(|at| ((at + entry * 7) % 17) as f32 / 17.0 - 0.5)
+                        .collect()
+                })
+                .collect();
+            let rows_of = |entry: usize| xs[entry].as_slice();
+            let one = [rows_of(0)];
+            let two = [rows_of(0), rows_of(1)];
+            let four = [rows_of(0), rows_of(1), rows_of(2), rows_of(3)];
+            let eight = [
+                rows_of(0),
+                rows_of(1),
+                rows_of(2),
+                rows_of(3),
+                rows_of(4),
+                rows_of(5),
+                rows_of(6),
+                rows_of(7),
+            ];
+
+            let single = best::<1>(ty, &data, cols, rows, &one, iterations);
+            let measured: [(usize, f64); 3] = [
+                (2, best::<2>(ty, &data, cols, rows, &two, iterations)),
+                (4, best::<4>(ty, &data, cols, rows, &four, iterations)),
+                (8, best::<8>(ty, &data, cols, rows, &eight, iterations)),
+            ];
+            let megabytes = (stride * rows) as f64 / 1e6;
+            let mut line = format!(
+                "{label:>18}: {rows}x{cols} {ty:?}, {megabytes:>6.1} MB per read, \
+                 B=1 {:>5.2} ms ({:>5.2} GB/s)",
+                single * 1000.0,
+                megabytes / 1e3 / single,
+            );
+            for (size, seconds) in measured {
+                line.push_str(&format!(
+                    ", B={size} {:>5.2} ms ({:>5.2}x)",
+                    seconds * 1000.0,
+                    size as f64 * single / seconds,
+                ));
+            }
+            println!("{line}");
+        }
+
+        measure("wq (Q4_K)", GgmlType::Q4K, 1536, 1536, 100);
+        measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 20);
+        measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 20);
+        measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 4);
     }
 
     #[test]
