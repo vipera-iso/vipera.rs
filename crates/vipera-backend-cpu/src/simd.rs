@@ -62,12 +62,15 @@ use std::arch::x86_64::{
     __m128i, __m256, __m256i, _mm_add_ps, _mm_add_ss, _mm_cvtsi64_si128, _mm_cvtss_f32,
     _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_set1_ps, _mm256_add_ps,
     _mm256_and_si256, _mm256_castps256_ps128, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
-    _mm256_cvtph_ps, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256,
-    _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps, _mm256_or_si256,
+    _mm256_cvtph_ps, _mm256_dpbusd_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps, _mm256_or_si256,
     _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_slli_epi16, _mm256_slli_epi32,
-    _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_sub_epi16, _mm256_sub_epi32,
+    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_slli_epi16,
+    _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_sub_epi16,
+    _mm256_sub_epi32,
 };
+#[cfg(test)]
+use std::arch::x86_64::{_mm256_add_epi32, _mm256_storeu_si256};
 
 use vipera_core::gguf::GgmlType;
 
@@ -76,6 +79,27 @@ use crate::quant::{BatchActivation, QuantizedX, f16_to_f32};
 /// Whether this CPU can run the kernels below. Cached by the standard library.
 pub fn available() -> bool {
     std::is_x86_feature_detected!("avx2")
+}
+
+/// Whether the `vpdpbusd` path can run: AVX2, `avx512_vnni` with `avx512_vl` for the 256-bit form,
+/// and no `VIPERA_NO_VNNI`.
+///
+/// The switch exists so an A/B run can hide the new kernel without rebuilding; the results are
+/// bit-identical either way, so it changes speed only.
+pub fn vnni_available() -> bool {
+    static VNNI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VNNI.get_or_init(|| {
+        if !available()
+            || !std::is_x86_feature_detected!("avx512vnni")
+            || !std::is_x86_feature_detected!("avx512vl")
+        {
+            return false;
+        }
+        !std::env::var("VIPERA_NO_VNNI").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
 }
 
 /// Convert `f16` values, little endian in `source`, into `values`.
@@ -278,6 +302,8 @@ pub(crate) fn try_dot(
                 // The faster kernel reorders float adds, so the exact path keeps the old one.
                 if crate::quant::exact_dot_requested() {
                     q4k_dot_previous(row, &xq.q, &xq.d, sums)
+                } else if vnni_available() {
+                    q4k_dot_vnni(row, &xq.q, &xq.d, sums)
                 } else {
                     q4k_dot(row, &xq.q, &xq.d, sums)
                 }
@@ -334,8 +360,15 @@ pub(crate) fn try_dot_batch<const B: usize>(
                 return false;
             };
             // SAFETY: `available()` established AVX2 support, and the caller's lengths match the
-            // scalar kernel's expectations, which the kernels below mirror exactly.
-            unsafe { q4k_dot_batch(row, xs, activation.sums(), out) };
+            // scalar kernel's expectations, which the kernels below mirror exactly. The VNNI kernel
+            // is only reached when its own feature check passed.
+            unsafe {
+                if vnni_available() {
+                    q4k_dot_batch_vnni(row, xs, activation.sums(), out)
+                } else {
+                    q4k_dot_batch(row, xs, activation.sums(), out)
+                }
+            }
             true
         }
         GgmlType::Q6K => match activation.quantized() {
@@ -749,6 +782,118 @@ pub(crate) unsafe fn q4k_dot_batch<const B: usize>(
     }
 }
 
+/// [`q4k_dot_batch`] with `vpdpbusd` in place of `maddubs` + `madd`, on 256-bit registers.
+///
+/// Same integer results, so every entry stays bit-identical to its own [`q4k_dot_vnni`] call and to
+/// [`q4k_dot`]. This is the kernel a decode step actually runs: the pooled path always goes through
+/// a batch, even a batch of one.
+///
+/// # Safety
+///
+/// As [`q4k_dot_batch`], plus a CPU with `avx512_vnni` and `avx512_vl`.
+///
+/// The nibble planes and the scale/min bytes are shared across the entries; only the `maddubs`
+/// against each entry's activation repeats. Per entry the operations happen in the same order as
+/// [`q4k_dot`], so entry `e` of a batch is bit-identical to its own single call.
+///
+/// # Safety
+///
+/// See the module documentation: `row` must be whole 144-byte blocks, every `xs[e]` must hold 256
+/// values and 8 scales per block, every `sums[e]` at least 8 entries per block, and the CPU must
+/// support AVX2.
+#[target_feature(enable = "avx2,avx512vnni,avx512vl")]
+pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
+    row: &[u8],
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32; B],
+) {
+    // SAFETY: the module documentation is the contract for every pointer below, and the CPU has
+    // AVX2. Each entry's `xq` covers the same 256 values per block as `x` does.
+    unsafe {
+        // Each entry's total is kept in an array of known length rather than written through the
+        // slice on every group, so a call costs `B` stores instead of `8 * B` read-modify-writes.
+        // The operations and their order are unchanged.
+        let mut totals = [0.0_f32; B];
+        // None of these pointers depend on the block, so they are resolved once per call.
+        let values_at: [*const i8; B] = std::array::from_fn(|entry| xs[entry].q.as_ptr());
+        let scales_at: [*const f32; B] = std::array::from_fn(|entry| xs[entry].d.as_ptr());
+        let sums_at: [*const f32; B] = std::array::from_fn(|entry| sums[entry].as_ptr());
+        let blocks = row.len() / 144;
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let zero = _mm256_setzero_si256();
+        // The same three accumulators, filled in the same order, as the single-entry kernel: two for
+        // the weights so the adds are not one dependent chain, one for the minimum term.
+        let mut weights0 = [_mm256_setzero_ps(); B];
+        let mut weights1 = [_mm256_setzero_ps(); B];
+        let mut minimums = [_mm256_setzero_ps(); B];
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 144);
+            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+            let (scale_at, min_at) = q4k_scale_vectors(block);
+            // Entry-independent part of the minimum product, built once per block. The coefficient
+            // keeps the single-entry kernel's order, `(scale * dx) * d`, so a batch entry stays
+            // bit-identical to its own call.
+            let subtracted = _mm256_mul_ps(min_at, _mm256_set1_ps(dmin));
+            let d_vector = _mm256_set1_ps(d);
+            let coefficients: [__m256; B] = std::array::from_fn(|entry| {
+                _mm256_mul_ps(
+                    _mm256_mul_ps(scale_at, _mm256_loadu_ps(scales_at[entry].add(b * 8))),
+                    d_vector,
+                )
+            });
+            for entry in 0..B {
+                minimums[entry] = _mm256_fmadd_ps(
+                    subtracted,
+                    _mm256_loadu_ps(sums_at[entry].add(b * 8)),
+                    minimums[entry],
+                );
+            }
+            for j in 0..4 {
+                let packed = _mm256_loadu_si256(block.add(16 + j * 32) as *const __m256i);
+                let low_bytes = _mm256_and_si256(packed, low_mask);
+                let high_bytes = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                for entry in 0..B {
+                    let values = values_at[entry].add(b * 256 + j * 64);
+                    let low_sums = _mm256_dpbusd_epi32(
+                        zero,
+                        low_bytes,
+                        _mm256_loadu_si256(values as *const __m256i),
+                    );
+                    let high_sums = _mm256_dpbusd_epi32(
+                        zero,
+                        high_bytes,
+                        _mm256_loadu_si256(values.add(32) as *const __m256i),
+                    );
+                    let low_coeff = _mm256_permutevar8x32_ps(
+                        coefficients[entry],
+                        _mm256_set1_epi32((2 * j) as i32),
+                    );
+                    let high_coeff = _mm256_permutevar8x32_ps(
+                        coefficients[entry],
+                        _mm256_set1_epi32((2 * j + 1) as i32),
+                    );
+                    let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
+                    let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                    if j.is_multiple_of(2) {
+                        weights0[entry] = _mm256_add_ps(weights0[entry], low_lanes);
+                        weights1[entry] = _mm256_add_ps(weights1[entry], high_lanes);
+                    } else {
+                        weights1[entry] = _mm256_add_ps(weights1[entry], low_lanes);
+                        weights0[entry] = _mm256_add_ps(weights0[entry], high_lanes);
+                    }
+                }
+            }
+        }
+        for entry in 0..B {
+            totals[entry] =
+                hsum(_mm256_add_ps(weights0[entry], weights1[entry])) - hsum(minimums[entry]);
+        }
+        out.copy_from_slice(&totals);
+    }
+}
+
 /// [`q6k_dot`] for `B` activations, sharing the six-bit unpacking across them.
 ///
 /// Every level and scale in a group is entry-independent; only the multiply against each entry's
@@ -1003,8 +1148,203 @@ pub(crate) unsafe fn q6k_dot_batch_q8<const B: usize>(
     }
 }
 
+/// [`q4k_dot`] with `vpdpbusd` in place of `maddubs` + `madd`, on 256-bit registers.
+///
+/// `vpdpbusd` multiplies four `u8` by four `i8` and adds the four products into one `i32` lane in
+/// a single instruction, which is exactly what `maddubs` followed by `madd` against ones
+/// computes. The integer result is identical, so the float path below is byte-for-byte
+/// `q4k_dot`'s and each row stays bit-exact.
+///
+/// 256-bit rather than 512-bit on purpose: the wide form downclocks and was measured 1.43x
+/// slower in this same kernel family. This CPU exposes `avx512_vnni` with `avx512_vl`, which
+/// gives the instruction on YMM without the wide-register cost.
+///
+/// # Safety
+///
+/// As [`q4k_dot`]: whole 144-byte blocks, 256 activation values and 8 scales per block, at least
+/// 8 sums per block, and a CPU with `avx512_vnni` and `avx512_vl`.
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+pub(crate) unsafe fn q4k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
+    // SAFETY: the caller guarantees the same layout `q4k_dot` needs, and the CPU features.
+    unsafe {
+        let blocks = row.len() / 144;
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let zero = _mm256_setzero_si256();
+        let mut weights0 = _mm256_setzero_ps();
+        let mut weights1 = _mm256_setzero_ps();
+        let mut minimums = _mm256_setzero_ps();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 144);
+            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+            let (scale_at, min_at) = q4k_scale_vectors(block);
+            let coefficients = _mm256_mul_ps(
+                _mm256_mul_ps(scale_at, _mm256_loadu_ps(dx.as_ptr().add(b * 8))),
+                _mm256_set1_ps(d),
+            );
+            minimums = _mm256_fmadd_ps(
+                _mm256_mul_ps(min_at, _mm256_set1_ps(dmin)),
+                _mm256_loadu_ps(sums.as_ptr().add(b * 8)),
+                minimums,
+            );
+            for j in 0..4 {
+                let q = block.add(16 + j * 32);
+                let packed = _mm256_loadu_si256(q as *const __m256i);
+                let low_bytes = _mm256_and_si256(packed, low_mask);
+                let high_bytes = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                let values = xq.as_ptr().add(b * 256 + j * 64);
+                let low_sums = _mm256_dpbusd_epi32(
+                    zero,
+                    low_bytes,
+                    _mm256_loadu_si256(values as *const __m256i),
+                );
+                let high_sums = _mm256_dpbusd_epi32(
+                    zero,
+                    high_bytes,
+                    _mm256_loadu_si256(values.add(32) as *const __m256i),
+                );
+                let low_coeff =
+                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j) as i32));
+                let high_coeff =
+                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j + 1) as i32));
+                let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
+                let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                if j.is_multiple_of(2) {
+                    weights0 = _mm256_add_ps(weights0, low_lanes);
+                    weights1 = _mm256_add_ps(weights1, high_lanes);
+                } else {
+                    weights1 = _mm256_add_ps(weights1, low_lanes);
+                    weights0 = _mm256_add_ps(weights0, high_lanes);
+                }
+            }
+        }
+        hsum(_mm256_add_ps(weights0, weights1)) - hsum(minimums)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// `vpdpbusd` against `maddubs` + `madd` on the shapes that dominate a decode step.
+    ///
+    /// Checks bit-exactness row by row, then times both at one and four threads.
+    ///
+    /// Ignored by default. Run it with
+    /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_vnni_versus_maddubs`.
+    #[test]
+    #[ignore]
+    fn q4k_vnni_versus_maddubs() {
+        if !available() {
+            eprintln!("skipped: this CPU has no AVX2");
+            return;
+        }
+        if !std::is_x86_feature_detected!("avx512vnni")
+            || !std::is_x86_feature_detected!("avx512vl")
+        {
+            eprintln!("skipped: this CPU has no avx512_vnni with avx512_vl");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0004);
+        for (name, rows, values) in [
+            ("attn_q", 1536usize, 1536usize),
+            ("ffn_gate+up", 8960, 1536),
+            ("ffn_down", 1536, 8960),
+        ] {
+            let blocks = values / 256;
+            let row_bytes = blocks * 144;
+            let row = q4k_row(&mut rng, blocks);
+            let raw: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+            let x: Vec<f32> = (0..values).map(|_| rng.unit()).collect();
+            let xq = QuantizedX::new(&x);
+            let sums = crate::quant::x_sums(&x);
+
+            for r in 0..rows {
+                let at = r * row_bytes;
+                // SAFETY: whole blocks, AVX2 and avx512_vnni checked above.
+                let fast = unsafe { q4k_dot_vnni(&raw[at..at + row_bytes], &xq.q, &xq.d, &sums) };
+                // SAFETY: as above.
+                let slow = unsafe { q4k_dot(&raw[at..at + row_bytes], &xq.q, &xq.d, &sums) };
+                assert_eq!(fast.to_bits(), slow.to_bits(), "{name} row {r}");
+            }
+            println!("{name}: every row bit-identical");
+
+            let gb = (rows * row_bytes) as f64 / 1e9;
+            let reps = 8;
+            let time = |vnni: bool| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    let mut total = 0.0f32;
+                    for _ in 0..reps {
+                        for r in 0..rows {
+                            let at = r * row_bytes;
+                            // SAFETY: as above.
+                            total += unsafe {
+                                if vnni {
+                                    q4k_dot_vnni(&raw[at..at + row_bytes], &xq.q, &xq.d, &sums)
+                                } else {
+                                    q4k_dot(&raw[at..at + row_bytes], &xq.q, &xq.d, &sums)
+                                }
+                            };
+                        }
+                    }
+                    std::hint::black_box(total);
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+                gb * reps as f64 / best
+            };
+            let threads = 4;
+            let rows_per = rows / threads;
+            let time_threads = |vnni: bool| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    std::thread::scope(|scope| {
+                        for t in 0..threads {
+                            let raw = &raw;
+                            let xq = &xq;
+                            let sums = &sums;
+                            scope.spawn(move || {
+                                let first = t * rows_per;
+                                let mut total = 0.0f32;
+                                for r in first..first + rows_per {
+                                    let at = r * row_bytes;
+                                    // SAFETY: as above.
+                                    total += unsafe {
+                                        if vnni {
+                                            q4k_dot_vnni(
+                                                &raw[at..at + row_bytes],
+                                                &xq.q,
+                                                &xq.d,
+                                                sums,
+                                            )
+                                        } else {
+                                            q4k_dot(&raw[at..at + row_bytes], &xq.q, &xq.d, sums)
+                                        }
+                                    };
+                                }
+                                std::hint::black_box(total);
+                            });
+                        }
+                    });
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+                gb / best
+            };
+            let madd1 = time(false);
+            let vnni1 = time(true);
+            let madd4 = time_threads(false);
+            let vnni4 = time_threads(true);
+            println!(
+                "{name}: 1 thread maddubs {madd1:.1} GB/s, vnni {vnni1:.1} GB/s, {:.2}x",
+                vnni1 / madd1
+            );
+            println!(
+                "{name}: 4 threads maddubs {madd4:.1} GB/s, vnni {vnni4:.1} GB/s, {:.2}x\n",
+                vnni4 / madd4
+            );
+        }
+    }
+
     use super::*;
 
     /// Deterministic bytes, so a failure is reproducible.
@@ -1073,6 +1413,156 @@ mod tests {
     ///
     /// Ignored by default: it is a measurement, not a check. Run it with
     /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_dot_throughput`.
+    /// The AVX2 inner loop of [`q4k_dot`] with the scales, the minimums and the float combination
+    /// removed: the same loads and the same integer work, so the difference between it and the real
+    /// kernel is what the per-block bookkeeping costs. Test-only, and only ever called from the
+    /// benchmark below.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be whole 144-byte blocks, `xq` 256 values per block, and the CPU must have AVX2.
+    #[cfg(test)]
+    #[target_feature(enable = "avx2")]
+    unsafe fn q4k_int_only(row: &[u8], xq: &[i8]) -> i32 {
+        // SAFETY: the caller's contract is this function's contract, and every load stays inside
+        // `row` and `xq` for the same arithmetic reasons as `q4k_dot`.
+        unsafe {
+            let blocks = row.len() / 144;
+            let low_mask = _mm256_set1_epi8(0x0f);
+            let ones = _mm256_set1_epi16(1);
+            let mut total = _mm256_setzero_si256();
+            for b in 0..blocks {
+                let block = row.as_ptr().add(b * 144);
+                for j in 0..4 {
+                    let q = block.add(16 + j * 32);
+                    let packed = _mm256_loadu_si256(q as *const __m256i);
+                    let low_bytes = _mm256_and_si256(packed, low_mask);
+                    let high_bytes = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                    let values = xq.as_ptr().add(b * 256 + j * 64);
+                    let low_sums = _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(
+                            low_bytes,
+                            _mm256_loadu_si256(values as *const __m256i),
+                        ),
+                        ones,
+                    );
+                    let high_sums = _mm256_madd_epi16(
+                        _mm256_maddubs_epi16(
+                            high_bytes,
+                            _mm256_loadu_si256(values.add(32) as *const __m256i),
+                        ),
+                        ones,
+                    );
+                    total = _mm256_add_epi32(total, _mm256_add_epi32(low_sums, high_sums));
+                }
+            }
+            let mut lanes = [0i32; 8];
+            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, total);
+            lanes.iter().sum()
+        }
+    }
+
+    /// How the Q4_K dot spends its time on each shape this model multiplies, split into bytes moved,
+    /// integer work, and per-block bookkeeping.
+    ///
+    /// Three variants over the same bytes: a byte sum (the memory floor), the kernel's integer loop
+    /// with the scales removed, and the whole kernel. `bookkeeping` is the share of the full
+    /// kernel's time that disappears when the per-block unpacking goes, which is the share an
+    /// 8-row layout can amortize.
+    ///
+    /// Ignored by default: it is a measurement, not a check. Run it with
+    /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_shape_breakdown`.
+    #[test]
+    #[ignore]
+    fn q4k_shape_breakdown() {
+        if !available() {
+            eprintln!("skipped: this CPU has no AVX2");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0002);
+        // Name, rows, values per row: the shapes a Q4_K_M 1.5B model multiplies per token.
+        let shapes = [
+            ("attn_q", 1536usize, 1536usize),
+            ("attn_kv", 512, 1536),
+            ("attn_output", 1536, 1536),
+            ("ffn_gate+up", 17_920, 1536),
+            ("ffn_down", 1536, 8960),
+        ];
+        println!(
+            "\n{:<14} {:>8} {:>9} {:>9} {:>9} {:>13} {:>11}",
+            "shape", "MB", "sum", "int", "full", "int/share", "bookkeeping"
+        );
+        for (name, rows, values) in shapes {
+            let blocks = values / 256;
+            let row = q4k_row(&mut rng, blocks);
+            let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+            let x: Vec<f32> = (0..values).map(|_| rng.unit()).collect();
+            let xq = QuantizedX::new(&x);
+            let sums = crate::quant::x_sums(&x);
+            let bytes = (rows * blocks * 144) as f64 / 1e6;
+            // Repeat until a shape has moved at least 200 MB, so a small matrix is not timed as noise.
+            let reps = ((200.0 / bytes).ceil() as usize).max(3);
+            let row_bytes = blocks * 144;
+            let time = |f: &mut dyn FnMut()| {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    for _ in 0..reps {
+                        f();
+                    }
+                    best = best.min(start.elapsed().as_secs_f64() / reps as f64);
+                }
+                best
+            };
+            let gbs = |seconds: f64| (rows * blocks * 144) as f64 / seconds / 1e9;
+            let sum_time = time(&mut || {
+                let mut total = 0u64;
+                for r in 0..rows {
+                    let slice = &matrix[r * row_bytes..(r + 1) * row_bytes];
+                    for word in slice.as_chunks::<8>().0 {
+                        total = total.wrapping_add(u64::from_le_bytes(*word));
+                    }
+                }
+                std::hint::black_box(total);
+            });
+            let int_time = time(&mut || {
+                let mut total = 0i32;
+                for r in 0..rows {
+                    // SAFETY: whole blocks on both sides, and the CPU was checked above.
+                    total = total.wrapping_add(unsafe {
+                        q4k_int_only(&matrix[r * row_bytes..(r + 1) * row_bytes], &xq.q)
+                    });
+                }
+                std::hint::black_box(total);
+            });
+            let full_time = time(&mut || {
+                let mut total = 0.0f32;
+                for r in 0..rows {
+                    // SAFETY: as above, plus `dx` and `sums` are one set per block.
+                    total += unsafe {
+                        q4k_dot(
+                            &matrix[r * row_bytes..(r + 1) * row_bytes],
+                            &xq.q,
+                            &xq.d,
+                            &sums,
+                        )
+                    };
+                }
+                std::hint::black_box(total);
+            });
+            println!(
+                "{:<14} {:>8.1} {:>9.1} {:>9.1} {:>9.1} {:>12.0}% {:>10.0}%",
+                name,
+                bytes,
+                gbs(sum_time),
+                gbs(int_time),
+                gbs(full_time),
+                int_time / full_time * 100.0,
+                (1.0 - int_time / full_time) * 100.0,
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn q4k_dot_throughput() {
