@@ -995,6 +995,47 @@ mod tests {
         assert!(zeros.q[32..64].iter().all(|value| *value == 0));
     }
 
+    /// What one pool dispatch costs, so the per-step dispatch overhead can be counted.
+    ///
+    /// A decode step issues one pooled product per weight matrix — 196 of them for this model — and
+    /// each one wakes every worker and waits for the replies. Timing a tiny product (8 rows) gives
+    /// that fixed cost almost without the work.
+    ///
+    /// Ignored by default. Run it with
+    /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture pool_dispatch_cost`.
+    #[test]
+    #[ignore]
+    fn pool_dispatch_cost() {
+        let blocks = 6;
+        let rows = 8;
+        // 144 bytes per superblock; the contents do not matter for a dispatch measurement.
+        let data = vec![0_u8; rows * blocks * 144];
+        let x = vec![0.01_f32; blocks * 256];
+        let mut out = vec![0.0_f32; rows];
+        std::thread::scope(|scope| {
+            for workers in [1_usize, 4] {
+                let pool = crate::pool::Pool::<1>::new(scope, workers);
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    for _ in 0..200 {
+                        let _ = super::matvec_pooled(
+                            &pool,
+                            GgmlType::Q4K,
+                            &data,
+                            blocks * 256,
+                            rows,
+                            &x,
+                            &mut out,
+                        );
+                    }
+                    best = best.min(start.elapsed().as_secs_f64() / 200.0);
+                }
+                println!("{workers} workers: {:.1} us per dispatch", best * 1e6);
+            }
+        });
+    }
+
     #[test]
     fn matvec_matches_a_hand_computed_product() {
         let mut data = Vec::new();

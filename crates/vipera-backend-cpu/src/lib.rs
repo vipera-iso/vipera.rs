@@ -13,6 +13,7 @@
 
 pub mod model;
 mod pool;
+pub mod profile;
 pub mod quant;
 #[cfg(target_arch = "x86_64")]
 pub mod simd;

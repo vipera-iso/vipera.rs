@@ -218,7 +218,11 @@ impl Tensor {
         x: &[f32],
         out: &mut [f32],
     ) -> Result<(), ViperaError> {
-        quant::matvec_pooled(pool, self.ty, self.data(file), self.cols, self.rows, x, out)
+        let at = crate::profile::stamp();
+        let result =
+            quant::matvec_pooled(pool, self.ty, self.data(file), self.cols, self.rows, x, out);
+        crate::profile::note(dot_phase(self.ty), at);
+        result
     }
 
     /// The same product for `B` activations, reading each row once for all of them.
@@ -229,7 +233,8 @@ impl Tensor {
         activations: &[&[f32]; B],
         out: &mut [f32],
     ) -> Result<(), ViperaError> {
-        quant::matvec_pooled_batch(
+        let at = crate::profile::stamp();
+        let result = quant::matvec_pooled_batch(
             pool,
             self.ty,
             self.data(file),
@@ -237,11 +242,23 @@ impl Tensor {
             self.rows,
             activations,
             out,
-        )
+        );
+        crate::profile::note(dot_phase(self.ty), at);
+        result
     }
 
     fn read_row(&self, file: &[u8], row: usize, out: &mut [f32]) -> Result<(), ViperaError> {
         quant::read_row(self.ty, self.data(file), self.cols, row, out)
+    }
+}
+
+/// The phase a matrix product belongs to, by weight format.
+fn dot_phase(ty: GgmlType) -> crate::profile::Phase {
+    use crate::profile::Phase;
+    match ty {
+        GgmlType::Q4K => Phase::Q4K,
+        GgmlType::Q6K => Phase::Q6K,
+        _ => Phase::OtherDot,
     }
 }
 
@@ -429,7 +446,17 @@ impl CpuBackend {
 
     /// Run the transformer over `context.new_tokens`, returning the logits of the last one.
     fn run(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+        let pass = crate::profile::stamp();
         let config = self.config;
+        // A prompt chunk is a group of positions that share every weight read, which is exactly what
+        // the batch path already does: one entry per position, each with a single new token, ordered
+        // by position so the KV it writes is in place before the position that reads it. Handing the
+        // chunk to that path turns `n` reads of 1.117 GB into `ceil(n / 8)`.
+        if context.new_tokens.len() > 1 {
+            // The batch path records the pass itself, so this one does not.
+            let _ = pass;
+            return self.run_positions(context);
+        }
         if context.new_tokens.is_empty() {
             return Err(ViperaError::invalid_argument(
                 "a forward pass needs at least one token",
@@ -525,7 +552,9 @@ impl CpuBackend {
                     kv.write(position, index, shape, k, v)?;
 
                     kv.load_layer(index, shape, position + 1, k_all, v_all)?;
+                    let at = crate::profile::stamp();
                     attention(q, k_all, v_all, position + 1, shape, scores, attn);
+                    crate::profile::note(crate::profile::Phase::Attention, at);
 
                     layer.wo.matvec(&pool, file, attn, h)?;
                     add_assign(x, h);
@@ -543,12 +572,49 @@ impl CpuBackend {
 
             rms_norm(x, output_norm, config.rms_eps, h);
             output.matvec(&pool, file, h, logits)?;
+            crate::profile::finish_pass(pass);
             Ok(logits.clone())
         })
     }
 }
 
 impl CpuBackend {
+    /// Compute a run of consecutive positions of one sequence through the batch path.
+    ///
+    /// The entries are the same sequence at `first_position`, `first_position + 1`, ...; the batch
+    /// kernel processes each entry with its own single new token and its own causal limit, and writes
+    /// each entry's K/V before the next entry reads it. Every entry's arithmetic is the batch kernel's
+    /// unchanged per-entry arithmetic, so the logits of the last position are bit-identical to what
+    /// the sequential path produced.
+    fn run_positions(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+        let tokens = context.new_tokens;
+        let first = context.first_position;
+        let kv = std::mem::take(&mut context.kv);
+        let mut logits = Vec::new();
+        let mut start = 0;
+        while start < tokens.len() {
+            let end = (start + MAX_BATCH).min(tokens.len());
+            let mut entries: Vec<BatchEntry<'_>> = (start..end)
+                .map(|index| BatchEntry {
+                    tokens: context.tokens,
+                    new_tokens: &tokens[index..index + 1],
+                    first_position: first + index as u32,
+                    block_table: context.block_table,
+                    tokens_per_block: context.tokens_per_block,
+                    bytes_per_token: context.bytes_per_token,
+                })
+                .collect();
+            let results = self.run_batch(&mut BatchContext {
+                kv: &mut *kv,
+                entries: &mut entries,
+            })?;
+            logits = results.into_iter().next_back().unwrap_or_default();
+            start = end;
+        }
+        context.kv = kv;
+        Ok(logits)
+    }
+
     /// A batched decode step, one new token per sequence.
     ///
     /// Anything that is not a single new token per context — a prefill, or a draft run — falls back
@@ -603,6 +669,7 @@ impl CpuBackend {
         kv: &mut [u8],
         contexts: &mut [BatchEntry<'_>; B],
     ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        let pass = crate::profile::stamp();
         let config = self.config;
         let mut positions = [0_usize; B];
         let mut tokens = [0_u32; B];
@@ -739,6 +806,7 @@ impl CpuBackend {
                         &mut batch.k_all,
                         &mut batch.v_all,
                     )?;
+                    let at = crate::profile::stamp();
                     attention(
                         &batch.q[entry * query..][..query],
                         &batch.k_all,
@@ -748,6 +816,7 @@ impl CpuBackend {
                         &mut batch.scores,
                         &mut batch.attn[entry * hidden..][..hidden],
                     );
+                    crate::profile::note(crate::profile::Phase::Attention, at);
                 }
 
                 layer.wo.matvec_batch::<B>(
@@ -812,6 +881,7 @@ impl CpuBackend {
                 &rows::<B>(&batch.h, hidden),
                 &mut batch.logits[..B * vocab],
             )?;
+            crate::profile::finish_pass(pass);
             Ok((0..B)
                 .map(|entry| batch.logits[entry * vocab..][..vocab].to_vec())
                 .collect())
