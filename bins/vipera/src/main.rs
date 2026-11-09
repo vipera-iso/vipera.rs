@@ -75,7 +75,7 @@ fn run(args: Vec<String>) -> Result<u8, ViperaError> {
 
     match command.as_str() {
         "--help" | "-h" | "help" => {
-            print!("{USAGE}");
+            emit(USAGE)?;
             Ok(0)
         }
         "model-info" | "inspect" => {
@@ -91,6 +91,58 @@ fn run(args: Vec<String>) -> Result<u8, ViperaError> {
         "serve" => serve::command(&args[1..]),
         other => Err(ViperaError::usage(format!("unknown command \"{other}\""))),
     }
+}
+
+fn resolve_model_path(path: &str) -> Result<String, ViperaError> {
+    let candidate = std::path::Path::new(path);
+    if !candidate.is_dir() {
+        return Ok(path.to_owned());
+    }
+    let mut found = Vec::new();
+    let entries = std::fs::read_dir(candidate).map_err(|error| {
+        ViperaError::internal(format!("cannot list model directory \"{path}\": {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ViperaError::internal(format!("cannot read model directory \"{path}\": {error}"))
+        })?;
+        let entry_path = entry.path();
+        if entry_path.is_file()
+            && entry_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            found.push(entry_path.to_string_lossy().into_owned());
+        }
+    }
+    match found.len() {
+        1 => Ok(found.into_iter().next().expect("one gguf")),
+        0 => Err(ViperaError::usage(format!(
+            "directory \"{path}\" contains no .gguf file; pass a model file directly"
+        ))),
+        many => Err(ViperaError::usage(format!(
+            "directory \"{path}\" contains {many} .gguf files; pass one model file directly"
+        ))),
+    }
+}
+
+fn write_out(writer: &mut dyn std::io::Write, text: &str) -> Result<(), ViperaError> {
+    match writer
+        .write_all(text.as_bytes())
+        .and_then(|()| writer.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(ViperaError::internal(format!(
+            "cannot write to stdout: {error}"
+        ))),
+    }
+}
+
+fn emit(text: &str) -> Result<(), ViperaError> {
+    let mut out = std::io::stdout().lock();
+    write_out(&mut out, text)
 }
 
 fn take_path<'a>(args: &'a [String], command: &str) -> Result<&'a str, ViperaError> {
@@ -112,17 +164,16 @@ fn model_info(args: &[String]) -> Result<(), ViperaError> {
     }
     let json = args.iter().any(|arg| arg == "--json");
 
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(resolve_model_path(path)?)?;
     let described = GgufFile::parse(&bytes)?.describe();
 
-    print!(
-        "{}",
-        if json {
+    emit(
+        &(if json {
             render_json(&described)
         } else {
             render_text(&described)
-        }
-    );
+        }),
+    )?;
     Ok(())
 }
 
@@ -170,7 +221,7 @@ fn plan_command(args: &[String]) -> Result<u8, ViperaError> {
     }
 
     let path = path.ok_or_else(|| ViperaError::usage("plan needs a model path"))?;
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(resolve_model_path(path)?)?;
     let file = GgufFile::parse(&bytes)?;
     let descriptor = file.describe();
     let hardware = SystemProbe::new().profile();
@@ -181,14 +232,13 @@ fn plan_command(args: &[String]) -> Result<u8, ViperaError> {
     };
     let placement = plan(&file, &hardware, &request)?;
 
-    print!(
-        "{}",
-        if json {
+    emit(
+        &(if json {
             render_plan_json(&placement)
         } else {
             render_plan_text(&placement, &hardware)
-        }
-    );
+        }),
+    )?;
 
     Ok(if placement.feasible { 0 } else { 3 })
 }
@@ -207,14 +257,13 @@ fn profile_command(args: &[String]) -> Result<u8, ViperaError> {
     }
 
     let hardware = SystemProbe::new().profile();
-    print!(
-        "{}",
-        if json {
+    emit(
+        &(if json {
             render_profile_json(&hardware)
         } else {
             render_profile_text(&hardware)
-        }
-    );
+        }),
+    )?;
     Ok(0)
 }
 
@@ -282,7 +331,7 @@ fn verify_command(args: &[String]) -> Result<u8, ViperaError> {
 
     // Baseline is taken before anything is loaded, so the delta below is this run's peak.
     let baseline = peak_resident_bytes();
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(resolve_model_path(path)?)?;
     let file = GgufFile::parse(&bytes)?;
     let descriptor = file.describe();
     let shape = ModelShape::from_gguf(&file)?;
@@ -360,14 +409,13 @@ fn verify_command(args: &[String]) -> Result<u8, ViperaError> {
         verdict,
     };
 
-    print!(
-        "{}",
-        if json {
+    emit(
+        &(if json {
             render_verification_json(&record)
         } else {
             render_verification_text(&record)
-        }
-    );
+        }),
+    )?;
     Ok(0)
 }
 
@@ -579,7 +627,7 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
 
     // One read serves both the metadata and the weights: the backend keeps the bytes it will read
     // rows from, so nothing is copied twice.
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(resolve_model_path(path)?)?;
     let file = GgufFile::parse(&bytes)?;
     let tokenizer = Tokenizer::from_gguf(&file)?;
     let backend = CpuBackend::from_bytes(bytes, &file)?;
@@ -592,6 +640,13 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
         ))
     })?;
     let context_limit = file.describe().context_limit.unwrap_or(2048);
+    if let Some(requested) = ctx
+        && requested > context_limit
+    {
+        return Err(ViperaError::unsupported(format!(
+            "requested context {requested} exceeds the model's maximum of {context_limit}"
+        )));
+    }
     let context_length = ctx.unwrap_or(context_limit.min(2048));
     let budget = context_length
         .checked_mul(bytes_per_token)
@@ -678,9 +733,9 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
     };
 
     if json {
-        print!("{}", render_generate_json(&report));
+        emit(&render_generate_json(&report))?;
     } else if !report.text.ends_with('\n') {
-        println!();
+        emit("\n")?;
     }
     Ok(0)
 }
@@ -813,7 +868,7 @@ fn tokenize_command(args: &[String]) -> Result<u8, ViperaError> {
         ));
     }
 
-    let bytes = std::fs::read(path)?;
+    let bytes = std::fs::read(resolve_model_path(path)?)?;
     let file = GgufFile::parse(&bytes)?;
     let tokenizer = Tokenizer::from_gguf(&file)?;
 
@@ -821,9 +876,9 @@ fn tokenize_command(args: &[String]) -> Result<u8, ViperaError> {
         let ids = parse_ids(raw)?;
         let decoded = tokenizer.decode(&ids)?;
         if json {
-            print!("{}", render_tokenize_json(&ids, &[], None, Some(&decoded)));
+            emit(&render_tokenize_json(&ids, &[], None, Some(&decoded)))?;
         } else {
-            print!("tokens: {}\ntext: {decoded}\n", ids.len());
+            emit(&format!("tokens: {}\ntext: {decoded}\n", ids.len()))?;
         }
         return Ok(0);
     }
@@ -852,10 +907,12 @@ fn tokenize_command(args: &[String]) -> Result<u8, ViperaError> {
         .collect();
 
     if json {
-        print!(
-            "{}",
-            render_tokenize_json(&ids, &pieces, prompt.as_deref(), None)
-        );
+        emit(&render_tokenize_json(
+            &ids,
+            &pieces,
+            prompt.as_deref(),
+            None,
+        ))?;
     } else {
         let mut out = format!("tokens: {}\n", ids.len());
         out.push_str("ids:");
@@ -866,7 +923,7 @@ fn tokenize_command(args: &[String]) -> Result<u8, ViperaError> {
         if let Some(prompt) = &prompt {
             out.push_str(&format!("prompt:\n{prompt}"));
         }
-        print!("{out}");
+        emit(&out)?;
     }
     Ok(0)
 }
@@ -1019,7 +1076,7 @@ fn sample_command(args: &[String]) -> Result<u8, ViperaError> {
     let logits = parse_logits(&raw)?;
 
     let mut sampler = Sampler::new(config)?;
-    let mut tokens = Vec::with_capacity(count as usize);
+    let mut tokens = Vec::new();
     for _ in 0..count {
         let id = sampler.sample(&logits, &recent)?;
         tokens.push(id);
@@ -1028,7 +1085,7 @@ fn sample_command(args: &[String]) -> Result<u8, ViperaError> {
 
     let text = match model {
         Some(path) => {
-            let bytes = std::fs::read(path)?;
+            let bytes = std::fs::read(resolve_model_path(path)?)?;
             let file = GgufFile::parse(&bytes)?;
             Some(Tokenizer::from_gguf(&file)?.decode(&tokens)?)
         }
@@ -1036,10 +1093,7 @@ fn sample_command(args: &[String]) -> Result<u8, ViperaError> {
     };
 
     if json {
-        print!(
-            "{}",
-            render_sample_json(&tokens, config.seed, text.as_deref())
-        );
+        emit(&render_sample_json(&tokens, config.seed, text.as_deref()))?;
     } else {
         let ids: Vec<String> = tokens.iter().map(u32::to_string).collect();
         let mut out = format!("ids: {}\n", ids.join(" "));
@@ -1047,7 +1101,7 @@ fn sample_command(args: &[String]) -> Result<u8, ViperaError> {
         if let Some(text) = &text {
             out.push_str(&format!("text: {text}\n"));
         }
-        print!("{out}");
+        emit(&out)?;
     }
     Ok(0)
 }
@@ -1338,6 +1392,65 @@ mod tests {
         assert!(text.starts_with("hardware_fingerprint: hw_"));
         assert!(text.contains("device: cuda NVIDIA GeForce RTX 3060"));
         assert!(text.contains("device_driver: 560.35"));
+    }
+
+    #[test]
+    fn directory_with_one_gguf_resolves_to_that_file() {
+        let dir = std::env::temp_dir().join("vipera-dir-test-one");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.gguf"), b"fake").unwrap();
+        let resolved = super::resolve_model_path(dir.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, dir.join("model.gguf").to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_without_gguf_is_an_error() {
+        let dir = std::env::temp_dir().join("vipera-dir-test-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(super::resolve_model_path(dir.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn directory_with_two_gguf_is_an_error() {
+        let dir = std::env::temp_dir().join("vipera-dir-test-two");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.gguf"), b"a").unwrap();
+        std::fs::write(dir.join("b.gguf"), b"b").unwrap();
+        assert!(super::resolve_model_path(dir.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_path_passes_through_unchanged() {
+        assert_eq!(
+            super::resolve_model_path("some/model.gguf").unwrap(),
+            "some/model.gguf"
+        );
+    }
+
+    struct BrokenPipe;
+    impl std::io::Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "pipe closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn broken_pipe_is_not_an_error() {
+        // Writing to a closed pipe must not surface as an internal error (or panic).
+        let mut writer = BrokenPipe;
+        assert!(super::write_out(&mut writer, "hello").is_ok());
     }
 
     fn verification() -> Verification {

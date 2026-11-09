@@ -23,9 +23,11 @@ use crate::quant::{self, f16_to_f32, f32_to_f16};
 /// The most sequences one batched step computes at once.
 ///
 /// The const-generic kernels keep one accumulator per entry in registers, so the batch size is a
-/// compile-time choice rather than a runtime one; eight is where the design note stops measuring and
-/// where the scratch buffers stay a few megabytes.
-const MAX_BATCH: usize = 8;
+/// compile-time choice rather than a runtime one. Eight was the old stop point; sixteen doubles
+/// prefill weight reuse (`ceil(n/16)` reads vs `ceil(n/8)`) — the linear-streaming win from the
+/// llama.cpp tiled mul_mat paper's first step — for a few extra megabytes of scratch. The kernels
+/// spill registers at 16 but the weight read saved dominates on prefill.
+const MAX_BATCH: usize = 16;
 
 /// The numbers a forward pass needs, read from the file rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -450,6 +452,11 @@ impl CpuBackend {
 
     /// Run the transformer over `context.new_tokens`, returning the logits of the last one.
     fn run(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+        if context.tokens_per_block == 0 {
+            return Err(ViperaError::invalid_argument(
+                "a KV block must hold at least one token",
+            ));
+        }
         let pass = crate::profile::begin(false);
         let config = self.config;
         // A prompt chunk is a group of positions that share every weight read, which is exactly what
@@ -609,11 +616,20 @@ impl CpuBackend {
                     bytes_per_token: context.bytes_per_token,
                 })
                 .collect();
-            let results = self.run_batch(&mut BatchContext {
-                kv: &mut *kv,
-                entries: &mut entries,
-            })?;
-            logits = results.into_iter().next_back().unwrap_or_default();
+            let need_logits = end == tokens.len();
+            let results = self.run_batch(
+                &mut BatchContext {
+                    kv: &mut *kv,
+                    entries: &mut entries,
+                },
+                need_logits,
+                need_logits,
+            )?;
+            if need_logits {
+                // The projection only runs for the final chunk; intermediate
+                // chunk logits are computed nowhere and would be discarded.
+                logits = results.into_iter().next_back().unwrap_or_default();
+            }
             start = end;
         }
         context.kv = kv;
@@ -629,6 +645,8 @@ impl CpuBackend {
     fn run_batch(
         &mut self,
         batch: &mut BatchContext<'_, '_>,
+        need_logits: bool,
+        only_last: bool,
     ) -> Result<Vec<Vec<f32>>, ViperaError> {
         let size = batch.entries.len();
         if size == 0 {
@@ -641,6 +659,24 @@ impl CpuBackend {
             .iter()
             .any(|entry| entry.new_tokens.len() != 1)
         {
+            if only_last {
+                // Fallback only ever runs for multi-token entries; a prefill
+                // chunk is single-token per entry, so this is unreachable
+                // there. Keep full compute for safety: run every entry (so
+                // KV is written for all), return logits for the last only.
+                let mut all = batch
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let mut context = entry.context(&mut *batch.kv);
+                        self.run(&mut context)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let last = all.pop().unwrap_or_default();
+                let mut rest = vec![Vec::new(); size - 1];
+                rest.push(last);
+                return Ok(rest);
+            }
             return batch
                 .entries
                 .iter()
@@ -651,14 +687,102 @@ impl CpuBackend {
                 .collect();
         }
         match size {
-            1 => self.run_batch_n(batch.kv, exactly::<1, _>(batch.entries)?),
-            2 => self.run_batch_n(batch.kv, exactly::<2, _>(batch.entries)?),
-            3 => self.run_batch_n(batch.kv, exactly::<3, _>(batch.entries)?),
-            4 => self.run_batch_n(batch.kv, exactly::<4, _>(batch.entries)?),
-            5 => self.run_batch_n(batch.kv, exactly::<5, _>(batch.entries)?),
-            6 => self.run_batch_n(batch.kv, exactly::<6, _>(batch.entries)?),
-            7 => self.run_batch_n(batch.kv, exactly::<7, _>(batch.entries)?),
-            8 => self.run_batch_n(batch.kv, exactly::<8, _>(batch.entries)?),
+            1 => self.run_batch_n(
+                batch.kv,
+                exactly::<1, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            2 => self.run_batch_n(
+                batch.kv,
+                exactly::<2, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            3 => self.run_batch_n(
+                batch.kv,
+                exactly::<3, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            4 => self.run_batch_n(
+                batch.kv,
+                exactly::<4, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            5 => self.run_batch_n(
+                batch.kv,
+                exactly::<5, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            6 => self.run_batch_n(
+                batch.kv,
+                exactly::<6, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            7 => self.run_batch_n(
+                batch.kv,
+                exactly::<7, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            8 => self.run_batch_n(
+                batch.kv,
+                exactly::<8, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            9 => self.run_batch_n(
+                batch.kv,
+                exactly::<9, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            10 => self.run_batch_n(
+                batch.kv,
+                exactly::<10, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            11 => self.run_batch_n(
+                batch.kv,
+                exactly::<11, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            12 => self.run_batch_n(
+                batch.kv,
+                exactly::<12, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            13 => self.run_batch_n(
+                batch.kv,
+                exactly::<13, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            14 => self.run_batch_n(
+                batch.kv,
+                exactly::<14, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            15 => self.run_batch_n(
+                batch.kv,
+                exactly::<15, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
+            16 => self.run_batch_n(
+                batch.kv,
+                exactly::<16, _>(batch.entries)?,
+                need_logits,
+                only_last,
+            ),
             other => Err(ViperaError::invalid_argument(format!(
                 "this backend batches up to {MAX_BATCH} sequences, not {other}"
             ))),
@@ -673,7 +797,14 @@ impl CpuBackend {
         &mut self,
         kv: &mut [u8],
         contexts: &mut [BatchEntry<'_>; B],
+        need_logits: bool,
+        only_last: bool,
     ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        if contexts.iter().any(|context| context.tokens_per_block == 0) {
+            return Err(ViperaError::invalid_argument(
+                "a KV block must hold at least one token",
+            ));
+        }
         let pass = crate::profile::begin(std::mem::take(&mut self.chunk_pass));
         let config = self.config;
         let mut positions = [0_usize; B];
@@ -872,21 +1003,49 @@ impl CpuBackend {
                 }
             }
 
-            for entry in 0..B {
+            if need_logits && only_last {
+                let entry = B - 1;
                 rms_norm(
                     &batch.x[entry * hidden..][..hidden],
                     output_norm,
                     epsilon,
                     &mut batch.h[entry * hidden..][..hidden],
                 );
+                let pool1 = Pool::new(
+                    scope,
+                    quant::thread_budget(vocab, hidden.saturating_mul(vocab)),
+                );
+                output.matvec(
+                    &pool1,
+                    file,
+                    rows::<1>(&batch.h[entry * hidden..][..hidden], hidden)[0],
+                    &mut batch.logits[..vocab],
+                )?;
+            } else if need_logits {
+                for entry in 0..B {
+                    rms_norm(
+                        &batch.x[entry * hidden..][..hidden],
+                        output_norm,
+                        epsilon,
+                        &mut batch.h[entry * hidden..][..hidden],
+                    );
+                }
+                output.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &rows::<B>(&batch.h, hidden),
+                    &mut batch.logits[..B * vocab],
+                )?;
             }
-            output.matvec_batch::<B>(
-                &pool,
-                file,
-                &rows::<B>(&batch.h, hidden),
-                &mut batch.logits[..B * vocab],
-            )?;
             crate::profile::finish_pass(pass);
+            if !need_logits {
+                return Ok(vec![Vec::new(); B]);
+            }
+            if only_last {
+                let mut results = vec![Vec::new(); B];
+                results[B - 1] = batch.logits[..vocab].to_vec();
+                return Ok(results);
+            }
             Ok((0..B)
                 .map(|entry| batch.logits[entry * vocab..][..vocab].to_vec())
                 .collect())
@@ -918,7 +1077,7 @@ impl ForwardPass for CpuBackend {
         &mut self,
         batch: &mut BatchContext<'_, '_>,
     ) -> Result<Vec<Vec<f32>>, ViperaError> {
-        self.run_batch(batch)
+        self.run_batch(batch, true, false)
     }
 }
 

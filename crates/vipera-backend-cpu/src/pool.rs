@@ -79,6 +79,11 @@ impl<'d, const B: usize> Pool<'d, B> {
         activations: &Arc<[OwnedActivation; B]>,
         out: &mut [f32],
     ) -> Result<(), ViperaError> {
+        if B == 0 {
+            return Err(ViperaError::invalid_argument(
+                "a matvec pool needs at least one entry",
+            ));
+        }
         if !out.len().is_multiple_of(B) {
             return Err(ViperaError::internal(format!(
                 "{} outputs are not a whole number of {B}-entry batches",
@@ -121,12 +126,22 @@ impl<'d, const B: usize> Pool<'d, B> {
             first_row += count;
         }
 
+        let mut worker_panicked = false;
         for _ in 0..dispatched {
             let (first_row, values) = self
                 .replies
                 .recv()
                 .map_err(|_| ViperaError::internal("a matvec worker stopped before replying"))?;
+            if first_row == usize::MAX {
+                worker_panicked = true;
+                continue;
+            }
             copy_back::<B>(out, rows, first_row, &values)?;
+        }
+        if worker_panicked {
+            return Err(ViperaError::internal(
+                "a matvec worker panicked; refusing to return partial results",
+            ));
         }
         Ok(())
     }
@@ -164,16 +179,55 @@ fn run_worker<'d, const B: usize>(
     for job in jobs {
         let mut values = vec![0.0_f32; job.count * B];
         let activation = BatchActivation::new(&job.activations);
-        quant::fill_rows_batch(
-            job.ty,
-            job.data,
-            job.stride,
-            job.first_row,
-            &activation,
-            &mut values,
-        );
+        // A panic inside one job must not hang the parent in replies.recv():
+        // catch it, signal the parent with the sentinel, and keep the worker alive.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            quant::fill_rows_batch(
+                job.ty,
+                job.data,
+                job.stride,
+                job.first_row,
+                &activation,
+                &mut values,
+            );
+        }))
+        .is_err();
+        if panicked {
+            if replies.send((usize::MAX, Vec::new())).is_err() {
+                return;
+            }
+            continue;
+        }
         if replies.send((job.first_row, values)).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quant::OwnedActivation;
+
+    #[test]
+    fn a_panicking_worker_returns_an_error_instead_of_hanging() {
+        // Data far too short for the stride row_bytes implies: fill_rows_batch
+        // would panic inside the worker (slice out of bounds).
+        let data = vec![0u8; 10];
+        let activation = OwnedActivation::new(vipera_core::gguf::GgmlType::F32, &[1.0f32; 32]);
+        std::thread::scope(|scope| {
+            let pool = Pool::<1>::new(scope, 2);
+            let activations = Arc::new([activation]);
+            let mut out = vec![0.0f32; 64];
+            let result = pool.fill_batch(
+                vipera_core::gguf::GgmlType::F32,
+                &data,
+                128,
+                2,
+                &activations,
+                &mut out,
+            );
+            assert!(result.is_err(), "expected internal error, got {result:?}");
+        });
     }
 }

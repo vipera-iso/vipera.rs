@@ -33,7 +33,9 @@ pub fn row_bytes(ty: GgmlType, cols: usize) -> Result<usize, ViperaError> {
             ty.name()
         )));
     }
-    Ok(cols / values * bytes)
+    (cols / values)
+        .checked_mul(bytes)
+        .ok_or_else(|| ViperaError::invalid_argument("row byte count overflows"))
 }
 
 /// Whole blocks of `N` bytes, with any remainder ignored. Callers validated the length first.
@@ -539,8 +541,11 @@ pub fn read_row(
             out.len()
         )));
     }
+    let end = start
+        .checked_add(stride)
+        .ok_or_else(|| ViperaError::invalid_argument("row offset overflows"))?;
     let bytes = data
-        .get(start..start + stride)
+        .get(start..end)
         .ok_or_else(|| ViperaError::parse(start as u64, "row lies outside the tensor data"))?;
     match ty {
         GgmlType::F32 => {
@@ -628,8 +633,16 @@ pub fn dequantize(
     cols: usize,
     rows: usize,
 ) -> Result<Vec<f32>, ViperaError> {
+    if cols == 0 {
+        return Err(ViperaError::invalid_argument(
+            "cannot dequantize zero columns",
+        ));
+    }
     let stride = row_bytes(ty, cols)?;
-    if data.len() < stride * rows {
+    let needed = stride
+        .checked_mul(rows)
+        .ok_or_else(|| ViperaError::invalid_argument("dequantize byte count overflows"))?;
+    if data.len() < needed {
         return Err(ViperaError::parse(
             data.len() as u64,
             format!(
@@ -638,7 +651,10 @@ pub fn dequantize(
             ),
         ));
     }
-    let mut out = vec![0.0; cols * rows];
+    let total = cols
+        .checked_mul(rows)
+        .ok_or_else(|| ViperaError::invalid_argument("dequantize value count overflows"))?;
+    let mut out = vec![0.0; total];
     for (row, chunk) in out.chunks_exact_mut(cols).enumerate() {
         read_row(ty, data, cols, row, chunk)?;
     }
@@ -737,6 +753,14 @@ pub(crate) fn matvec_pooled<'d>(
 ///
 /// `out` holds `B * rows` values, token-major: entry `entry`'s `rows` results start at
 /// `entry * rows`.
+///
+/// When `VIPERA_TILED=1` and `B >= 8` and `ty` is `F32`/`F16`, this takes the scalar tiled path ([`crate::tiled::matvec_tiled_batch`]) on dequantized weights, which changes
+/// summation order and is approximate (documented parity is
+/// `max_abs <= 1e-3 + 1e-4 * max|ref|`); with the gate off the result stays
+/// bit-exact via the pooled kernel. Quantized types (`Q8_0`/`Q4_K`/`Q6_K`)
+/// stay on the pooled kernel even with the gate on: the scalar float tiled
+/// kernel is 22x slower there (1.7 vs 40 tok/s) because it bypasses
+/// `QuantizedX` + VNNI and the `Pool`, pending an integer tiled kernel.
 pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     pool: &crate::pool::Pool<'d, B>,
     ty: GgmlType,
@@ -770,6 +794,9 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
             data.len() as u64,
             format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
         ));
+    }
+    if crate::tiled::tiled_serves::<B>() && matches!(ty, GgmlType::F32 | GgmlType::F16) {
+        return crate::tiled::matvec_tiled_batch(ty, data, stride, cols, rows, activations, out);
     }
     let owned: std::sync::Arc<[OwnedActivation; B]> =
         std::sync::Arc::new(std::array::from_fn(|entry| {
@@ -821,6 +848,11 @@ pub(crate) fn fill_rows(
     out: &mut [f32],
 ) {
     for (offset, slot) in out.iter_mut().enumerate() {
+        // Prefetch 4 rows ahead while current row unpacks (decode-stream).
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ahead) = offset.checked_add(4).map(|o| (first_row + o) * stride) {
+            crate::simd::prefetch_ahead(data, ahead);
+        }
         let start = (first_row + offset) * stride;
         *slot = dot(ty, &data[start..start + stride], activation);
     }
@@ -841,6 +873,12 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     let count = out.len() / B;
     let mut row = [0.0_f32; B];
     for offset in 0..count {
+        // Prefetch 4 rows ahead (prefill-tiled Decode). The unpack loop is instruction-bound,
+        // not load-bound, so this is a pure hint: it never changes results.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ahead) = offset.checked_add(4).map(|o| (first_row + o) * stride) {
+            crate::simd::prefetch_ahead(data, ahead);
+        }
         let start = (first_row + offset) * stride;
         dot_batch(ty, &data[start..start + stride], activation, &mut row);
         for (entry, value) in row.iter().enumerate() {
@@ -1264,6 +1302,24 @@ mod tests {
         measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 20);
         measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 20);
         measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 4);
+    }
+
+    #[test]
+    fn huge_cols_is_an_error_not_a_panic() {
+        assert!(row_bytes(GgmlType::F32, usize::MAX / 2).is_err());
+    }
+
+    #[test]
+    fn huge_row_is_an_error_not_a_panic() {
+        let mut out = vec![0.0; 3];
+        assert!(read_row(GgmlType::F32, &[], 3, usize::MAX / 12, &mut out).is_err());
+    }
+
+    #[test]
+    fn zero_cols_is_an_error_not_a_panic() {
+        assert!(dequantize(GgmlType::F32, &[], 0, 1).is_err());
+        assert!(dequantize(GgmlType::F32, &[], 0, 0).is_err());
+        assert!(dequantize(GgmlType::F32, &[], 3, usize::MAX).is_err());
     }
 
     #[test]

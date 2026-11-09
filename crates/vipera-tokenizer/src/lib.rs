@@ -70,6 +70,7 @@ impl Tokenizer {
             .filter_map(|id| vocab.piece(id).map(|piece| (piece.to_owned(), id)))
             .filter(|(piece, id)| {
                 !piece.is_empty()
+                    && vocab.token_type(*id) != TokenType::Byte
                     && (matches!(
                         vocab.token_type(*id),
                         TokenType::Control | TokenType::UserDefined

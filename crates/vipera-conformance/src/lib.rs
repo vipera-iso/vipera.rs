@@ -4,9 +4,11 @@
 //! (spec FR-023, SC-008). Each suite is a list of cases plus a runner, so the same contract can be
 //! applied to the reference implementation and to every future implementation.
 //!
-//! Slice 2 ships the GGUF parser suite. Algorithm and backend suites arrive with the first algorithm
-//! and backend — writing their cases before an implementation exists would pin semantics nobody has
-//! implemented yet.
+//! Slice 2 ships the GGUF parser suite. The sampler suite now ships too, because
+//! the first algorithms exist (`greedy` and `temperature` in `vipera-sampler`);
+//! the backend suite is still pending, because the `ForwardPass` contract
+//! needs KV fixtures shared with its implementers and those live in
+//! `vipera-backend-cpu`, outside this crate.
 
 #![warn(missing_docs)]
 
@@ -337,6 +339,150 @@ pub fn gguf_cases() -> Vec<Case> {
     cases
 }
 
+/// What a sampler case expects the strategy to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SamplerExpect {
+    /// The strategy must return this token id.
+    Returns(u32),
+    /// The strategy must fail, and the error must contain this text.
+    Rejects {
+        /// Substring the error must contain.
+        containing: &'static str,
+    },
+}
+
+/// One contract case: logits in, expected token out.
+#[derive(Debug, Clone)]
+pub struct SamplerCase {
+    /// Stable case name, used in reports.
+    pub name: &'static str,
+    /// One logit per vocabulary entry, in id order.
+    pub logits: Vec<f32>,
+    /// Expected outcome.
+    pub expect: SamplerExpect,
+}
+
+impl SamplerCase {
+    /// A case that must return `id`.
+    pub fn returns(name: &'static str, logits: Vec<f32>, id: u32) -> Self {
+        Self {
+            name,
+            logits,
+            expect: SamplerExpect::Returns(id),
+        }
+    }
+
+    /// A case that must fail with an error containing `containing`.
+    pub fn rejects(name: &'static str, logits: Vec<f32>, containing: &'static str) -> Self {
+        Self {
+            name,
+            logits,
+            expect: SamplerExpect::Rejects { containing },
+        }
+    }
+}
+
+/// Run sampler cases against `check`, which returns `Ok(id)` when a token was picked.
+pub fn run_sampler(
+    cases: &[SamplerCase],
+    check: impl Fn(&[f32]) -> Result<u32, String>,
+) -> Vec<CaseResult> {
+    cases
+        .iter()
+        .map(|case| {
+            let outcome = check(&case.logits);
+            let (passed, detail) = match (&case.expect, &outcome) {
+                (SamplerExpect::Returns(expected), Ok(id)) if *id == *expected => {
+                    (true, String::new())
+                }
+                (SamplerExpect::Returns(expected), Ok(id)) => {
+                    (false, format!("expected token {expected}, got {id}"))
+                }
+                (SamplerExpect::Returns(expected), Err(message)) => (
+                    false,
+                    format!("expected token {expected}, got error: {message}"),
+                ),
+                (SamplerExpect::Rejects { containing }, Err(message)) => {
+                    if message.contains(containing) {
+                        (true, String::new())
+                    } else {
+                        (
+                            false,
+                            format!(
+                                "rejected for the wrong reason: {message:?} lacks {containing:?}"
+                            ),
+                        )
+                    }
+                }
+                (SamplerExpect::Rejects { containing }, Ok(id)) => (
+                    false,
+                    format!("expected rejection containing {containing:?}, got token {id}"),
+                ),
+            };
+            CaseResult {
+                name: case.name,
+                passed,
+                detail,
+            }
+        })
+        .collect()
+}
+
+/// Run a sampler suite and panic with a readable report if any case fails.
+pub fn assert_sampler_conforms(
+    contract: &str,
+    cases: &[SamplerCase],
+    check: impl Fn(&[f32]) -> Result<u32, String>,
+) {
+    let results = run_sampler(cases, check);
+    let failures: Vec<&CaseResult> = results.iter().filter(|result| !result.passed).collect();
+    assert!(
+        failures.is_empty(),
+        "conformance suite \"{contract}\" failed {}/{} cases:\n{}",
+        failures.len(),
+        results.len(),
+        failures
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Contract cases every greedy sampler must pass (FR-012, FR-023).
+///
+/// Every case below is a behavior already pinned by `vipera-sampler`'s own
+/// tests (`zero_temperature_is_greedy`, `greedy_breaks_ties_towards_the_lowest_id`,
+/// `non_finite_logits_are_skipped`, `empty_or_unusable_logits_are_rejected`);
+/// the shared suite copies them so a second algorithm has a contract to
+/// meet without reading the first implementation. Temperature sampling is
+/// deliberately absent: it is stochastic, and pinning a fixed-seed sequence
+/// here would freeze the private `Rng` stream as a contract.
+pub fn sampler_cases() -> Vec<SamplerCase> {
+    vec![
+        SamplerCase::returns("clear argmax", vec![0.1, 5.0, 0.2], 1),
+        SamplerCase::returns("tie goes to lowest id", vec![2.0, 2.0, 2.0], 0),
+        SamplerCase::returns("single logit", vec![-1.5], 0),
+        SamplerCase::returns("negative logits argmax", vec![-5.0, -1.0, -3.0], 1),
+        SamplerCase::returns(
+            "non-finite logits are skipped",
+            vec![f32::NAN, 1.0, f32::INFINITY],
+            1,
+        ),
+        SamplerCase::rejects("empty logits", Vec::new(), "NoFiniteLogits"),
+        SamplerCase::rejects(
+            "all logits non-finite",
+            vec![f32::NAN, f32::NEG_INFINITY],
+            "NoFiniteLogits",
+        ),
+        SamplerCase::rejects(
+            "all logits infinite",
+            vec![f32::INFINITY, f32::INFINITY],
+            "NoFiniteLogits",
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +522,53 @@ mod tests {
             GgufBuilder::minimal().build(),
             GgufBuilder::minimal().build()
         );
+    }
+
+    #[test]
+    fn a_sampler_case_that_returns_the_expected_id_passes() {
+        let cases = vec![SamplerCase::returns("only", vec![0.0], 0)];
+        let results = run_sampler(&cases, |_| Ok(0));
+        assert!(results[0].passed);
+    }
+
+    #[test]
+    fn a_sampler_case_that_returns_the_wrong_id_fails() {
+        let cases = vec![SamplerCase::returns("only", vec![0.0], 0)];
+        let results = run_sampler(&cases, |_| Ok(1));
+        assert!(!results[0].passed);
+        assert!(results[0].detail.contains("expected token 0"));
+    }
+
+    #[test]
+    fn a_sampler_rejection_for_the_wrong_reason_fails() {
+        let cases = vec![SamplerCase::rejects("empty", Vec::new(), "NoFiniteLogits")];
+        let results = run_sampler(&cases, |_| Err("something else".to_owned()));
+        assert!(!results[0].passed);
+        assert!(results[0].detail.contains("wrong reason"));
+    }
+
+    #[test]
+    fn sampler_cases_accept_a_greedy_stub() {
+        // Greedy stub: the argmax, ties to lowest id, skipping non-finite.
+        assert_sampler_conforms("sampler-stub", &sampler_cases(), |logits: &[f32]| {
+            let mut best: Option<(u32, f32)> = None;
+            for (id, logit) in logits.iter().enumerate() {
+                let value = *logit;
+                if !value.is_finite() {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((best_id, best_value)) => {
+                        value > best_value || (value == best_value && (id as u32) < best_id)
+                    }
+                };
+                if better {
+                    best = Some((id as u32, value));
+                }
+            }
+            best.map(|(id, _)| id)
+                .ok_or_else(|| "NoFiniteLogits".to_owned())
+        });
     }
 }

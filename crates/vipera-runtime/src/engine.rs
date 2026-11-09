@@ -152,6 +152,9 @@ pub struct StepReport {
     pub tokens: Vec<(u64, u32)>,
     /// Turns that ended this step, with their generations.
     pub finished: Vec<Generation>,
+    /// Turns that failed this step, as `(sequence, message)`. A failure is
+    /// per-sequence: other turns in the same batch still report theirs.
+    pub failed: Vec<(u64, String)>,
 }
 
 /// Sequences, KV blocks, and the model behind them.
@@ -313,6 +316,9 @@ impl<F: ForwardPass> Engine<F> {
             {
                 return Ok(generation);
             }
+            if let Some((_, message)) = report.failed.iter().find(|(sequence, _)| *sequence == id) {
+                return Err(ViperaError::internal(message.clone()));
+            }
             if !self.is_active(id) {
                 return Err(ViperaError::internal(format!(
                     "sequence {id} left the batch without finishing its turn"
@@ -420,10 +426,12 @@ impl<F: ForwardPass> Engine<F> {
             && let Err(error) = self.forward(&batch)
         {
             // The call that failed took its entries with it; the others keep their turns.
+            let message = error.to_string();
             for id in &batch {
                 self.fail(*id);
+                report.failed.push((*id, message.clone()));
             }
-            return Err(error);
+            return Ok(report);
         }
 
         // One draw per turn that has logits, in id order.
@@ -436,7 +444,7 @@ impl<F: ForwardPass> Engine<F> {
         for id in ready {
             if let Err(error) = self.sample(id, &mut report) {
                 self.fail(id);
-                return Err(error);
+                report.failed.push((id, error.to_string()));
             }
         }
 
@@ -649,6 +657,11 @@ impl<F: ForwardPass> Engine<F> {
 
     /// Record a restorable point at the current end of the context.
     pub fn snapshot(&mut self, id: u64, label: Option<String>) -> Result<u32, ViperaError> {
+        if self.is_active(id) {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {id} has an active turn; finish or cancel it before snapshotting"
+            )));
+        }
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
@@ -657,9 +670,20 @@ impl<F: ForwardPass> Engine<F> {
 
     /// Rewind a sequence to a snapshot. Later snapshots become invalid.
     pub fn restore(&mut self, id: u64, snapshot: u32) -> Result<usize, ViperaError> {
+        if self.is_active(id) {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {id} has an active turn; finish or cancel it before restoring"
+            )));
+        }
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
+        if !sequence.is_usable() {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {id} is {} and cannot be restored",
+                sequence.state().as_str()
+            )));
+        }
         let target = sequence
             .snapshot_by_id(snapshot)
             .cloned()
@@ -1007,6 +1031,19 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_restore_refuse_an_active_turn() {
+        let mut engine = engine_with(greedy(), ToyForward::new(32), 64);
+        let id = engine.admit(&[1, 2], 1).unwrap();
+        let snap = engine.snapshot(id, None).unwrap();
+        engine.enqueue(id).unwrap();
+        assert!(engine.snapshot(id, None).is_err());
+        assert!(engine.restore(id, snap).is_err());
+        engine.cancel(id).unwrap();
+        assert!(engine.snapshot(id, None).is_err());
+        assert!(engine.restore(id, snap).is_err());
+    }
+
+    #[test]
     fn releasing_a_sequence_frees_every_block() {
         let mut engine = engine_with(greedy(), ToyForward::new(32), 16);
         let id = engine.admit(&[1, 2, 3], 2).unwrap();
@@ -1033,6 +1070,56 @@ mod tests {
             SequenceState::Cancelled
         );
         assert!(engine.generate(id).is_err());
+    }
+
+    #[test]
+    fn one_bad_turn_does_not_sink_the_other_in_the_same_batch() {
+        struct PerSeq;
+        impl ForwardPass for PerSeq {
+            fn logits(
+                &mut self,
+                context: &mut ForwardContext<'_>,
+            ) -> Result<Vec<f32>, ViperaError> {
+                let vocab = 32usize;
+                let mut logits = vec![0.0f32; vocab];
+                if context.tokens.last() == Some(&99) {
+                    return Ok(vec![f32::NAN; vocab]);
+                }
+                logits[1] = 10.0;
+                Ok(logits)
+            }
+        }
+        let kv = KvCache::new(KvConfig::new(8, 4, 64).expect("geometry")).expect("cache");
+        let mut engine = Engine::new(
+            kv,
+            PerSeq,
+            EngineConfig {
+                max_batch: 4,
+                ..greedy()
+            },
+        );
+        let bad = engine.admit(&[99], 2).unwrap();
+        let good = engine.admit(&[1], 2).unwrap();
+        engine.enqueue(bad).unwrap();
+        engine.enqueue(good).unwrap();
+        // Prefill+sample of the first token happens in one step: bad has no
+        // finite logits, good does. Old code returned Err and lost good's token.
+        let report = engine.step().expect("step must succeed for the good turn");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, bad);
+        assert!(report.tokens.iter().any(|(id, _)| *id == good));
+        // bad is failed and no longer active; good is still mid-turn, so drive
+        // it to completion with steps (generate would re-enqueue it).
+        assert!(engine.generate(bad).is_err());
+        let mut finished_tokens = Vec::new();
+        for _ in 0..10 {
+            let report = engine.step().expect("drive good to finish");
+            finished_tokens.extend(report.finished.iter().map(|g| g.tokens.clone()));
+            if finished_tokens.iter().any(|tokens| !tokens.is_empty()) {
+                break;
+            }
+        }
+        assert!(!finished_tokens.is_empty(), "good turn must finish");
     }
 
     #[test]

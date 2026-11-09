@@ -13,8 +13,9 @@
 //!
 //! What Phase 1 does not do, stated here rather than implied: request bodies must be `Content-Length`
 //! framed (chunked bodies are refused with `invalid_request`), `stop` sequences are parsed and ignored,
-//! per-key rate limiting (`429`) is not implemented, and a client that disconnects mid-stream still
-//! lets the current turn finish before the connection is dropped.
+//! and a client that disconnects mid-stream still lets the current turn finish before the
+//! connection is dropped. Per-key rate limiting is opt-in via `--rate-limit` (requests per minute
+//! per client, `429` + `Retry-After` when exceeded); without the flag there is no limit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -52,6 +53,7 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let mut model_id: Option<String> = None;
     let mut ctx: Option<u64> = None;
     let mut kv_type = KvCacheType::F16;
+    let mut rate_limit: Option<u32> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -80,6 +82,16 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
                 kv_type = KvCacheType::parse(next_value(args, index, "--kv-type")?)?;
                 index += 1;
             }
+            "--rate-limit" => {
+                let limit = next_number(args, index, "--rate-limit")?;
+                if limit == 0 {
+                    return Err(ViperaError::usage(
+                        "--rate-limit must be at least 1 (omit the flag for no limit)",
+                    ));
+                }
+                rate_limit = Some(limit);
+                index += 1;
+            }
             flag if flag.starts_with('-') => {
                 return Err(ViperaError::usage(format!(
                     "unknown flag \"{flag}\" for serve"
@@ -100,38 +112,54 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let path = path.ok_or_else(|| ViperaError::usage("serve needs a model path"))?;
     let model_id = model_id.unwrap_or_else(|| default_model_id(path));
 
-    // A model exposed beyond loopback without a key is an open door; refuse instead of warning.
-    let loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
-    if !loopback && api_key.is_none() {
-        return Err(ViperaError::usage(
-            "binding serve to a non-loopback address needs --api-key",
-        ));
-    }
-
-    let served = Arc::new(Served::load(path, model_id, api_key, ctx, kv_type)?);
+    let served = Arc::new(Served::load(
+        path,
+        model_id,
+        api_key.clone(),
+        ctx,
+        kv_type,
+        rate_limit,
+    )?);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| {
         ViperaError::invalid_argument(format!("cannot bind {host}:{port}: {error}"))
     })?;
     let address = listener
         .local_addr()
         .map_err(|error| ViperaError::internal(format!("bound socket has no address: {error}")))?;
-    println!(
-        "vipera: serving {} as \"{}\" on http://{address}",
-        path, served.model
-    );
-    std::io::stdout()
-        .flush()
-        .map_err(|error| ViperaError::internal(format!("cannot flush stdout: {error}")))?;
+    // A model exposed beyond loopback without a key is an open door; refuse instead of warning.
+    // Decide from the *bound* address, not the requested hostname: a name that
+    // resolves to a non-loopback address must not bypass the key requirement.
+    if !address.ip().is_loopback() && served.api_key.is_none() {
+        return Err(ViperaError::usage(
+            "binding serve to a non-loopback address needs --api-key",
+        ));
+    }
+    {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        // Ignore a closed pipe here: the server should keep serving.
+        let _ = writeln!(
+            out,
+            "vipera: serving {} as \"{}\" on http://{address}",
+            path, served.model
+        );
+        let _ = out.flush();
+    }
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
                 let served = Arc::clone(&served);
-                std::thread::spawn(move || {
+                match std::thread::Builder::new().spawn(move || {
                     if let Err(error) = handle(&served, stream) {
                         eprintln!("vipera: connection ended: {error}");
                     }
-                });
+                }) {
+                    Ok(_) => {}
+                    Err(error) => eprintln!("vipera: cannot spawn connection thread: {error}"),
+                }
             }
             Err(error) => eprintln!("vipera: accept failed: {error}"),
         }
@@ -153,6 +181,40 @@ fn next_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a st
         .ok_or_else(|| ViperaError::usage(format!("{flag} needs a value")))
 }
 
+fn resolve_model_path(path: &str) -> Result<String, ViperaError> {
+    let candidate = std::path::Path::new(path);
+    if !candidate.is_dir() {
+        return Ok(path.to_owned());
+    }
+    let mut found = Vec::new();
+    let entries = std::fs::read_dir(candidate).map_err(|error| {
+        ViperaError::internal(format!("cannot list model directory \"{path}\": {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            ViperaError::internal(format!("cannot read model directory \"{path}\": {error}"))
+        })?;
+        let entry_path = entry.path();
+        if entry_path.is_file()
+            && entry_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            found.push(entry_path.to_string_lossy().into_owned());
+        }
+    }
+    match found.len() {
+        1 => Ok(found.into_iter().next().expect("one gguf")),
+        0 => Err(ViperaError::usage(format!(
+            "directory \"{path}\" contains no .gguf file; pass a model file directly"
+        ))),
+        many => Err(ViperaError::usage(format!(
+            "directory \"{path}\" contains {many} .gguf files; pass one model file directly"
+        ))),
+    }
+}
+
 fn next_number<T: std::str::FromStr>(
     args: &[String],
     index: usize,
@@ -163,6 +225,45 @@ fn next_number<T: std::str::FromStr>(
         .map_err(|_| ViperaError::usage(format!("{flag} needs a number, got \"{raw}\"")))
 }
 
+/// Token bucket per client, shared across handler threads.
+struct RateLimiter {
+    per_minute: f64,
+    buckets: Mutex<HashMap<String, (f64, Instant)>>,
+}
+
+impl RateLimiter {
+    fn new(per_minute: u32) -> Self {
+        Self {
+            per_minute: per_minute as f64,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allow(&self, client: &str) -> Result<(), u64> {
+        self.allow_at(client, Instant::now())
+    }
+
+    fn allow_at(&self, client: &str, now: Instant) -> Result<(), u64> {
+        let mut buckets = match self.buckets.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = buckets
+            .entry(client.to_owned())
+            .or_insert((self.per_minute, now));
+        let elapsed = now.duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * self.per_minute / 60.0).min(self.per_minute);
+        entry.1 = now;
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            Ok(())
+        } else {
+            let retry = ((1.0 - entry.0) * 60.0 / self.per_minute).ceil() as u64;
+            Err(retry.max(1))
+        }
+    }
+}
+
 /// The loaded model plus everything the handlers share.
 struct Served {
     engine: Arc<Mutex<Engine<CpuBackend>>>,
@@ -171,6 +272,7 @@ struct Served {
     model: String,
     context_length: usize,
     api_key: Option<String>,
+    rate_limit: Option<Arc<RateLimiter>>,
     metrics: Mutex<Metrics>,
 }
 
@@ -181,8 +283,9 @@ impl Served {
         api_key: Option<String>,
         ctx: Option<u64>,
         kv_type: KvCacheType,
+        rate_limit: Option<u32>,
     ) -> Result<Served, ViperaError> {
-        let bytes = std::fs::read(path)?;
+        let bytes = std::fs::read(resolve_model_path(path)?)?;
         let file = GgufFile::parse(&bytes)?;
         let tokenizer = Tokenizer::from_gguf(&file)?;
         let backend = CpuBackend::from_bytes(bytes, &file)?;
@@ -244,6 +347,7 @@ impl Served {
             model,
             context_length: usize::try_from(context_length).unwrap_or(usize::MAX),
             api_key,
+            rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
             metrics: Mutex::new(Metrics::default()),
         })
     }
@@ -336,6 +440,11 @@ impl Router {
                 let _ = sender.send(Event::Finished(Box::new(generation)));
             }
         }
+        for (sequence, message) in report.failed {
+            if let Some(sender) = routes.remove(&sequence) {
+                let _ = sender.send(Event::Failed(message));
+            }
+        }
     }
 
     /// Fail every waiting handler: a step that returned an error left no tokens to hand out.
@@ -359,12 +468,11 @@ fn schedule(engine: Arc<Mutex<Engine<CpuBackend>>>, router: Arc<Router>, eos: Ve
         router.wait_for_work();
         loop {
             let report = {
+                // Recover a poisoned lock like Router::wait_for_work does, instead of
+                // abandoning the scheduler forever (handlers would block indefinitely).
                 let mut engine = match engine.lock() {
                     Ok(engine) => engine,
-                    Err(_) => {
-                        router.fail("engine lock was poisoned");
-                        return;
-                    }
+                    Err(poisoned) => poisoned.into_inner(),
                 };
                 if !engine.has_work() {
                     break;
@@ -385,11 +493,15 @@ fn schedule(engine: Arc<Mutex<Engine<CpuBackend>>>, router: Arc<Router>, eos: Ve
 }
 
 fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
     let Some(request) = read_request(&mut stream)? else {
         return Ok(());
     };
     let started = Instant::now();
-    let status = route(served, &mut stream, &request, started)?;
+    let status = route(served, &mut stream, &request, started, &peer)?;
     let endpoint = endpoint_name(&request.path);
     if let Ok(mut metrics) = served.metrics.lock() {
         metrics.record(endpoint, status, started.elapsed().as_secs_f64());
@@ -402,7 +514,38 @@ fn route(
     stream: &mut TcpStream,
     request: &Request,
     started: Instant,
+    peer: &str,
 ) -> std::io::Result<u16> {
+    // G01: when a key is configured, protect every business route. /health is
+    // the only public one (it reports nothing about the model).
+    if let Some(key) = &served.api_key
+        && !matches!(request.path.as_str(), "/health")
+        && !request.authorized(key)
+    {
+        respond_error(stream, 401, "unauthorized", "missing or wrong API key")?;
+        return Ok(401);
+    }
+    if let Some(limiter) = &served.rate_limit
+        && !matches!(request.path.as_str(), "/health")
+    {
+        let client = request
+            .header("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| peer.to_owned());
+        if let Err(retry) = limiter.allow(&client) {
+            respond_error_retry(
+                stream,
+                429,
+                "rate_limited",
+                "request rate limit exceeded",
+                retry,
+            )?;
+            return Ok(429);
+        }
+    }
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => {
             respond(stream, 200, "OK", "application/json", r#"{"status":"ok"}"#)?;
@@ -435,15 +578,7 @@ fn route(
             respond(stream, 200, "OK", "text/plain; version=0.0.4", &body)?;
             Ok(200)
         }
-        ("POST", "/v1/chat/completions") => {
-            if let Some(key) = &served.api_key
-                && !request.authorized(key)
-            {
-                respond_error(stream, 401, "unauthorized", "missing or wrong API key")?;
-                return Ok(401);
-            }
-            chat(served, stream, request, started)
-        }
+        ("POST", "/v1/chat/completions") => chat(served, stream, request, started),
         ("GET", _) | ("POST", _) | ("PUT", _) | ("DELETE", _) | ("PATCH", _) => {
             respond_error(stream, 404, "not_found", "no such route")?;
             Ok(404)
@@ -772,20 +907,23 @@ fn sampler_of(request: &Json) -> SamplerConfig {
     if let Some(value) = request.get("temperature").and_then(Json::as_f64) {
         sampler.temperature = value.clamp(0.0, 2.0) as f32;
     }
-    if let Some(value) = request.get("top_p").and_then(Json::as_f64) {
-        sampler.top_p = (value.clamp(0.0, 1.0)) as f32;
+    if let Some(value) = request.get("top_p").and_then(Json::as_f64)
+        && value > 0.0
+    {
+        sampler.top_p = (value.clamp(f32::MIN_POSITIVE as f64, 1.0)) as f32;
     }
     if let Some(value) = request.get("top_k").and_then(Json::as_u32) {
         sampler.top_k = value as usize;
     }
     if let Some(value) = request.get("min_p").and_then(Json::as_f64) {
-        sampler.min_p = (value.clamp(0.0, 1.0)) as f32;
+        sampler.min_p = (value.clamp(0.0, 0.999_999)) as f32;
     }
     if let Some(value) = request.get("seed").and_then(Json::as_u32) {
         sampler.seed = u64::from(value);
     }
     if let Some(value) = request.get("repetition_penalty").and_then(Json::as_f64)
         && value > 0.0
+        && value.is_finite()
     {
         sampler.repetition_penalty = value as f32;
     }
@@ -885,6 +1023,29 @@ fn respond_error(
         _ => "Error",
     };
     respond(stream, status, reason, "application/json", &body)?;
+    Ok(status)
+}
+
+fn respond_error_retry(
+    stream: &mut TcpStream,
+    status: u16,
+    code: &str,
+    message: &str,
+    retry_after: u64,
+) -> std::io::Result<u16> {
+    let kind = "rate_limit_error";
+    let body = format!(
+        r#"{{"error":{{"message":{},"type":"{kind}","code":{}}}}}"#,
+        quote(message),
+        quote(code)
+    );
+    let head = format!(
+        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
     Ok(status)
 }
 
@@ -1142,6 +1303,28 @@ mod tests {
         .unwrap();
         let messages = messages_of(&request).expect("valid");
         assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn rate_limiter_allows_burst_then_refills() {
+        let limiter = RateLimiter::new(60);
+        let start = Instant::now();
+        for _ in 0..60 {
+            assert!(limiter.allow_at("alice", start).is_ok());
+        }
+        let retry = limiter
+            .allow_at("alice", start)
+            .expect_err("61st must be limited");
+        assert!(retry >= 1);
+        assert!(
+            limiter.allow_at("bob", start).is_ok(),
+            "other client unaffected"
+        );
+        assert!(
+            limiter
+                .allow_at("alice", start + std::time::Duration::from_secs(61))
+                .is_ok()
+        );
     }
 
     #[test]

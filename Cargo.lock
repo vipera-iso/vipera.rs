@@ -54,6 +54,7 @@ dependencies = [
 name = "vipera-sampler"
 version = "0.1.0"
 dependencies = [
+ "vipera-conformance",
  "vipera-errors",
  "vipera-traits",
 ]

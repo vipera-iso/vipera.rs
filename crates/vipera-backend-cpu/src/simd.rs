@@ -59,15 +59,15 @@
 #![allow(unsafe_code)]
 
 use std::arch::x86_64::{
-    __m128i, __m256, __m256i, _mm_add_ps, _mm_add_ss, _mm_cvtsi64_si128, _mm_cvtss_f32,
-    _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_set1_ps, _mm256_add_ps,
-    _mm256_and_si256, _mm256_castps256_ps128, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
-    _mm256_cvtph_ps, _mm256_dpbusd_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps, _mm256_or_si256,
-    _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_slli_epi16,
-    _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_sub_epi16,
-    _mm256_sub_epi32,
+    __m128i, __m256, __m256i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss, _mm_cvtsi64_si128,
+    _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch,
+    _mm_set1_ps, _mm256_add_ps, _mm256_and_si256, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
+    _mm256_cvtepu8_epi32, _mm256_cvtph_ps, _mm256_dpbusd_epi32, _mm256_extractf128_ps,
+    _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+    _mm256_mul_ps, _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8,
+    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256,
+    _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps,
+    _mm256_sub_epi16, _mm256_sub_epi32,
 };
 #[cfg(test)]
 use std::arch::x86_64::{_mm256_add_epi32, _mm256_storeu_si256};
@@ -79,6 +79,21 @@ use crate::quant::{BatchActivation, QuantizedX, f16_to_f32};
 /// Whether this CPU can run the kernels below. Cached by the standard library.
 pub fn available() -> bool {
     std::is_x86_feature_detected!("avx2")
+}
+
+/// Prefetch `data[ahead_byte ..]` into L1, hint T0.
+///
+/// Streaming rows from DRAM is bandwidth-bound; the hint found by Genesis (one PREFETCHNTA)
+/// lets the memory pipeline run ahead of the integer unpack loop. Safe: no dereference, only a
+/// cache hint on a valid offset. No-op when out of range or no AVX2.
+pub(crate) fn prefetch_ahead(data: &[u8], byte_offset: usize) {
+    if byte_offset >= data.len() || !available() {
+        return;
+    }
+    // SAFETY: byte_offset is within data; prefetch is a hint, never a fault.
+    unsafe {
+        _mm_prefetch(data.as_ptr().add(byte_offset) as *const i8, _MM_HINT_T0);
+    }
 }
 
 /// Whether the `vpdpbusd` path can run: AVX2, `avx512_vnni` with `avx512_vl` for the 256-bit form,
@@ -843,6 +858,14 @@ pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
                     d_vector,
                 )
             });
+            // Scalar-broadcast pool: one float per (entry, j), extracted once
+            // per block so the inner `j` loop does scalar broadcast instead of
+            // `permutevar8x32` (cross-lane shuffle, 3-cycle latency) per
+            // (j, entry). Extraction is a single store per entry per block.
+            let mut coeff_stack = [[0.0_f32; 8]; B];
+            for entry in 0..B {
+                _mm256_storeu_ps(coeff_stack[entry].as_mut_ptr(), coefficients[entry]);
+            }
             for entry in 0..B {
                 minimums[entry] = _mm256_fmadd_ps(
                     subtracted,
@@ -866,14 +889,8 @@ pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
                         high_bytes,
                         _mm256_loadu_si256(values.add(32) as *const __m256i),
                     );
-                    let low_coeff = _mm256_permutevar8x32_ps(
-                        coefficients[entry],
-                        _mm256_set1_epi32((2 * j) as i32),
-                    );
-                    let high_coeff = _mm256_permutevar8x32_ps(
-                        coefficients[entry],
-                        _mm256_set1_epi32((2 * j + 1) as i32),
-                    );
+                    let low_coeff = _mm256_set1_ps(coeff_stack[entry][2 * j]);
+                    let high_coeff = _mm256_set1_ps(coeff_stack[entry][2 * j + 1]);
                     let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
                     let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
                     if j.is_multiple_of(2) {
@@ -891,6 +908,67 @@ pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
                 hsum(_mm256_add_ps(weights0[entry], weights1[entry])) - hsum(minimums[entry]);
         }
         out.copy_from_slice(&totals);
+    }
+}
+
+/// One packed row against an `i8` activation, `dpbusd` over unpacked weights.
+///
+/// Prototype Pha 1b for `crate::repack::PackedTile`: the tile holds weights
+/// unpacked to `u8` 0..15 in row-major order, so each 32-value group is one
+/// `dpbusd` call with no nibble unpack in the dot. Parity target is
+/// [`crate::quant::q4k_dot`] within `1e-3 + 1e-4 * |ref|`, not bit-identical:
+/// lane grouping changes addition order.
+///
+/// # Safety
+///
+/// `tile.q` has `8 * cols` bytes, `coeff`/`min_coeff` have `8 * blocks * 8`
+/// entries, `xq`/`dx`/`sums` cover `cols`, and the CPU supports
+/// AVX2 + `avx512_vnni` with `avx512_vl` (caller checks via
+/// `vnni_available()`).
+#[cfg(test)]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl")]
+pub(crate) unsafe fn q4k_dot_packed_row_vnni(
+    tile: &crate::repack::PackedTile,
+    row: usize,
+    xq: &[i8],
+    dx: &[f32],
+    sums: &[f32],
+) -> f32 {
+    // SAFETY: caller's contract as above; all loads stay inside the slices.
+    unsafe {
+        let cols = tile.cols;
+        let blocks = tile.blocks;
+        let w_row = tile.q.as_ptr().add(row * cols);
+        let c_row = tile.coeff.as_ptr().add(row * blocks * 8);
+        let m_row = tile.min_coeff.as_ptr().add(row * blocks * 8);
+        let zero = _mm256_setzero_si256();
+        let mut weights0 = _mm256_setzero_ps();
+        let mut weights1 = _mm256_setzero_ps();
+        let mut minimum = 0.0_f32;
+        for b in 0..blocks {
+            for g in 0..8 {
+                let global = b * 8 + g;
+                let w = w_row.add(b * 256 + g * 32) as *const i8;
+                let a = xq.as_ptr().add(b * 256 + g * 32);
+                let int_sum = _mm256_dpbusd_epi32(
+                    zero,
+                    _mm256_loadu_si256(w as *const __m256i),
+                    _mm256_loadu_si256(a as *const __m256i),
+                );
+                let scale = dx[global];
+                let combined = _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(int_sum),
+                    _mm256_set1_ps(*c_row.add(global) * scale),
+                );
+                minimum += *m_row.add(global) * sums[global];
+                if g.is_multiple_of(2) {
+                    weights0 = _mm256_add_ps(weights0, combined);
+                } else {
+                    weights1 = _mm256_add_ps(weights1, combined);
+                }
+            }
+        }
+        hsum(_mm256_add_ps(weights0, weights1)) - minimum
     }
 }
 
@@ -1462,6 +1540,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn q4k_packed_row_matches_scalar_within_tolerance() {
+        if !vnni_available() {
+            eprintln!("skipped: no VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0006);
+        let cols = 512;
+        let blocks = cols / 256;
+        let rows: Vec<Vec<u8>> = (0..8).map(|_| q4k_row(&mut rng, blocks)).collect();
+        let refs: [&[u8]; 8] = std::array::from_fn(|i| rows[i].as_slice());
+        let tile = crate::repack::pack_q4k8(&refs, cols).expect("pack");
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let xq = QuantizedX::new(&x);
+        let sums = crate::quant::x_sums(&x);
+        for (row, row_bytes) in rows.iter().enumerate() {
+            // SAFETY: whole blocks, VNNI checked above.
+            let fast = unsafe { q4k_dot_packed_row_vnni(&tile, row, &xq.q, &xq.d, &sums) };
+            // SAFETY: as above; integer reference matches kernel arithmetic.
+            let slow = unsafe { q4k_dot(row_bytes, &xq.q, &xq.d, &sums) };
+            let tol = 1e-3 + 1e-4 * slow.abs();
+            assert!(
+                (fast - slow).abs() <= tol,
+                "row {row}: fast {fast}, slow {slow}"
+            );
+        }
+    }
+
     /// How the Q4_K dot spends its time on each shape this model multiplies, split into bytes moved,
     /// integer work, and per-block bookkeeping.
     ///
@@ -1561,6 +1667,77 @@ mod tests {
                 (1.0 - int_time / full_time) * 100.0,
             );
         }
+    }
+
+    /// Packed row kernel vs current VNNI kernel on the gate shape.
+    ///
+    /// Ignored by default: it is a measurement, not a check. Run it with
+    /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_packed_throughput`.
+    #[test]
+    #[ignore]
+    fn q4k_packed_throughput() {
+        if !vnni_available() {
+            eprintln!("skipped: no VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0007);
+        let rows = 8960;
+        let values = 1536;
+        let blocks = values / 256;
+        let row = q4k_row(&mut rng, blocks);
+        let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+        let refs: Vec<&[u8]> = (0..rows)
+            .map(|r| &matrix[r * blocks * 144..(r + 1) * blocks * 144])
+            .collect();
+        let mut tiles = Vec::with_capacity(rows / 8);
+        for chunk in refs.as_chunks::<8>().0 {
+            let arr = *chunk;
+            tiles.push(crate::repack::pack_q4k8(&arr, values).expect("pack"));
+        }
+        let x: Vec<f32> = (0..values).map(|_| rng.unit()).collect();
+        let xq = QuantizedX::new(&x);
+        let sums = crate::quant::x_sums(&x);
+        let gbs = |seconds: f64| (rows * blocks * 144) as f64 / 1e9 / seconds;
+        let timeit = |f: &mut dyn FnMut()| {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                f();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let t_current = timeit(&mut || {
+            let mut total = 0.0f32;
+            for r in 0..rows {
+                // SAFETY: whole blocks, VNNI checked above.
+                total += unsafe {
+                    q4k_dot(
+                        &matrix[r * blocks * 144..(r + 1) * blocks * 144],
+                        &xq.q,
+                        &xq.d,
+                        &sums,
+                    )
+                };
+            }
+            std::hint::black_box(total);
+        });
+        let t_packed = timeit(&mut || {
+            let mut total = 0.0f32;
+            for (t, tile) in tiles.iter().enumerate() {
+                for row in 0..8 {
+                    let _ = t;
+                    // SAFETY: as above; tile covers the same bytes as matrix.
+                    total += unsafe { q4k_dot_packed_row_vnni(tile, row, &xq.q, &xq.d, &sums) };
+                }
+            }
+            std::hint::black_box(total);
+        });
+        println!(
+            "current: {:.2} GB/s, packed: {:.2} GB/s (pack excluded)",
+            gbs(t_current),
+            gbs(t_packed)
+        );
     }
 
     #[test]
