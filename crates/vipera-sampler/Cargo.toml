@@ -9,5 +9,8 @@ license.workspace = true
 vipera-traits.workspace = true
 vipera-errors.workspace = true
 
+[dev-dependencies]
+vipera-conformance.workspace = true
+
 [lints]
 workspace = true

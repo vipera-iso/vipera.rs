@@ -207,10 +207,26 @@ impl GgufFile {
             }
             let mut dims = Vec::with_capacity(rank as usize);
             for _ in 0..rank {
-                dims.push(reader.u64()?);
+                let dim = reader.u64()?;
+                if dim == 0 {
+                    return Err(ViperaError::parse(
+                        info_offset,
+                        format!("tensor \"{name}\" has a zero dimension"),
+                    ));
+                }
+                dims.push(dim);
             }
             let ty = GgmlType::from_id(reader.u32()?)?;
             let offset = reader.u64()?;
+            if tensors
+                .iter()
+                .any(|existing: &TensorInfo| existing.name == name)
+            {
+                return Err(ViperaError::parse(
+                    info_offset,
+                    format!("tensor \"{name}\" appears more than once"),
+                ));
+            }
             tensors.push(TensorInfo {
                 name,
                 dims,
@@ -249,6 +265,29 @@ impl GgufFile {
                         "tensor \"{}\" ends at byte {end} but the file is {file_len} bytes",
                         tensor.name
                     ),
+                ));
+            }
+        }
+
+        let mut intervals: Vec<(u64, u64, &str)> = tensors
+            .iter()
+            .map(|tensor| {
+                let byte_len = tensor.byte_len().unwrap_or(0);
+                (
+                    tensor.offset,
+                    tensor.offset.saturating_add(byte_len),
+                    tensor.name.as_str(),
+                )
+            })
+            .collect();
+        intervals.sort_by_key(|(start, _, _)| *start);
+        for pair in intervals.windows(2) {
+            let (_, prev_end, prev_name) = pair[0];
+            let (next_start, _, next_name) = pair[1];
+            if next_start < prev_end {
+                return Err(ViperaError::parse(
+                    data_offset,
+                    format!("tensors \"{prev_name}\" and \"{next_name}\" overlap in the file"),
                 ));
             }
         }
@@ -305,7 +344,7 @@ impl GgufFile {
             .tensors
             .iter()
             .filter_map(TensorInfo::element_count)
-            .sum();
+            .fold(0u64, |acc, count| acc.saturating_add(count));
 
         ModelDescriptor {
             name: architecture,

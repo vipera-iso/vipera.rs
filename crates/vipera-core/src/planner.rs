@@ -113,7 +113,12 @@ impl ModelShape {
         let max_context = file
             .metadata
             .get(&format!("{architecture}.context_length"))
-            .and_then(Value::as_u64);
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                file.metadata
+                    .get("general.context_length")
+                    .and_then(Value::as_u64)
+            });
 
         if n_head == 0 || n_head_kv == 0 {
             return Err(ViperaError::unsupported(
@@ -197,7 +202,7 @@ pub struct PlanRequest {
     pub ctx: u64,
     /// KV cache storage type.
     pub kv_type: KvCacheType,
-    /// Batch size. Recorded; the KV estimate currently covers one sequence.
+    /// Batch size. The KV estimate covers this many sequences.
     pub batch_size: u64,
 }
 
@@ -252,7 +257,8 @@ pub fn plan_shape(
             "context length must be at least 1",
         ));
     }
-    let kv_bytes = shape.kv_bytes(request.ctx, request.kv_type)?;
+    let kv_per_sequence = shape.kv_bytes(request.ctx, request.kv_type)?;
+    let kv_bytes = kv_per_sequence.saturating_mul(request.batch_size.max(1));
     let per_layer = shape.per_layer_bytes();
 
     let mut violations = Vec::new();
@@ -300,20 +306,49 @@ pub fn plan_shape(
         });
     };
 
-    // Prefer the most layers that fit, scanning down from "everything on the device".
-    for layers in (0..=shape.n_layer).rev() {
-        let (device_bytes, host_bytes) = footprint(shape, per_layer, kv_bytes, layers);
-        let required = device_bytes + reserve(layers);
+    // Prefer the most layers that fit. Device use grows monotonically with
+    // layers while host use shrinks, so the largest device-feasible split is
+    // the optimum when it also fits the host; a linear scan over n_layer
+    // (file-controlled) would let a crafted file hang the planner, so binary
+    // search the device bound instead.
+    let device_fits = |layers: u64| {
+        let (device_bytes, _) = footprint(shape, per_layer, kv_bytes, layers);
+        device_bytes.saturating_add(reserve(layers)) <= device.memory_free_bytes
+    };
+    let mut lo = 0u64;
+    let mut hi = shape.n_layer;
+    let mut best_device_layers = 0u64;
+    loop {
+        let mid = lo + (hi.saturating_sub(lo) / 2);
+        if device_fits(mid) {
+            best_device_layers = mid;
+            if mid == u64::MAX || mid == hi {
+                break;
+            }
+            lo = mid + 1;
+        } else {
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+        }
+        if lo > hi {
+            break;
+        }
+    }
+    {
+        let (device_bytes, host_bytes) = footprint(shape, per_layer, kv_bytes, best_device_layers);
+        let required = device_bytes.saturating_add(reserve(best_device_layers));
         if required <= device.memory_free_bytes && host_bytes <= profile.ram_total_bytes {
             return Ok(PlacementPlan {
                 model_identity: model_identity.to_owned(),
                 hardware_fingerprint: profile.fingerprint(),
-                layers_on_device: layers,
+                layers_on_device: best_device_layers,
                 kv_cache_type: request.kv_type.as_str().to_owned(),
                 context_length: request.ctx,
                 batch_size: request.batch_size,
                 predicted_device_bytes: required,
-                device_reserve_bytes: reserve(layers),
+                device_reserve_bytes: reserve(best_device_layers),
                 predicted_host_bytes: host_bytes,
                 feasible: violations.is_empty(),
                 violations,
@@ -324,15 +359,8 @@ pub fn plan_shape(
     // Nothing fits. Report the closest attempt — the most layers the device alone could hold — so the
     // message names the constraint that is actually binding instead of one that only looks binding
     // when every layer is on the GPU.
-    let best_device_layers = (0..=shape.n_layer)
-        .rev()
-        .find(|layers| {
-            let (device_bytes, _) = footprint(shape, per_layer, kv_bytes, *layers);
-            device_bytes + reserve(*layers) <= device.memory_free_bytes
-        })
-        .unwrap_or(0);
     let (device_bytes, host_bytes) = footprint(shape, per_layer, kv_bytes, best_device_layers);
-    let device_required = device_bytes + reserve(best_device_layers);
+    let device_required = device_bytes.saturating_add(reserve(best_device_layers));
     if device_required > device.memory_free_bytes {
         violations.push(Violation {
             constraint: "device_memory",
@@ -453,6 +481,46 @@ mod tests {
             kv_type: KvCacheType::F16,
             batch_size: 1,
         }
+    }
+
+    #[test]
+    fn batch_size_scales_the_kv_estimate() {
+        let one = plan_shape(
+            "m",
+            &machine(48 * 1024 * 1024 * 1024, 128 * 1024 * 1024 * 1024),
+            &shape(),
+            &request(4096),
+        )
+        .unwrap();
+        let mut req = request(4096);
+        req.batch_size = 8;
+        let eight = plan_shape(
+            "m",
+            &machine(48 * 1024 * 1024 * 1024, 128 * 1024 * 1024 * 1024),
+            &shape(),
+            &req,
+        )
+        .unwrap();
+        assert!(
+            eight.predicted_host_bytes > one.predicted_host_bytes
+                || eight.predicted_device_bytes > one.predicted_device_bytes
+        );
+        assert!(eight.batch_size == 8);
+    }
+
+    #[test]
+    fn huge_layer_count_returns_quickly() {
+        let mut big = shape();
+        big.n_layer = 10_000_000;
+        big.weights_bytes = big.n_layer * 1024;
+        let start = std::time::Instant::now();
+        let plan = plan_shape("m", &machine(1024, 1024), &big, &request(4096)).unwrap();
+        assert!(!plan.feasible);
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "planner took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

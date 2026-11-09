@@ -144,7 +144,7 @@ impl GgmlType {
         if !elements.is_multiple_of(block) {
             return None;
         }
-        Some(elements / block * self.block_bytes())
+        (elements / block).checked_mul(self.block_bytes())
     }
 }
 
@@ -171,6 +171,12 @@ mod tests {
         let err = GgmlType::from_id(99).unwrap_err();
         assert!(err.to_string().contains("99"));
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn huge_elements_are_none_not_wrapped() {
+        assert_eq!(GgmlType::F32.byte_len(1 << 62), None);
+        assert_eq!(GgmlType::F32.byte_len(u64::MAX), None);
     }
 
     #[test]

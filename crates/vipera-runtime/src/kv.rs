@@ -44,6 +44,16 @@ impl KvConfig {
                 "a KV cache needs at least one block",
             ));
         }
+        if blocks > u64::from(u32::MAX) {
+            return Err(ViperaError::invalid_argument(
+                "KV cache has more blocks than the table can address",
+            ));
+        }
+        if bytes_per_token.checked_mul(tokens_per_block).is_none() {
+            return Err(ViperaError::invalid_argument(
+                "KV cache geometry overflows a 64-bit byte count",
+            ));
+        }
         let config = Self {
             bytes_per_token,
             tokens_per_block,
@@ -73,7 +83,7 @@ impl KvConfig {
 
     /// Bytes a block occupies.
     pub fn block_bytes(&self) -> u64 {
-        self.bytes_per_token * self.tokens_per_block
+        self.bytes_per_token.saturating_mul(self.tokens_per_block)
     }
 
     /// Total bytes the cache owns.
@@ -165,7 +175,7 @@ impl KvCache {
 
     /// Bytes in use.
     pub fn used_bytes(&self) -> u64 {
-        self.used_blocks() * self.config.block_bytes()
+        self.used_blocks().saturating_mul(self.config.block_bytes())
     }
 
     /// Make sure `sequence` has blocks covering `tokens`, allocating the difference.
@@ -175,6 +185,18 @@ impl KvCache {
             return Err(ViperaError::infeasible(format!(
                 "{tokens} tokens need {needed} KV blocks but the cache has {}; shorten the context",
                 self.config.blocks
+            )));
+        }
+        let current = self
+            .tables
+            .get(&sequence)
+            .map_or(0, |table| table.len() as u64);
+        let deficit = needed.saturating_sub(current);
+        if (self.free.len() as u64) < deficit {
+            return Err(ViperaError::infeasible(format!(
+                "KV cache is full: {} blocks in use, {} needed for sequence {sequence}",
+                self.used_blocks(),
+                needed
             )));
         }
         let table = self.tables.entry(sequence).or_default();
@@ -303,6 +325,31 @@ mod tests {
         let config = KvConfig::from_bytes(1000, 10, 16).unwrap();
         assert_eq!(config.blocks, 6);
         assert!(config.total_bytes().unwrap() <= 1000);
+    }
+
+    #[test]
+    fn a_failed_reserve_leaves_no_partial_allocation() {
+        let mut cache = cache(2);
+        cache.reserve(1, 4).unwrap();
+        assert_eq!(cache.free_blocks(), 1);
+        let err = cache.reserve(2, 8).unwrap_err();
+        assert!(err.to_string().contains("full"));
+        assert_eq!(
+            cache.free_blocks(),
+            1,
+            "failed reserve must not drain the free list"
+        );
+        assert_eq!(
+            cache.table(2),
+            None,
+            "failed reserve must not leave a partial table"
+        );
+    }
+
+    #[test]
+    fn huge_geometry_is_rejected_not_wrapped() {
+        assert!(KvConfig::new(1 << 40, 1 << 40, 1).is_err());
+        assert!(KvConfig::new(2, 16, u32::MAX as u64 + 1).is_err());
     }
 
     #[test]

@@ -104,6 +104,9 @@ impl Strategy for Greedy {
                 continue;
             }
             let value = request.penalty.apply(id, *logit);
+            if !value.is_finite() {
+                continue;
+            }
             let better = match best {
                 None => true,
                 Some((best_id, best_value)) => {
@@ -157,7 +160,10 @@ impl Strategy for Temperature {
         let mut total = 0.0_f32;
         for (id, logit) in logits.iter().enumerate() {
             if logit.is_finite() {
-                total += (penalty.apply(id, *logit) * scale - peak).exp();
+                let penalized = penalty.apply(id, *logit);
+                if penalized.is_finite() {
+                    total += (penalized * scale - peak).exp();
+                }
             }
         }
         // `NaN` compares false against everything, so it is caught by the finiteness check.
@@ -361,8 +367,13 @@ fn top_candidates(logits: &[f32], penalty: &dyn LogitPenalty, top_k: usize) -> V
         let mut all: Vec<(u32, f32)> = logits
             .iter()
             .enumerate()
-            .filter(|(_, logit)| logit.is_finite())
-            .map(|(id, logit)| (id as u32, penalty.apply(id, *logit)))
+            .filter_map(|(id, logit)| {
+                if !logit.is_finite() {
+                    return None;
+                }
+                let value = penalty.apply(id, *logit);
+                value.is_finite().then_some((id as u32, value))
+            })
             .collect();
         all.sort_unstable_by(by_probability);
         return all;
@@ -373,8 +384,12 @@ fn top_candidates(logits: &[f32], penalty: &dyn LogitPenalty, top_k: usize) -> V
         if !logit.is_finite() {
             continue;
         }
+        let value = penalty.apply(id, *logit);
+        if !value.is_finite() {
+            continue;
+        }
         let ranked = Ranked {
-            value: penalty.apply(id, *logit),
+            value,
             id: id as u32,
         };
         if heap.len() < top_k {
@@ -588,6 +603,17 @@ mod tests {
         for _ in 0..200 {
             assert_eq!(s.sample(&[5.0, 4.9, -5.0], &[]).unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn non_finite_penalized_logits_are_skipped() {
+        // -5 * 1e38 overflows to -inf after penalization; it must be skipped,
+        // not treated as a finite (very negative) candidate that still wins
+        // or poisons the softmax.
+        let mut s = sampler(0.0, 0, 1.0, 0.0, 1e38);
+        assert_eq!(s.sample(&[-5.0, 1.0], &[0]).unwrap(), 1);
+        let mut t = sampler(1.0, 0, 1.0, 0.0, 1e38);
+        assert_eq!(t.sample(&[-5.0, 1.0], &[0]).unwrap(), 1);
     }
 
     #[test]

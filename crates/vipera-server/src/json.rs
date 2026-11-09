@@ -38,6 +38,7 @@ impl Json {
     /// Parse one JSON document. Trailing non-whitespace is an error.
     pub fn parse(text: &str) -> Result<Json, String> {
         let mut parser = Parser {
+            text,
             bytes: text.as_bytes(),
             at: 0,
         };
@@ -129,6 +130,7 @@ pub fn quote(value: &str) -> String {
 }
 
 struct Parser<'a> {
+    text: &'a str,
     bytes: &'a [u8],
     at: usize,
 }
@@ -273,11 +275,16 @@ impl Parser<'_> {
                 byte if byte < 0x20 => {
                     return Err(format!("raw control byte {} in string", byte));
                 }
+                byte if byte < 0x80 => {
+                    out.push(char::from(byte));
+                    self.at += 1;
+                }
                 _ => {
-                    // Copy one whole UTF-8 scalar, not one byte.
-                    let rest = std::str::from_utf8(&self.bytes[self.at..])
-                        .map_err(|_| format!("invalid UTF-8 at byte {}", self.at))?;
-                    let ch = rest
+                    // Copy one whole UTF-8 scalar. The input is already a
+                    // &str, so this slice is on a char boundary and costs O(1)
+                    // (the previous from_utf8 validated the whole remainder
+                    // per character — O(n^2) on large bodies).
+                    let ch = self.text[self.at..]
                         .chars()
                         .next()
                         .ok_or_else(|| "unterminated string".to_owned())?;
@@ -375,6 +382,20 @@ mod tests {
     fn reads_escapes_and_surrogate_pairs() {
         let value = Json::parse(r#""a\"b\\c\nd\u00e9\ud83d\ude00""#).expect("valid");
         assert_eq!(value.as_str(), Some("a\"b\\c\ndé😀"));
+    }
+
+    #[test]
+    fn a_large_string_parses_without_quadratic_revalidation() {
+        let big = "a".repeat(200_000) + "é😀" + &"b".repeat(20_000);
+        let body = format!("\"{big}\"");
+        let start = std::time::Instant::now();
+        let parsed = Json::parse(&body).expect("valid");
+        assert_eq!(parsed.as_str(), Some(big.as_str()));
+        assert!(
+            start.elapsed().as_secs() < 5,
+            "parse took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
