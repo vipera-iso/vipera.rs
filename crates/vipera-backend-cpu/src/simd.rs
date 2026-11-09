@@ -560,6 +560,8 @@ pub unsafe fn q4k_dot(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
                 _mm256_loadu_ps(sums.as_ptr().add(b * 8)),
                 minimums,
             );
+            let mut coeff_stack = [0.0f32; 8];
+            _mm256_storeu_ps(coeff_stack.as_mut_ptr(), coefficients);
             for j in 0..4 {
                 let q = block.add(16 + j * 32);
                 let packed = _mm256_loadu_si256(q as *const __m256i);
@@ -577,10 +579,8 @@ pub unsafe fn q4k_dot(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
                     ),
                     ones,
                 );
-                let low_coeff =
-                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j) as i32));
-                let high_coeff =
-                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j + 1) as i32));
+                let low_coeff = _mm256_set1_ps(coeff_stack[2 * j]);
+                let high_coeff = _mm256_set1_ps(coeff_stack[2 * j + 1]);
                 let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
                 let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
                 if j.is_multiple_of(2) {

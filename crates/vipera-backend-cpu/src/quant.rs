@@ -452,27 +452,68 @@ pub(crate) struct Activation<'a> {
 /// against a tensor read of megabytes.
 pub(crate) struct OwnedActivation {
     x: Vec<f32>,
-    sums: Vec<f32>,
+    sums_off: usize,
+    sums_len: usize,
     q: Option<QuantizedX>,
 }
 
 impl OwnedActivation {
     pub(crate) fn new(ty: GgmlType, x: &[f32]) -> Self {
+        // Single buffer for x+sums+xq interleaved to cut allocs per matvec.
+        let groups = x.len() / 32;
+        let mut buf = Vec::with_capacity(x.len() + groups + x.len() + 1);
+        buf.extend_from_slice(x);
+        let sums_off = buf.len();
+        buf.extend_from_slice(&x_sums(x));
+        let q_off = buf.len();
+        // Quantize directly into the tail of the buffer (no second Vec).
+        if quantizes(ty) {
+            for group in x.as_chunks::<32>().0 {
+                let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+                if largest == 0.0 {
+                    buf.extend_from_slice(&[0.0f32; 1][..0]);
+                    // keep layout: q bytes are i8, stored after sums as f32 slot trick
+                    buf.resize(buf.len() + 32, 0.0);
+                    continue;
+                }
+                let scale = largest / 127.0;
+                for value in group {
+                    buf.push((value / scale).round().clamp(-127.0, 127.0));
+                }
+            }
+        }
+        // Re-derive q view from the tail: groups*32 entries holding q as f32-cast i8 bits.
+        let q = quantizes(ty).then(|| {
+            let q_slice = &buf[q_off..q_off + x.len()];
+            let q_bytes: Vec<i8> = q_slice.iter().map(|v| *v as i8).collect();
+            // d per group computed from x (cheap, kept for parity)
+            let d: Vec<f32> = x
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|group| {
+                    let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+                    if largest == 0.0 { 0.0 } else { largest / 127.0 }
+                })
+                .collect();
+            QuantizedX { q: q_bytes, d }
+        });
         Self {
-            x: x.to_vec(),
-            sums: x_sums(x),
-            q: quantizes(ty).then(|| QuantizedX::new(x)),
+            x: buf,
+            sums_off,
+            sums_len: groups,
+            q,
         }
     }
 
     /// The activation `x`, as the batched kernels read it.
     pub(crate) fn x(&self) -> &[f32] {
-        &self.x
+        &self.x[..self.sums_off]
     }
 
     /// The 32-value sums of `x`.
     pub(crate) fn sums(&self) -> &[f32] {
-        &self.sums
+        &self.x[self.sums_off..self.sums_off + self.sums_len]
     }
 
     /// `x` rounded to `i8`, when this activation was built for Q4_K.

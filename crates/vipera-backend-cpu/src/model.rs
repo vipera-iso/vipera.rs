@@ -574,9 +574,7 @@ impl CpuBackend {
                     rms_norm(x, &layer.ffn_norm, config.rms_eps, h);
                     layer.wg.matvec(&pool, file, h, gate)?;
                     layer.wu.matvec(&pool, file, h, up)?;
-                    for (value, gate) in up.iter_mut().zip(gate.iter()) {
-                        *value *= silu(*gate);
-                    }
+                    silu_mul(up, gate);
                     layer.wd.matvec(&pool, file, up, h)?;
                     add_assign(x, h);
                 }
@@ -986,9 +984,7 @@ impl CpuBackend {
                 layer
                     .wu
                     .matvec_batch::<B>(&pool, file, &activations, &mut batch.up[..B * ffn])?;
-                for (value, gate) in batch.up[..B * ffn].iter_mut().zip(&batch.gate[..B * ffn]) {
-                    *value *= silu(*gate);
-                }
+                silu_mul(&mut batch.up[..B * ffn], &batch.gate[..B * ffn]);
                 layer.wd.matvec_batch::<B>(
                     &pool,
                     file,
@@ -1275,6 +1271,10 @@ fn attention(
     // accumulation is eight lanes either way, because it changes no rounding.
     let sequential = quant::exact_dot_requested();
     scores.resize(positions, 0.0);
+    // Fused softmax+normalize into one pass over the window after scoring:
+    // exp and divide in the same loop eliminates one full O(positions) pass.
+    // Total must be accumulated in the same (increasing position) order as
+    // before so rounding is unchanged.
     for head in 0..shape.heads {
         let kv_head = head / group;
         let query = &q[head * head_dim..(head + 1) * head_dim];
@@ -1291,11 +1291,9 @@ fn attention(
             best = best.max(*score);
         }
         let window = &mut scores[..positions];
+        let mut total = 0.0_f32;
         for score in window.iter_mut() {
             *score = (*score - best).exp();
-        }
-        let mut total = 0.0_f32;
-        for score in window.iter() {
             total += *score;
         }
         let inverse = 1.0 / total;
@@ -1311,12 +1309,35 @@ fn attention(
 /// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
 fn rope(vector: &mut [f32], position: usize, heads: usize, head_dim: usize, base: f32) {
     let half = head_dim / 2;
+    // Precompute inv_freq once per call on the stack (head-independent).
+    let mut inv_freq = [0.0f32; 64];
+    if half <= 64 {
+        for (index, slot) in inv_freq.iter_mut().enumerate().take(half) {
+            let exponent = 2.0 * index as f32 / head_dim as f32;
+            *slot = 1.0 / base.powf(exponent);
+        }
+    }
+    // Compute sin/cos once per frequency (shared across heads) instead
+    // of per (head, pair): heads*half sincos -> half sincos.
+    let (positions_n, _heads) = (position, heads);
+    let mut sincos = [(0.0f32, 0.0f32); 64];
+    if half <= 64 {
+        for (index, slot) in sincos.iter_mut().enumerate().take(half) {
+            let exponent = 2.0 * index as f32 / head_dim as f32;
+            let inv = 1.0 / base.powf(exponent);
+            *slot = (positions_n as f32 * inv).sin_cos();
+        }
+    }
     for head in 0..heads {
         let head = &mut vector[head * head_dim..(head + 1) * head_dim];
         for index in 0..half {
-            let exponent = 2.0 * index as f32 / head_dim as f32;
-            let angle = position as f32 / base.powf(exponent);
-            let (sin, cos) = angle.sin_cos();
+            let (sin, cos) = if half <= 64 {
+                sincos[index]
+            } else {
+                let exponent = 2.0 * index as f32 / head_dim as f32;
+                let inv = 1.0 / base.powf(exponent);
+                (positions_n as f32 * inv).sin_cos()
+            };
             let first = head[index];
             let second = head[index + half];
             head[index] = first * cos - second * sin;
@@ -1337,6 +1358,13 @@ fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
 }
 
+fn silu_mul(up: &mut [f32], gate: &[f32]) {
+    for (out, gate) in up.iter_mut().zip(gate) {
+        *out *= silu(*gate);
+    }
+}
+
+#[inline]
 fn add_assign(target: &mut [f32], addition: &[f32]) {
     for (target, addition) in target.iter_mut().zip(addition) {
         *target += addition;
