@@ -826,12 +826,10 @@ pub(crate) fn fill_rows(
     }
 }
 
-/// Fill rows four at a time, returning how many rows were written.
+/// Fill `B * rows` results, reading each row once for all `B` activations.
 ///
-/// Four rows share one activation read and keep four weight streams in flight, which is what lifts a
-/// single thread from about 9 GB/s to about 16 GB/s on an i5-11300H. Each row still accumulates in
-/// its own order, so the values are bit-identical to the single-row path; formats or CPUs without a
-/// four-row kernel simply get `0` and the caller fills every row one at a time.
+/// Rows are filled one at a time: two rows in flight was measured at 0% on this machine, because the
+/// loop is bound by instruction throughput rather than by load latency at every thread count.
 pub(crate) fn fill_rows_batch<const B: usize>(
     ty: GgmlType,
     data: &[u8],

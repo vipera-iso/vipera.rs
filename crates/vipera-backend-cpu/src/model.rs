@@ -340,6 +340,9 @@ pub struct CpuBackend {
     v_all: Vec<f32>,
     logits: Vec<f32>,
     batch: BatchScratch,
+    /// Set while a prompt chunk runs through the batch path, so the profile can tell a chunk from a
+    /// decode step. Only meaningful when the phase timers are on.
+    chunk_pass: bool,
 }
 
 impl CpuBackend {
@@ -435,6 +438,7 @@ impl CpuBackend {
             k_all: Vec::new(),
             v_all: Vec::new(),
             logits: vec![0.0; config.vocab],
+            chunk_pass: false,
             batch: BatchScratch::new(config),
         })
     }
@@ -446,7 +450,7 @@ impl CpuBackend {
 
     /// Run the transformer over `context.new_tokens`, returning the logits of the last one.
     fn run(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
-        let pass = crate::profile::stamp();
+        let pass = crate::profile::begin(false);
         let config = self.config;
         // A prompt chunk is a group of positions that share every weight read, which is exactly what
         // the batch path already does: one entry per position, each with a single new token, ordered
@@ -455,6 +459,7 @@ impl CpuBackend {
         if context.new_tokens.len() > 1 {
             // The batch path records the pass itself, so this one does not.
             let _ = pass;
+            self.chunk_pass = true;
             return self.run_positions(context);
         }
         if context.new_tokens.is_empty() {
@@ -669,7 +674,7 @@ impl CpuBackend {
         kv: &mut [u8],
         contexts: &mut [BatchEntry<'_>; B],
     ) -> Result<Vec<Vec<f32>>, ViperaError> {
-        let pass = crate::profile::stamp();
+        let pass = crate::profile::begin(std::mem::take(&mut self.chunk_pass));
         let config = self.config;
         let mut positions = [0_usize; B];
         let mut tokens = [0_u32; B];
