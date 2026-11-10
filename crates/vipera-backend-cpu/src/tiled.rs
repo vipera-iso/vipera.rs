@@ -33,6 +33,13 @@ pub(crate) fn tiled_serves<const B: usize>() -> bool {
     tiled_enabled() && B >= 8
 }
 
+/// Tile row height: larger than the microtile 16 so a K-tile walk reuses
+/// one unpacked tile across many output rows without holding a 256-row
+/// accumulator in registers. 64 fits comfortably in L1 for the weight
+/// tile (64*256*4 = 64 KiB) while giving the weight traffic 4× reuse
+/// over the 16-row version.
+pub(crate) const TILED_ROWS: usize = 64;
+
 fn read_f16(bytes: &[u8], at: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
 }
@@ -263,16 +270,21 @@ pub(crate) fn matvec_tiled_batch<const B: usize>(
     for value in out.iter_mut() {
         *value = 0.0;
     }
-    let mut w_tile = [[0.0_f32; 256]; 16];
-    let mut x_tile = [[0.0_f32; 256]; 16];
-    let mut acc = [[0.0_f32; 16]; 16];
+    // Larger row tile: 64 rows × 256 cols per K-tile walk. w_tile is heap
+    // backed to keep the stack frame small; acc stays register-sized in
+    // chunks of 16-column microtiles processed sequentially.
+    let mut w_tile = vec![[0.0_f32; 256]; TILED_ROWS];
+    let mut x_tile = vec![[0.0_f32; 256]; 16];
+    // Accumulator for 16-column microtiles; outer loop chunks the 64-row
+    // tile into 16-row sub-tiles so the register accumulator stays 16 wide.
+    let mut acc = [[0.0_f32; TILED_ROWS]; 16];
     let n_entries = B.min(16);
     let mut row0 = 0;
     let block_bytes = stride / (cols / 256);
     while row0 < rows {
-        let row_cnt = (rows - row0).min(16);
+        let row_cnt = (rows - row0).min(TILED_ROWS);
         for entry in 0..n_entries {
-            acc[entry][..row_cnt].fill(0.0);
+            acc[entry].fill(0.0);
         }
         let mut k0 = 0;
         while k0 < cols {
@@ -289,22 +301,35 @@ pub(crate) fn matvec_tiled_batch<const B: usize>(
             for entry in 0..n_entries {
                 x_tile[entry][..256].copy_from_slice(&activations[entry][k0..k0 + 256]);
             }
-            // 16x16 micro-tile accumulate: safe indexing lets LLVM
-            // auto-vectorize the 16-wide inner loop (was `.iter().zip().sum()`
-            // closure, which forced scalar + opaque call per partial).
-            let mut k1 = 0;
-            while k1 < 256 {
-                let k1_lim = (k1 + 16).min(256);
-                for slot in 0..row_cnt {
-                    for entry in 0..n_entries {
-                        let mut partial = 0.0_f32;
-                        for k in k1..k1_lim {
-                            partial += w_tile[slot][k] * x_tile[entry][k];
+            // 16-column microtiles, applied to 16-row sub-chunks to keep
+            // the accumulator register-resident while the tile is 64 rows.
+            let mut sub0 = 0;
+            let mut sub_acc = [[0.0_f32; 16]; 16];
+            while sub0 < row_cnt {
+                let sub_cnt = (row_cnt - sub0).min(16);
+                for entry in 0..n_entries {
+                    sub_acc[entry][..sub_cnt].fill(0.0);
+                }
+                let mut k1 = 0;
+                while k1 < 256 {
+                    let k1_lim = (k1 + 16).min(256);
+                    for slot in 0..sub_cnt {
+                        for entry in 0..n_entries {
+                            let mut partial = 0.0_f32;
+                            for k in k1..k1_lim {
+                                partial += w_tile[sub0 + slot][k] * x_tile[entry][k];
+                            }
+                            sub_acc[entry][slot] += partial;
                         }
-                        acc[entry][slot] += partial;
+                    }
+                    k1 = k1_lim;
+                }
+                for slot in 0..sub_cnt {
+                    for entry in 0..n_entries {
+                        acc[entry][slot] += sub_acc[entry][slot];
                     }
                 }
-                k1 = k1_lim;
+                sub0 += sub_cnt;
             }
             k0 += 256;
         }

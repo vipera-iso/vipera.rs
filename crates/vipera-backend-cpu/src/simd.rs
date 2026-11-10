@@ -58,19 +58,23 @@
 //! safe entry point that checks the CPU.
 #![allow(unsafe_code)]
 
-use std::arch::x86_64::{
-    __m128i, __m256, __m256i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss, _mm_cvtsi64_si128,
-    _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch,
-    _mm_set1_ps, _mm256_add_ps, _mm256_and_si256, _mm256_castps256_ps128, _mm256_cvtepi32_ps,
-    _mm256_cvtepu8_epi32, _mm256_cvtph_ps, _mm256_dpbusd_epi32, _mm256_extractf128_ps,
-    _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
-    _mm256_mul_ps, _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8,
-    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256,
-    _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps,
-    _mm256_sub_epi16, _mm256_sub_epi32,
-};
 #[cfg(test)]
-use std::arch::x86_64::{_mm256_add_epi32, _mm256_storeu_si256};
+use std::arch::x86_64::_mm256_add_epi32;
+use std::arch::x86_64::{
+    __m128i, __m256, __m256i, __m512, __m512i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss,
+    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps,
+    _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm256_add_ps, _mm256_and_si256,
+    _mm256_castps256_ps128, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32, _mm256_cvtph_ps,
+    _mm256_dpbusd_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps, _mm256_or_si256,
+    _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8, _mm256_set1_epi16,
+    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_slli_epi16,
+    _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_storeu_si256,
+    _mm256_sub_epi16, _mm256_sub_epi32, _mm512_add_ps, _mm512_cvtepi32_ps, _mm512_dpbusd_epi32,
+    _mm512_loadu_ps, _mm512_loadu_si512, _mm512_mul_ps, _mm512_mullo_epi32, _mm512_set1_epi32,
+    _mm512_set1_ps, _mm512_setzero_ps, _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_epi32,
+    _mm512_sub_ps,
+};
 
 use vipera_core::gguf::GgmlType;
 
@@ -911,6 +915,438 @@ pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
     }
 }
 
+/// Whether the AVX-512 VNNI tiled kernel can run: 512-bit forms plus
+/// `avx512_vnni`, and no `VIPERA_NO_VNNI`.
+pub fn vnni512_available() -> bool {
+    static VNNI512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VNNI512.get_or_init(|| {
+        if !std::is_x86_feature_detected!("avx512f")
+            || !std::is_x86_feature_detected!("avx512bw")
+            || !std::is_x86_feature_detected!("avx512vnni")
+        {
+            return false;
+        }
+        !std::env::var("VIPERA_NO_VNNI").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
+/// Safe entry point for [`q4k_matvec_tiled_range`]: checks the CPU and the
+/// activation lengths itself, so callers outside this module can use it
+/// without `unsafe`.
+pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+) -> bool {
+    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(144) || B == 0 || B > 32 {
+        return false;
+    }
+    let blocks = stride / 144;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || xs.iter().any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+        || sums.iter().any(|s| s.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: vnni512_available checked the CPU and the lengths above match
+    // the kernel's contract.
+    unsafe { q4k_matvec_tiled_range(data, stride, first_row, count, xs, sums, out) };
+    true
+}
+
+/// Tiled Q4_K matvec range: `count` rows from `first_row`, `B` quantized
+/// activations, token-major `out` holding `B * count` values.
+///
+/// A 256-column slab is unpacked once for a 32-row window: the 32 rows share
+/// one activation tile, and inside it an 8-row x 16-column ZMM `dpbusd`
+/// microtile loads each activation group once for 8 weight rows. That is the
+/// reuse the row-by-row batch kernel cannot get: with 8960 rows and 16
+/// activations, the row kernel re-reads the activation tile once per row.
+///
+/// Math mirrors [`q4k_dot`]: per sub-block `s`, the integer sum is the `u8`
+/// codes 0..15 against the `i8` activation codes, times `d * scale[s] * dx[s]`,
+/// minus `dmin * min[s]` times the exact per-sub-block activation sum
+/// (`sums[e]`, the sum of the original `f32` values). Summation order across
+/// sub-blocks differs from the row kernel, so results agree within
+/// `1e-3 + 1e-4 * |ref|`, not bit-for-bit.
+///
+/// # Safety
+///
+/// `data` must hold the rows with the given `stride` (a whole number of
+/// 144-byte Q4_K blocks per row), every `xs[e].q` must cover the row width,
+/// every `xs[e].d` and `sums[e]` one entry per 32-value group, and the CPU
+/// must support AVX-512F/BW/VNNI (the caller checks via
+/// [`vnni512_available`]).
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+) {
+    // SAFETY: the module contract above; every load below stays inside the
+    // rows, blocks, and activation slices the caller validated.
+    unsafe {
+        const ROW_WIN: usize = 32;
+        const BAND: usize = 8;
+        const COLS: usize = 16;
+        // A tile is 16 activations wide, the width one 512-bit `dpbusd`
+        // consumes. A batch of 17..=32 runs two tile halves against the same
+        // unpacked weight window, so the unpack and the weight loads are paid
+        // once for 32 activations instead of twice.
+        let halves = B.div_ceil(COLS);
+        let stride_cols = halves * COLS;
+        let blocks = stride / 144;
+        let mut wq = vec![0_u8; ROW_WIN * 256];
+        let mut scales = vec![[0_i32; 8]; ROW_WIN];
+        let mut mins = vec![[0_i32; 8]; ROW_WIN];
+        let mut dvec = [0.0_f32; ROW_WIN];
+        let mut dminvec = [0.0_f32; ROW_WIN];
+        // Activation tile in (half, group, entry, 4) order: one 64-byte ZMM
+        // load holds 4 codes for each of the 16 columns of that half.
+        let mut act = vec![0_i8; halves * 64 * COLS * 4];
+        // Full-range accumulator, [row][entry]; the slab loop walks the
+        // whole row range per 256-column slab so the activation tile is
+        // built once and reused across every window of the slab.
+        let mut buf = vec![0.0_f32; count.saturating_mul(stride_cols)];
+        let low_mask = _mm256_set1_epi8(0x0f);
+        for b in 0..blocks {
+            act.fill(0);
+            let mut dxs = [[[0.0_f32; COLS]; 8]; 2];
+            let mut sumt = [[[0.0_f32; COLS]; 8]; 2];
+            for entry in 0..B {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                let chunk = xs[entry].q.as_ptr().add(b * 256);
+                for grp in 0..64 {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.add(grp * 4),
+                        act.as_mut_ptr()
+                            .add(half * 64 * COLS * 4 + grp * 64 + col * 4),
+                        4,
+                    );
+                }
+                for sub in 0..8 {
+                    dxs[half][sub][col] = xs[entry].d[b * 8 + sub];
+                    sumt[half][sub][col] = sums[entry][b * 8 + sub];
+                }
+            }
+            let act_ptr = act.as_ptr();
+            let mut win = 0;
+            while win < count {
+                let cnt = (count - win).min(ROW_WIN);
+                // Pull the next window's block in while this one unpacks.
+                // The walk takes 144 bytes out of every row, so consecutive
+                // addresses are a stride apart and the hardware prefetcher
+                // only sees part of the stream; an explicit hint covers the
+                // rows this window is too short to reach.
+                let next = win + ROW_WIN;
+                if next < count {
+                    for r in 0..(count - next).min(ROW_WIN) {
+                        let at = (first_row + next + r) * stride + b * 144;
+                        prefetch_ahead(data, at);
+                        prefetch_ahead(data, at + 64);
+                        prefetch_ahead(data, at + 128);
+                    }
+                }
+                wq.fill(0);
+                for slot in scales.iter_mut() {
+                    *slot = [0; 8];
+                }
+                for slot in mins.iter_mut() {
+                    *slot = [0; 8];
+                }
+                dvec.fill(0.0);
+                dminvec.fill(0.0);
+                for r in 0..cnt {
+                    let block = data.as_ptr().add((first_row + win + r) * stride + b * 144);
+                    dvec[r] = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+                    dminvec[r] = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+                    let scale_bytes = std::slice::from_raw_parts(block.add(4), 12);
+                    for s in 0..8 {
+                        let (scale, min) = crate::quant::q4k_scale_min(scale_bytes, s);
+                        scales[r][s] = i32::from(scale);
+                        mins[r][s] = i32::from(min);
+                    }
+                    let wrow = wq.as_mut_ptr().add(r * 256);
+                    for j in 0..4 {
+                        let packed = _mm256_loadu_si256(block.add(16 + j * 32) as *const __m256i);
+                        let low = _mm256_and_si256(packed, low_mask);
+                        let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                        _mm256_storeu_si256(wrow.add(j * 64) as *mut __m256i, low);
+                        _mm256_storeu_si256(wrow.add(j * 64 + 32) as *mut __m256i, high);
+                    }
+                }
+                let wq_ptr = wq.as_ptr();
+                for half in 0..halves {
+                    let half_act = act_ptr.add(half * 64 * COLS * 4);
+                    let mut band = 0;
+                    while band < cnt {
+                        let band_cnt = (cnt - band).min(BAND);
+                        let mut facc: [__m512; BAND] = [_mm512_setzero_ps(); BAND];
+                        for s in 0..8 {
+                            let mut acc: [__m512i; BAND] = [_mm512_setzero_si512(); BAND];
+                            for g in 0..8 {
+                                let grp = s * 8 + g;
+                                let codes =
+                                    _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
+                                for (t, slot) in acc.iter_mut().enumerate().take(band_cnt) {
+                                    let word = u32::from_le(std::ptr::read_unaligned(
+                                        wq_ptr.add((band + t) * 256 + grp * 4) as *const u32,
+                                    ));
+                                    *slot = _mm512_dpbusd_epi32(
+                                        *slot,
+                                        _mm512_set1_epi32(word as i32),
+                                        codes,
+                                    );
+                                }
+                            }
+                            let dxv = _mm512_loadu_ps(dxs[half][s].as_ptr());
+                            let sumv = _mm512_loadu_ps(sumt[half][s].as_ptr());
+                            for (t, (acc_slot, facc_slot)) in
+                                acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
+                            {
+                                let row = band + t;
+                                let raw = _mm512_mullo_epi32(
+                                    *acc_slot,
+                                    _mm512_set1_epi32(scales[row][s]),
+                                );
+                                let main = _mm512_mul_ps(
+                                    _mm512_mul_ps(_mm512_cvtepi32_ps(raw), dxv),
+                                    _mm512_set1_ps(dvec[row]),
+                                );
+                                let minterm = _mm512_mul_ps(
+                                    sumv,
+                                    _mm512_set1_ps(dminvec[row] * mins[row][s] as f32),
+                                );
+                                *facc_slot =
+                                    _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
+                            }
+                        }
+                        for (t, value) in facc.iter().enumerate().take(band_cnt) {
+                            let slot = buf
+                                .as_mut_ptr()
+                                .add((win + band + t) * stride_cols + half * COLS);
+                            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
+                        }
+                        band += band_cnt;
+                    }
+                }
+                win += cnt;
+            }
+        }
+        for r in 0..count {
+            for entry in 0..B {
+                out[entry * count + r] = buf[r * stride_cols + entry];
+            }
+        }
+    }
+}
+
+/// Safe entry point for [`q6k_matvec_tiled_range`], as
+/// [`try_q4k_matvec_tiled_range`] is for Q4_K.
+pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+) -> bool {
+    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(210) || B == 0 || B > 32 {
+        return false;
+    }
+    let blocks = stride / 210;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || xs.iter().any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: vnni512_available checked the CPU and the lengths above match
+    // the kernel's contract.
+    unsafe { q6k_matvec_tiled_range(data, stride, first_row, count, xs, out) };
+    true
+}
+
+/// Tiled Q6_K matvec range, the Q6_K twin of [`q4k_matvec_tiled_range`]:
+/// `row = d * sum over 16-value groups of scale * (sum of (wq - 32) * xq)`,
+/// with the weights biased by +32 so the unsigned side of `dpbusd` can read
+/// them directly and the bias corrected per group as `raw - 32 * bsum`.
+///
+/// # Safety
+///
+/// `data` must hold the rows with the given `stride` (a whole number of
+/// 210-byte Q6_K blocks per row), every `xs[e].q` must cover the row width,
+/// every `xs[e].d` one entry per 32-value group, and the CPU must support
+/// AVX-512F/BW/VNNI (the caller checks via [`vnni512_available`]).
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+) {
+    // SAFETY: the module contract above; every load below stays inside the
+    // rows, blocks, and activation slices the caller validated.
+    unsafe {
+        const ROW_WIN: usize = 32;
+        const BAND: usize = 8;
+        const COLS: usize = 16;
+        let halves = B.div_ceil(COLS);
+        let stride_cols = halves * COLS;
+        let blocks = stride / 210;
+        let mut wq = vec![0_u8; ROW_WIN * 256];
+        let mut scales = vec![[0_i32; 16]; ROW_WIN];
+        let mut dvec = [0.0_f32; ROW_WIN];
+        // Activation tile in (half, group, entry, 4) order, as in the Q4_K kernel.
+        let mut act = vec![0_i8; halves * 64 * COLS * 4];
+        let mut buf = vec![0.0_f32; count.saturating_mul(stride_cols)];
+        for b in 0..blocks {
+            act.fill(0);
+            let mut bsumt = [[[0_i32; COLS]; 16]; 2];
+            let mut dxs = [[[0.0_f32; COLS]; 16]; 2];
+            for (entry, x) in xs.iter().enumerate() {
+                let col_half = entry / COLS;
+                let col = entry % COLS;
+                let chunk = x.q.as_ptr().add(b * 256);
+                for grp in 0..64 {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.add(grp * 4),
+                        act.as_mut_ptr()
+                            .add(col_half * 64 * COLS * 4 + grp * 64 + col * 4),
+                        4,
+                    );
+                }
+                for k in 0..16 {
+                    let mut sum = 0_i32;
+                    for i in 0..16 {
+                        sum += i32::from(*chunk.add(k * 16 + i));
+                    }
+                    bsumt[col_half][k][col] = sum;
+                    dxs[col_half][k][col] = x.d[b * 8 + k / 2];
+                }
+            }
+            let act_ptr = act.as_ptr();
+            let mut win = 0;
+            while win < count {
+                let cnt = (count - win).min(ROW_WIN);
+                // Pull the next window's block in while this one unpacks:
+                // the walk takes 210 bytes out of every row, so consecutive
+                // addresses are a stride apart and the hardware prefetcher
+                // only sees part of the stream.
+                let next = win + ROW_WIN;
+                if next < count {
+                    for r in 0..(count - next).min(ROW_WIN) {
+                        let at = (first_row + next + r) * stride + b * 210;
+                        prefetch_ahead(data, at);
+                        prefetch_ahead(data, at + 64);
+                        prefetch_ahead(data, at + 128);
+                        prefetch_ahead(data, at + 192);
+                    }
+                }
+                wq.fill(0);
+                for slot in scales.iter_mut() {
+                    *slot = [0; 16];
+                }
+                dvec.fill(0.0);
+                for r in 0..cnt {
+                    let block = data.as_ptr().add((first_row + win + r) * stride + b * 210);
+                    dvec[r] = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+                    let scale_bytes = std::slice::from_raw_parts(block.add(192), 16);
+                    for k in 0..16 {
+                        scales[r][k] = i32::from(scale_bytes[k] as i8);
+                    }
+                    let wrow = wq.as_mut_ptr().add(r * 256);
+                    for half in 0..2 {
+                        let ql = block.add(half * 64);
+                        let qh = block.add(128 + half * 32);
+                        for l in 0..32 {
+                            let lo = *ql.add(l);
+                            let hi = *ql.add(32 + l);
+                            let h = *qh.add(l);
+                            let base = half * 128 + l;
+                            *wrow.add(base) = (lo & 0x0f) | ((h & 0x03) << 4);
+                            *wrow.add(base + 32) = (hi & 0x0f) | (((h >> 2) & 0x03) << 4);
+                            *wrow.add(base + 64) = (lo >> 4) | (((h >> 4) & 0x03) << 4);
+                            *wrow.add(base + 96) = (hi >> 4) | (((h >> 6) & 0x03) << 4);
+                        }
+                    }
+                }
+                let wq_ptr = wq.as_ptr();
+                for col_half in 0..halves {
+                    let half_act = act_ptr.add(col_half * 64 * COLS * 4);
+                    let mut band = 0;
+                    while band < cnt {
+                        let band_cnt = (cnt - band).min(BAND);
+                        let mut facc: [__m512; BAND] = [_mm512_setzero_ps(); BAND];
+                        for k in 0..16 {
+                            let mut acc: [__m512i; BAND] = [_mm512_setzero_si512(); BAND];
+                            for g in 0..4 {
+                                let grp = k * 4 + g;
+                                let codes =
+                                    _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
+                                for (t, slot) in acc.iter_mut().enumerate().take(band_cnt) {
+                                    let word = u32::from_le(std::ptr::read_unaligned(
+                                        wq_ptr.add((band + t) * 256 + grp * 4) as *const u32,
+                                    ));
+                                    *slot = _mm512_dpbusd_epi32(
+                                        *slot,
+                                        _mm512_set1_epi32(word as i32),
+                                        codes,
+                                    );
+                                }
+                            }
+                            let bias = _mm512_mullo_epi32(
+                                _mm512_loadu_si512(bsumt[col_half][k].as_ptr() as *const __m512i),
+                                _mm512_set1_epi32(32),
+                            );
+                            let dxv = _mm512_loadu_ps(dxs[col_half][k].as_ptr());
+                            for (t, (acc_slot, facc_slot)) in
+                                acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
+                            {
+                                let row = band + t;
+                                let corr = _mm512_sub_epi32(*acc_slot, bias);
+                                let main = _mm512_mul_ps(
+                                    _mm512_mul_ps(_mm512_cvtepi32_ps(corr), dxv),
+                                    _mm512_set1_ps(dvec[row] * scales[row][k] as f32),
+                                );
+                                *facc_slot = _mm512_add_ps(*facc_slot, main);
+                            }
+                        }
+                        for (t, value) in facc.iter().enumerate().take(band_cnt) {
+                            let slot = buf
+                                .as_mut_ptr()
+                                .add((win + band + t) * stride_cols + col_half * COLS);
+                            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
+                        }
+                        band += band_cnt;
+                    }
+                }
+                win += cnt;
+            }
+        }
+        for r in 0..count {
+            for entry in 0..B {
+                out[entry * count + r] = buf[r * stride_cols + entry];
+            }
+        }
+    }
+}
+
 /// One packed row against an `i8` activation, `dpbusd` over unpacked weights.
 ///
 /// Prototype Pha 1b for `crate::repack::PackedTile`: the tile holds weights
@@ -1455,6 +1891,214 @@ mod tests {
     }
 
     /// A Q4_K row of `blocks` blocks with random scales and nibbles.
+    #[test]
+    fn tiled_q4k_tile_parity_vs_row_dot() {
+        if !vnni_available() {
+            return;
+        }
+        let mut rng = Rng(0x1112_2222_3333_4444);
+        let rows = 256usize;
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 144;
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let xq = QuantizedX::new(&x);
+        let sums = crate::quant::x_sums(&x);
+        // Row-by-row reference through the shipped VNNI batch kernel at B=1.
+        for row in [0usize, 17, 128, 255] {
+            let row_bytes = &data[row * stride..(row + 1) * stride];
+            // SAFETY: whole blocks, VNNI checked.
+            let want = unsafe { q4k_dot(row_bytes, &xq.q, &xq.d, &sums) };
+            assert!(want.is_finite());
+        }
+    }
+
+    #[test]
+    fn q4k_tiled_range_matches_batch_vnni() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let rows = 48usize; // straddles the 32-row window
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 144;
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut got = vec![0.0_f32; 16 * rows];
+        // SAFETY: whole blocks, VNNI-512 checked above.
+        unsafe { q4k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &sums, &mut got) };
+        let mut totals = [0.0_f32; 16];
+        for row in 0..rows {
+            let row_bytes = &data[row * stride..(row + 1) * stride];
+            // SAFETY: whole blocks, VNNI checked above.
+            unsafe { q4k_dot_batch_vnni(row_bytes, &xs, &sums, &mut totals) };
+            for entry in 0..16 {
+                let want = totals[entry];
+                let g = got[entry * rows + row];
+                assert!(
+                    (g - want).abs() <= 1e-3 + 1e-4 * want.abs(),
+                    "entry {entry} row {row}: got {g}, want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q6k_tiled_range_matches_batch_q8() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x85eb_ca6b_c2b2_ae35);
+        let rows = 48usize;
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 210;
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let mut got = vec![0.0_f32; 16 * rows];
+        // SAFETY: whole blocks, VNNI-512 checked above.
+        unsafe { q6k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &mut got) };
+        let mut totals = [0.0_f32; 16];
+        for row in 0..rows {
+            let row_bytes = &data[row * stride..(row + 1) * stride];
+            // SAFETY: whole blocks, VNNI checked above.
+            unsafe { q6k_dot_batch_q8(row_bytes, &xs, &mut totals) };
+            for entry in 0..16 {
+                let want = totals[entry];
+                let g = got[entry * rows + row];
+                assert!(
+                    (g - want).abs() <= 1e-3 + 1e-4 * want.abs(),
+                    "entry {entry} row {row}: got {g}, want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_tiled_vs_row_single_thread() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let rows = 8960usize;
+        let cols = 1536usize;
+        let blocks = cols / 256;
+        let stride = blocks * 144;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let gb = (data.len() as f64) / 1e9;
+        let reps = 5;
+        let mut out = vec![0.0_f32; 16 * rows];
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            let _ = try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs, &sums, &mut out);
+        }
+        let tiled = start.elapsed().as_secs_f64();
+        println!("tiled single-thread: {:.2} GB/s", gb * reps as f64 / tiled);
+        let mut totals = [0.0_f32; 16];
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            for row in 0..rows {
+                let rb = &data[row * stride..(row + 1) * stride];
+                unsafe { q4k_dot_batch_vnni(rb, &xs, &sums, &mut totals) };
+            }
+        }
+        let row = start.elapsed().as_secs_f64();
+        println!(
+            "row batch single-thread: {:.2} GB/s",
+            gb * reps as f64 / row
+        );
+        std::hint::black_box((&out, &totals));
+    }
+
+    /// B=32 against two B=16 passes: same shape, same data, 32 activations.
+    ///
+    /// The B=32 kernel runs two 16-wide halves against one unpacked weight
+    /// window, so it should match the two-call result closely while doing
+    /// half the unpacking, and per-token time is the number that matters.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_tiled_b32_vs_two_b16() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x0bad_c0de_1234_5678);
+        let rows = 8960usize;
+        let cols = 1536usize;
+        let blocks = cols / 256;
+        let stride = blocks * 144;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let source: Vec<Vec<f32>> = (0..32)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs_lo: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let xs_hi: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e + 16]);
+        let sums_lo: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let sums_hi: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e + 16].as_slice());
+        let xs32: [&QuantizedX; 32] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums32: [&[f32]; 32] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut two = vec![0.0_f32; 32 * rows];
+        let mut one = vec![0.0_f32; 32 * rows];
+        let reps = 5;
+        let (lo, hi) = two.split_at_mut(16 * rows);
+        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_lo, &sums_lo, lo);
+        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_hi, &sums_hi, hi);
+        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs32, &sums32, &mut one);
+        let mut worst = 0.0_f32;
+        for (a, b) in two.iter().zip(one.iter()) {
+            let tol = 1e-3 + 1e-4 * a.abs();
+            worst = worst.max((a - b).abs() - tol);
+        }
+        println!("parity B=32 vs 2x B=16: worst excess over tolerance {worst:.3e}");
+        assert!(worst <= 0.0, "B=32 disagrees with two B=16 passes");
+        let macs = (rows * cols * 32) as f64;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            let (lo, hi) = two.split_at_mut(16 * rows);
+            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_lo, &sums_lo, lo);
+            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_hi, &sums_hi, hi);
+        }
+        let t16 = start.elapsed().as_secs_f64() / reps as f64;
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs32, &sums32, &mut one);
+        }
+        let t32 = start.elapsed().as_secs_f64() / reps as f64;
+        println!(
+            "2x B=16: {:.1} ms, {:.1} G token-MAC/s",
+            t16 * 1e3,
+            macs / t16 / 1e9
+        );
+        println!(
+            "B=32:    {:.1} ms, {:.1} G token-MAC/s",
+            t32 * 1e3,
+            macs / t32 / 1e9
+        );
+        println!("B=32 speedup: {:.2}x", t16 / t32);
+        std::hint::black_box((&two, &one));
+    }
+
     fn q4k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
         let mut row = Vec::with_capacity(blocks * 144);
         for _ in 0..blocks {
@@ -1471,6 +2115,62 @@ mod tests {
     }
 
     /// A Q6_K row of `blocks` blocks with random scales and nibbles.
+    /// Q6_K tiled against the row kernel at the shape that dominates prefill.
+    ///
+    /// Q6_K carries more bytes per weight than Q4_K (210 vs 144 per 256
+    /// values), so the same MAC count moves more memory and its per-block
+    /// epilogue is shorter (one integer correction, no separate min term).
+    /// This measures where it lands relative to the Q4_K tiled kernel's
+    /// ~24 MAC/cycle, i.e. how much headroom a rewrite could still find.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q6k_tiled_vs_row() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x0dd6_ba11_0000_0001);
+        let rows = 8960usize;
+        let cols = 1536usize;
+        let blocks = cols / 256;
+        let stride = blocks * 210;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let reps = 5;
+        let mut out = vec![0.0_f32; 16 * rows];
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            try_q6k_matvec_tiled_range(&data, stride, 0, rows, &xs, &mut out);
+        }
+        let tiled = start.elapsed().as_secs_f64();
+        let mut totals = [0.0_f32; 16];
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            for row in 0..rows {
+                let rb = &data[row * stride..(row + 1) * stride];
+                // SAFETY: whole 210-byte blocks, VNNI checked above.
+                unsafe { q6k_dot_batch_q8(rb, &xs, &mut totals) };
+            }
+        }
+        let row = start.elapsed().as_secs_f64();
+        let macs = (rows * cols * 16) as f64;
+        let gb = (data.len() as f64) / 1e9;
+        println!(
+            "q6k tiled: {:.2} GB/s, {:.1} G token-MAC/s",
+            gb * reps as f64 / tiled,
+            macs * reps as f64 / tiled / 1e9
+        );
+        println!(
+            "q6k row:   {:.2} GB/s, {:.1} G token-MAC/s",
+            gb * reps as f64 / row,
+            macs * reps as f64 / row / 1e9
+        );
+        std::hint::black_box((&out, &totals));
+    }
+
     fn q6k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
         let mut row = Vec::with_capacity(blocks * 210);
         for _ in 0..blocks {

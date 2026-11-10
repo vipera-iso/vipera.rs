@@ -798,10 +798,10 @@ pub(crate) fn matvec_pooled<'d>(
 /// When `VIPERA_TILED=1` and `B >= 8` and `ty` is `F32`/`F16`, this takes the scalar tiled path ([`crate::tiled::matvec_tiled_batch`]) on dequantized weights, which changes
 /// summation order and is approximate (documented parity is
 /// `max_abs <= 1e-3 + 1e-4 * max|ref|`); with the gate off the result stays
-/// bit-exact via the pooled kernel. Quantized types (`Q8_0`/`Q4_K`/`Q6_K`)
-/// stay on the pooled kernel even with the gate on: the scalar float tiled
-/// kernel is 22x slower there (1.7 vs 40 tok/s) because it bypasses
-/// `QuantizedX` + VNNI and the `Pool`, pending an integer tiled kernel.
+/// bit-exact via the pooled kernel. `Q4_K` with `VIPERA_TILED=1` on an
+/// AVX-512 VNNI CPU takes the integer tiled kernel in
+/// `fill_rows_batch` (same approximate parity, activation tile shared
+/// across 32 rows); `Q8_0`/`Q6_K` stay on the pooled kernel.
 pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     pool: &crate::pool::Pool<'d, B>,
     ty: GgmlType,
@@ -912,6 +912,41 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     out: &mut [f32],
 ) {
     let count = out.len() / B;
+    // Integer tiled path: with VIPERA_TILED=1 and an AVX-512 VNNI CPU, a
+    // Q4_K batch reuses one activation tile across 32 weight rows (8-row
+    // bands inside), which is the prefill lever. Exact mode keeps the old
+    // summation order, so it stays on the row kernel. A batch of one keeps
+    // the row kernel: its VNNI-256 path is already the faster one here (a
+    // column-parallel 512-bit port measured 6.95 vs 11.87 GB/s), because the
+    // sixteen-entry tile wastes fifteen lanes but the 512-bit form is
+    // double-pumped on this CPU.
+    #[cfg(target_arch = "x86_64")]
+    if !exact_dot_requested()
+        && crate::tiled::tiled_enabled()
+        && crate::simd::vnni512_available()
+        && (8..=16).contains(&B)
+    {
+        if ty == GgmlType::Q4K
+            && let Some(xs) = activation.quantized()
+            && crate::simd::try_q4k_matvec_tiled_range(
+                data,
+                stride,
+                first_row,
+                count,
+                xs,
+                activation.sums(),
+                out,
+            )
+        {
+            return;
+        }
+        if ty == GgmlType::Q6K
+            && let Some(xs) = activation.quantized()
+            && crate::simd::try_q6k_matvec_tiled_range(data, stride, first_row, count, xs, out)
+        {
+            return;
+        }
+    }
     let mut row = [0.0_f32; B];
     for offset in 0..count {
         // Prefetch 4 rows ahead (prefill-tiled Decode). The unpack loop is instruction-bound,

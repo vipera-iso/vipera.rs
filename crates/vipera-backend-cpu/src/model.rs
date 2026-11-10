@@ -325,6 +325,8 @@ impl BatchScratch {
 pub struct CpuBackend {
     bytes: Vec<u8>,
     config: ModelConfig,
+    /// The architecture family the model declared; reported, not recomputed.
+    architecture: String,
     tok_embd: Tensor,
     output: Tensor,
     output_norm: Vec<f32>,
@@ -359,6 +361,12 @@ impl CpuBackend {
     /// read the model twice.
     pub fn from_bytes(bytes: Vec<u8>, file: &GgufFile) -> Result<Self, ViperaError> {
         let config = ModelConfig::from_gguf(file)?;
+        let architecture = file
+            .metadata
+            .get("general.architecture")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
         if config.kv_bytes_per_token() == 0 {
             return Err(ViperaError::unsupported("model declares zero KV heads"));
         }
@@ -424,6 +432,7 @@ impl CpuBackend {
         Ok(Self {
             config,
             bytes,
+            architecture,
             tok_embd,
             output,
             output_norm,
@@ -448,6 +457,14 @@ impl CpuBackend {
     /// The model's shape.
     pub const fn config(&self) -> ModelConfig {
         self.config
+    }
+
+    /// The model's declared architecture family, e.g. `qwen2` or `llama`.
+    ///
+    /// Read once at construction from the file's `general.architecture`; a backend that reports a
+    /// different name here is lying about which block layout it computed over.
+    pub fn architecture(&self) -> &str {
+        &self.architecture
     }
 
     /// Run the transformer over `context.new_tokens`, returning the logits of the last one.
@@ -1074,6 +1091,38 @@ impl ForwardPass for CpuBackend {
         batch: &mut BatchContext<'_, '_>,
     ) -> Result<Vec<Vec<f32>>, ViperaError> {
         self.run_batch(batch, true, false)
+    }
+
+    fn logits_range(
+        &mut self,
+        context: &mut ForwardContext<'_>,
+    ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        // Batch path already computes per-token logits as separate entries,
+        // one per position in the chunk. Reuse it so speculative verify is
+        // one batched forward instead of k serial forwards.
+        let tokens = context.new_tokens;
+        let first = context.first_position;
+        let kv = std::mem::take(&mut context.kv);
+        let mut entries: Vec<BatchEntry<'_>> = (0..tokens.len())
+            .map(|index| BatchEntry {
+                tokens: context.tokens,
+                new_tokens: &tokens[index..index + 1],
+                first_position: first + index as u32,
+                block_table: context.block_table,
+                tokens_per_block: context.tokens_per_block,
+                bytes_per_token: context.bytes_per_token,
+            })
+            .collect();
+        let results = self.run_batch(
+            &mut BatchContext {
+                kv: &mut *kv,
+                entries: &mut entries,
+            },
+            true,
+            false,
+        )?;
+        context.kv = kv;
+        Ok(results)
     }
 }
 
