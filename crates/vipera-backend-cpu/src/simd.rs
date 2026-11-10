@@ -1046,6 +1046,20 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
             let mut win = 0;
             while win < count {
                 let cnt = (count - win).min(ROW_WIN);
+                // Pull the next window's block in while this one unpacks.
+                // The walk takes 144 bytes out of every row, so consecutive
+                // addresses are a stride apart and the hardware prefetcher
+                // only sees part of the stream; an explicit hint covers the
+                // rows this window is too short to reach.
+                let next = win + ROW_WIN;
+                if next < count {
+                    for r in 0..(count - next).min(ROW_WIN) {
+                        let at = (first_row + next + r) * stride + b * 144;
+                        prefetch_ahead(data, at);
+                        prefetch_ahead(data, at + 64);
+                        prefetch_ahead(data, at + 128);
+                    }
+                }
                 wq.fill(0);
                 for slot in scales.iter_mut() {
                     *slot = [0; 8];
@@ -1230,6 +1244,20 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
             let mut win = 0;
             while win < count {
                 let cnt = (count - win).min(ROW_WIN);
+                // Pull the next window's block in while this one unpacks:
+                // the walk takes 210 bytes out of every row, so consecutive
+                // addresses are a stride apart and the hardware prefetcher
+                // only sees part of the stream.
+                let next = win + ROW_WIN;
+                if next < count {
+                    for r in 0..(count - next).min(ROW_WIN) {
+                        let at = (first_row + next + r) * stride + b * 210;
+                        prefetch_ahead(data, at);
+                        prefetch_ahead(data, at + 64);
+                        prefetch_ahead(data, at + 128);
+                        prefetch_ahead(data, at + 192);
+                    }
+                }
                 wq.fill(0);
                 for slot in scales.iter_mut() {
                     *slot = [0; 16];
