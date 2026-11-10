@@ -80,6 +80,11 @@ use vipera_core::gguf::GgmlType;
 
 use crate::quant::{BatchActivation, QuantizedX, f16_to_f32};
 
+/// Tile halves the tiled kernels keep activation coefficients for: 16
+/// activations per half, and batches up to 64 wide run four halves against one
+/// weight pass.
+const MAX_HALVES: usize = 8;
+
 /// Whether this CPU can run the kernels below. Cached by the standard library.
 pub fn available() -> bool {
     std::is_x86_feature_detected!("avx2")
@@ -945,7 +950,7 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     sums: &[&[f32]; B],
     out: &mut [f32],
 ) -> bool {
-    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(144) || B == 0 || B > 32 {
+    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(144) || B == 0 || B > 128 {
         return false;
     }
     let blocks = stride / 144;
@@ -1002,10 +1007,11 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         const BAND: usize = 8;
         const COLS: usize = 16;
         // A tile is 16 activations wide, the width one 512-bit `dpbusd`
-        // consumes. A batch of 17..=32 runs two tile halves against the same
+        // consumes. Wider batches run several tile halves against the same
         // unpacked weight window, so the unpack and the weight loads are paid
-        // once for 32 activations instead of twice.
+        // once for the whole batch instead of once per 16 activations.
         let halves = B.div_ceil(COLS);
+        debug_assert!(halves <= MAX_HALVES);
         let stride_cols = halves * COLS;
         let blocks = stride / 144;
         let mut wq = vec![0_u8; ROW_WIN * 256];
@@ -1023,8 +1029,8 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         let low_mask = _mm256_set1_epi8(0x0f);
         for b in 0..blocks {
             act.fill(0);
-            let mut dxs = [[[0.0_f32; COLS]; 8]; 2];
-            let mut sumt = [[[0.0_f32; COLS]; 8]; 2];
+            let mut dxs = [[[0.0_f32; COLS]; 8]; MAX_HALVES];
+            let mut sumt = [[[0.0_f32; COLS]; 8]; MAX_HALVES];
             for entry in 0..B {
                 let half = entry / COLS;
                 let col = entry % COLS;
@@ -1164,7 +1170,7 @@ pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
     xs: &[&QuantizedX; B],
     out: &mut [f32],
 ) -> bool {
-    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(210) || B == 0 || B > 32 {
+    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(210) || B == 0 || B > 128 {
         return false;
     }
     let blocks = stride / 210;
@@ -1207,6 +1213,7 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
         const BAND: usize = 8;
         const COLS: usize = 16;
         let halves = B.div_ceil(COLS);
+        debug_assert!(halves <= MAX_HALVES);
         let stride_cols = halves * COLS;
         let blocks = stride / 210;
         let mut wq = vec![0_u8; ROW_WIN * 256];
@@ -1217,8 +1224,8 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
         let mut buf = vec![0.0_f32; count.saturating_mul(stride_cols)];
         for b in 0..blocks {
             act.fill(0);
-            let mut bsumt = [[[0_i32; COLS]; 16]; 2];
-            let mut dxs = [[[0.0_f32; COLS]; 16]; 2];
+            let mut bsumt = [[[0_i32; COLS]; 16]; MAX_HALVES];
+            let mut dxs = [[[0.0_f32; COLS]; 16]; MAX_HALVES];
             for (entry, x) in xs.iter().enumerate() {
                 let col_half = entry / COLS;
                 let col = entry % COLS;
@@ -2028,6 +2035,53 @@ mod tests {
             gb * reps as f64 / row
         );
         std::hint::black_box((&out, &totals));
+    }
+
+    /// Per-token cost against ubatch width: the weight pass is paid once per
+    /// `B` tokens, so this is the curve a bigger engine batch would follow.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_ubatch_curve() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0xabcd_1234_5678_9f01);
+        let rows = 8960usize;
+        let cols = 1536usize;
+        let blocks = cols / 256;
+        let stride = blocks * 144;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let source: Vec<Vec<f32>> = (0..128)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let reps = 3;
+        macro_rules! bench {
+            ($b:literal) => {{
+                let xs: [&QuantizedX; $b] = std::array::from_fn(|e| &xs_vec[e]);
+                let sums: [&[f32]; $b] = std::array::from_fn(|e| sums_vec[e].as_slice());
+                let mut out = vec![0.0_f32; $b * rows];
+                let mut best = f64::INFINITY;
+                for _ in 0..reps {
+                    let start = std::time::Instant::now();
+                    let _ =
+                        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs, &sums, &mut out);
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+                std::hint::black_box(&out);
+                println!(
+                    "B={:>3}: {:>6.1} ms/pass, {:>6.2} ms/token (single thread)",
+                    $b,
+                    best * 1e3,
+                    best * 1e3 / f64::from($b)
+                );
+            }};
+        }
+        bench!(16);
+        bench!(32);
+        bench!(64);
+        bench!(128);
     }
 
     /// B=32 against two B=16 passes: same shape, same data, 32 activations.

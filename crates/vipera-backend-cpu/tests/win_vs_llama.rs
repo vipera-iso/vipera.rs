@@ -270,7 +270,7 @@ fn prefill_vs_decode() {
     let mut backend = CpuBackend::load(&path).expect("load model");
     let config = backend.config();
 
-    for &n in &[64usize, 128] {
+    for &n in &[64usize, 128, 512] {
         let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
         // Chunked: một ForwardContext có n new_tokens -> run_positions dùng batch path.
         let chunk_ms = {

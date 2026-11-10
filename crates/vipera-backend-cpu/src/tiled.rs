@@ -26,9 +26,9 @@ pub(crate) fn tiled_enabled() -> bool {
 
 /// Whether `B`-entry batches may take the tiled path (`B >= 8`).
 ///
-/// `MAX_BATCH` is 16, so 32 would never fire; the point of the tile is to
-/// share one unpack across many activations, which 8 already gives, and the
-/// gate keeps the bit-exact pooled kernel as the default.
+/// The point of the tile is to share one unpack across many activations, so
+/// a wide batch is where it pays; narrow batches keep the bit-exact pooled
+/// kernel, which stays the default.
 pub(crate) fn tiled_serves<const B: usize>() -> bool {
     tiled_enabled() && B >= 8
 }
