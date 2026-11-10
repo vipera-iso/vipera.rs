@@ -145,6 +145,48 @@ impl fmt::Debug for Turn {
     }
 }
 
+/// Whether speculative decoding is requested (`VIPERA_SPECULATIVE=1`).
+pub fn speculative_enabled() -> bool {
+    std::env::var("VIPERA_SPECULATIVE")
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+        .unwrap_or(false)
+}
+
+/// Draft tokens proposed from the latest repeated n-gram in `context`.
+#[cfg(test)]
+#[allow(dead_code)]
+fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
+    if n == 0 || context.len() < 2 * n {
+        return Vec::new();
+    }
+    let needle = &context[context.len() - n..];
+    for start in (0..=context.len() - n - 1).rev() {
+        if &context[start..start + n] == needle {
+            let after = start + n;
+            if after < context.len() {
+                let end = (after + 4).min(context.len());
+                return context[after..end].to_vec();
+            }
+            return Vec::new();
+        }
+    }
+    Vec::new()
+}
+
+/// How many draft tokens equal the target's greedy tokens from the front.
+#[cfg(test)]
+#[allow(dead_code)]
+fn speculative_accept(draft: &[u32], target: &[u32]) -> usize {
+    draft
+        .iter()
+        .zip(target)
+        .take_while(|(draft, target)| draft == target)
+        .count()
+}
+
 /// What one step did.
 #[derive(Debug, Clone, Default)]
 pub struct StepReport {

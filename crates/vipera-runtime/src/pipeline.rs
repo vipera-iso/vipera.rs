@@ -196,6 +196,19 @@ pub trait ForwardPass {
     /// [`ForwardContext::kv`].
     fn logits(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError>;
 
+    /// Logits for *every* token in `context.new_tokens`, one vector per token, in order.
+    /// Default is a correct-but-slow fallback via `logits` on each 1-token prefix
+    /// (requires the backend to be re-entered per prefix; provided for API
+    /// completeness, backends override with their batched path).
+    fn logits_range(
+        &mut self,
+        _context: &mut ForwardContext<'_>,
+    ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        Err(ViperaError::internal(
+            "logits_range requires a backend override; default is unsupported",
+        ))
+    }
+
     /// Logits for the last token of every entry of `batch`, one vector per entry, in order.
     ///
     /// The default computes them one at a time through [`Self::logits`], reborrowing the shared
