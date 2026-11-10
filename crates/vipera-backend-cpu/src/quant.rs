@@ -924,7 +924,7 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     if !exact_dot_requested()
         && crate::tiled::tiled_enabled()
         && crate::simd::vnni512_available()
-        && (8..=16).contains(&B)
+        && (8..=128).contains(&B)
     {
         if ty == GgmlType::Q4K
             && let Some(xs) = activation.quantized()

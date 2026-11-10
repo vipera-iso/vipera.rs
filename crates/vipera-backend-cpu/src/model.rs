@@ -27,7 +27,7 @@ use crate::quant::{self, f16_to_f32, f32_to_f16};
 /// prefill weight reuse (`ceil(n/16)` reads vs `ceil(n/8)`) — the linear-streaming win from the
 /// llama.cpp tiled mul_mat paper's first step — for a few extra megabytes of scratch. The kernels
 /// spill registers at 16 but the weight read saved dominates on prefill.
-const MAX_BATCH: usize = 16;
+const MAX_BATCH: usize = 128;
 
 /// The numbers a forward pass needs, read from the file rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -701,107 +701,32 @@ impl CpuBackend {
                 })
                 .collect();
         }
-        match size {
-            1 => self.run_batch_n(
-                batch.kv,
-                exactly::<1, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            2 => self.run_batch_n(
-                batch.kv,
-                exactly::<2, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            3 => self.run_batch_n(
-                batch.kv,
-                exactly::<3, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            4 => self.run_batch_n(
-                batch.kv,
-                exactly::<4, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            5 => self.run_batch_n(
-                batch.kv,
-                exactly::<5, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            6 => self.run_batch_n(
-                batch.kv,
-                exactly::<6, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            7 => self.run_batch_n(
-                batch.kv,
-                exactly::<7, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            8 => self.run_batch_n(
-                batch.kv,
-                exactly::<8, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            9 => self.run_batch_n(
-                batch.kv,
-                exactly::<9, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            10 => self.run_batch_n(
-                batch.kv,
-                exactly::<10, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            11 => self.run_batch_n(
-                batch.kv,
-                exactly::<11, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            12 => self.run_batch_n(
-                batch.kv,
-                exactly::<12, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            13 => self.run_batch_n(
-                batch.kv,
-                exactly::<13, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            14 => self.run_batch_n(
-                batch.kv,
-                exactly::<14, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            15 => self.run_batch_n(
-                batch.kv,
-                exactly::<15, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            16 => self.run_batch_n(
-                batch.kv,
-                exactly::<16, _>(batch.entries)?,
-                need_logits,
-                only_last,
-            ),
-            other => Err(ViperaError::invalid_argument(format!(
-                "this backend batches up to {MAX_BATCH} sequences, not {other}"
-            ))),
+        macro_rules! dispatch {
+            ($($width:literal),* $(,)?) => {
+                match size {
+                    $(
+                        $width => self.run_batch_n(
+                            batch.kv,
+                            exactly::<$width, _>(batch.entries)?,
+                            need_logits,
+                            only_last,
+                        ),
+                    )*
+                    other => Err(ViperaError::invalid_argument(format!(
+                        "this backend batches up to {MAX_BATCH} sequences, not {other}"
+                    ))),
+                }
+            };
         }
+        dispatch!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
+            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
+            110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126,
+            127, 128,
+        )
     }
 
     /// One decode step for `B` sequences, reading each weight tensor once for all of them.
