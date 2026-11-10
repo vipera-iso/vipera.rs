@@ -2037,6 +2037,95 @@ mod tests {
         std::hint::black_box((&out, &totals));
     }
 
+    /// What one Q6_K pass costs, warm and cold, so the output projection's
+    /// share of a chunk can be judged against the kernel's own ceiling.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q6k_tiled() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x96_9600_0000_1234);
+        let rows = 8_960usize;
+        let cold_rows = 57_344usize;
+        let cols = 1536usize;
+        let blocks = cols / 256;
+        let stride = blocks * 210;
+        let data: Vec<u8> = (0..cold_rows)
+            .flat_map(|_| q6k_row(&mut rng, blocks))
+            .collect();
+        let source: Vec<Vec<f32>> = (0..128)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let reps = 3;
+        macro_rules! bench {
+            ($b:literal, $rows:expr, $label:literal) => {{
+                let xs: [&QuantizedX; $b] = std::array::from_fn(|e| &xs_vec[e]);
+                let mut out = vec![0.0_f32; $b * $rows];
+                let mut best = f64::INFINITY;
+                for _ in 0..reps {
+                    let start = std::time::Instant::now();
+                    let _ = try_q6k_matvec_tiled_range(&data, stride, 0, $rows, &xs, &mut out);
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+                std::hint::black_box(&out);
+                let gb = ($rows * stride) as f64 / 1e9;
+                println!(
+                    "{} B={:>3}: {:>7.2} ms/pass, {:>6.2} ms/token, {:>5.2} GB/s",
+                    $label,
+                    $b,
+                    best * 1e3,
+                    best * 1e3 / f64::from($b),
+                    gb / best
+                );
+            }};
+        }
+        bench!(16, rows, "warm");
+        bench!(128, rows, "warm");
+        bench!(16, cold_rows, "cold");
+        bench!(128, cold_rows, "cold");
+    }
+
+    /// The output projection's shape: one activation against the vocabulary
+    /// matrix, which is the largest single tensor read in a chunk and runs at
+    /// B=1 because only the last position needs logits.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q6k_output_projection() {
+        let mut rng = Rng(0x96_9600_0000_9876);
+        let rows = 151_936usize;
+        let cols = 1536usize;
+        let blocks = cols / 256;
+        let stride = blocks * 210;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let xs_vec = QuantizedX::new(&x);
+        let xs = [&xs_vec];
+        let mut out = [0.0_f32; 1];
+        let reps = 2;
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let start = std::time::Instant::now();
+            for r in 0..rows {
+                // SAFETY: each row is a whole number of 210-byte blocks and
+                // `xs` covers the row width.
+                unsafe {
+                    q6k_dot_batch_q8::<1>(&data[r * stride..(r + 1) * stride], &xs, &mut out);
+                }
+            }
+            best = best.min(start.elapsed().as_secs_f64());
+        }
+        std::hint::black_box(&out);
+        let gb = (rows * stride) as f64 / 1e9;
+        println!(
+            "output projection: {:.2} ms single thread, {:.2} GB/s ({:.1} MB read)",
+            best * 1e3,
+            gb / best,
+            gb * 1e3
+        );
+    }
+
     /// Per-token cost against ubatch width: the weight pass is paid once per
     /// `B` tokens, so this is the curve a bigger engine batch would follow.
     #[test]
