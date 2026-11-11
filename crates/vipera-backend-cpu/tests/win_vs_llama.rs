@@ -657,13 +657,13 @@ fn decode_speculative(
     state: &mut State,
     start: u32,
     steps: usize,
+    n: usize,
+    k: usize,
 ) -> Vec<u32> {
-    const N: usize = 3;
-    const K: usize = 5;
     let mut out = Vec::with_capacity(steps);
     let mut next = start;
     while out.len() < steps {
-        let draft = draft_from_ngram(&state.tokens, N, K);
+        let draft = draft_from_ngram(&state.tokens, n, k);
         let mut chunk = Vec::with_capacity(draft.len() + 1);
         chunk.push(next);
         chunk.extend_from_slice(&draft);
@@ -718,10 +718,24 @@ fn speculative_decode_wins() {
     let plain = decode_plain(&mut backend, &mut plain_state, first, STEPS);
     let plain_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let mut spec_state = state.clone();
-    let start = Instant::now();
-    let speculative = decode_speculative(&mut backend, &mut spec_state, first, STEPS);
-    let spec_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let mut best = (f64::INFINITY, 0, 0, Vec::new());
+    for (n, k) in [(2, 4), (3, 5), (3, 8), (4, 6), (5, 8)] {
+        let mut spec_state = state.clone();
+        let start = Instant::now();
+        let stream = decode_speculative(&mut backend, &mut spec_state, first, STEPS, n, k);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "  draft n={n} k={k}: {ms:.1} ms ({:.1} t/s), identical {}",
+            STEPS as f64 * 1000.0 / ms,
+            stream == plain
+        );
+        assert_eq!(stream, plain, "speculation changed the greedy stream");
+        if ms < best.0 {
+            best = (ms, n, k, stream);
+        }
+    }
+    let (spec_ms, n, k, speculative) = best;
+    println!("  best draft n={n} k={k}");
 
     println!(
         "decode {STEPS} tokens: plain {plain_ms:.1} ms ({:.1} t/s), speculative {spec_ms:.1} ms \
