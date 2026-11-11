@@ -19,7 +19,10 @@ pub mod memory;
 pub mod pipeline;
 pub mod sequence;
 
-pub use engine::{Engine, EngineConfig, Generation, Released, RuntimeStats, StepReport};
+pub use engine::{
+    Engine, EngineConfig, Generation, Released, RuntimeStats, StepReport, ngram_draft,
+    speculative_accept,
+};
 pub use kv::{DEFAULT_TOKENS_PER_BLOCK, KvCache, KvConfig};
 pub use memory::{WeightBuffer, parse_status_kib, peak_resident_bytes, resident_bytes};
 pub use pipeline::{

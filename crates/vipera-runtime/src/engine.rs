@@ -156,9 +156,11 @@ pub fn speculative_enabled() -> bool {
 }
 
 /// Draft tokens proposed from the latest repeated n-gram in `context`.
-#[cfg(test)]
-#[allow(dead_code)]
-fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
+///
+/// `n` is how many trailing tokens form the needle and the draft is up to four tokens long. The
+/// shortest useful history measured fastest on the CPU backend: `n = 1` with a two-token draft, so
+/// callers that pass their own `n` are usually paying for entries they never accept.
+pub fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
     if n == 0 || context.len() < 2 * n {
         return Vec::new();
     }
@@ -177,9 +179,10 @@ fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
 }
 
 /// How many draft tokens equal the target's greedy tokens from the front.
-#[cfg(test)]
-#[allow(dead_code)]
-fn speculative_accept(draft: &[u32], target: &[u32]) -> usize {
+///
+/// This is the acceptance rule for greedy verification: the first mismatch ends the accepted
+/// prefix, and the token the target picked there becomes the next input.
+pub fn speculative_accept(draft: &[u32], target: &[u32]) -> usize {
     draft
         .iter()
         .zip(target)
@@ -1388,5 +1391,29 @@ mod tests {
             run([1, 0]),
             "scheduling order changed a sequence's tokens"
         );
+    }
+}
+
+#[cfg(test)]
+mod speculation {
+    use super::{ngram_draft, speculative_accept};
+
+    #[test]
+    fn draft_follows_the_last_repeat() {
+        // The needle "7 9" last appeared before 4, so the draft continues from there, up to four
+        // tokens long.
+        let context = [7_u32, 9, 4, 5, 1, 2, 7, 9];
+        assert_eq!(ngram_draft(&context, 2), vec![4, 5, 1, 2]);
+        // No earlier repeat: nothing to draft, never a stale guess.
+        assert!(ngram_draft(&[1_u32, 2, 3], 2).is_empty());
+        assert!(ngram_draft(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn accept_stops_at_the_first_miss() {
+        assert_eq!(speculative_accept(&[4, 5, 6], &[4, 5, 9]), 2);
+        assert_eq!(speculative_accept(&[4, 5], &[4, 5]), 2);
+        assert_eq!(speculative_accept(&[4], &[9]), 0);
+        assert_eq!(speculative_accept(&[], &[1]), 0);
     }
 }

@@ -751,7 +751,7 @@ fn speculative_decode_wins() {
     let mut backend = CpuBackend::load(&path).expect("load model");
     let config = backend.config();
     let prompt: Vec<u32> = (0..64).map(|at| 1000 + (at % 12) as u32).collect();
-    const STEPS: usize = 16;
+    const STEPS: usize = 32;
     // Room for the prompt plus every token both loops may compute, including drafts that are
     // thrown away.
     let mut state = State::with_room(config, prompt.len() + 4 * STEPS, KvCacheType::F16);
@@ -767,7 +767,7 @@ fn speculative_decode_wins() {
     let plain_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let mut best = (f64::INFINITY, 0, 0, Vec::new());
-    for (n, k) in [(1, 2), (1, 3), (1, 4), (2, 2)] {
+    for (n, k) in [(1, 1), (1, 2), (1, 3), (2, 2)] {
         let mut spec_state = state.clone();
         let start = Instant::now();
         let stream = decode_speculative(&mut backend, &mut spec_state, first, STEPS, n, k);
