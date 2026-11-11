@@ -531,3 +531,87 @@ fn logits_each_matches_single_passes() {
         assert_eq!(each[at], expected, "position {at} differs");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 10. Speculation payoff: what a 5-token verify pass costs, and how often it pays
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn speculative_payoff() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    // A repetitive prompt: the kind of text prompt-lookup speculation exists for.
+    let prompt: Vec<u32> = (0..64).map(|at| 1000 + (at % 12) as u32).collect();
+    let (mut state, first) = prefill_chunked(&mut backend, config, &prompt, KvCacheType::F16);
+
+    // Reference greedy stream, one token per pass, exactly today's decode.
+    let mut greedy = vec![first];
+    let mut probe = state.clone();
+    for _ in 0..6 {
+        let token = *greedy.last().expect("non-empty");
+        let logits = backend
+            .logits(&mut probe.context(&[token]))
+            .expect("decode fits");
+        probe.tokens.push(token);
+        greedy.push(argmax(&logits) as u32);
+    }
+
+    // One verify pass over the same 6 tokens must answer the same thing, and its wall time is
+    // what a speculation round pays.
+    let single = timed_best(3, || {
+        let mut s = state.clone();
+        for token in &greedy[..5] {
+            let _ = backend.logits(&mut s.context(&[*token]));
+            s.tokens.push(*token);
+        }
+    });
+    let verify = timed_best(3, || {
+        let mut s = state.clone();
+        let _ = backend
+            .logits_each(&mut s.context(&greedy[..5]))
+            .expect("verify fits");
+    });
+
+    // Draft from the n-gram: repeat of the last 3 tokens found earlier in the prompt.
+    let context: Vec<u32> = state
+        .tokens
+        .iter()
+        .copied()
+        .chain(greedy.iter().copied())
+        .collect();
+    let mut accepted = 0;
+    let mut tried = 0;
+    for at in 3..context.len().saturating_sub(4) {
+        let needle = &context[at - 3..at];
+        if let Some(pos) = (0..at - 3)
+            .rev()
+            .find(|start| &context[*start..*start + 3] == needle)
+        {
+            let draft = &context[pos + 3..(pos + 6).min(context.len())];
+            if !draft.is_empty() {
+                tried += 1;
+                let hit = draft
+                    .iter()
+                    .zip(&context[at..])
+                    .take_while(|(d, t)| d == t)
+                    .count();
+                accepted += hit;
+            }
+        }
+    }
+    let rate = if tried == 0 {
+        0.0
+    } else {
+        accepted as f64 / tried as f64
+    };
+    println!(
+        "speculation: 5 single passes {single:.1} ms, one 5-token verify {verify:.1} ms, \
+         verify/5-single {:.2}x, n-gram acceptance {rate:.2} ({} drafts)",
+        verify / single,
+        tried
+    );
+}
