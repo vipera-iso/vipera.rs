@@ -814,6 +814,7 @@ impl CpuBackend {
             }
 
             for (index, layer) in layers.iter().enumerate() {
+                let at = crate::profile::stamp();
                 for entry in 0..B {
                     rms_norm(
                         &batch.x[entry * hidden..][..hidden],
@@ -822,6 +823,7 @@ impl CpuBackend {
                         &mut batch.h[entry * hidden..][..hidden],
                     );
                 }
+                crate::profile::note(crate::profile::Phase::Norm, at);
                 let activations = rows::<B>(&batch.h, hidden);
                 layer
                     .wq
@@ -908,6 +910,7 @@ impl CpuBackend {
                     );
                 }
 
+                let at = crate::profile::stamp();
                 for entry in 0..B {
                     rms_norm(
                         &batch.x[entry * hidden..][..hidden],
@@ -916,6 +919,7 @@ impl CpuBackend {
                         &mut batch.h[entry * hidden..][..hidden],
                     );
                 }
+                crate::profile::note(crate::profile::Phase::Norm, at);
                 let activations = rows::<B>(&batch.h, hidden);
                 layer.wg.matvec_batch::<B>(
                     &pool,
@@ -1328,8 +1332,39 @@ fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, out: &mut [f32]) {
     }
 }
 
+/// `e^value` without the libm call.
+///
+/// The feed-forward block evaluates 11.0M sigmoids per 128-token chunk, every one of them a
+/// `f32::exp` call into libm at 4.5 ns. Splitting `e^x` into `2^(x log2 e)` turns the fractional
+/// part into a degree-five polynomial and the integer part into an exponent-byte shift, both of
+/// which stay in registers. The split is exact in the sense that matters here: the polynomial's
+/// argument is the true rounded fraction, so the error is the polynomial's own, under 1e-7.
+#[inline]
+fn exp(value: f32) -> f32 {
+    const LOG2_E: f32 = std::f32::consts::LOG2_E;
+    // Round to nearest by adding and subtracting 1.5 * 2^23, which forces the
+    // low mantissa bits to hold the integer part without a branch.
+    let scaled = value * LOG2_E;
+    let whole = (scaled + 12_582_912.0) - 12_582_912.0;
+    let fraction = scaled - whole;
+    let polynomial = 1.0
+        + fraction
+            * (std::f32::consts::LN_2
+                + fraction
+                    * (0.240_226_5
+                        + fraction
+                            * (0.055_504_11
+                                + fraction
+                                    * (0.009_618_129
+                                        + fraction
+                                            * (0.001_333_355_8 + fraction * 0.000_154_035_3)))));
+    // Exponents outside this range are already zero or infinity in `f32`.
+    let exponent = (whole as i32 + 127).clamp(0, 254) as u32;
+    polynomial * f32::from_bits(exponent << 23)
+}
+
 fn silu(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
+    value / (1.0 + exp(-value))
 }
 
 fn silu_mul(up: &mut [f32], gate: &[f32]) {
@@ -1419,6 +1454,54 @@ mod tests {
         let expected = 1.0 / (12.5_f32).sqrt();
         assert!((out[0] - 3.0 * expected).abs() < 1e-6);
         assert!((out[1] - 4.0 * expected).abs() < 1e-6);
+    }
+
+    /// The in-register exponential has to stay inside libm's shadow on the value the model actually
+    /// uses, `x * sigmoid(x)`. Its own error is `x * log2 e` rounded in `f32`, which is largest where
+    /// the sigmoid has already saturated, so checking the exponential alone overstates the damage.
+    #[test]
+    fn fast_silu_stays_close_to_libm() {
+        let mut worst = 0.0_f32;
+        let mut value = -30.0_f32;
+        while value < 30.0 {
+            let got = silu(value);
+            let want = value / (1.0 + (-value).exp());
+            let scale = want.abs().max(1e-30);
+            worst = worst.max((got - want).abs() / scale);
+            value += 0.013;
+        }
+        assert!(worst < 2e-6, "worst relative error {worst}");
+    }
+
+    /// Measurement: what the SwiGLU multiply costs for one 128-token chunk, which is the part of the
+    /// profile's `rest` a faster sigmoid would remove. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib silu_mul_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn silu_mul_cost() {
+        let layers = 28usize;
+        let per_layer = 128 * 3072;
+        let mut up: Vec<f32> = (0..per_layer)
+            .map(|i| (i % 97) as f32 * 0.05 - 2.0)
+            .collect();
+        let gate: Vec<f32> = (0..per_layer)
+            .map(|i| (i % 89) as f32 * 0.04 - 1.8)
+            .collect();
+        let start = std::time::Instant::now();
+        for _ in 0..layers {
+            silu_mul(&mut up, &gate);
+        }
+        let elapsed = start.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "silu_mul: {} elements in {:.2} ms ({:.1} ns/element, single thread)",
+            layers * per_layer,
+            elapsed,
+            elapsed * 1e6 / (layers * per_layer) as f64
+        );
+        std::hint::black_box(&up);
     }
 
     #[test]

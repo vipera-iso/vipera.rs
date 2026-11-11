@@ -1021,46 +1021,49 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         let mut dminvec = [0.0_f32; ROW_WIN];
         // Activation tile in (half, group, entry, 4) order: one 64-byte ZMM
         // load holds 4 codes for each of the 16 columns of that half.
-        let mut act = vec![0_i8; halves * 64 * COLS * 4];
-        // Full-range accumulator, [row][entry]; the slab loop walks the
-        // whole row range per 256-column slab so the activation tile is
-        // built once and reused across every window of the slab.
-        let mut buf = vec![0.0_f32; count.saturating_mul(stride_cols)];
-        let low_mask = _mm256_set1_epi8(0x0f);
+        // The activation tile for every block is built once, up front, and stays in L2 while the
+        // row windows below walk it. Building it per window would repeat the same copies 144 times.
+        let mut act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
+        let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
         for b in 0..blocks {
-            act.fill(0);
-            let mut dxs = [[[0.0_f32; COLS]; 8]; MAX_HALVES];
-            let mut sumt = [[[0.0_f32; COLS]; 8]; MAX_HALVES];
             for entry in 0..B {
                 let half = entry / COLS;
                 let col = entry % COLS;
                 let chunk = xs[entry].q.as_ptr().add(b * 256);
+                let base = (b * halves + half) * 64 * COLS * 4;
                 for grp in 0..64 {
                     std::ptr::copy_nonoverlapping(
                         chunk.add(grp * 4),
-                        act.as_mut_ptr()
-                            .add(half * 64 * COLS * 4 + grp * 64 + col * 4),
+                        act.as_mut_ptr().add(base + grp * 64 + col * 4),
                         4,
                     );
                 }
                 for sub in 0..8 {
-                    dxs[half][sub][col] = xs[entry].d[b * 8 + sub];
-                    sumt[half][sub][col] = sums[entry][b * 8 + sub];
+                    let at = ((b * halves + half) * 8 + sub) * COLS + col;
+                    dxs[at] = xs[entry].d[b * 8 + sub];
+                    sumt[at] = sums[entry][b * 8 + sub];
                 }
             }
-            let act_ptr = act.as_ptr();
-            let mut win = 0;
-            while win < count {
-                let cnt = (count - win).min(ROW_WIN);
-                // Pull the next window's block in while this one unpacks.
-                // The walk takes 144 bytes out of every row, so consecutive
-                // addresses are a stride apart and the hardware prefetcher
-                // only sees part of the stream; an explicit hint covers the
-                // rows this window is too short to reach.
-                let next = win + ROW_WIN;
-                if next < count {
-                    for r in 0..(count - next).min(ROW_WIN) {
-                        let at = (first_row + next + r) * stride + b * 144;
+        }
+        let low_mask = _mm256_set1_epi8(0x0f);
+        // Window-major accumulation: one row window of `ROW_WIN` rows keeps its partial sums in
+        // `buf` (ROW_WIN * stride_cols floats, L2-resident) across every block, and `out` is written
+        // once per window. The old order walked all rows per 256-column slab and parked partials in
+        // a `count * stride_cols` buffer — 8960 rows deep, which is tens of megabytes of DRAM
+        // traffic per block and the reason wide batches never paid off.
+        let mut buf = vec![0.0_f32; ROW_WIN * stride_cols];
+        let mut win = 0;
+        while win < count {
+            let cnt = (count - win).min(ROW_WIN);
+            buf[..cnt * stride_cols].fill(0.0);
+            for b in 0..blocks {
+                // The walk takes 144 bytes out of every row, so consecutive addresses are a stride
+                // apart and the hardware prefetcher only sees part of the stream; an explicit hint
+                // covers the block this window is about to unpack next.
+                if b + 1 < blocks {
+                    for r in 0..cnt {
+                        let at = (first_row + win + r) * stride + (b + 1) * 144;
                         prefetch_ahead(data, at);
                         prefetch_ahead(data, at + 64);
                         prefetch_ahead(data, at + 128);
@@ -1096,7 +1099,9 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                 }
                 let wq_ptr = wq.as_ptr();
                 for half in 0..halves {
-                    let half_act = act_ptr.add(half * 64 * COLS * 4);
+                    let half_act = act.as_ptr().add((b * halves + half) * 64 * COLS * 4);
+                    let dxs_ptr = dxs.as_ptr().add((b * halves + half) * 8 * COLS);
+                    let sumt_ptr = sumt.as_ptr().add((b * halves + half) * 8 * COLS);
                     let mut band = 0;
                     while band < cnt {
                         let band_cnt = (cnt - band).min(BAND);
@@ -1118,8 +1123,8 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                                     );
                                 }
                             }
-                            let dxv = _mm512_loadu_ps(dxs[half][s].as_ptr());
-                            let sumv = _mm512_loadu_ps(sumt[half][s].as_ptr());
+                            let dxv = _mm512_loadu_ps(dxs_ptr.add(s * COLS));
+                            let sumv = _mm512_loadu_ps(sumt_ptr.add(s * COLS));
                             for (t, (acc_slot, facc_slot)) in
                                 acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
                             {
@@ -1141,21 +1146,19 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                             }
                         }
                         for (t, value) in facc.iter().enumerate().take(band_cnt) {
-                            let slot = buf
-                                .as_mut_ptr()
-                                .add((win + band + t) * stride_cols + half * COLS);
+                            let slot = buf.as_mut_ptr().add((band + t) * stride_cols + half * COLS);
                             _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
                         }
                         band += band_cnt;
                     }
                 }
-                win += cnt;
             }
-        }
-        for r in 0..count {
-            for entry in 0..B {
-                out[entry * count + r] = buf[r * stride_cols + entry];
+            for r in 0..cnt {
+                for entry in 0..B {
+                    out[entry * count + win + r] = buf[r * stride_cols + entry];
+                }
             }
+            win += cnt;
         }
     }
 }
@@ -1217,24 +1220,23 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
         let stride_cols = halves * COLS;
         let blocks = stride / 210;
         let mut wq = vec![0_u8; ROW_WIN * 256];
-        let mut scales = vec![[0_i32; 16]; ROW_WIN];
+        // Sub-block major: `scales[k][row]`, so the sub-block loop reads one contiguous band.
+        let mut scales = vec![[0_i32; ROW_WIN]; 16];
         let mut dvec = [0.0_f32; ROW_WIN];
-        // Activation tile in (half, group, entry, 4) order, as in the Q4_K kernel.
-        let mut act = vec![0_i8; halves * 64 * COLS * 4];
-        let mut buf = vec![0.0_f32; count.saturating_mul(stride_cols)];
+        // Activation tile for every block, built once and reused by every row window.
+        let mut act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+        let mut bsumt = vec![0_i32; blocks * halves * 16 * COLS];
+        let mut dxs = vec![0.0_f32; blocks * halves * 16 * COLS];
         for b in 0..blocks {
-            act.fill(0);
-            let mut bsumt = [[[0_i32; COLS]; 16]; MAX_HALVES];
-            let mut dxs = [[[0.0_f32; COLS]; 16]; MAX_HALVES];
             for (entry, x) in xs.iter().enumerate() {
                 let col_half = entry / COLS;
                 let col = entry % COLS;
                 let chunk = x.q.as_ptr().add(b * 256);
+                let base = (b * halves + col_half) * 64 * COLS * 4;
                 for grp in 0..64 {
                     std::ptr::copy_nonoverlapping(
                         chunk.add(grp * 4),
-                        act.as_mut_ptr()
-                            .add(col_half * 64 * COLS * 4 + grp * 64 + col * 4),
+                        act.as_mut_ptr().add(base + grp * 64 + col * 4),
                         4,
                     );
                 }
@@ -1243,22 +1245,26 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                     for i in 0..16 {
                         sum += i32::from(*chunk.add(k * 16 + i));
                     }
-                    bsumt[col_half][k][col] = sum;
-                    dxs[col_half][k][col] = x.d[b * 8 + k / 2];
+                    let at = ((b * halves + col_half) * 16 + k) * COLS + col;
+                    bsumt[at] = sum;
+                    dxs[at] = x.d[b * 8 + k / 2];
                 }
             }
-            let act_ptr = act.as_ptr();
-            let mut win = 0;
-            while win < count {
-                let cnt = (count - win).min(ROW_WIN);
-                // Pull the next window's block in while this one unpacks:
-                // the walk takes 210 bytes out of every row, so consecutive
-                // addresses are a stride apart and the hardware prefetcher
-                // only sees part of the stream.
-                let next = win + ROW_WIN;
-                if next < count {
-                    for r in 0..(count - next).min(ROW_WIN) {
-                        let at = (first_row + next + r) * stride + b * 210;
+        }
+        // Window-major accumulation, as in the Q4_K kernel: `out` is written once per row window
+        // and the partial sums live in a ROW_WIN * stride_cols buffer instead of one entry per row
+        // of the whole matrix.
+        let mut buf = vec![0.0_f32; ROW_WIN * stride_cols];
+        let mut win = 0;
+        while win < count {
+            let cnt = (count - win).min(ROW_WIN);
+            buf[..cnt * stride_cols].fill(0.0);
+            for b in 0..blocks {
+                // The walk takes 210 bytes out of every row, so consecutive addresses are a
+                // stride apart and the hardware prefetcher only sees part of the stream.
+                if b + 1 < blocks {
+                    for r in 0..cnt {
+                        let at = (first_row + win + r) * stride + (b + 1) * 210;
                         prefetch_ahead(data, at);
                         prefetch_ahead(data, at + 64);
                         prefetch_ahead(data, at + 128);
@@ -1267,15 +1273,15 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                 }
                 wq.fill(0);
                 for slot in scales.iter_mut() {
-                    *slot = [0; 16];
+                    *slot = [0; ROW_WIN];
                 }
                 dvec.fill(0.0);
                 for r in 0..cnt {
                     let block = data.as_ptr().add((first_row + win + r) * stride + b * 210);
                     dvec[r] = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
                     let scale_bytes = std::slice::from_raw_parts(block.add(192), 16);
-                    for k in 0..16 {
-                        scales[r][k] = i32::from(scale_bytes[k] as i8);
+                    for (column, byte) in scales.iter_mut().zip(scale_bytes) {
+                        column[r] = i32::from(*byte as i8);
                     }
                     let wrow = wq.as_mut_ptr().add(r * 256);
                     for half in 0..2 {
@@ -1295,12 +1301,14 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                 }
                 let wq_ptr = wq.as_ptr();
                 for col_half in 0..halves {
-                    let half_act = act_ptr.add(col_half * 64 * COLS * 4);
+                    let half_act = act.as_ptr().add((b * halves + col_half) * 64 * COLS * 4);
+                    let bsumt_ptr = bsumt.as_ptr().add((b * halves + col_half) * 16 * COLS);
+                    let dxs_ptr = dxs.as_ptr().add((b * halves + col_half) * 16 * COLS);
                     let mut band = 0;
                     while band < cnt {
                         let band_cnt = (cnt - band).min(BAND);
                         let mut facc: [__m512; BAND] = [_mm512_setzero_ps(); BAND];
-                        for k in 0..16 {
+                        for (k, by_row) in scales.iter().enumerate() {
                             let mut acc: [__m512i; BAND] = [_mm512_setzero_si512(); BAND];
                             for g in 0..4 {
                                 let grp = k * 4 + g;
@@ -1318,10 +1326,10 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                                 }
                             }
                             let bias = _mm512_mullo_epi32(
-                                _mm512_loadu_si512(bsumt[col_half][k].as_ptr() as *const __m512i),
+                                _mm512_loadu_si512(bsumt_ptr.add(k * COLS) as *const __m512i),
                                 _mm512_set1_epi32(32),
                             );
-                            let dxv = _mm512_loadu_ps(dxs[col_half][k].as_ptr());
+                            let dxv = _mm512_loadu_ps(dxs_ptr.add(k * COLS));
                             for (t, (acc_slot, facc_slot)) in
                                 acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
                             {
@@ -1329,7 +1337,7 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                                 let corr = _mm512_sub_epi32(*acc_slot, bias);
                                 let main = _mm512_mul_ps(
                                     _mm512_mul_ps(_mm512_cvtepi32_ps(corr), dxv),
-                                    _mm512_set1_ps(dvec[row] * scales[row][k] as f32),
+                                    _mm512_set1_ps(dvec[row] * by_row[band + t] as f32),
                                 );
                                 *facc_slot = _mm512_add_ps(*facc_slot, main);
                             }
@@ -1337,19 +1345,19 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                         for (t, value) in facc.iter().enumerate().take(band_cnt) {
                             let slot = buf
                                 .as_mut_ptr()
-                                .add((win + band + t) * stride_cols + col_half * COLS);
+                                .add((band + t) * stride_cols + col_half * COLS);
                             _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
                         }
                         band += band_cnt;
                     }
                 }
-                win += cnt;
             }
-        }
-        for r in 0..count {
-            for entry in 0..B {
-                out[entry * count + r] = buf[r * stride_cols + entry];
+            for r in 0..cnt {
+                for entry in 0..B {
+                    out[entry * count + win + r] = buf[r * stride_cols + entry];
+                }
             }
+            win += cnt;
         }
     }
 }
