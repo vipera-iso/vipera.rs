@@ -694,6 +694,54 @@ fn decode_speculative(
     out
 }
 
+/// Same loop, but the draft length follows the last round: shrink on a miss, grow on a full hit.
+fn decode_adaptive(
+    backend: &mut CpuBackend,
+    state: &mut State,
+    start: u32,
+    steps: usize,
+) -> Vec<u32> {
+    const N: usize = 2;
+    let mut out = Vec::with_capacity(steps);
+    let mut next = start;
+    let mut k = 4;
+    while out.len() < steps {
+        let draft = draft_from_ngram(&state.tokens, N, k);
+        let mut chunk = Vec::with_capacity(draft.len() + 1);
+        chunk.push(next);
+        chunk.extend_from_slice(&draft);
+        let answers = backend
+            .logits_each(&mut state.context(&chunk))
+            .expect("verify fits");
+        let mut accepted = 0;
+        while accepted < draft.len() && accepted + 1 < answers.len() {
+            let pick = argmax(&answers[accepted]) as u32;
+            if pick != draft[accepted] {
+                break;
+            }
+            accepted += 1;
+            out.push(pick);
+            if out.len() == steps {
+                break;
+            }
+        }
+        let tail = argmax(&answers[accepted]) as u32;
+        state.tokens.extend_from_slice(&chunk[..=accepted]);
+        out.push(tail);
+        state.tokens.push(tail);
+        next = tail;
+        k = if accepted == 0 {
+            k.saturating_sub(1).max(1)
+        } else if accepted == draft.len() {
+            (k + 1).min(8)
+        } else {
+            k
+        };
+    }
+    out.truncate(steps);
+    out
+}
+
 #[test]
 #[ignore = "measurement, not a correctness check"]
 fn speculative_decode_wins() {
@@ -719,7 +767,7 @@ fn speculative_decode_wins() {
     let plain_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     let mut best = (f64::INFINITY, 0, 0, Vec::new());
-    for (n, k) in [(2, 4), (3, 5), (3, 8), (4, 6), (5, 8)] {
+    for (n, k) in [(1, 2), (1, 3), (1, 4), (2, 2)] {
         let mut spec_state = state.clone();
         let start = Instant::now();
         let stream = decode_speculative(&mut backend, &mut spec_state, first, STEPS, n, k);
@@ -734,6 +782,20 @@ fn speculative_decode_wins() {
             best = (ms, n, k, stream);
         }
     }
+    let mut adaptive_state = state.clone();
+    let start = Instant::now();
+    let adaptive = decode_adaptive(&mut backend, &mut adaptive_state, first, STEPS);
+    let adaptive_ms = start.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "  adaptive: {adaptive_ms:.1} ms ({:.1} t/s), identical {}",
+        STEPS as f64 * 1000.0 / adaptive_ms,
+        adaptive == plain
+    );
+    assert_eq!(
+        adaptive, plain,
+        "adaptive speculation changed the greedy stream"
+    );
+
     let (spec_ms, n, k, speculative) = best;
     println!("  best draft n={n} k={k}");
 
