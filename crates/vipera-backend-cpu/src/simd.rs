@@ -2046,11 +2046,16 @@ mod tests {
             return;
         }
         let mut rng = Rng(0xabcd_1234_5678_9f01);
+        // Warm first (fits L3), then a tensor large enough that every pass
+        // streams from DRAM like the engine's weights do.
         let rows = 8960usize;
+        let cold_rows = 57_344usize;
         let cols = 1536usize;
         let blocks = cols / 256;
         let stride = blocks * 144;
-        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let data: Vec<u8> = (0..cold_rows)
+            .flat_map(|_| q4k_row(&mut rng, blocks))
+            .collect();
         let source: Vec<Vec<f32>> = (0..128)
             .map(|_| (0..cols).map(|_| rng.unit()).collect())
             .collect();
@@ -2058,30 +2063,36 @@ mod tests {
         let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
         let reps = 3;
         macro_rules! bench {
-            ($b:literal) => {{
+            ($b:literal, $rows:expr, $label:literal) => {{
                 let xs: [&QuantizedX; $b] = std::array::from_fn(|e| &xs_vec[e]);
                 let sums: [&[f32]; $b] = std::array::from_fn(|e| sums_vec[e].as_slice());
-                let mut out = vec![0.0_f32; $b * rows];
+                let mut out = vec![0.0_f32; $b * $rows];
                 let mut best = f64::INFINITY;
                 for _ in 0..reps {
                     let start = std::time::Instant::now();
                     let _ =
-                        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs, &sums, &mut out);
+                        try_q4k_matvec_tiled_range(&data, stride, 0, $rows, &xs, &sums, &mut out);
                     best = best.min(start.elapsed().as_secs_f64());
                 }
                 std::hint::black_box(&out);
+                let gb = ($rows * stride) as f64 / 1e9;
                 println!(
-                    "B={:>3}: {:>6.1} ms/pass, {:>6.2} ms/token (single thread)",
+                    "{} B={:>3}: {:>7.2} ms/pass, {:>6.2} ms/token, {:>5.2} GB/s",
+                    $label,
                     $b,
                     best * 1e3,
-                    best * 1e3 / f64::from($b)
+                    best * 1e3 / f64::from($b),
+                    gb / best
                 );
             }};
         }
-        bench!(16);
-        bench!(32);
-        bench!(64);
-        bench!(128);
+        bench!(16, rows, "warm");
+        bench!(32, rows, "warm");
+        bench!(64, rows, "warm");
+        bench!(128, rows, "warm");
+        bench!(16, cold_rows, "cold");
+        bench!(64, cold_rows, "cold");
+        bench!(128, cold_rows, "cold");
     }
 
     /// B=32 against two B=16 passes: same shape, same data, 32 activations.
