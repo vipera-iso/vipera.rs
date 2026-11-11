@@ -615,3 +615,121 @@ fn speculative_payoff() {
         tried
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. Prompt-lookup speculation end to end: same tokens, fewer passes
+// ---------------------------------------------------------------------------
+
+fn draft_from_ngram(context: &[u32], n: usize, k: usize) -> Vec<u32> {
+    if context.len() < n + 1 {
+        return Vec::new();
+    }
+    let needle = &context[context.len() - n..];
+    for start in (0..context.len() - n).rev() {
+        if &context[start..start + n] == needle {
+            let after = start + n;
+            if after < context.len() {
+                return context[after..(after + k).min(context.len())].to_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Greedy continuation, one forward pass per token.
+fn decode_plain(backend: &mut CpuBackend, state: &mut State, start: u32, steps: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(steps);
+    let mut next = start;
+    for _ in 0..steps {
+        let logits = backend
+            .logits(&mut state.context(&[next]))
+            .expect("decode fits");
+        state.tokens.push(next);
+        next = argmax(&logits) as u32;
+        out.push(next);
+    }
+    out
+}
+
+/// Greedy continuation with prompt-lookup drafts verified one pass per round.
+fn decode_speculative(
+    backend: &mut CpuBackend,
+    state: &mut State,
+    start: u32,
+    steps: usize,
+) -> Vec<u32> {
+    const N: usize = 3;
+    const K: usize = 5;
+    let mut out = Vec::with_capacity(steps);
+    let mut next = start;
+    while out.len() < steps {
+        let draft = draft_from_ngram(&state.tokens, N, K);
+        let mut chunk = Vec::with_capacity(draft.len() + 1);
+        chunk.push(next);
+        chunk.extend_from_slice(&draft);
+        let answers = backend
+            .logits_each(&mut state.context(&chunk))
+            .expect("verify fits");
+        // answers[i] is the model's pick after chunk[..=i]; it must equal chunk[i + 1] to accept.
+        let mut accepted = 0;
+        while accepted < draft.len() && accepted + 1 < answers.len() {
+            let pick = argmax(&answers[accepted]) as u32;
+            if pick != draft[accepted] {
+                break;
+            }
+            accepted += 1;
+            out.push(pick);
+            if out.len() == steps {
+                break;
+            }
+        }
+        // The token after the last accepted draft is the model's own answer, always usable.
+        let tail = argmax(&answers[accepted]) as u32;
+        state.tokens.extend_from_slice(&chunk[..=accepted]);
+        out.push(tail);
+        state.tokens.push(tail);
+        next = tail;
+    }
+    out.truncate(steps);
+    out
+}
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn speculative_decode_wins() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let prompt: Vec<u32> = (0..64).map(|at| 1000 + (at % 12) as u32).collect();
+    const STEPS: usize = 16;
+    // Room for the prompt plus every token both loops may compute, including drafts that are
+    // thrown away.
+    let mut state = State::with_room(config, prompt.len() + 4 * STEPS, KvCacheType::F16);
+    let logits = backend
+        .logits(&mut state.context(&prompt))
+        .expect("prompt fits");
+    state.tokens.extend_from_slice(&prompt);
+    let first = argmax(&logits) as u32;
+
+    let mut plain_state = state.clone();
+    let start = Instant::now();
+    let plain = decode_plain(&mut backend, &mut plain_state, first, STEPS);
+    let plain_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut spec_state = state.clone();
+    let start = Instant::now();
+    let speculative = decode_speculative(&mut backend, &mut spec_state, first, STEPS);
+    let spec_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    println!(
+        "decode {STEPS} tokens: plain {plain_ms:.1} ms ({:.1} t/s), speculative {spec_ms:.1} ms \
+         ({:.1} t/s), speedup {:.2}x, identical tokens {}",
+        STEPS as f64 * 1000.0 / plain_ms,
+        STEPS as f64 * 1000.0 / spec_ms,
+        plain_ms / spec_ms,
+        plain == speculative
+    );
+    assert_eq!(plain, speculative, "speculation changed the greedy stream");
+}
