@@ -500,3 +500,34 @@ fn print_llama_hint(what: &str) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 9. Speculation groundwork: every position's logits must match a separate pass
+// ---------------------------------------------------------------------------
+//
+// Prompt-lookup speculation verifies several proposed tokens in one batch pass, which is only
+// sound if entry `i` of that pass answers exactly what a pass over that token alone would.
+
+#[test]
+fn logits_each_matches_single_passes() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let prompt: Vec<u32> = (0..8).map(|at| 1000 + (at % 400) as u32).collect();
+
+    let mut chunk = State::with_room(config, prompt.len() + 4, KvCacheType::F16);
+    let each = backend
+        .logits_each(&mut chunk.context(&prompt))
+        .expect("chunk fits");
+    assert_eq!(each.len(), prompt.len(), "one answer per position");
+
+    for at in 0..prompt.len() {
+        let mut alone = State::with_room(config, prompt.len() + 4, KvCacheType::F16);
+        let expected = backend
+            .logits(&mut alone.context(&prompt[..=at]))
+            .expect("prefix fits");
+        assert_eq!(each[at], expected, "position {at} differs");
+    }
+}
