@@ -546,7 +546,7 @@ fn speculative_payoff() {
     let config = backend.config();
     // A repetitive prompt: the kind of text prompt-lookup speculation exists for.
     let prompt: Vec<u32> = (0..64).map(|at| 1000 + (at % 12) as u32).collect();
-    let (mut state, first) = prefill_chunked(&mut backend, config, &prompt, KvCacheType::F16);
+    let (state, first) = prefill_chunked(&mut backend, config, &prompt, KvCacheType::F16);
 
     // Reference greedy stream, one token per pass, exactly today's decode.
     let mut greedy = vec![first];
