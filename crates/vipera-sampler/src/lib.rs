@@ -41,6 +41,10 @@ pub struct SamplerConfig {
     pub min_p: f32,
     /// Penalty applied to tokens that already appear in the recent context; `1.0` disables it.
     pub repetition_penalty: f32,
+    /// Constant subtracted from the logit of every token already seen; `0.0` disables it.
+    pub presence_penalty: f32,
+    /// Subtracted per occurrence of a token already seen; `0.0` disables it.
+    pub frequency_penalty: f32,
     /// Seed for every random choice in the run.
     pub seed: u64,
 }
@@ -53,6 +57,8 @@ impl Default for SamplerConfig {
             top_p: 0.95,
             min_p: 0.05,
             repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 0,
         }
     }
@@ -80,6 +86,16 @@ impl SamplerConfig {
             return Err(ViperaError::invalid_argument(
                 "repetition_penalty must be a finite number above 0",
             ));
+        }
+        for (name, value) in [
+            ("presence_penalty", self.presence_penalty),
+            ("frequency_penalty", self.frequency_penalty),
+        ] {
+            if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+                return Err(ViperaError::invalid_argument(format!(
+                    "{name} must be a finite number from -2 to 2"
+                )));
+            }
         }
         Ok(())
     }
@@ -294,7 +310,12 @@ impl Sampler {
         top_n: usize,
     ) -> Result<SampleDetails, ViperaError> {
         let token = self.sample(logits, recent)?;
-        let penalty = RepetitionPenalty::new(recent, self.config.repetition_penalty);
+        let penalty = RepetitionPenalty::new(
+            recent,
+            self.config.repetition_penalty,
+            self.config.presence_penalty,
+            self.config.frequency_penalty,
+        );
         let temperature = if self.config.temperature > 0.0 {
             self.config.temperature
         } else {
@@ -353,7 +374,12 @@ impl Sampler {
             ));
         }
 
-        let penalty = RepetitionPenalty::new(recent, self.config.repetition_penalty);
+        let penalty = RepetitionPenalty::new(
+            recent,
+            self.config.repetition_penalty,
+            self.config.presence_penalty,
+            self.config.frequency_penalty,
+        );
         let request = SampleRequest {
             logits,
             penalty: &penalty,
@@ -491,9 +517,11 @@ fn top_candidates(logits: &[f32], penalty: &dyn LogitPenalty, top_k: usize) -> V
 /// tens of scans per token once the context is long. Sorting the handful of recent ids once turns
 /// that into a `log n` lookup on the single pass that already visits every logit.
 struct RepetitionPenalty {
-    /// The penalized ids, sorted and deduplicated; empty when the penalty is disabled.
-    ids: Vec<u32>,
+    /// The penalized ids with their occurrence counts, sorted by id; empty when disabled.
+    counts: Vec<(u32, u32)>,
     factor: f32,
+    presence: f32,
+    frequency: f32,
 }
 
 impl LogitPenalty for RepetitionPenalty {
@@ -510,28 +538,50 @@ impl Random for Rng {
 }
 
 impl RepetitionPenalty {
-    fn new(recent: &[u32], factor: f32) -> Self {
-        if factor == 1.0 || recent.is_empty() {
+    fn new(recent: &[u32], factor: f32, presence: f32, frequency: f32) -> Self {
+        let disabled = factor == 1.0 && presence == 0.0 && frequency == 0.0;
+        if disabled || recent.is_empty() {
             return Self {
-                ids: Vec::new(),
+                counts: Vec::new(),
                 factor,
+                presence,
+                frequency,
             };
         }
-        let mut ids = recent.to_vec();
-        ids.sort_unstable();
-        ids.dedup();
-        Self { ids, factor }
+        let mut sorted = recent.to_vec();
+        sorted.sort_unstable();
+        let mut counts: Vec<(u32, u32)> = Vec::new();
+        for id in sorted {
+            match counts.last_mut() {
+                Some((last, count)) if *last == id => *count += 1,
+                _ => counts.push((id, 1)),
+            }
+        }
+        Self {
+            counts,
+            factor,
+            presence,
+            frequency,
+        }
     }
 
     fn apply(&self, id: usize, logit: f32) -> f32 {
-        if self.ids.is_empty() || self.ids.binary_search(&(id as u32)).is_err() {
+        let Ok(at) = self
+            .counts
+            .binary_search_by_key(&(id as u32), |(id, _)| *id)
+        else {
             return logit;
+        };
+        let count = self.counts[at].1;
+        let mut value = logit;
+        if self.factor != 1.0 {
+            value = if value > 0.0 {
+                value / self.factor
+            } else {
+                value * self.factor
+            };
         }
-        if logit > 0.0 {
-            logit / self.factor
-        } else {
-            logit * self.factor
-        }
+        value - self.presence - self.frequency * count as f32
     }
 }
 
@@ -580,7 +630,7 @@ mod tests {
     fn a_strategy_that_only_exists_in_a_test_is_found_by_the_same_lookup() {
         let found = TEST_ONLY.find("lowest").expect("the test lists it");
         assert_eq!(found.name(), "lowest");
-        let penalty = RepetitionPenalty::new(&[], 1.0);
+        let penalty = RepetitionPenalty::new(&[], 1.0, 0.0, 0.0);
         let logits = [1.0_f32, -2.0, 3.0];
         assert_eq!(
             found.draw(&request(&logits, &penalty), &mut Rng::from_seed(0)),
@@ -615,7 +665,12 @@ mod tests {
                 "temperature"
             };
             let strategy = SAMPLERS.find(name).expect("the build ships it");
-            let penalty = RepetitionPenalty::new(&[], config.repetition_penalty);
+            let penalty = RepetitionPenalty::new(
+                &[],
+                config.repetition_penalty,
+                config.presence_penalty,
+                config.frequency_penalty,
+            );
             let request = SampleRequest {
                 logits: &logits,
                 penalty: &penalty,
@@ -639,6 +694,8 @@ mod tests {
             top_p,
             min_p,
             repetition_penalty: penalty,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: 1234,
         })
         .expect("config is valid")
@@ -722,6 +779,32 @@ mod tests {
         // A token that dominates the distribution has a logprob close to zero.
         let (_token, logprob) = s.sample_with_logprob(&[20.0, 0.0], &[]).unwrap();
         assert!(logprob > -1e-6, "{logprob}");
+    }
+
+    #[test]
+    fn presence_penalty_shifts_every_seen_token_once() {
+        let config = SamplerConfig {
+            temperature: 0.0,
+            presence_penalty: 1.0,
+            ..SamplerConfig::default()
+        };
+        let mut s = Sampler::new(config).expect("config is valid");
+        // 5.0 wins by 0.5; seeing it once costs 1.0, so the unseen token wins instead.
+        assert_eq!(s.sample(&[5.0, 4.5], &[0]).unwrap(), 1);
+        assert_eq!(s.sample(&[5.0, 4.5], &[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn frequency_penalty_scales_with_occurrences() {
+        let config = SamplerConfig {
+            temperature: 0.0,
+            frequency_penalty: 0.6,
+            ..SamplerConfig::default()
+        };
+        let mut s = Sampler::new(config).expect("config is valid");
+        // One occurrence costs 0.6, not enough to lose; five cost 3.0, which flips the argmax.
+        assert_eq!(s.sample(&[6.0, 3.5], &[0]).unwrap(), 0);
+        assert_eq!(s.sample(&[6.0, 3.5], &[0, 0, 0, 0, 0]).unwrap(), 1);
     }
 
     #[test]
@@ -840,6 +923,18 @@ mod tests {
             },
             SamplerConfig {
                 repetition_penalty: 0.0,
+                ..SamplerConfig::default()
+            },
+            SamplerConfig {
+                presence_penalty: 2.1,
+                ..SamplerConfig::default()
+            },
+            SamplerConfig {
+                frequency_penalty: -2.1,
+                ..SamplerConfig::default()
+            },
+            SamplerConfig {
+                presence_penalty: f32::NAN,
                 ..SamplerConfig::default()
             },
         ] {

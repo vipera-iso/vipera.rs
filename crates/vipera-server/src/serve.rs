@@ -523,6 +523,14 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Headers that let a page call the server directly.
+///
+/// Authentication is a bearer header rather than a cookie, so a wildcard origin does not expose
+/// credentials; `authorization` stays an allowed request header.
+const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
+    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+    Access-Control-Allow-Headers: authorization, content-type\r\n";
+
 fn route(
     served: &Served,
     stream: &mut TcpStream,
@@ -530,6 +538,12 @@ fn route(
     started: Instant,
     peer: &str,
 ) -> std::io::Result<u16> {
+    // A preflight carries no credentials, so it has to be answered before authentication. It also
+    // must not consume the rate limit: one user action would otherwise spend two requests.
+    if request.method == "OPTIONS" {
+        respond_preflight(stream)?;
+        return Ok(204);
+    }
     // G01: when a key is configured, protect every business route. /health is
     // the only public one (it reports nothing about the model).
     if let Some(key) = &served.api_key
@@ -751,8 +765,8 @@ fn chat(
         stream.set_nodelay(true).ok();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-             Connection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{CORS_HEADERS}\
+             Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
         )?;
         let mut seen: Vec<u32> = Vec::new();
         let mut shown = String::new();
@@ -1425,6 +1439,16 @@ fn sampler_of(request: &Json) -> SamplerConfig {
     {
         sampler.repetition_penalty = value as f32;
     }
+    for (key, target) in [
+        ("presence_penalty", &mut sampler.presence_penalty),
+        ("frequency_penalty", &mut sampler.frequency_penalty),
+    ] {
+        if let Some(value) = request.get(key).and_then(Json::as_f64)
+            && value.is_finite()
+        {
+            *target = value.clamp(-2.0, 2.0) as f32;
+        }
+    }
     sampler
 }
 
@@ -1508,8 +1532,15 @@ fn attach_turns(
     top_n: usize,
 ) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
     let mut turns = Vec::with_capacity(n);
-    for _ in 0..n {
-        match attach_turn(served, ids, max_tokens, sampler, logprobs, top_n) {
+    for choice in 0..n {
+        match attach_turn(
+            served,
+            ids,
+            max_tokens,
+            seed_for_choice(sampler, choice),
+            logprobs,
+            top_n,
+        ) {
             Ok(turn) => turns.push(turn),
             Err(error) => {
                 for (sequence, _) in turns.drain(..) {
@@ -1520,6 +1551,16 @@ fn attach_turns(
         }
     }
     Ok(turns)
+}
+
+/// Give each of the `n` choices its own seed.
+///
+/// Every turn restarts its sampler from the same configuration, so sharing the seed would make
+/// every choice draw the same tokens. The first choice keeps the requested seed, which keeps a
+/// single-choice request reproducible.
+fn seed_for_choice(mut sampler: SamplerConfig, choice: usize) -> SamplerConfig {
+    sampler.seed = sampler.seed.wrapping_add(choice as u64);
+    sampler
 }
 
 fn attach_turn(
@@ -1768,12 +1809,22 @@ fn respond(
     body: &str,
 ) -> std::io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{CORS_HEADERS}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Answer a CORS preflight: no credentials, no body, and a day-long cache.
+fn respond_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes())?;
     stream.flush()
 }
 
@@ -1826,7 +1877,8 @@ fn respond_error_retry(
         quote(code)
     );
     let head = format!(
-        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\n{CORS_HEADERS}\
+         Content-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -2116,16 +2168,33 @@ mod tests {
     #[test]
     fn sampler_fields_are_clamped() {
         let request = Json::parse(
-            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2}"#,
+            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2,"presence_penalty":5,"frequency_penalty":-5}"#,
         )
         .unwrap();
         let sampler = sampler_of(&request);
+        assert_eq!(sampler.presence_penalty, 2.0);
+        assert_eq!(sampler.frequency_penalty, -2.0);
         assert_eq!(sampler.temperature, 2.0);
         assert_eq!(sampler.top_p, 1.0);
         assert_eq!(sampler.top_k, 5);
         assert_eq!(sampler.min_p, 0.0);
         assert_eq!(sampler.seed, 7);
         assert!((sampler.repetition_penalty - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn choices_get_distinct_seeds() {
+        let base = SamplerConfig {
+            seed: 7,
+            ..SamplerConfig::default()
+        };
+        assert_eq!(seed_for_choice(base, 0).seed, 7);
+        assert_eq!(seed_for_choice(base, 3).seed, 10);
+        let last = SamplerConfig {
+            seed: u64::MAX,
+            ..base
+        };
+        assert_eq!(seed_for_choice(last, 1).seed, 0);
     }
 
     #[test]
