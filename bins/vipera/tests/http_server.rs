@@ -85,6 +85,17 @@ fn serve_answers_chat_completions_and_streams() {
         "{streamed}"
     );
 
+    let two_choices = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":1,"temperature":0,"n":2}"#,
+    )
+    .expect("two choices");
+    assert!(two_choices.starts_with("HTTP/1.1 200"), "{two_choices}");
+    assert!(two_choices.contains(r#""index":0"#), "{two_choices}");
+    assert!(two_choices.contains(r#""index":1"#), "{two_choices}");
+
     let completion = http(
         port,
         "POST",
