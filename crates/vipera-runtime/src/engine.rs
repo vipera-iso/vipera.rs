@@ -21,7 +21,9 @@ use vipera_errors::ViperaError;
 use vipera_sampler::{Sampler, SamplerConfig};
 
 use crate::kv::KvCache;
-use crate::pipeline::{BatchContext, BatchEntry, ForwardPass, RequestLog, Stage, StageTimings};
+use crate::pipeline::{
+    BatchContext, BatchEntry, ForwardContext, ForwardPass, RequestLog, Stage, StageTimings,
+};
 use crate::sequence::{FinishReason, Sequence};
 
 /// Runtime knobs that are not per-request.
@@ -142,6 +144,8 @@ struct Turn {
     top_logprobs: Vec<Vec<(u32, f32)>>,
     /// How many alternatives each position reports; `0` disables the scan.
     top_n: usize,
+    /// Whether this turn may verify n-gram drafts in one pass instead of decoding one token at a time.
+    speculative: bool,
     timings: StageTimings,
 }
 
@@ -439,6 +443,7 @@ impl<F: ForwardPass> Engine<F> {
             )));
         }
         let sampler = Sampler::new(self.config.sampler)?;
+        let speculative_allowed = speculative_enabled() && self.config.sampler.temperature == 0.0;
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
@@ -465,6 +470,9 @@ impl<F: ForwardPass> Engine<F> {
         } else {
             Phase::Decode
         };
+        // Drafts are only sound for greedy decoding, and a turn that must report logprobs produces
+        // one entry per sampled token, which the verify path does not build.
+        let speculative = speculative_allowed && !collect_logprobs && top_n == 0;
         sequence.begin_prefill();
         self.waiting.push_back(Turn {
             id,
@@ -479,6 +487,7 @@ impl<F: ForwardPass> Engine<F> {
             logprobs: Vec::new(),
             top_logprobs: Vec::new(),
             top_n,
+            speculative,
             timings: StageTimings::new(),
         });
         Ok(())
@@ -512,10 +521,21 @@ impl<F: ForwardPass> Engine<F> {
             .filter(|(_, turn)| turn.phase == Phase::Prefill)
             .map(|(id, _)| *id)
             .collect();
+        // A speculative turn needs its own range call so it gets every position's logits, which the
+        // batch call does not return. It leaves the batch and is handled one step at a time.
+        let speculative: Vec<u64> = if prefill.is_empty() {
+            self.turns
+                .iter()
+                .filter(|(_, turn)| turn.phase == Phase::Decode && turn.speculative)
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let batch: Vec<u64> = if prefill.is_empty() {
             self.turns
                 .iter()
-                .filter(|(_, turn)| turn.phase == Phase::Decode)
+                .filter(|(_, turn)| turn.phase == Phase::Decode && !turn.speculative)
                 .map(|(id, _)| *id)
                 .collect()
         } else {
@@ -531,6 +551,13 @@ impl<F: ForwardPass> Engine<F> {
                 report.failed.push((*id, message.clone()));
             }
             return Ok(report);
+        }
+
+        for id in speculative {
+            if let Err(error) = self.step_speculative(id, &mut report) {
+                self.fail(id);
+                report.failed.push((id, error.to_string()));
+            }
         }
 
         // One draw per turn that has logits, in id order.
@@ -654,6 +681,149 @@ impl<F: ForwardPass> Engine<F> {
             } else {
                 Phase::Prefill
             };
+        }
+        Ok(())
+    }
+
+    /// Verify an n-gram draft for `id` in one range pass.
+    ///
+    /// The sequence's trailing token is still unprocessed, so the chunk is that token followed by up
+    /// to four drafted ids. Every position's logits come back from the same weight read: the prefix
+    /// that matches the draft is kept, and the model's own pick after it becomes the next
+    /// unprocessed token. The greedy stream is unchanged, which is what makes this safe to measure.
+    fn step_speculative(&mut self, id: u64, report: &mut StepReport) -> Result<(), ViperaError> {
+        let Engine {
+            kv,
+            forward,
+            config,
+            sequences,
+            turns,
+            counters,
+            ..
+        } = self;
+        let capacity = kv.config().capacity_tokens();
+        let sequence = sequences
+            .get_mut(&id)
+            .ok_or_else(|| ViperaError::internal("a speculative turn lost its sequence"))?;
+        let turn = turns
+            .get_mut(&id)
+            .ok_or_else(|| ViperaError::internal("a speculative turn lost its state"))?;
+
+        if sequence.len() as u64 >= capacity {
+            let generation = end_turn(sequence, turn, FinishReason::Length);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+            return Ok(());
+        }
+        let remaining =
+            u64::from(sequence.max_new_tokens()).saturating_sub(turn.generated.len() as u64);
+        if remaining == 0 {
+            let generation = end_turn(sequence, turn, FinishReason::Length);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+            return Ok(());
+        }
+
+        let processed = sequence.processed();
+        // One slot is always left for the model's own token after the accepted prefix.
+        let room = (capacity - sequence.len() as u64).min(remaining.saturating_sub(1));
+        let mut draft = ngram_draft(sequence.tokens(), 2);
+        draft.truncate(usize::try_from(room.min(4)).unwrap_or(0));
+        let mut all = sequence.tokens().to_vec();
+        all.extend_from_slice(&draft);
+
+        let tokens_per_block = kv.config().tokens_per_block as usize;
+        let bytes_per_token = kv.config().bytes_per_token;
+        let allocate = Instant::now();
+        kv.reserve(id, all.len() as u64)?;
+        // Only after `reserve`: the table copy has to include the blocks it just grew.
+        let table = kv.table(id).unwrap_or(&[]).to_vec();
+        turn.timings.record(Stage::Allocate, allocate.elapsed());
+
+        let started = Instant::now();
+        let answers = {
+            let mut context = ForwardContext {
+                tokens: &all,
+                new_tokens: &all[processed..],
+                first_position: u32::try_from(processed)
+                    .map_err(|_| ViperaError::internal("sequence position exceeds 32 bits"))?,
+                block_table: &table,
+                tokens_per_block: tokens_per_block as u64,
+                bytes_per_token,
+                kv: kv.storage_mut(),
+            };
+            forward.logits_range(&mut context)
+        };
+        turn.timings.record(Stage::Compute, started.elapsed());
+        let verify = Instant::now();
+        let answers = answers?;
+        if answers.len() != all.len() - processed {
+            return Err(ViperaError::internal(format!(
+                "the verify pass returned {} results for {} positions",
+                answers.len(),
+                all.len() - processed
+            )));
+        }
+
+        // The drafts were proposed from the context; acceptance is the same greedy rule a plain
+        // decode would apply, with the turn's own sampler and recent window.
+        let recent_start = |len: usize| len.saturating_sub(config.recent_window);
+        let mut accepted = 0_usize;
+        let mut emit: Vec<u32> = Vec::with_capacity(draft.len() + 1);
+        for index in 0..draft.len() {
+            let upto = processed + 1 + index;
+            let recent = &all[recent_start(upto)..upto];
+            let pick = turn.sampler.sample(&answers[index], recent)?;
+            if pick != draft[index] {
+                break;
+            }
+            accepted += 1;
+            emit.push(pick);
+            if config.eos.contains(&pick) {
+                break;
+            }
+        }
+        let eos = emit.last().is_some_and(|token| config.eos.contains(token));
+        if !eos {
+            let upto = processed + 1 + accepted;
+            let recent = &all[recent_start(upto)..upto];
+            emit.push(turn.sampler.sample(&answers[accepted], recent)?);
+        }
+
+        sequence.begin_decode();
+        for token in &emit {
+            sequence.push_generated(*token);
+        }
+        // The KV holds every verified position; only the rejected suffix is abandoned.
+        sequence.set_processed(processed + 1 + accepted);
+        turn.generated.extend(emit.iter().copied());
+        for token in &emit {
+            report.tokens.push(StepToken {
+                sequence: id,
+                token: *token,
+                logprob: None,
+                top_logprobs: Vec::new(),
+            });
+        }
+        turn.timings.record(Stage::Speculative, Duration::ZERO);
+        turn.timings.record(Stage::Verify, verify.elapsed());
+
+        let eos = emit.last().is_some_and(|token| config.eos.contains(token));
+        let length = u64::from(sequence.max_new_tokens()) <= turn.generated.len() as u64;
+        if eos || length {
+            let reason = if eos {
+                FinishReason::EndOfSequence
+            } else {
+                FinishReason::Length
+            };
+            let generation = end_turn(sequence, turn, reason);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+        } else {
+            turn.phase = Phase::Decode;
         }
         Ok(())
     }
