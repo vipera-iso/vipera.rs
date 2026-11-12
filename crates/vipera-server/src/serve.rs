@@ -335,6 +335,9 @@ impl Served {
                 },
                 recent_window: 128,
                 max_batch: 4,
+                // A turn only speculates when it is the only one decoding; with company the batch
+                // keeps the weight read shared.
+                speculative: true,
             },
         );
 

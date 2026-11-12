@@ -37,6 +37,10 @@ pub struct EngineConfig {
     pub recent_window: usize,
     /// Turns one step drives at once. Beyond this, requests wait their turn in the queue.
     pub max_batch: usize,
+    /// Whether greedy turns may verify n-gram drafts in one pass. Off in the library default so a
+    /// backend without a range override is never asked for one; the CLI and server turn it on.
+    /// `VIPERA_SPECULATIVE=0` disables it and `VIPERA_SPECULATIVE=1` forces it on.
+    pub speculative: bool,
 }
 
 impl Default for EngineConfig {
@@ -49,6 +53,7 @@ impl Default for EngineConfig {
             },
             recent_window: 64,
             max_batch: 4,
+            speculative: false,
         }
     }
 }
@@ -165,14 +170,20 @@ impl fmt::Debug for Turn {
     }
 }
 
-/// Whether speculative decoding is requested (`VIPERA_SPECULATIVE=1`).
-pub fn speculative_enabled() -> bool {
+/// Whether speculative decoding runs, given what the host asked for in [`EngineConfig`].
+///
+/// The verified tokens are the same ones plain decoding produces, so a greedy turn has nothing to
+/// lose on prose and up to 1.7x to gain where the text repeats. The host opts in through the config;
+/// `VIPERA_SPECULATIVE` overrides it (`0`/`false` off, anything else on) so an A/B run needs no
+/// rebuild. Turns that batch with another request do not speculate regardless, because the verify
+/// pass takes its turn out of the batch.
+pub fn speculative_enabled(config: bool) -> bool {
     std::env::var("VIPERA_SPECULATIVE")
         .map(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "0"
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
         })
-        .unwrap_or(false)
+        .unwrap_or(config)
 }
 
 /// Draft tokens proposed from the latest repeated n-gram in `context`.
@@ -488,7 +499,8 @@ impl<F: ForwardPass> Engine<F> {
             )));
         }
         let sampler = Sampler::new(self.config.sampler)?;
-        let speculative_allowed = speculative_enabled() && self.config.sampler.temperature == 0.0;
+        let speculative_allowed =
+            speculative_enabled(self.config.speculative) && self.config.sampler.temperature == 0.0;
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
@@ -568,8 +580,16 @@ impl<F: ForwardPass> Engine<F> {
             .map(|(id, _)| *id)
             .collect();
         // A speculative turn needs its own range call so it gets every position's logits, which the
-        // batch call does not return. It leaves the batch and is handled one step at a time.
-        let speculative: Vec<u64> = if prefill.is_empty() {
+        // batch call does not return. It leaves the batch and is handled one step at a time, so it
+        // only does that when it is the only turn decoding: with company, the batch reads the
+        // weights once for everybody and speculation would give that up.
+        let decode_turns = self
+            .turns
+            .values()
+            .filter(|turn| turn.phase == Phase::Decode)
+            .count();
+        let alone = decode_turns == 1;
+        let speculative: Vec<u64> = if prefill.is_empty() && alone {
             self.turns
                 .iter()
                 .filter(|(_, turn)| turn.phase == Phase::Decode && turn.speculative)
@@ -581,7 +601,7 @@ impl<F: ForwardPass> Engine<F> {
         let batch: Vec<u64> = if prefill.is_empty() {
             self.turns
                 .iter()
-                .filter(|(_, turn)| turn.phase == Phase::Decode && !turn.speculative)
+                .filter(|(_, turn)| turn.phase == Phase::Decode && !(alone && turn.speculative))
                 .map(|(id, _)| *id)
                 .collect()
         } else {

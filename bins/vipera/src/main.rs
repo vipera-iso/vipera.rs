@@ -674,6 +674,9 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
             recent_window: 128,
             // One request at a time keeps the CLI's tokens exactly what they were before batching.
             max_batch: 1,
+            // Greedy generation is a single turn here, so draft verification always has the step
+            // to itself and emits the same tokens one weight read at a time.
+            speculative: true,
         },
     );
 
