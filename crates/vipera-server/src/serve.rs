@@ -31,7 +31,7 @@ use vipera_errors::ViperaError;
 use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, Generation, KvCache, KvConfig, StepReport,
 };
-use vipera_sampler::SamplerConfig;
+use vipera_sampler::{MAX_LOGIT_BIAS, SamplerConfig};
 use vipera_tokenizer::{ChatMessage, Tokenizer};
 
 use crate::json::{Json, quote};
@@ -704,7 +704,13 @@ fn chat(
         .unwrap_or(256)
         .max(1);
     let max_tokens = requested.min(remaining);
-    let sampler = sampler_of(&parsed);
+    let sampler = match sampler_of(&parsed) {
+        Ok(sampler) => sampler,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
     let stops = match stop_sequences_of(&parsed) {
         Ok(stops) => stops,
         Err(message) => {
@@ -1075,7 +1081,13 @@ fn completions(
         .unwrap_or(256)
         .max(1);
     let max_tokens = requested.min(remaining);
-    let sampler = sampler_of(&parsed);
+    let sampler = match sampler_of(&parsed) {
+        Ok(sampler) => sampler,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
     let stops = match stop_sequences_of(&parsed) {
         Ok(stops) => stops,
         Err(message) => {
@@ -1413,8 +1425,9 @@ fn messages_of(request: &Json) -> Result<Vec<ChatMessage>, String> {
     Ok(messages)
 }
 
-/// Sampling knobs from the request. Unknown or out-of-range values fall back to the defaults.
-fn sampler_of(request: &Json) -> SamplerConfig {
+/// Sampling knobs from the request. Unknown or out-of-range values fall back to the defaults;
+/// malformed `logit_bias` is an error because silently dropping a ban changes what is generated.
+fn sampler_of(request: &Json) -> Result<SamplerConfig, String> {
     let mut sampler = SamplerConfig::default();
     if let Some(value) = request.get("temperature").and_then(Json::as_f64) {
         sampler.temperature = value.clamp(0.0, 2.0) as f32;
@@ -1449,7 +1462,29 @@ fn sampler_of(request: &Json) -> SamplerConfig {
             *target = value.clamp(-2.0, 2.0) as f32;
         }
     }
-    sampler
+    if let Some(value) = request.get("logit_bias") {
+        let Json::Object(entries) = value else {
+            return Err("logit_bias must be an object mapping token ids to numbers".to_owned());
+        };
+        if entries.len() > MAX_LOGIT_BIAS {
+            return Err(format!(
+                "logit_bias accepts at most {MAX_LOGIT_BIAS} entries"
+            ));
+        }
+        for (slot, (key, value)) in entries.iter().enumerate() {
+            let id = key
+                .parse::<u32>()
+                .map_err(|_| format!("logit_bias key {key:?} is not a token id"))?;
+            let bias = value
+                .as_f64()
+                .ok_or_else(|| format!("logit_bias for {key:?} must be a number"))?;
+            if !bias.is_finite() {
+                return Err(format!("logit_bias for {key:?} must be finite"));
+            }
+            sampler.logit_bias[slot] = Some((id, bias.clamp(-100.0, 100.0) as f32));
+        }
+    }
+    Ok(sampler)
 }
 
 /// Stop sequences from a request: one string or an array of up to four, as OpenAI defines them.
@@ -2168,10 +2203,13 @@ mod tests {
     #[test]
     fn sampler_fields_are_clamped() {
         let request = Json::parse(
-            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2,"presence_penalty":5,"frequency_penalty":-5}"#,
+            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2,"presence_penalty":5,"frequency_penalty":-5,"logit_bias":{"42":200,"7":-5}}"#,
         )
         .unwrap();
-        let sampler = sampler_of(&request);
+        let sampler = sampler_of(&request).expect("valid request");
+        assert_eq!(sampler.logit_bias[0], Some((42, 100.0)));
+        assert_eq!(sampler.logit_bias[1], Some((7, -5.0)));
+        assert_eq!(sampler.logit_bias[2], None);
         assert_eq!(sampler.presence_penalty, 2.0);
         assert_eq!(sampler.frequency_penalty, -2.0);
         assert_eq!(sampler.temperature, 2.0);
@@ -2180,6 +2218,18 @@ mod tests {
         assert_eq!(sampler.min_p, 0.0);
         assert_eq!(sampler.seed, 7);
         assert!((sampler.repetition_penalty - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn malformed_logit_bias_is_rejected() {
+        for body in [
+            r#"{"logit_bias":[1,2]}"#,
+            r#"{"logit_bias":{"x":1}}"#,
+            r#"{"logit_bias":{"7":"high"}}"#,
+        ] {
+            let request = Json::parse(body).unwrap();
+            assert!(sampler_of(&request).is_err(), "accepted {body}");
+        }
     }
 
     #[test]

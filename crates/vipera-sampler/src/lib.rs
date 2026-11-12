@@ -22,6 +22,9 @@ use vipera_traits::{
 
 pub use rng::Rng;
 
+/// How many token ids one request may bias.
+pub const MAX_LOGIT_BIAS: usize = 16;
+
 /// A token id and its log-probability.
 pub type TokenLogprob = (u32, f32);
 
@@ -45,6 +48,8 @@ pub struct SamplerConfig {
     pub presence_penalty: f32,
     /// Subtracted per occurrence of a token already seen; `0.0` disables it.
     pub frequency_penalty: f32,
+    /// Additive bias by token id, at most [`MAX_LOGIT_BIAS`] entries; `-100` effectively bans one.
+    pub logit_bias: [Option<(u32, f32)>; MAX_LOGIT_BIAS],
     /// Seed for every random choice in the run.
     pub seed: u64,
 }
@@ -59,6 +64,7 @@ impl Default for SamplerConfig {
             repetition_penalty: 1.0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            logit_bias: [None; MAX_LOGIT_BIAS],
             seed: 0,
         }
     }
@@ -95,6 +101,13 @@ impl SamplerConfig {
                 return Err(ViperaError::invalid_argument(format!(
                     "{name} must be a finite number from -2 to 2"
                 )));
+            }
+        }
+        for bias in self.logit_bias.iter().flatten() {
+            if !bias.1.is_finite() || !(-100.0..=100.0).contains(&bias.1) {
+                return Err(ViperaError::invalid_argument(
+                    "logit_bias values must be finite numbers from -100 to 100",
+                ));
             }
         }
         Ok(())
@@ -315,6 +328,7 @@ impl Sampler {
             self.config.repetition_penalty,
             self.config.presence_penalty,
             self.config.frequency_penalty,
+            &self.config.logit_bias,
         );
         let temperature = if self.config.temperature > 0.0 {
             self.config.temperature
@@ -379,6 +393,7 @@ impl Sampler {
             self.config.repetition_penalty,
             self.config.presence_penalty,
             self.config.frequency_penalty,
+            &self.config.logit_bias,
         );
         let request = SampleRequest {
             logits,
@@ -519,6 +534,8 @@ fn top_candidates(logits: &[f32], penalty: &dyn LogitPenalty, top_k: usize) -> V
 struct RepetitionPenalty {
     /// The penalized ids with their occurrence counts, sorted by id; empty when disabled.
     counts: Vec<(u32, u32)>,
+    /// Additive per-id biases, sorted by id and deduplicated.
+    bias: Vec<(u32, f32)>,
     factor: f32,
     presence: f32,
     frequency: f32,
@@ -538,11 +555,21 @@ impl Random for Rng {
 }
 
 impl RepetitionPenalty {
-    fn new(recent: &[u32], factor: f32, presence: f32, frequency: f32) -> Self {
+    fn new(
+        recent: &[u32],
+        factor: f32,
+        presence: f32,
+        frequency: f32,
+        logit_bias: &[Option<(u32, f32)>],
+    ) -> Self {
+        let mut bias: Vec<(u32, f32)> = logit_bias.iter().flatten().copied().collect();
+        bias.sort_unstable_by_key(|(id, _)| *id);
+        bias.dedup_by_key(|(id, _)| *id);
         let disabled = factor == 1.0 && presence == 0.0 && frequency == 0.0;
-        if disabled || recent.is_empty() {
+        if recent.is_empty() || disabled {
             return Self {
                 counts: Vec::new(),
+                bias,
                 factor,
                 presence,
                 frequency,
@@ -559,6 +586,7 @@ impl RepetitionPenalty {
         }
         Self {
             counts,
+            bias,
             factor,
             presence,
             frequency,
@@ -566,22 +594,25 @@ impl RepetitionPenalty {
     }
 
     fn apply(&self, id: usize, logit: f32) -> f32 {
-        let Ok(at) = self
+        let mut value = logit;
+        if let Ok(at) = self
             .counts
             .binary_search_by_key(&(id as u32), |(id, _)| *id)
-        else {
-            return logit;
-        };
-        let count = self.counts[at].1;
-        let mut value = logit;
-        if self.factor != 1.0 {
-            value = if value > 0.0 {
-                value / self.factor
-            } else {
-                value * self.factor
-            };
+        {
+            let count = self.counts[at].1;
+            if self.factor != 1.0 {
+                value = if value > 0.0 {
+                    value / self.factor
+                } else {
+                    value * self.factor
+                };
+            }
+            value -= self.presence + self.frequency * count as f32;
         }
-        value - self.presence - self.frequency * count as f32
+        if let Ok(at) = self.bias.binary_search_by_key(&(id as u32), |(id, _)| *id) {
+            value += self.bias[at].1;
+        }
+        value
     }
 }
 
@@ -630,7 +661,7 @@ mod tests {
     fn a_strategy_that_only_exists_in_a_test_is_found_by_the_same_lookup() {
         let found = TEST_ONLY.find("lowest").expect("the test lists it");
         assert_eq!(found.name(), "lowest");
-        let penalty = RepetitionPenalty::new(&[], 1.0, 0.0, 0.0);
+        let penalty = RepetitionPenalty::new(&[], 1.0, 0.0, 0.0, &[]);
         let logits = [1.0_f32, -2.0, 3.0];
         assert_eq!(
             found.draw(&request(&logits, &penalty), &mut Rng::from_seed(0)),
@@ -670,6 +701,7 @@ mod tests {
                 config.repetition_penalty,
                 config.presence_penalty,
                 config.frequency_penalty,
+                &config.logit_bias,
             );
             let request = SampleRequest {
                 logits: &logits,
@@ -696,6 +728,7 @@ mod tests {
             repetition_penalty: penalty,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            logit_bias: [None; MAX_LOGIT_BIAS],
             seed: 1234,
         })
         .expect("config is valid")
@@ -805,6 +838,29 @@ mod tests {
         // One occurrence costs 0.6, not enough to lose; five cost 3.0, which flips the argmax.
         assert_eq!(s.sample(&[6.0, 3.5], &[0]).unwrap(), 0);
         assert_eq!(s.sample(&[6.0, 3.5], &[0, 0, 0, 0, 0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn logit_bias_moves_one_token_without_touching_its_neighbours() {
+        let mut biases = [None; MAX_LOGIT_BIAS];
+        biases[0] = Some((1, 5.0));
+        let config = SamplerConfig {
+            temperature: 0.0,
+            logit_bias: biases,
+            ..SamplerConfig::default()
+        };
+        let mut s = Sampler::new(config).expect("config is valid");
+        // Equal logits; the bias alone decides the argmax.
+        assert_eq!(s.sample(&[1.0, 1.0], &[]).unwrap(), 1);
+        // A strong enough negative bias bans a token that would otherwise win.
+        biases[0] = Some((0, -100.0));
+        let config = SamplerConfig {
+            temperature: 0.0,
+            logit_bias: biases,
+            ..SamplerConfig::default()
+        };
+        let mut s = Sampler::new(config).expect("config is valid");
+        assert_eq!(s.sample(&[5.0, 4.0], &[]).unwrap(), 1);
     }
 
     #[test]
@@ -935,6 +991,10 @@ mod tests {
             },
             SamplerConfig {
                 presence_penalty: f32::NAN,
+                ..SamplerConfig::default()
+            },
+            SamplerConfig {
+                logit_bias: [Some((0, 200.0)); MAX_LOGIT_BIAS],
                 ..SamplerConfig::default()
             },
         ] {
