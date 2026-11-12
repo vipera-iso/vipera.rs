@@ -44,6 +44,9 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// OpenAI accepts at most four stop sequences per request.
 const MAX_STOP_SEQUENCES: usize = 4;
 
+/// The engine batches at most four turns, so that is the ceiling for `n`.
+const MAX_CHOICES: usize = 4;
+
 /// Run `vipera serve`: parse `args`, load the model, and serve until a signal arrives.
 ///
 /// `args` are the flags after the subcommand. Returns the process exit code, which is `0` after a
@@ -703,8 +706,24 @@ fn chat(
 
     let id = format!("chatcmpl-{}", request_id());
     let created = now_seconds();
-    let (sequence, receiver) = match attach_turn(served, &ids, max_tokens, sampler) {
-        Ok(turn) => turn,
+    let n = match choices_of(&parsed) {
+        Ok(n) => n,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    if streaming && n > 1 {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "n greater than 1 needs stream: false",
+        )?;
+        return Ok(400);
+    }
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n) {
+        Ok(turns) => turns,
         Err((status, code, message)) => {
             respond_error(stream, status, code, &message)?;
             return Ok(status);
@@ -712,6 +731,7 @@ fn chat(
     };
 
     if streaming {
+        let (sequence, receiver) = turns.remove(0);
         stream.set_nodelay(true).ok();
         write!(
             stream,
@@ -832,57 +852,74 @@ fn chat(
         return Ok(200);
     }
 
-    let mut finished: Option<Generation> = None;
-    let mut failure: Option<String> = None;
-    for event in receiver {
-        match event {
-            // A non-streaming caller only needs the generation; the tokens are in it.
-            Event::Token(_) => {}
-            Event::Finished(generation) => {
-                finished = Some(*generation);
-                break;
-            }
-            Event::Failed(message) => {
-                failure = Some(message);
-                break;
+    let prompt_tokens = ids.len();
+    let mut completion_tokens = 0usize;
+    let mut index = 0usize;
+    let mut choices = String::new();
+    while !turns.is_empty() {
+        let (sequence, receiver) = turns.remove(0);
+        let mut finished: Option<Generation> = None;
+        let mut failure: Option<String> = None;
+        for event in receiver {
+            match event {
+                // A non-streaming caller only needs the generation; the tokens are in it.
+                Event::Token(_) => {}
+                Event::Finished(generation) => {
+                    finished = Some(*generation);
+                    break;
+                }
+                Event::Failed(message) => {
+                    failure = Some(message);
+                    break;
+                }
             }
         }
+        release_sequence(served, sequence);
+        if let Some(message) = failure {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(stream, 500, "internal_error", &message)?;
+            return Ok(500);
+        }
+        let Some(generation) = finished else {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(
+                stream,
+                500,
+                "internal_error",
+                "the turn ended without a generation",
+            )?;
+            return Ok(500);
+        };
+        let text = served
+            .tokenizer
+            .decode(&generation.tokens)
+            .unwrap_or_default();
+        let (text, stopped) = without_stop(&text, &stops);
+        let reason = if stopped {
+            "stop"
+        } else {
+            finish_reason(&generation.finish)
+        };
+        completion_tokens += generation.tokens.len();
+        if !choices.is_empty() {
+            choices.push(',');
+        }
+        choices.push_str(&format!(
+            r#"{{"index":{},"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}"#,
+            index,
+            quote(text),
+            quote(reason)
+        ));
+        index += 1;
     }
-    served.router.unregister(sequence);
-    if let Ok(mut engine) = served.engine.lock() {
-        let _ = engine.release(sequence);
-    }
-    if let Some(message) = failure {
-        respond_error(stream, 500, "internal_error", &message)?;
-        return Ok(500);
-    }
-    let Some(generation) = finished else {
-        respond_error(
-            stream,
-            500,
-            "internal_error",
-            "the turn ended without a generation",
-        )?;
-        return Ok(500);
-    };
-    let text = served
-        .tokenizer
-        .decode(&generation.tokens)
-        .unwrap_or_default();
-    let (text, stopped) = without_stop(&text, &stops);
-    let reason = if stopped {
-        "stop"
-    } else {
-        finish_reason(&generation.finish)
-    };
-    let prompt_tokens = ids.len();
-    let completion_tokens = generation.tokens.len();
     let body = format!(
-        r#"{{"id":{},"object":"chat.completion","created":{created},"model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
+        r#"{{"id":{},"object":"chat.completion","created":{created},"model":{},"choices":[{choices}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
         quote(&id),
         quote(&served.model),
-        quote(text),
-        quote(reason),
         prompt_tokens + completion_tokens
     );
     respond(stream, 200, "OK", "application/json", &body)?;
@@ -976,8 +1013,24 @@ fn completions(
 
     let id = format!("cmpl-{}", request_id());
     let created = now_seconds();
-    let (sequence, receiver) = match attach_turn(served, &ids, max_tokens, sampler) {
-        Ok(turn) => turn,
+    let n = match choices_of(&parsed) {
+        Ok(n) => n,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    if streaming && n > 1 {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "n greater than 1 needs stream: false",
+        )?;
+        return Ok(400);
+    }
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n) {
+        Ok(turns) => turns,
         Err((status, code, message)) => {
             respond_error(stream, status, code, &message)?;
             return Ok(status);
@@ -985,6 +1038,7 @@ fn completions(
     };
 
     if streaming {
+        let (sequence, receiver) = turns.remove(0);
         stream.set_nodelay(true).ok();
         write!(
             stream,
@@ -1100,56 +1154,73 @@ fn completions(
         return Ok(200);
     }
 
-    let mut finished: Option<Generation> = None;
-    let mut failure: Option<String> = None;
-    for event in receiver {
-        match event {
-            Event::Token(_) => {}
-            Event::Finished(generation) => {
-                finished = Some(*generation);
-                break;
-            }
-            Event::Failed(message) => {
-                failure = Some(message);
-                break;
+    let prompt_tokens = ids.len();
+    let mut completion_tokens = 0usize;
+    let mut index = 0usize;
+    let mut choices = String::new();
+    while !turns.is_empty() {
+        let (sequence, receiver) = turns.remove(0);
+        let mut finished: Option<Generation> = None;
+        let mut failure: Option<String> = None;
+        for event in receiver {
+            match event {
+                Event::Token(_) => {}
+                Event::Finished(generation) => {
+                    finished = Some(*generation);
+                    break;
+                }
+                Event::Failed(message) => {
+                    failure = Some(message);
+                    break;
+                }
             }
         }
+        release_sequence(served, sequence);
+        if let Some(message) = failure {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(stream, 500, "internal_error", &message)?;
+            return Ok(500);
+        }
+        let Some(generation) = finished else {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(
+                stream,
+                500,
+                "internal_error",
+                "the turn ended without a generation",
+            )?;
+            return Ok(500);
+        };
+        let text = served
+            .tokenizer
+            .decode(&generation.tokens)
+            .unwrap_or_default();
+        let (text, stopped) = without_stop(&text, &stops);
+        let reason = if stopped {
+            "stop"
+        } else {
+            finish_reason(&generation.finish)
+        };
+        completion_tokens += generation.tokens.len();
+        if !choices.is_empty() {
+            choices.push(',');
+        }
+        choices.push_str(&format!(
+            r#"{{"text":{},"index":{},"logprobs":null,"finish_reason":{}}}"#,
+            quote(text),
+            index,
+            quote(reason)
+        ));
+        index += 1;
     }
-    served.router.unregister(sequence);
-    if let Ok(mut engine) = served.engine.lock() {
-        let _ = engine.release(sequence);
-    }
-    if let Some(message) = failure {
-        respond_error(stream, 500, "internal_error", &message)?;
-        return Ok(500);
-    }
-    let Some(generation) = finished else {
-        respond_error(
-            stream,
-            500,
-            "internal_error",
-            "the turn ended without a generation",
-        )?;
-        return Ok(500);
-    };
-    let text = served
-        .tokenizer
-        .decode(&generation.tokens)
-        .unwrap_or_default();
-    let (text, stopped) = without_stop(&text, &stops);
-    let reason = if stopped {
-        "stop"
-    } else {
-        finish_reason(&generation.finish)
-    };
-    let prompt_tokens = ids.len();
-    let completion_tokens = generation.tokens.len();
     let body = format!(
-        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{{"text":{},"index":0,"logprobs":null,"finish_reason":{}}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
+        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{choices}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
         quote(&id),
         quote(&served.model),
-        quote(text),
-        quote(reason),
         prompt_tokens + completion_tokens
     );
     respond(stream, 200, "OK", "application/json", &body)?;
@@ -1293,12 +1364,56 @@ fn emit_boundary(text: &str, shown: usize, stops: &[String], finished: bool) -> 
 }
 
 /// Attach a turn to the engine and return the receiver its tokens arrive on.
+/// A queued turn: its sequence id and the channel its tokens arrive on.
+type QueuedTurn = (u64, mpsc::Receiver<Event>);
+
+/// Release one turn's blocks and drop its route.
+fn release_sequence(served: &Served, sequence: u64) {
+    served.router.unregister(sequence);
+    if let Ok(mut engine) = served.engine.lock() {
+        let _ = engine.release(sequence);
+    }
+}
+
+/// Attach `n` turns for one request, releasing the ones already queued if a later admit fails.
+fn attach_turns(
+    served: &Served,
+    ids: &[u32],
+    max_tokens: u32,
+    sampler: SamplerConfig,
+    n: usize,
+) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
+    let mut turns = Vec::with_capacity(n);
+    for choice in 0..n {
+        match attach_turn(served, ids, max_tokens, seed_for_choice(sampler, choice)) {
+            Ok(turn) => turns.push(turn),
+            Err(error) => {
+                for (sequence, _) in turns.drain(..) {
+                    release_sequence(served, sequence);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(turns)
+}
+
+/// Give each of the `n` choices its own seed.
+///
+/// Every turn restarts its sampler from the same configuration, so sharing the seed would make
+/// every choice draw the same tokens. The first choice keeps the requested seed, which keeps a
+/// single-choice request reproducible.
+fn seed_for_choice(mut sampler: SamplerConfig, choice: usize) -> SamplerConfig {
+    sampler.seed = sampler.seed.wrapping_add(choice as u64);
+    sampler
+}
+
 fn attach_turn(
     served: &Served,
     ids: &[u32],
     max_tokens: u32,
     sampler: SamplerConfig,
-) -> Result<(u64, mpsc::Receiver<Event>), (u16, &'static str, String)> {
+) -> Result<QueuedTurn, (u16, &'static str, String)> {
     let (sender, receiver) = mpsc::channel();
     let sequence = {
         // The lock is held only long enough to attach this request's sampler and queue its turn. The
@@ -1326,6 +1441,18 @@ fn attach_turn(
     };
     served.router.wake();
     Ok((sequence, receiver))
+}
+
+/// `n` from the request, clamped to what one batch can hold.
+fn choices_of(request: &Json) -> Result<usize, String> {
+    let n = request.get("n").and_then(Json::as_u32).unwrap_or(1);
+    if n == 0 {
+        return Err("n must be at least 1".to_owned());
+    }
+    if n as usize > MAX_CHOICES {
+        return Err(format!("n is at most {MAX_CHOICES} on this server"));
+    }
+    Ok(n as usize)
 }
 
 fn finish_reason(finish: &vipera_runtime::FinishReason) -> &'static str {
@@ -1776,6 +1903,21 @@ mod tests {
     }
 
     #[test]
+    fn choices_get_distinct_seeds() {
+        let base = SamplerConfig {
+            seed: 7,
+            ..SamplerConfig::default()
+        };
+        assert_eq!(seed_for_choice(base, 0).seed, 7);
+        assert_eq!(seed_for_choice(base, 3).seed, 10);
+        let last = SamplerConfig {
+            seed: u64::MAX,
+            ..base
+        };
+        assert_eq!(seed_for_choice(last, 1).seed, 0);
+    }
+
+    #[test]
     fn stream_frames_parse_as_json() {
         let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None);
         let parsed = Json::parse(&frame).expect("valid frame");
@@ -1822,6 +1964,14 @@ mod tests {
         assert!(out.contains("vipera_request_duration_seconds_bucket{le=\"0.25\"} 1"));
         assert!(out.contains("vipera_request_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(out.contains("vipera_request_duration_seconds_count 1"));
+    }
+
+    #[test]
+    fn n_defaults_to_one_and_is_capped_at_the_batch_size() {
+        assert_eq!(choices_of(&Json::parse("{}").unwrap()), Ok(1));
+        assert_eq!(choices_of(&Json::parse(r#"{"n":4}"#).unwrap()), Ok(4));
+        assert!(choices_of(&Json::parse(r#"{"n":0}"#).unwrap()).is_err());
+        assert!(choices_of(&Json::parse(r#"{"n":5}"#).unwrap()).is_err());
     }
 
     #[test]
