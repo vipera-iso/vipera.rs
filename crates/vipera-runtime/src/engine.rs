@@ -146,6 +146,10 @@ struct Turn {
     top_n: usize,
     /// Whether this turn may verify n-gram drafts in one pass instead of decoding one token at a time.
     speculative: bool,
+    /// Longest draft this turn will verify, raised while drafts keep landing and lowered when they
+    /// stop. A long draft costs more positions in the verify pass, so it is only paid for while it
+    /// is being accepted.
+    draft_cap: usize,
     timings: StageTimings,
 }
 
@@ -189,6 +193,36 @@ pub fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
                 return context[after..end].to_vec();
             }
             return Vec::new();
+        }
+    }
+    Vec::new()
+}
+
+/// The longest continuation of the context's trailing tokens, up to `max_draft`.
+///
+/// A longer needle is a stronger promise: four trailing tokens that repeated before are more
+/// likely to repeat again than two, which is what keeps drafts landing on quoted or structured
+/// text. The search falls back to shorter needles so a fresh bigram still drafts something, and
+/// the continuation is bounded by `max_draft` because every drafted position is a position the
+/// verify pass has to compute.
+pub fn longest_ngram_draft(context: &[u32], max_draft: usize) -> Vec<u32> {
+    if max_draft == 0 {
+        return Vec::new();
+    }
+    for n in (2..=4).rev() {
+        if context.len() < 2 * n {
+            continue;
+        }
+        let needle = &context[context.len() - n..];
+        for start in (0..=context.len() - n - 1).rev() {
+            if &context[start..start + n] == needle {
+                let after = start + n;
+                if after < context.len() {
+                    let end = (after + max_draft).min(context.len());
+                    return context[after..end].to_vec();
+                }
+                break;
+            }
         }
     }
     Vec::new()
@@ -488,6 +522,7 @@ impl<F: ForwardPass> Engine<F> {
             top_logprobs: Vec::new(),
             top_n,
             speculative,
+            draft_cap: 4,
             timings: StageTimings::new(),
         });
         Ok(())
@@ -729,8 +764,9 @@ impl<F: ForwardPass> Engine<F> {
         let processed = sequence.processed();
         // One slot is always left for the model's own token after the accepted prefix.
         let room = (capacity - sequence.len() as u64).min(remaining.saturating_sub(1));
-        let mut draft = ngram_draft(sequence.tokens(), 2);
-        draft.truncate(usize::try_from(room.min(4)).unwrap_or(0));
+        let cap = turn.draft_cap.max(2);
+        let mut draft = longest_ngram_draft(sequence.tokens(), cap);
+        draft.truncate(usize::try_from(room).unwrap_or(0));
         let mut all = sequence.tokens().to_vec();
         all.extend_from_slice(&draft);
 
@@ -790,6 +826,16 @@ impl<F: ForwardPass> Engine<F> {
             let upto = processed + 1 + accepted;
             let recent = &all[recent_start(upto)..upto];
             emit.push(turn.sampler.sample(&answers[accepted], recent)?);
+        }
+
+        // A draft that lands completely means the context is repeating, so the next pass may verify
+        // more positions; a draft that dies immediately means the compute is wasted, so it shrinks.
+        if !draft.is_empty() {
+            if accepted == draft.len() {
+                turn.draft_cap = (turn.draft_cap + 1).min(8);
+            } else if accepted == 0 {
+                turn.draft_cap = 2;
+            }
         }
 
         sequence.begin_decode();
@@ -1635,7 +1681,7 @@ mod tests {
 
 #[cfg(test)]
 mod speculation {
-    use super::{ngram_draft, speculative_accept};
+    use super::{longest_ngram_draft, ngram_draft, speculative_accept};
 
     #[test]
     fn draft_follows_the_last_repeat() {
@@ -1646,6 +1692,19 @@ mod speculation {
         // No earlier repeat: nothing to draft, never a stale guess.
         assert!(ngram_draft(&[1_u32, 2, 3], 2).is_empty());
         assert!(ngram_draft(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn longest_draft_prefers_the_longer_needle_and_respects_its_cap() {
+        // Four trailing tokens recur at the front, so the continuation there is the draft; the
+        // shorter "1 2" match would have picked a different one.
+        let context = [1_u32, 2, 3, 4, 8, 9, 1, 2, 3, 4];
+        assert_eq!(longest_ngram_draft(&context, 8), vec![8, 9, 1, 2, 3, 4]);
+        assert_eq!(longest_ngram_draft(&context, 1), vec![8]);
+        // Only a bigram repeats, so the walk falls back to it rather than drafting nothing.
+        assert_eq!(longest_ngram_draft(&[1_u32, 2, 1, 2], 8), vec![1, 2]);
+        assert!(longest_ngram_draft(&[1_u32, 2, 3], 8).is_empty());
+        assert!(longest_ngram_draft(&[1_u32, 2, 1, 2], 0).is_empty());
     }
 
     #[test]

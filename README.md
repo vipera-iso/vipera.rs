@@ -15,8 +15,9 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
 - **Sampling**: greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
   penalties, per-token `logit_bias`, seeded RNG.
 - **Generation** on the CPU, with a KV cache in `f16` or `q8_0`, streamed to stdout token by token.
-- **Prompt-lookup speculation** (`VIPERA_SPECULATIVE=1`, greedy): verifies an n-gram draft in one
-  weight read and keeps the token stream bit-identical; measured 1.78x on repetitive prompts.
+- **Prompt-lookup speculation** (`VIPERA_SPECULATIVE=1`, greedy): verifies a longest-match n-gram
+  draft in one weight read, growing the draft while it lands, and keeps the token stream
+  bit-identical; measured 1.8x on repetitive prompts and 1.05-1.1x on quoted text.
 - **HTTP server** (`vipera serve`): `POST /v1/chat/completions` and `POST /v1/completions`
   (streaming SSE and non-streaming), request `stop` sequences, streamed usage
   (`stream_options.include_usage`), token logprobs with top alternatives (chat streaming and
