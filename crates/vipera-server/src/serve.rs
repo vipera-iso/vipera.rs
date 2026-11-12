@@ -509,6 +509,14 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Headers that let a page call the server directly.
+///
+/// Authentication is a bearer header rather than a cookie, so a wildcard origin does not expose
+/// credentials; `authorization` stays an allowed request header.
+const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
+    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+    Access-Control-Allow-Headers: authorization, content-type\r\n";
+
 fn route(
     served: &Served,
     stream: &mut TcpStream,
@@ -516,6 +524,12 @@ fn route(
     started: Instant,
     peer: &str,
 ) -> std::io::Result<u16> {
+    // A preflight carries no credentials, so it has to be answered before authentication. It also
+    // must not consume the rate limit: one user action would otherwise spend two requests.
+    if request.method == "OPTIONS" {
+        respond_preflight(stream)?;
+        return Ok(204);
+    }
     // G01: when a key is configured, protect every business route. /health is
     // the only public one (it reports nothing about the model).
     if let Some(key) = &served.api_key
@@ -716,8 +730,8 @@ fn chat(
         stream.set_nodelay(true).ok();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-             Connection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{CORS_HEADERS}\
+             Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
         )?;
         let mut seen: Vec<u32> = Vec::new();
         let mut shown = String::new();
@@ -982,12 +996,22 @@ fn respond(
     body: &str,
 ) -> std::io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{CORS_HEADERS}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Answer a CORS preflight: no credentials, no body, and a day-long cache.
+fn respond_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes())?;
     stream.flush()
 }
 
@@ -1040,7 +1064,8 @@ fn respond_error_retry(
         quote(code)
     );
     let head = format!(
-        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\n{CORS_HEADERS}\
+         Content-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;

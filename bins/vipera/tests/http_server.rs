@@ -31,6 +31,24 @@ fn serve_answers_chat_completions_and_streams() {
 
     let health = http(port, "GET", "/health", "").expect("health");
     assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(
+        health.contains("Access-Control-Allow-Origin: *"),
+        "{health}"
+    );
+
+    // A browser sends the preflight without the API key; it must still succeed and advertise the
+    // methods and headers the endpoint accepts.
+    let preflight =
+        http_with_key(port, "OPTIONS", "/v1/chat/completions", "", None).expect("preflight");
+    assert!(preflight.starts_with("HTTP/1.1 204"), "{preflight}");
+    assert!(
+        preflight.contains("Access-Control-Allow-Origin: *"),
+        "{preflight}"
+    );
+    assert!(
+        preflight.contains("Access-Control-Allow-Headers: authorization, content-type"),
+        "{preflight}"
+    );
     assert!(health.contains(r#""status":"ok""#), "{health}");
 
     let unauthorized = http_with_key(
