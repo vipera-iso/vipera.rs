@@ -21,7 +21,7 @@
 //!
 //! 1. The kernel multiplies `i8` activations against the nibbles: `_mm256_maddubs_epi16` handles 32
 //!    weights per instruction where the `f32` path needs four widen-multiply-add rounds. The cost
-//!    is one quantization of `x` per matvec (see [`crate::quant::QuantizedX`]), which bounds the
+//!    is one quantization of `x` per matvec (see `crate::quant::QuantizedX`), which bounds the
 //!    error of each 32-value group to `0.5/127` of that group's largest magnitude.
 //! 2. [`crate::quant::f16_to_f32`] stopped calling `powi` with a runtime exponent, which compiled to
 //!    the `__powisf2` compiler-rt helper and ran twice per Q4_K block. This was the larger of the
@@ -41,7 +41,7 @@
 //!
 //! Two were written at 512 bits, measured against these kernels in the same session, and removed. A
 //! Q4_K `zmm` version: 7.99 vs 8.01 tok/s end to end and 5.2 vs 6.8 GB/s at the kernel level. A Q6_K
-//! VNNI version, two 32-value runs per `vpdpbusd` and bit-identical to [`q6k_dot_q8`]: 8.7 vs 8.7
+//! VNNI version, two 32-value runs per `vpdpbusd` and bit-identical to `q6k_dot_q8`: 8.7 vs 8.7
 //! tok/s on one thread, 19.8 vs 20.0 on four, 19.1 vs 19.5 GB/s on `ffn_down`.
 //!
 //! Neither loop is limited by vector width. The Q4_K kernel spends its time on per-block scalar
@@ -54,7 +54,7 @@
 //! The public functions are `unsafe` because they use AVX2 intrinsics. Besides CPU support, `row` must
 //! be a whole number of blocks of the format named by the function (144 bytes for Q4_K, 210 for Q6_K),
 //! `x` exactly 256 values per block, and `sums` at least 16 entries per Q4_K block. Q6_K ignores
-//! `sums`. [`crate::quant::matvec`] validates all of that before dispatching, and [`try_dot`] is the
+//! `sums`. [`crate::quant::matvec`] validates all of that before dispatching, and `try_dot` is the
 //! safe entry point that checks the CPU.
 #![allow(unsafe_code)]
 
@@ -523,7 +523,7 @@ unsafe fn q4k_scale_vectors(block: *const u8) -> (__m256, __m256) {
 }
 
 /// Q4_K row dot against an `i8` activation. Mirrors [`crate::quant`]'s scalar version up to the
-/// activation quantization described on [`QuantizedX`].
+/// activation quantization described on `QuantizedX`.
 ///
 /// One 32-byte weight load yields both nibble planes, and each plane is dotted with 32 `i8`
 /// activations by `maddubs` (unsigned × signed, 16 pair sums) followed by `madd` against ones (8
@@ -607,7 +607,7 @@ pub unsafe fn q4k_dot(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
     }
 }
 
-/// Q6_K row dot, eight values per lane group. Mirrors [`crate::quant::q6k_dot`].
+/// Q6_K row dot, eight values per lane group. Mirrors `crate::quant::q6k_dot`.
 ///
 /// A Q6_K block is 210 bytes: 128 bytes of low nibbles, 64 bytes of the two high bits, 16 signed
 /// scales, and one `f16` super-scale. Each half of 128 activation values is produced by walking 32
