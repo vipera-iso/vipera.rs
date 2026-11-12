@@ -31,6 +31,24 @@ fn serve_answers_chat_completions_and_streams() {
 
     let health = http(port, "GET", "/health", "").expect("health");
     assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(
+        health.contains("Access-Control-Allow-Origin: *"),
+        "{health}"
+    );
+
+    // A browser sends the preflight without the API key; it must still succeed and advertise the
+    // methods and headers the endpoint accepts.
+    let preflight =
+        http_with_key(port, "OPTIONS", "/v1/chat/completions", "", None).expect("preflight");
+    assert!(preflight.starts_with("HTTP/1.1 204"), "{preflight}");
+    assert!(
+        preflight.contains("Access-Control-Allow-Origin: *"),
+        "{preflight}"
+    );
+    assert!(
+        preflight.contains("Access-Control-Allow-Headers: authorization, content-type"),
+        "{preflight}"
+    );
     assert!(health.contains(r#""status":"ok""#), "{health}");
 
     let unauthorized = http_with_key(
@@ -63,7 +81,7 @@ fn serve_answers_chat_completions_and_streams() {
         port,
         "POST",
         "/v1/chat/completions",
-        r#"{"model":"test","stream":true,"messages":[{"role":"user","content":"Say hi"}],"max_tokens":3,"temperature":0}"#,
+        r#"{"model":"test","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Say hi"}],"max_tokens":3,"temperature":0}"#,
     )
     .expect("stream");
     assert!(streamed.starts_with("HTTP/1.1 200"), "{streamed}");
@@ -83,6 +101,77 @@ fn serve_answers_chat_completions_and_streams() {
         streamed.contains(r#""finish_reason":"stop""#)
             || streamed.contains(r#""finish_reason":"length""#),
         "{streamed}"
+    );
+    assert!(
+        streamed.contains(r#""choices":[],"usage":{"prompt_tokens""#),
+        "include_usage must add a usage chunk: {streamed}"
+    );
+
+    let with_logprobs = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":2,"temperature":0,"logprobs":true,"top_logprobs":2}"#,
+    )
+    .expect("logprobs");
+    assert!(with_logprobs.starts_with("HTTP/1.1 200"), "{with_logprobs}");
+    assert!(
+        with_logprobs.contains(r#""logprobs":{"content":["#),
+        "{with_logprobs}"
+    );
+    assert!(with_logprobs.contains(r#""logprob":"#), "{with_logprobs}");
+    assert!(
+        with_logprobs.contains(r#""top_logprobs":[{"token""#),
+        "{with_logprobs}"
+    );
+
+    let streamed_logprobs = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":3,"temperature":0,"stream":true,"logprobs":true,"top_logprobs":2}"#,
+    )
+    .expect("streamed logprobs");
+    assert!(
+        streamed_logprobs.starts_with("HTTP/1.1 200"),
+        "{streamed_logprobs}"
+    );
+    assert!(
+        streamed_logprobs.contains(r#""logprobs":{"content":["#),
+        "{streamed_logprobs}"
+    );
+    assert!(
+        streamed_logprobs.contains(r#""top_logprobs":[{"token""#),
+        "{streamed_logprobs}"
+    );
+
+    let two_choices = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":1,"temperature":0,"n":2}"#,
+    )
+    .expect("two choices");
+    assert!(two_choices.starts_with("HTTP/1.1 200"), "{two_choices}");
+    assert!(two_choices.contains(r#""index":0"#), "{two_choices}");
+    assert!(two_choices.contains(r#""index":1"#), "{two_choices}");
+
+    let completion = http(
+        port,
+        "POST",
+        "/v1/completions",
+        r#"{"model":"test","prompt":"The capital of France is","max_tokens":2,"temperature":0,"stop":["\n"]}"#,
+    )
+    .expect("completion endpoint");
+    assert!(completion.starts_with("HTTP/1.1 200"), "{completion}");
+    assert!(
+        completion.contains(r#""object":"text_completion""#),
+        "{completion}"
+    );
+    assert!(
+        completion.contains(r#""finish_reason":"stop""#)
+            || completion.contains(r#""finish_reason":"length""#),
+        "{completion}"
     );
 
     let metrics = http(port, "GET", "/metrics", "").expect("metrics");

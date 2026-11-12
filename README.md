@@ -15,9 +15,14 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
 - **Sampling**: greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
   penalties, per-token `logit_bias`, seeded RNG.
 - **Generation** on the CPU, with a KV cache in `f16` or `q8_0`, streamed to stdout token by token.
-- **HTTP server** (`vipera serve`): `POST /v1/chat/completions` (streaming SSE and non-streaming),
-  `GET /v1/models`, `/health`, `/ready`, `/metrics`, bearer auth, error envelopes.
-- **AVX2 Q4_K matmul**, selected at runtime and checked against the scalar reference.
+- **HTTP server** (`vipera serve`): `POST /v1/chat/completions` and `POST /v1/completions`
+  (streaming SSE and non-streaming), request `stop` sequences, streamed usage
+  (`stream_options.include_usage`), token logprobs with top alternatives (chat streaming and
+  non-streaming) and up to four `n` choices on the non-streaming path,
+  `GET /v1/models`, `/health`, `/ready`, `/metrics`, bearer auth, error envelopes, opt-in per-key
+  rate limiting.
+- **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
+  scalar reference.
 
 ## Layout
 
@@ -44,7 +49,7 @@ Requires stable Rust (edition 2024). No system libraries, no network, no GPU.
 
 ```bash
 cargo build --release
-cargo test --workspace        # 278 tests; model-dependent ones skip when no model is present
+cargo test --workspace        # 285 tests; model-dependent ones skip when no model is present
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -74,14 +79,16 @@ curl -s localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-The server is single-conversation and serialized behind one engine; there is no rate limiting yet.
+The server batches up to four conversations into one weight read; `--rate-limit` adds a per-key
+request budget, and there is no request logging.
 
 ## Limitations
 
 - **GPU**: there is no CUDA, Metal or Vulkan backend. `verify` reports host memory only.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
-- **Server**: no rate limiting, no request logging, no concurrent conversations.
+- **Server**: no request logging and no TLS; put it behind a proxy for either. Rate limiting is
+  opt-in (`--rate-limit`), not a default.
 - **Parity checks**: the tokenizer and continuation tests skip unless `llama-server` is installed.
 - **Speed**: the CPU path is usable for a single conversation, not a throughput claim. Q4_K
   activations are multiplied as `i8`, so outputs agree with the `f32` path on the checked prompts

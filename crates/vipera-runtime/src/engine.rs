@@ -64,6 +64,10 @@ pub struct Generation {
     pub reused_tokens: usize,
     /// Tokens that actually went through the forward pass.
     pub processed_tokens: u64,
+    /// Log-probability of each generated token, when the caller asked for them; empty otherwise.
+    pub logprobs: Vec<f32>,
+    /// Alternative tokens and their log-probabilities for each position, when requested.
+    pub top_logprobs: Vec<Vec<(u32, f32)>>,
     /// Per-stage timings for the whole turn.
     pub timings: StageTimings,
     /// One structured log line describing the turn.
@@ -130,6 +134,14 @@ struct Turn {
     prompt_tokens: usize,
     /// Tokens that went through the forward pass in this turn.
     processed: u64,
+    /// Whether this turn records a log-probability for each generated token.
+    collect_logprobs: bool,
+    /// Log-probabilities recorded so far, aligned with `generated`.
+    logprobs: Vec<f32>,
+    /// Top alternatives recorded so far, aligned with `generated`.
+    top_logprobs: Vec<Vec<(u32, f32)>>,
+    /// How many alternatives each position reports; `0` disables the scan.
+    top_n: usize,
     timings: StageTimings,
 }
 
@@ -190,11 +202,24 @@ pub fn speculative_accept(draft: &[u32], target: &[u32]) -> usize {
         .count()
 }
 
+/// A token drawn this step, with the logprob data its sequence asked to record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepToken {
+    /// Sequence that drew the token.
+    pub sequence: u64,
+    /// The drawn token id.
+    pub token: u32,
+    /// Log-probability of the token when the sequence requested logprobs.
+    pub logprob: Option<f32>,
+    /// Alternatives in descending order when the sequence requested `top_logprobs`.
+    pub top_logprobs: Vec<(u32, f32)>,
+}
+
 /// What one step did.
 #[derive(Debug, Clone, Default)]
 pub struct StepReport {
-    /// Tokens drawn this step, in the order they were drawn, as `(sequence, token)`.
-    pub tokens: Vec<(u64, u32)>,
+    /// Tokens drawn this step, in the order they were drawn.
+    pub tokens: Vec<StepToken>,
     /// Turns that ended this step, with their generations.
     pub finished: Vec<Generation>,
     /// Turns that failed this step, as `(sequence, message)`. A failure is
@@ -294,6 +319,29 @@ impl<F: ForwardPass> Engine<F> {
         Ok(id)
     }
 
+    /// Ask sequence `id` to record a log-probability for every token it generates.
+    ///
+    /// Set this between [`Engine::admit`] and [`Engine::enqueue`]: the turn copies the flag when it
+    /// is queued, so changing it mid-turn does not affect tokens already drawn.
+    pub fn set_logprobs(&mut self, id: u64, wants: bool) -> Result<(), ViperaError> {
+        let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
+            ViperaError::invalid_argument(format!("sequence {id} does not exist"))
+        })?;
+        sequence.set_logprobs(wants);
+        Ok(())
+    }
+
+    /// Ask sequence `id` to report the `top` most likely alternatives for each generated token.
+    ///
+    /// Implies [`Engine::set_logprobs`]; call both between admit and enqueue.
+    pub fn set_top_logprobs(&mut self, id: u64, top: usize) -> Result<(), ViperaError> {
+        let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
+            ViperaError::invalid_argument(format!("sequence {id} does not exist"))
+        })?;
+        sequence.set_top_logprobs(top);
+        Ok(())
+    }
+
     /// Add a follow-up prompt, reusing the retained prefix.
     ///
     /// Returns how many leading tokens were already resident. The cache is cut back to the common
@@ -349,9 +397,9 @@ impl<F: ForwardPass> Engine<F> {
         self.enqueue(id)?;
         loop {
             let report = self.step()?;
-            for (sequence, token) in &report.tokens {
-                if *sequence == id && !self.config.eos.contains(token) {
-                    (on_token)(*token);
+            for step in &report.tokens {
+                if step.sequence == id && !self.config.eos.contains(&step.token) {
+                    (on_token)(step.token);
                 }
             }
             if let Some(generation) = report
@@ -408,6 +456,8 @@ impl<F: ForwardPass> Engine<F> {
 
         let reused = sequence.take_reused();
         let prompt_tokens = sequence.len().saturating_sub(reused);
+        let collect_logprobs = sequence.wants_logprobs();
+        let top_n = sequence.top_logprobs();
         // Nothing new to prefill, as after a restore or a repeated turn: sampling still needs the
         // logits of the last retained token, so the turn starts by computing that one position.
         let phase = if sequence.processed() < sequence.len() {
@@ -425,6 +475,10 @@ impl<F: ForwardPass> Engine<F> {
             reused,
             prompt_tokens,
             processed: 0,
+            collect_logprobs,
+            logprobs: Vec::new(),
+            top_logprobs: Vec::new(),
+            top_n,
             timings: StageTimings::new(),
         });
         Ok(())
@@ -633,14 +687,27 @@ impl<F: ForwardPass> Engine<F> {
 
         let recent_start = sequence.len().saturating_sub(config.recent_window);
         let started = Instant::now();
-        let token = turn
-            .sampler
-            .sample(&turn.logits, &sequence.tokens()[recent_start..])?;
+        let recent = &sequence.tokens()[recent_start..];
+        let (token, logprob, top) = if turn.collect_logprobs {
+            let (token, logprob, top) =
+                turn.sampler
+                    .sample_with_details(&turn.logits, recent, turn.top_n)?;
+            turn.logprobs.push(logprob);
+            turn.top_logprobs.push(top.clone());
+            (token, Some(logprob), top)
+        } else {
+            (turn.sampler.sample(&turn.logits, recent)?, None, Vec::new())
+        };
         turn.timings.record(Stage::Sample, started.elapsed());
         sequence.begin_decode();
         sequence.push_generated(token);
         turn.generated.push(token);
-        report.tokens.push((id, token));
+        report.tokens.push(StepToken {
+            sequence: id,
+            token,
+            logprob,
+            top_logprobs: top,
+        });
 
         let finish = if config.eos.contains(&token) {
             Some(FinishReason::EndOfSequence)
@@ -790,6 +857,8 @@ fn end_turn(sequence: &mut Sequence, turn: &mut Turn, reason: FinishReason) -> G
         finish: reason,
         reused_tokens: turn.reused,
         processed_tokens: turn.processed,
+        logprobs: std::mem::take(&mut turn.logprobs),
+        top_logprobs: std::mem::take(&mut turn.top_logprobs),
         timings: turn.timings,
         log_line: log.to_json(),
     }
@@ -942,8 +1011,8 @@ mod tests {
         let mut finished = Vec::new();
         for _ in 0..1000 {
             let report = engine.step().expect("a step");
-            for (id, token) in report.tokens {
-                tokens.entry(id).or_default().push(token);
+            for step in report.tokens {
+                tokens.entry(step.sequence).or_default().push(step.token);
             }
             finished.extend(report.finished);
             if engine.turns.is_empty() && engine.waiting.is_empty() {
@@ -1152,7 +1221,7 @@ mod tests {
         let report = engine.step().expect("step must succeed for the good turn");
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, bad);
-        assert!(report.tokens.iter().any(|(id, _)| *id == good));
+        assert!(report.tokens.iter().any(|step| step.sequence == good));
         // bad is failed and no longer active; good is still mid-turn, so drive
         // it to completion with steps (generate would re-enqueue it).
         assert!(engine.generate(bad).is_err());
@@ -1312,7 +1381,7 @@ mod tests {
         engine.enqueue(first).unwrap();
         let opening = engine.step().unwrap();
         assert_eq!(opening.tokens.len(), 1, "the first turn prefills and draws");
-        assert_eq!(opening.tokens[0].0, first);
+        assert_eq!(opening.tokens[0].sequence, first);
 
         let second = engine.admit(&[4, 5], 3).unwrap();
         engine.enqueue(second).unwrap();

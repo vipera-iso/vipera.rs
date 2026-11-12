@@ -41,6 +41,12 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Request line plus headers must fit here; anything larger is not a chat request.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 
+/// OpenAI accepts at most four stop sequences per request.
+const MAX_STOP_SEQUENCES: usize = 4;
+
+/// The engine batches at most four turns, so that is the ceiling for `n`.
+const MAX_CHOICES: usize = 4;
+
 /// Run `vipera serve`: parse `args`, load the model, and serve until a signal arrives.
 ///
 /// `args` are the flags after the subcommand. Returns the process exit code, which is `0` after a
@@ -355,7 +361,11 @@ impl Served {
 
 /// What a handler receives from the scheduler: one token, the end of its turn, or a failure.
 enum Event {
-    Token(u32),
+    Token {
+        token: u32,
+        logprob: Option<f32>,
+        top_logprobs: Vec<(u32, f32)>,
+    },
     Finished(Box<Generation>),
     Failed(String),
 }
@@ -427,12 +437,16 @@ impl Router {
         let Ok(mut routes) = self.routes.lock() else {
             return;
         };
-        for (sequence, token) in report.tokens {
-            if eos.contains(&token) {
+        for step in report.tokens {
+            if eos.contains(&step.token) {
                 continue;
             }
-            if let Some(sender) = routes.get(&sequence) {
-                let _ = sender.send(Event::Token(token));
+            if let Some(sender) = routes.get(&step.sequence) {
+                let _ = sender.send(Event::Token {
+                    token: step.token,
+                    logprob: step.logprob,
+                    top_logprobs: step.top_logprobs,
+                });
             }
         }
         for generation in report.finished {
@@ -509,6 +523,14 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Headers that let a page call the server directly.
+///
+/// Authentication is a bearer header rather than a cookie, so a wildcard origin does not expose
+/// credentials; `authorization` stays an allowed request header.
+const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
+    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+    Access-Control-Allow-Headers: authorization, content-type\r\n";
+
 fn route(
     served: &Served,
     stream: &mut TcpStream,
@@ -516,6 +538,12 @@ fn route(
     started: Instant,
     peer: &str,
 ) -> std::io::Result<u16> {
+    // A preflight carries no credentials, so it has to be answered before authentication. It also
+    // must not consume the rate limit: one user action would otherwise spend two requests.
+    if request.method == "OPTIONS" {
+        respond_preflight(stream)?;
+        return Ok(204);
+    }
     // G01: when a key is configured, protect every business route. /health is
     // the only public one (it reports nothing about the model).
     if let Some(key) = &served.api_key
@@ -579,6 +607,7 @@ fn route(
             Ok(200)
         }
         ("POST", "/v1/chat/completions") => chat(served, stream, request, started),
+        ("POST", "/v1/completions") => completions(served, stream, request, started),
         ("GET", _) | ("POST", _) | ("PUT", _) | ("DELETE", _) | ("PATCH", _) => {
             respond_error(stream, 404, "not_found", "no such route")?;
             Ok(404)
@@ -593,6 +622,7 @@ fn route(
 fn endpoint_name(path: &str) -> &'static str {
     match path {
         "/v1/chat/completions" => "chat_completions",
+        "/v1/completions" => "completions",
         "/v1/models" => "models",
         "/metrics" => "metrics",
         "/health" => "health",
@@ -644,6 +674,7 @@ fn chat(
         .get("stream")
         .and_then(Json::as_bool)
         .unwrap_or(false);
+    let include_usage = include_usage_of(&parsed);
 
     let ids = match served.tokenizer.encode_chat(&messages, true) {
         Ok(ids) => ids,
@@ -680,60 +711,83 @@ fn chat(
             return Ok(400);
         }
     };
-
+    let stops = match stop_sequences_of(&parsed) {
+        Ok(stops) => stops,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    let wants_logprobs = parsed
+        .get("logprobs")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let top_n = parsed
+        .get("top_logprobs")
+        .and_then(Json::as_u32)
+        .unwrap_or(0) as usize;
+    if top_n > 5 {
+        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
+        return Ok(400);
+    }
+    if top_n > 0 && !wants_logprobs {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "top_logprobs needs logprobs: true",
+        )?;
+        return Ok(400);
+    }
     let id = format!("chatcmpl-{}", request_id());
     let created = now_seconds();
-    let (sender, receiver) = mpsc::channel();
-    let sequence = {
-        // The lock is held only long enough to attach this request's sampler and queue its turn. The
-        // scheduler does the work, so other requests can join the same forward pass instead of
-        // queueing behind this one.
-        let mut engine = match served.engine.lock() {
-            Ok(engine) => engine,
-            Err(_) => {
-                respond_error(stream, 500, "internal_error", "engine lock was poisoned")?;
-                return Ok(500);
-            }
-        };
-        engine.set_sampler(sampler);
-        let sequence = match engine.admit(&ids, max_tokens) {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                let (status, code) = map_engine_error(&error);
-                respond_error(stream, status, code, &error.to_string())?;
-                return Ok(status);
-            }
-        };
-        // The route goes in before the turn is queued: a step that starts the moment after `enqueue`
-        // must already have somewhere to send the first token.
-        served.router.register(sequence, sender);
-        if let Err(error) = engine.enqueue(sequence) {
-            served.router.unregister(sequence);
-            let _ = engine.release(sequence);
-            let (status, code) = map_engine_error(&error);
-            respond_error(stream, status, code, &error.to_string())?;
+    let n = match choices_of(&parsed) {
+        Ok(n) => n,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    if streaming && n > 1 {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "n greater than 1 needs stream: false",
+        )?;
+        return Ok(400);
+    }
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
+    {
+        Ok(turns) => turns,
+        Err((status, code, message)) => {
+            respond_error(stream, status, code, &message)?;
             return Ok(status);
         }
-        sequence
     };
-    served.router.wake();
 
     if streaming {
+        let (sequence, receiver) = turns.remove(0);
         stream.set_nodelay(true).ok();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-             Connection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{CORS_HEADERS}\
+             Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
         )?;
         let mut seen: Vec<u32> = Vec::new();
         let mut shown = String::new();
         let mut first = true;
         let mut disconnected = false;
+        let mut stopped = false;
         let mut finished: Option<Generation> = None;
         let mut failure: Option<String> = None;
         for event in receiver {
-            let token = match event {
-                Event::Token(token) => token,
+            let (token, logprob, top) = match event {
+                Event::Token {
+                    token,
+                    logprob,
+                    top_logprobs,
+                } => (token, logprob, top_logprobs),
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -750,28 +804,52 @@ fn chat(
             if !text.starts_with(shown.as_str()) {
                 continue;
             }
-            let delta = &text[shown.len()..];
-            if delta.is_empty() {
-                continue;
-            }
-            let frame = chunk(&id, created, &served.model, Some(delta), None);
-            if sse(stream, &frame).is_err() {
-                // The client is gone: stop the turn instead of generating into a dead socket.
-                disconnected = true;
-                break;
-            }
-            if first {
-                first = false;
+            // A stop sequence may arrive across token boundaries, so search the text decoded so far
+            // and emit only what precedes it. The held-back tail is what keeps a stop from leaking
+            // out one token at a time.
+            let stop_at = stops.iter().filter_map(|stop| text.find(stop)).min();
+            let cut = match stop_at {
+                Some(at) => {
+                    stopped = true;
+                    at
+                }
+                None => emit_boundary(&text, shown.len(), &stops, false),
+            };
+            if cut > shown.len() {
+                let delta = &text[shown.len()..cut];
+                let entry = logprob
+                    .map(|logprob| stream_logprob_json(&served.tokenizer, delta, logprob, &top));
+                let frame = chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    Some(delta),
+                    None,
+                    entry.as_deref(),
+                );
+                if sse(stream, &frame).is_err() {
+                    // The client is gone: stop the turn instead of generating into a dead socket.
+                    disconnected = true;
+                    break;
+                }
+                if first {
+                    first = false;
+                    if let Ok(mut metrics) = served.metrics.lock() {
+                        metrics.time_to_first_token(started.elapsed().as_secs_f64());
+                    }
+                }
+                shown.push_str(delta);
                 if let Ok(mut metrics) = served.metrics.lock() {
-                    metrics.time_to_first_token(started.elapsed().as_secs_f64());
+                    metrics.tokens_generated(1);
                 }
             }
-            shown.push_str(delta);
-            if let Ok(mut metrics) = served.metrics.lock() {
-                metrics.tokens_generated(1);
+            if stopped {
+                break;
             }
         }
-        if disconnected && let Ok(mut engine) = served.engine.lock() {
+        if (disconnected || stopped)
+            && let Ok(mut engine) = served.engine.lock()
+        {
             let _ = engine.cancel(sequence);
         }
         served.router.unregister(sequence);
@@ -784,6 +862,24 @@ fn chat(
         }
         if let Some(message) = failure {
             let _ = sse(stream, &format!(r#"{{"error":{}}}"#, quote(&message)));
+            let _ = sse(stream, "[DONE]");
+            let _ = stream.flush();
+            return Ok(200);
+        }
+        if stopped {
+            let frame = chunk(&id, created, &served.model, None, Some("stop"), None);
+            let _ = sse(stream, &frame);
+            if include_usage {
+                let usage = usage_chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    "chat.completion.chunk",
+                    ids.len(),
+                    seen.len(),
+                );
+                let _ = sse(stream, &usage);
+            }
             let _ = sse(stream, "[DONE]");
             let _ = stream.flush();
             return Ok(200);
@@ -805,62 +901,484 @@ fn chat(
                     &served.model,
                     Some(&text[shown.len()..]),
                     None,
+                    None,
                 ),
             );
         }
         let reason = finish_reason(&finished.finish);
-        let final_frame = chunk(&id, created, &served.model, None, Some(reason));
+        let final_frame = chunk(&id, created, &served.model, None, Some(reason), None);
         let _ = sse(stream, &final_frame);
+        if include_usage {
+            let usage = usage_chunk(
+                &id,
+                created,
+                &served.model,
+                "chat.completion.chunk",
+                ids.len(),
+                finished.tokens.len(),
+            );
+            let _ = sse(stream, &usage);
+        }
         let _ = sse(stream, "[DONE]");
         let _ = stream.flush();
         return Ok(200);
     }
 
-    let mut finished: Option<Generation> = None;
-    let mut failure: Option<String> = None;
-    for event in receiver {
-        match event {
-            // A non-streaming caller only needs the generation; the tokens are in it.
-            Event::Token(_) => {}
-            Event::Finished(generation) => {
-                finished = Some(*generation);
-                break;
+    let prompt_tokens = ids.len();
+    let mut completion_tokens = 0usize;
+    let mut index = 0usize;
+    let mut choices = String::new();
+    while !turns.is_empty() {
+        let (sequence, receiver) = turns.remove(0);
+        let mut finished: Option<Generation> = None;
+        let mut failure: Option<String> = None;
+        for event in receiver {
+            match event {
+                // A non-streaming caller only needs the generation; the tokens are in it.
+                Event::Token { .. } => {}
+                Event::Finished(generation) => {
+                    finished = Some(*generation);
+                    break;
+                }
+                Event::Failed(message) => {
+                    failure = Some(message);
+                    break;
+                }
             }
-            Event::Failed(message) => {
-                failure = Some(message);
+        }
+        release_sequence(served, sequence);
+        if let Some(message) = failure {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(stream, 500, "internal_error", &message)?;
+            return Ok(500);
+        }
+        let Some(generation) = finished else {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(
+                stream,
+                500,
+                "internal_error",
+                "the turn ended without a generation",
+            )?;
+            return Ok(500);
+        };
+        let text = served
+            .tokenizer
+            .decode(&generation.tokens)
+            .unwrap_or_default();
+        let (text, stopped) = without_stop(&text, &stops);
+        let reason = if stopped {
+            "stop"
+        } else {
+            finish_reason(&generation.finish)
+        };
+        completion_tokens += generation.tokens.len();
+        let choice_logprobs = if wants_logprobs {
+            logprobs_json(
+                &served.tokenizer,
+                &generation.tokens,
+                &generation.logprobs,
+                &generation.top_logprobs,
+                text,
+            )
+        } else {
+            "null".to_owned()
+        };
+        if !choices.is_empty() {
+            choices.push(',');
+        }
+        choices.push_str(&format!(
+            r#"{{"index":{},"message":{{"role":"assistant","content":{}}},"logprobs":{choice_logprobs},"finish_reason":{}}}"#,
+            index,
+            quote(text),
+            quote(reason)
+        ));
+        index += 1;
+    }
+    let body = format!(
+        r#"{{"id":{},"object":"chat.completion","created":{created},"model":{},"choices":[{choices}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
+        quote(&id),
+        quote(&served.model),
+        prompt_tokens + completion_tokens
+    );
+    respond(stream, 200, "OK", "application/json", &body)?;
+    if let Ok(mut metrics) = served.metrics.lock() {
+        metrics.tokens_generated(completion_tokens as u64);
+    }
+    Ok(200)
+}
+
+/// `POST /v1/completions`: the legacy text endpoint, with the same sampling, stop and streaming
+/// behaviour as chat.
+fn completions(
+    served: &Served,
+    stream: &mut TcpStream,
+    request: &Request,
+    started: Instant,
+) -> std::io::Result<u16> {
+    let body = match std::str::from_utf8(&request.body) {
+        Ok(text) => text,
+        Err(_) => {
+            respond_error(stream, 400, "invalid_request", "body is not UTF-8")?;
+            return Ok(400);
+        }
+    };
+    let parsed = match Json::parse(body) {
+        Ok(value) => value,
+        Err(error) => {
+            respond_error(stream, 400, "invalid_request", &error)?;
+            return Ok(400);
+        }
+    };
+    if let Some(model) = parsed.get("model").and_then(Json::as_str)
+        && model != served.model
+    {
+        respond_error(
+            stream,
+            404,
+            "model_not_found",
+            &format!("no model named {model:?}"),
+        )?;
+        return Ok(404);
+    }
+    let Some(prompt) = parsed.get("prompt").and_then(Json::as_str) else {
+        respond_error(stream, 400, "invalid_request", "prompt must be a string")?;
+        return Ok(400);
+    };
+    let ids = match served.tokenizer.encode(prompt) {
+        Ok(ids) => ids,
+        Err(error) => {
+            respond_error(stream, 500, "internal_error", &error.to_string())?;
+            return Ok(500);
+        }
+    };
+    if ids.is_empty() {
+        respond_error(stream, 400, "invalid_request", "prompt must not be empty")?;
+        return Ok(400);
+    }
+    if ids.len() >= served.context_length {
+        respond_error(
+            stream,
+            422,
+            "context_too_long",
+            &format!(
+                "prompt is {} tokens but the context holds {}",
+                ids.len(),
+                served.context_length
+            ),
+        )?;
+        return Ok(422);
+    }
+
+    let remaining = (served.context_length - ids.len()) as u32;
+    let requested = parsed
+        .get("max_tokens")
+        .and_then(Json::as_u32)
+        .unwrap_or(256)
+        .max(1);
+    let max_tokens = requested.min(remaining);
+    let sampler = match sampler_of(&parsed) {
+        Ok(sampler) => sampler,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    let stops = match stop_sequences_of(&parsed) {
+        Ok(stops) => stops,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    let streaming = parsed
+        .get("stream")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let include_usage = include_usage_of(&parsed);
+    let wants_logprobs = parsed
+        .get("logprobs")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let top_n = parsed
+        .get("top_logprobs")
+        .and_then(Json::as_u32)
+        .unwrap_or(0) as usize;
+    if top_n > 5 {
+        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
+        return Ok(400);
+    }
+    if top_n > 0 && !wants_logprobs {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "top_logprobs needs logprobs: true",
+        )?;
+        return Ok(400);
+    }
+    if wants_logprobs && streaming {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "logprobs needs stream: false",
+        )?;
+        return Ok(400);
+    }
+
+    let id = format!("cmpl-{}", request_id());
+    let created = now_seconds();
+    let n = match choices_of(&parsed) {
+        Ok(n) => n,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    if streaming && n > 1 {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "n greater than 1 needs stream: false",
+        )?;
+        return Ok(400);
+    }
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
+    {
+        Ok(turns) => turns,
+        Err((status, code, message)) => {
+            respond_error(stream, status, code, &message)?;
+            return Ok(status);
+        }
+    };
+
+    if streaming {
+        let (sequence, receiver) = turns.remove(0);
+        stream.set_nodelay(true).ok();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+             Connection: close\r\n\r\n"
+        )?;
+        let mut seen: Vec<u32> = Vec::new();
+        let mut shown = String::new();
+        let mut first = true;
+        let mut disconnected = false;
+        let mut stopped = false;
+        let mut finished: Option<Generation> = None;
+        let mut failure: Option<String> = None;
+        for event in receiver {
+            let (token, _, _) = match event {
+                Event::Token {
+                    token,
+                    logprob,
+                    top_logprobs,
+                } => (token, logprob, top_logprobs),
+                Event::Finished(generation) => {
+                    finished = Some(*generation);
+                    break;
+                }
+                Event::Failed(message) => {
+                    failure = Some(message);
+                    break;
+                }
+            };
+            seen.push(token);
+            let Ok(text) = served.tokenizer.decode(&seen) else {
+                continue;
+            };
+            if !text.starts_with(shown.as_str()) {
+                continue;
+            }
+            let stop_at = stops.iter().filter_map(|stop| text.find(stop)).min();
+            let cut = match stop_at {
+                Some(at) => {
+                    stopped = true;
+                    at
+                }
+                None => emit_boundary(&text, shown.len(), &stops, false),
+            };
+            if cut > shown.len() {
+                let delta = &text[shown.len()..cut];
+                let frame = completion_chunk(&id, created, &served.model, Some(delta), None);
+                if sse(stream, &frame).is_err() {
+                    disconnected = true;
+                    break;
+                }
+                if first {
+                    first = false;
+                    if let Ok(mut metrics) = served.metrics.lock() {
+                        metrics.time_to_first_token(started.elapsed().as_secs_f64());
+                    }
+                }
+                shown.push_str(delta);
+                if let Ok(mut metrics) = served.metrics.lock() {
+                    metrics.tokens_generated(1);
+                }
+            }
+            if stopped {
                 break;
             }
         }
+        if (disconnected || stopped)
+            && let Ok(mut engine) = served.engine.lock()
+        {
+            let _ = engine.cancel(sequence);
+        }
+        served.router.unregister(sequence);
+        if let Ok(mut engine) = served.engine.lock() {
+            let _ = engine.release(sequence);
+        }
+        if disconnected {
+            let _ = stream.flush();
+            return Ok(200);
+        }
+        if let Some(message) = failure {
+            let _ = sse(stream, &format!(r#"{{"error":{}}}"#, quote(&message)));
+            let _ = sse(stream, "[DONE]");
+            let _ = stream.flush();
+            return Ok(200);
+        }
+        if stopped {
+            let frame = completion_chunk(&id, created, &served.model, None, Some("stop"));
+            let _ = sse(stream, &frame);
+            if include_usage {
+                let usage = usage_chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    "text_completion",
+                    ids.len(),
+                    seen.len(),
+                );
+                let _ = sse(stream, &usage);
+            }
+            let _ = sse(stream, "[DONE]");
+            let _ = stream.flush();
+            return Ok(200);
+        }
+        let Some(finished) = finished else {
+            let _ = stream.flush();
+            return Ok(200);
+        };
+        if let Ok(text) = served.tokenizer.decode(&finished.tokens)
+            && text.starts_with(shown.as_str())
+            && text.len() > shown.len()
+        {
+            let _ = sse(
+                stream,
+                &completion_chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    Some(&text[shown.len()..]),
+                    None,
+                ),
+            );
+        }
+        let reason = finish_reason(&finished.finish);
+        let frame = completion_chunk(&id, created, &served.model, None, Some(reason));
+        let _ = sse(stream, &frame);
+        if include_usage {
+            let usage = usage_chunk(
+                &id,
+                created,
+                &served.model,
+                "text_completion",
+                ids.len(),
+                finished.tokens.len(),
+            );
+            let _ = sse(stream, &usage);
+        }
+        let _ = sse(stream, "[DONE]");
+        let _ = stream.flush();
+        return Ok(200);
     }
-    served.router.unregister(sequence);
-    if let Ok(mut engine) = served.engine.lock() {
-        let _ = engine.release(sequence);
-    }
-    if let Some(message) = failure {
-        respond_error(stream, 500, "internal_error", &message)?;
-        return Ok(500);
-    }
-    let Some(generation) = finished else {
-        respond_error(
-            stream,
-            500,
-            "internal_error",
-            "the turn ended without a generation",
-        )?;
-        return Ok(500);
-    };
-    let text = served
-        .tokenizer
-        .decode(&generation.tokens)
-        .unwrap_or_default();
+
     let prompt_tokens = ids.len();
-    let completion_tokens = generation.tokens.len();
+    let mut completion_tokens = 0usize;
+    let mut index = 0usize;
+    let mut choices = String::new();
+    while !turns.is_empty() {
+        let (sequence, receiver) = turns.remove(0);
+        let mut finished: Option<Generation> = None;
+        let mut failure: Option<String> = None;
+        for event in receiver {
+            match event {
+                Event::Token { .. } => {}
+                Event::Finished(generation) => {
+                    finished = Some(*generation);
+                    break;
+                }
+                Event::Failed(message) => {
+                    failure = Some(message);
+                    break;
+                }
+            }
+        }
+        release_sequence(served, sequence);
+        if let Some(message) = failure {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(stream, 500, "internal_error", &message)?;
+            return Ok(500);
+        }
+        let Some(generation) = finished else {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(
+                stream,
+                500,
+                "internal_error",
+                "the turn ended without a generation",
+            )?;
+            return Ok(500);
+        };
+        let text = served
+            .tokenizer
+            .decode(&generation.tokens)
+            .unwrap_or_default();
+        let (text, stopped) = without_stop(&text, &stops);
+        let reason = if stopped {
+            "stop"
+        } else {
+            finish_reason(&generation.finish)
+        };
+        completion_tokens += generation.tokens.len();
+        let choice_logprobs = if wants_logprobs {
+            logprobs_json(
+                &served.tokenizer,
+                &generation.tokens,
+                &generation.logprobs,
+                &generation.top_logprobs,
+                text,
+            )
+        } else {
+            "null".to_owned()
+        };
+        if !choices.is_empty() {
+            choices.push(',');
+        }
+        choices.push_str(&format!(
+            r#"{{"text":{},"index":{},"logprobs":{choice_logprobs},"finish_reason":{}}}"#,
+            quote(text),
+            index,
+            quote(reason)
+        ));
+        index += 1;
+    }
     let body = format!(
-        r#"{{"id":{},"object":"chat.completion","created":{created},"model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
+        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{choices}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
         quote(&id),
         quote(&served.model),
-        quote(&text),
-        quote(finish_reason(&generation.finish)),
         prompt_tokens + completion_tokens
     );
     respond(stream, 200, "OK", "application/json", &body)?;
@@ -969,6 +1487,183 @@ fn sampler_of(request: &Json) -> Result<SamplerConfig, String> {
     Ok(sampler)
 }
 
+/// Stop sequences from a request: one string or an array of up to four, as OpenAI defines them.
+fn stop_sequences_of(request: &Json) -> Result<Vec<String>, String> {
+    let Some(value) = request.get("stop") else {
+        return Ok(Vec::new());
+    };
+    let mut stops = Vec::new();
+    match value {
+        Json::String(text) => {
+            if !text.is_empty() {
+                stops.push(text.clone());
+            }
+        }
+        Json::Array(items) => {
+            if items.len() > MAX_STOP_SEQUENCES {
+                return Err(format!("stop accepts at most {MAX_STOP_SEQUENCES} strings"));
+            }
+            for item in items {
+                match item {
+                    Json::String(text) if !text.is_empty() => stops.push(text.clone()),
+                    _ => return Err("stop must be a string or an array of strings".to_owned()),
+                }
+            }
+        }
+        _ => return Err("stop must be a string or an array of strings".to_owned()),
+    }
+    Ok(stops)
+}
+
+/// Generated text up to the earliest stop sequence, and whether one was found.
+fn without_stop<'a>(text: &'a str, stops: &[String]) -> (&'a str, bool) {
+    match stops.iter().filter_map(|stop| text.find(stop)).min() {
+        Some(at) => (&text[..at], true),
+        None => (text, false),
+    }
+}
+
+/// How much of `text` may be emitted without cutting a stop sequence in half.
+///
+/// Until the turn finishes, the last `longest stop - 1` bytes are held back: a stop sequence can
+/// arrive across token boundaries, so text that looks safe now may become its prefix next token.
+fn emit_boundary(text: &str, shown: usize, stops: &[String], finished: bool) -> usize {
+    if finished {
+        return text.len();
+    }
+    let hold = stops
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
+    let mut cut = text.len().saturating_sub(hold).max(shown);
+    while cut > shown && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// Attach a turn to the engine and return the receiver its tokens arrive on.
+/// A queued turn: its sequence id and the channel its tokens arrive on.
+type QueuedTurn = (u64, mpsc::Receiver<Event>);
+
+/// Release one turn's blocks and drop its route.
+fn release_sequence(served: &Served, sequence: u64) {
+    served.router.unregister(sequence);
+    if let Ok(mut engine) = served.engine.lock() {
+        let _ = engine.release(sequence);
+    }
+}
+
+/// Attach `n` turns for one request, releasing the ones already queued if a later admit fails.
+fn attach_turns(
+    served: &Served,
+    ids: &[u32],
+    max_tokens: u32,
+    sampler: SamplerConfig,
+    n: usize,
+    logprobs: bool,
+    top_n: usize,
+) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
+    let mut turns = Vec::with_capacity(n);
+    for choice in 0..n {
+        match attach_turn(
+            served,
+            ids,
+            max_tokens,
+            seed_for_choice(sampler, choice),
+            logprobs,
+            top_n,
+        ) {
+            Ok(turn) => turns.push(turn),
+            Err(error) => {
+                for (sequence, _) in turns.drain(..) {
+                    release_sequence(served, sequence);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(turns)
+}
+
+/// Give each of the `n` choices its own seed.
+///
+/// Every turn restarts its sampler from the same configuration, so sharing the seed would make
+/// every choice draw the same tokens. The first choice keeps the requested seed, which keeps a
+/// single-choice request reproducible.
+fn seed_for_choice(mut sampler: SamplerConfig, choice: usize) -> SamplerConfig {
+    sampler.seed = sampler.seed.wrapping_add(choice as u64);
+    sampler
+}
+
+fn attach_turn(
+    served: &Served,
+    ids: &[u32],
+    max_tokens: u32,
+    sampler: SamplerConfig,
+    logprobs: bool,
+    top_n: usize,
+) -> Result<QueuedTurn, (u16, &'static str, String)> {
+    let (sender, receiver) = mpsc::channel();
+    let sequence = {
+        // The lock is held only long enough to attach this request's sampler and queue its turn. The
+        // scheduler does the work, so other requests can join the same forward pass instead of
+        // queueing behind this one.
+        let mut engine = served
+            .engine
+            .lock()
+            .map_err(|_| (500, "internal_error", "engine lock was poisoned".to_owned()))?;
+        engine.set_sampler(sampler);
+        let sequence = engine.admit(ids, max_tokens).map_err(|error| {
+            let (status, code) = map_engine_error(&error);
+            (status, code, error.to_string())
+        })?;
+        engine.set_logprobs(sequence, logprobs).map_err(|error| {
+            let (status, code) = map_engine_error(&error);
+            (status, code, error.to_string())
+        })?;
+        engine.set_top_logprobs(sequence, top_n).map_err(|error| {
+            let (status, code) = map_engine_error(&error);
+            (status, code, error.to_string())
+        })?;
+        // The route goes in before the turn is queued: a step that starts the moment after
+        // `enqueue` must already have somewhere to send the first token.
+        served.router.register(sequence, sender);
+        if let Err(error) = engine.enqueue(sequence) {
+            served.router.unregister(sequence);
+            let _ = engine.release(sequence);
+            let (status, code) = map_engine_error(&error);
+            return Err((status, code, error.to_string()));
+        }
+        sequence
+    };
+    served.router.wake();
+    Ok((sequence, receiver))
+}
+
+/// Whether the caller asked for the final usage chunk on a stream.
+fn include_usage_of(request: &Json) -> bool {
+    request
+        .get("stream_options")
+        .and_then(|options| options.get("include_usage"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
+}
+
+/// `n` from the request, clamped to what one batch can hold.
+fn choices_of(request: &Json) -> Result<usize, String> {
+    let n = request.get("n").and_then(Json::as_u32).unwrap_or(1);
+    if n == 0 {
+        return Err("n must be at least 1".to_owned());
+    }
+    if n as usize > MAX_CHOICES {
+        return Err(format!("n is at most {MAX_CHOICES} on this server"));
+    }
+    Ok(n as usize)
+}
+
 fn finish_reason(finish: &vipera_runtime::FinishReason) -> &'static str {
     match finish {
         vipera_runtime::FinishReason::EndOfSequence => "stop",
@@ -992,6 +1687,7 @@ fn chunk(
     model: &str,
     content: Option<&str>,
     finish: Option<&str>,
+    logprob: Option<&str>,
 ) -> String {
     let delta = match content {
         Some(text) => format!(r#"{{"role":"assistant","content":{}}}"#, quote(text)),
@@ -1001,8 +1697,135 @@ fn chunk(
         Some(reason) => quote(reason),
         None => "null".to_owned(),
     };
+    let logprobs = match logprob {
+        Some(entry) => format!(r#"{{"content":[{entry}]}}"#),
+        None => "null".to_owned(),
+    };
     format!(
-        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"finish_reason":{reason}}}]}}"#,
+        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"logprobs":{logprobs},"finish_reason":{reason}}}]}}"#,
+        quote(id),
+        quote(model)
+    )
+}
+
+/// One streaming token's logprob entry, shaped like an entry of the non-streaming array.
+fn stream_logprob_json(
+    tokenizer: &Tokenizer,
+    delta: &str,
+    logprob: f32,
+    top: &[(u32, f32)],
+) -> String {
+    let mut alternatives = String::new();
+    for (id, probability) in top {
+        let Ok(token_text) = tokenizer.decode(&[*id]) else {
+            continue;
+        };
+        if !alternatives.is_empty() {
+            alternatives.push(',');
+        }
+        alternatives.push_str(&format!(
+            r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
+            quote(&token_text)
+        ));
+    }
+    format!(
+        r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
+        quote(delta)
+    )
+}
+
+/// OpenAI's `logprobs.content`: one entry per generated token, decoding each token as the delta
+/// from the text shown so far. Entries stop before any text past `visible`, so a stop sequence is
+/// not reported as a generated token.
+fn logprobs_json(
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    logprobs: &[f32],
+    top: &[Vec<(u32, f32)>],
+    visible: &str,
+) -> String {
+    let mut entries = String::new();
+    let mut shown = String::new();
+    for (index, _) in tokens.iter().enumerate() {
+        let Ok(text) = tokenizer.decode(&tokens[..=index]) else {
+            continue;
+        };
+        if text.len() > visible.len() || !text.starts_with(shown.as_str()) {
+            break;
+        }
+        let delta = &text[shown.len()..];
+        let logprob = logprobs.get(index).copied().unwrap_or(f32::NAN);
+        let logprob = if logprob.is_finite() {
+            format!("{logprob}")
+        } else {
+            "null".to_owned()
+        };
+        let mut alternatives = String::new();
+        for (id, probability) in top.get(index).map(Vec::as_slice).unwrap_or(&[]) {
+            let Ok(token_text) = tokenizer.decode(&[*id]) else {
+                continue;
+            };
+            let probability = if probability.is_finite() {
+                format!("{probability}")
+            } else {
+                "null".to_owned()
+            };
+            if !alternatives.is_empty() {
+                alternatives.push(',');
+            }
+            alternatives.push_str(&format!(
+                r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
+                quote(&token_text)
+            ));
+        }
+        if !entries.is_empty() {
+            entries.push(',');
+        }
+        entries.push_str(&format!(
+            r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
+            quote(delta)
+        ));
+        shown = text;
+    }
+    format!(r#"{{"content":[{entries}]}}"#)
+}
+
+/// The extra chunk OpenAI clients expect when `stream_options.include_usage` is set: no choices,
+/// just the token counts for the whole stream.
+fn usage_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    object: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> String {
+    format!(
+        r#"{{"id":{},"object":{},"created":{created},"model":{},"choices":[],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
+        quote(id),
+        quote(object),
+        quote(model),
+        prompt_tokens + completion_tokens
+    )
+}
+
+fn completion_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    content: Option<&str>,
+    finish: Option<&str>,
+) -> String {
+    let text = match content {
+        Some(text) => quote(text),
+        None => quote(""),
+    };
+    let reason = match finish {
+        Some(reason) => quote(reason),
+        None => "null".to_owned(),
+    };
+    format!(
+        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{{"text":{text},"index":0,"logprobs":null,"finish_reason":{reason}}}]}}"#,
         quote(id),
         quote(model)
     )
@@ -1021,12 +1844,22 @@ fn respond(
     body: &str,
 ) -> std::io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{CORS_HEADERS}\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+/// Answer a CORS preflight: no credentials, no body, and a day-long cache.
+fn respond_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes())?;
     stream.flush()
 }
 
@@ -1079,7 +1912,8 @@ fn respond_error_retry(
         quote(code)
     );
     let head = format!(
-        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\n{CORS_HEADERS}\
+         Content-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -1399,8 +2233,23 @@ mod tests {
     }
 
     #[test]
+    fn choices_get_distinct_seeds() {
+        let base = SamplerConfig {
+            seed: 7,
+            ..SamplerConfig::default()
+        };
+        assert_eq!(seed_for_choice(base, 0).seed, 7);
+        assert_eq!(seed_for_choice(base, 3).seed, 10);
+        let last = SamplerConfig {
+            seed: u64::MAX,
+            ..base
+        };
+        assert_eq!(seed_for_choice(last, 1).seed, 0);
+    }
+
+    #[test]
     fn stream_frames_parse_as_json() {
-        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None);
+        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None, None);
         let parsed = Json::parse(&frame).expect("valid frame");
         assert_eq!(
             parsed
@@ -1411,7 +2260,7 @@ mod tests {
                 .and_then(Json::as_str),
             Some("hi \"there\"")
         );
-        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"));
+        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"), None);
         assert_eq!(
             Json::parse(&final_frame)
                 .unwrap()
@@ -1445,6 +2294,108 @@ mod tests {
         assert!(out.contains("vipera_request_duration_seconds_bucket{le=\"0.25\"} 1"));
         assert!(out.contains("vipera_request_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(out.contains("vipera_request_duration_seconds_count 1"));
+    }
+
+    #[test]
+    fn n_defaults_to_one_and_is_capped_at_the_batch_size() {
+        assert_eq!(choices_of(&Json::parse("{}").unwrap()), Ok(1));
+        assert_eq!(choices_of(&Json::parse(r#"{"n":4}"#).unwrap()), Ok(4));
+        assert!(choices_of(&Json::parse(r#"{"n":0}"#).unwrap()).is_err());
+        assert!(choices_of(&Json::parse(r#"{"n":5}"#).unwrap()).is_err());
+    }
+
+    #[test]
+    fn stop_accepts_a_string_or_an_array() {
+        let request = Json::parse(r#"{"stop":"\n\n"}"#).unwrap();
+        assert_eq!(stop_sequences_of(&request).unwrap(), vec!["\n\n"]);
+        let request = Json::parse(r#"{"stop":["a","b"]}"#).unwrap();
+        assert_eq!(stop_sequences_of(&request).unwrap(), vec!["a", "b"]);
+        let request = Json::parse("{}").unwrap();
+        assert!(stop_sequences_of(&request).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_rejects_more_than_four_sequences_or_a_bad_type() {
+        let request = Json::parse(r#"{"stop":["a","b","c","d","e"]}"#).unwrap();
+        assert!(stop_sequences_of(&request).is_err());
+        let request = Json::parse(r#"{"stop":7}"#).unwrap();
+        assert!(stop_sequences_of(&request).is_err());
+    }
+
+    #[test]
+    fn stop_cuts_at_the_earliest_match() {
+        let stops = vec!["STOP".to_owned(), "TOP".to_owned()];
+        assert_eq!(without_stop("abcSTOPdef", &stops), ("abc", true));
+        assert_eq!(without_stop("abcdef", &stops), ("abcdef", false));
+    }
+
+    #[test]
+    fn streaming_holds_back_a_partial_stop() {
+        let stops = vec!["world".to_owned()];
+        // Four trailing bytes could still become "world"; only "hello" is safe.
+        assert_eq!(emit_boundary("hello wor", 0, &stops, false), 5);
+        // A finished turn emits everything, because no stop occurred.
+        assert_eq!(emit_boundary("hello wor", 0, &stops, true), 9);
+        // The hold-back never splits a UTF-8 character.
+        assert_eq!(emit_boundary("aé", 0, &["xyz".to_owned()], false), 1);
+    }
+
+    #[test]
+    fn include_usage_requires_a_true_flag() {
+        let parse = |body: &str| include_usage_of(&Json::parse(body).unwrap());
+        assert!(parse(r#"{"stream_options":{"include_usage":true}}"#));
+        assert!(!parse(r#"{"stream_options":{"include_usage":false}}"#));
+        assert!(!parse(r#"{"stream_options":{}}"#));
+        assert!(!parse("{}"));
+        assert!(!parse(r#"{"stream_options":{"include_usage":"yes"}}"#));
+    }
+
+    #[test]
+    fn usage_chunk_has_no_choices_and_counts_tokens() {
+        let frame = usage_chunk("chatcmpl-1", 42, "qwen2", "chat.completion.chunk", 5, 3);
+        let parsed = Json::parse(&frame).expect("valid frame");
+        assert_eq!(
+            parsed
+                .get("choices")
+                .and_then(Json::as_array)
+                .map(<[Json]>::len),
+            Some(0)
+        );
+        let usage = parsed.get("usage").expect("usage present");
+        assert_eq!(usage.get("prompt_tokens").and_then(Json::as_u32), Some(5));
+        assert_eq!(
+            usage.get("completion_tokens").and_then(Json::as_u32),
+            Some(3)
+        );
+        assert_eq!(usage.get("total_tokens").and_then(Json::as_u32), Some(8));
+    }
+
+    #[test]
+    fn completion_frames_parse_as_json() {
+        let frame = completion_chunk("cmpl-1", 42, "qwen2", Some("hi"), None);
+        let parsed = Json::parse(&frame).expect("valid frame");
+        assert_eq!(
+            parsed.get("object").and_then(Json::as_str),
+            Some("text_completion")
+        );
+        assert_eq!(
+            parsed
+                .get("choices")
+                .and_then(Json::as_array)
+                .and_then(|choices| choices[0].get("text"))
+                .and_then(Json::as_str),
+            Some("hi")
+        );
+        let final_frame = completion_chunk("cmpl-1", 42, "qwen2", None, Some("stop"));
+        assert_eq!(
+            Json::parse(&final_frame)
+                .unwrap()
+                .get("choices")
+                .and_then(Json::as_array)
+                .and_then(|choices| choices[0].get("finish_reason"))
+                .and_then(Json::as_str),
+            Some("stop")
+        );
     }
 
     #[test]
