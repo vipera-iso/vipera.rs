@@ -63,7 +63,7 @@ fn serve_answers_chat_completions_and_streams() {
         port,
         "POST",
         "/v1/chat/completions",
-        r#"{"model":"test","stream":true,"messages":[{"role":"user","content":"Say hi"}],"max_tokens":3,"temperature":0}"#,
+        r#"{"model":"test","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Say hi"}],"max_tokens":3,"temperature":0}"#,
     )
     .expect("stream");
     assert!(streamed.starts_with("HTTP/1.1 200"), "{streamed}");
@@ -83,6 +83,10 @@ fn serve_answers_chat_completions_and_streams() {
         streamed.contains(r#""finish_reason":"stop""#)
             || streamed.contains(r#""finish_reason":"length""#),
         "{streamed}"
+    );
+    assert!(
+        streamed.contains(r#""choices":[],"usage":{"prompt_tokens""#),
+        "include_usage must add a usage chunk: {streamed}"
     );
 
     let two_choices = http(

@@ -652,6 +652,7 @@ fn chat(
         .get("stream")
         .and_then(Json::as_bool)
         .unwrap_or(false);
+    let include_usage = include_usage_of(&parsed);
 
     let ids = match served.tokenizer.encode_chat(&messages, true) {
         Ok(ids) => ids,
@@ -806,6 +807,17 @@ fn chat(
         if stopped {
             let frame = chunk(&id, created, &served.model, None, Some("stop"));
             let _ = sse(stream, &frame);
+            if include_usage {
+                let usage = usage_chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    "chat.completion.chunk",
+                    ids.len(),
+                    seen.len(),
+                );
+                let _ = sse(stream, &usage);
+            }
             let _ = sse(stream, "[DONE]");
             let _ = stream.flush();
             return Ok(200);
@@ -833,6 +845,17 @@ fn chat(
         let reason = finish_reason(&finished.finish);
         let final_frame = chunk(&id, created, &served.model, None, Some(reason));
         let _ = sse(stream, &final_frame);
+        if include_usage {
+            let usage = usage_chunk(
+                &id,
+                created,
+                &served.model,
+                "chat.completion.chunk",
+                ids.len(),
+                finished.tokens.len(),
+            );
+            let _ = sse(stream, &usage);
+        }
         let _ = sse(stream, "[DONE]");
         let _ = stream.flush();
         return Ok(200);
@@ -996,6 +1019,7 @@ fn completions(
         .get("stream")
         .and_then(Json::as_bool)
         .unwrap_or(false);
+    let include_usage = include_usage_of(&parsed);
 
     let id = format!("cmpl-{}", request_id());
     let created = now_seconds();
@@ -1109,6 +1133,17 @@ fn completions(
         if stopped {
             let frame = completion_chunk(&id, created, &served.model, None, Some("stop"));
             let _ = sse(stream, &frame);
+            if include_usage {
+                let usage = usage_chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    "text_completion",
+                    ids.len(),
+                    seen.len(),
+                );
+                let _ = sse(stream, &usage);
+            }
             let _ = sse(stream, "[DONE]");
             let _ = stream.flush();
             return Ok(200);
@@ -1135,6 +1170,17 @@ fn completions(
         let reason = finish_reason(&finished.finish);
         let frame = completion_chunk(&id, created, &served.model, None, Some(reason));
         let _ = sse(stream, &frame);
+        if include_usage {
+            let usage = usage_chunk(
+                &id,
+                created,
+                &served.model,
+                "text_completion",
+                ids.len(),
+                finished.tokens.len(),
+            );
+            let _ = sse(stream, &usage);
+        }
         let _ = sse(stream, "[DONE]");
         let _ = stream.flush();
         return Ok(200);
@@ -1409,6 +1455,15 @@ fn attach_turn(
     Ok((sequence, receiver))
 }
 
+/// Whether the caller asked for the final usage chunk on a stream.
+fn include_usage_of(request: &Json) -> bool {
+    request
+        .get("stream_options")
+        .and_then(|options| options.get("include_usage"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
+}
+
 /// `n` from the request, clamped to what one batch can hold.
 fn choices_of(request: &Json) -> Result<usize, String> {
     let n = request.get("n").and_then(Json::as_u32).unwrap_or(1);
@@ -1457,6 +1512,25 @@ fn chunk(
         r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"finish_reason":{reason}}}]}}"#,
         quote(id),
         quote(model)
+    )
+}
+
+/// The extra chunk OpenAI clients expect when `stream_options.include_usage` is set: no choices,
+/// just the token counts for the whole stream.
+fn usage_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    object: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> String {
+    format!(
+        r#"{{"id":{},"object":{},"created":{created},"model":{},"choices":[],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
+        quote(id),
+        quote(object),
+        quote(model),
+        prompt_tokens + completion_tokens
     )
 }
 
@@ -1946,6 +2020,36 @@ mod tests {
         assert_eq!(emit_boundary("hello wor", 0, &stops, true), 9);
         // The hold-back never splits a UTF-8 character.
         assert_eq!(emit_boundary("aé", 0, &["xyz".to_owned()], false), 1);
+    }
+
+    #[test]
+    fn include_usage_requires_a_true_flag() {
+        let parse = |body: &str| include_usage_of(&Json::parse(body).unwrap());
+        assert!(parse(r#"{"stream_options":{"include_usage":true}}"#));
+        assert!(!parse(r#"{"stream_options":{"include_usage":false}}"#));
+        assert!(!parse(r#"{"stream_options":{}}"#));
+        assert!(!parse("{}"));
+        assert!(!parse(r#"{"stream_options":{"include_usage":"yes"}}"#));
+    }
+
+    #[test]
+    fn usage_chunk_has_no_choices_and_counts_tokens() {
+        let frame = usage_chunk("chatcmpl-1", 42, "qwen2", "chat.completion.chunk", 5, 3);
+        let parsed = Json::parse(&frame).expect("valid frame");
+        assert_eq!(
+            parsed
+                .get("choices")
+                .and_then(Json::as_array)
+                .map(<[Json]>::len),
+            Some(0)
+        );
+        let usage = parsed.get("usage").expect("usage present");
+        assert_eq!(usage.get("prompt_tokens").and_then(Json::as_u32), Some(5));
+        assert_eq!(
+            usage.get("completion_tokens").and_then(Json::as_u32),
+            Some(3)
+        );
+        assert_eq!(usage.get("total_tokens").and_then(Json::as_u32), Some(8));
     }
 
     #[test]
