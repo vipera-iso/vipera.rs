@@ -1360,8 +1360,8 @@ fn attach_turns(
     n: usize,
 ) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
     let mut turns = Vec::with_capacity(n);
-    for _ in 0..n {
-        match attach_turn(served, ids, max_tokens, sampler) {
+    for choice in 0..n {
+        match attach_turn(served, ids, max_tokens, seed_for_choice(sampler, choice)) {
             Ok(turn) => turns.push(turn),
             Err(error) => {
                 for (sequence, _) in turns.drain(..) {
@@ -1372,6 +1372,16 @@ fn attach_turns(
         }
     }
     Ok(turns)
+}
+
+/// Give each of the `n` choices its own seed.
+///
+/// Every turn restarts its sampler from the same configuration, so sharing the seed would make
+/// every choice draw the same tokens. The first choice keeps the requested seed, which keeps a
+/// single-choice request reproducible.
+fn seed_for_choice(mut sampler: SamplerConfig, choice: usize) -> SamplerConfig {
+    sampler.seed = sampler.seed.wrapping_add(choice as u64);
+    sampler
 }
 
 fn attach_turn(
@@ -1853,6 +1863,21 @@ mod tests {
         assert_eq!(sampler.min_p, 0.0);
         assert_eq!(sampler.seed, 7);
         assert!((sampler.repetition_penalty - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn choices_get_distinct_seeds() {
+        let base = SamplerConfig {
+            seed: 7,
+            ..SamplerConfig::default()
+        };
+        assert_eq!(seed_for_choice(base, 0).seed, 7);
+        assert_eq!(seed_for_choice(base, 3).seed, 10);
+        let last = SamplerConfig {
+            seed: u64::MAX,
+            ..base
+        };
+        assert_eq!(seed_for_choice(last, 1).seed, 0);
     }
 
     #[test]
