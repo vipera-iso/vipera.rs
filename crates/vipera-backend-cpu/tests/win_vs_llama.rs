@@ -500,3 +500,312 @@ fn print_llama_hint(what: &str) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 9. Speculation groundwork: every position's logits must match a separate pass
+// ---------------------------------------------------------------------------
+//
+// Prompt-lookup speculation verifies several proposed tokens in one batch pass, which is only
+// sound if entry `i` of that pass answers exactly what a pass over that token alone would.
+
+#[test]
+fn logits_each_matches_single_passes() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let prompt: Vec<u32> = (0..8).map(|at| 1000 + (at % 400) as u32).collect();
+
+    let mut chunk = State::with_room(config, prompt.len() + 4, KvCacheType::F16);
+    let each = backend
+        .logits_each(&mut chunk.context(&prompt))
+        .expect("chunk fits");
+    assert_eq!(each.len(), prompt.len(), "one answer per position");
+
+    for at in 0..prompt.len() {
+        let mut alone = State::with_room(config, prompt.len() + 4, KvCacheType::F16);
+        let expected = backend
+            .logits(&mut alone.context(&prompt[..=at]))
+            .expect("prefix fits");
+        assert_eq!(each[at], expected, "position {at} differs");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. Speculation payoff: what a 5-token verify pass costs, and how often it pays
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn speculative_payoff() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    // A repetitive prompt: the kind of text prompt-lookup speculation exists for.
+    let prompt: Vec<u32> = (0..64).map(|at| 1000 + (at % 12) as u32).collect();
+    let (state, first) = prefill_chunked(&mut backend, config, &prompt, KvCacheType::F16);
+
+    // Reference greedy stream, one token per pass, exactly today's decode.
+    let mut greedy = vec![first];
+    let mut probe = state.clone();
+    for _ in 0..6 {
+        let token = *greedy.last().expect("non-empty");
+        let logits = backend
+            .logits(&mut probe.context(&[token]))
+            .expect("decode fits");
+        probe.tokens.push(token);
+        greedy.push(argmax(&logits) as u32);
+    }
+
+    // One verify pass over the same 6 tokens must answer the same thing, and its wall time is
+    // what a speculation round pays.
+    let single = timed_best(3, || {
+        let mut s = state.clone();
+        for token in &greedy[..5] {
+            let _ = backend.logits(&mut s.context(&[*token]));
+            s.tokens.push(*token);
+        }
+    });
+    let verify = timed_best(3, || {
+        let mut s = state.clone();
+        let _ = backend
+            .logits_each(&mut s.context(&greedy[..5]))
+            .expect("verify fits");
+    });
+
+    // Draft from the n-gram: repeat of the last 3 tokens found earlier in the prompt.
+    let context: Vec<u32> = state
+        .tokens
+        .iter()
+        .copied()
+        .chain(greedy.iter().copied())
+        .collect();
+    let mut accepted = 0;
+    let mut tried = 0;
+    for at in 3..context.len().saturating_sub(4) {
+        let needle = &context[at - 3..at];
+        if let Some(pos) = (0..at - 3)
+            .rev()
+            .find(|start| &context[*start..*start + 3] == needle)
+        {
+            let draft = &context[pos + 3..(pos + 6).min(context.len())];
+            if !draft.is_empty() {
+                tried += 1;
+                let hit = draft
+                    .iter()
+                    .zip(&context[at..])
+                    .take_while(|(d, t)| d == t)
+                    .count();
+                accepted += hit;
+            }
+        }
+    }
+    let rate = if tried == 0 {
+        0.0
+    } else {
+        accepted as f64 / tried as f64
+    };
+    println!(
+        "speculation: 5 single passes {single:.1} ms, one 5-token verify {verify:.1} ms, \
+         verify/5-single {:.2}x, n-gram acceptance {rate:.2} ({} drafts)",
+        verify / single,
+        tried
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. Prompt-lookup speculation end to end: same tokens, fewer passes
+// ---------------------------------------------------------------------------
+
+fn draft_from_ngram(context: &[u32], n: usize, k: usize) -> Vec<u32> {
+    if context.len() < n + 1 {
+        return Vec::new();
+    }
+    let needle = &context[context.len() - n..];
+    for start in (0..context.len() - n).rev() {
+        if &context[start..start + n] == needle {
+            let after = start + n;
+            if after < context.len() {
+                return context[after..(after + k).min(context.len())].to_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Greedy continuation, one forward pass per token.
+fn decode_plain(backend: &mut CpuBackend, state: &mut State, start: u32, steps: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(steps);
+    let mut next = start;
+    for _ in 0..steps {
+        let logits = backend
+            .logits(&mut state.context(&[next]))
+            .expect("decode fits");
+        state.tokens.push(next);
+        next = argmax(&logits) as u32;
+        out.push(next);
+    }
+    out
+}
+
+/// Greedy continuation with prompt-lookup drafts verified one pass per round.
+fn decode_speculative(
+    backend: &mut CpuBackend,
+    state: &mut State,
+    start: u32,
+    steps: usize,
+    n: usize,
+    k: usize,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(steps);
+    let mut next = start;
+    while out.len() < steps {
+        let draft = draft_from_ngram(&state.tokens, n, k);
+        let mut chunk = Vec::with_capacity(draft.len() + 1);
+        chunk.push(next);
+        chunk.extend_from_slice(&draft);
+        let answers = backend
+            .logits_each(&mut state.context(&chunk))
+            .expect("verify fits");
+        // answers[i] is the model's pick after chunk[..=i]; it must equal chunk[i + 1] to accept.
+        let mut accepted = 0;
+        while accepted < draft.len() && accepted + 1 < answers.len() {
+            let pick = argmax(&answers[accepted]) as u32;
+            if pick != draft[accepted] {
+                break;
+            }
+            accepted += 1;
+            out.push(pick);
+            if out.len() == steps {
+                break;
+            }
+        }
+        // The token after the last accepted draft is the model's own answer, always usable.
+        let tail = argmax(&answers[accepted]) as u32;
+        state.tokens.extend_from_slice(&chunk[..=accepted]);
+        out.push(tail);
+        state.tokens.push(tail);
+        next = tail;
+    }
+    out.truncate(steps);
+    out
+}
+
+/// Same loop, but the draft length follows the last round: shrink on a miss, grow on a full hit.
+fn decode_adaptive(
+    backend: &mut CpuBackend,
+    state: &mut State,
+    start: u32,
+    steps: usize,
+) -> Vec<u32> {
+    const N: usize = 2;
+    let mut out = Vec::with_capacity(steps);
+    let mut next = start;
+    let mut k = 4;
+    while out.len() < steps {
+        let draft = draft_from_ngram(&state.tokens, N, k);
+        let mut chunk = Vec::with_capacity(draft.len() + 1);
+        chunk.push(next);
+        chunk.extend_from_slice(&draft);
+        let answers = backend
+            .logits_each(&mut state.context(&chunk))
+            .expect("verify fits");
+        let mut accepted = 0;
+        while accepted < draft.len() && accepted + 1 < answers.len() {
+            let pick = argmax(&answers[accepted]) as u32;
+            if pick != draft[accepted] {
+                break;
+            }
+            accepted += 1;
+            out.push(pick);
+            if out.len() == steps {
+                break;
+            }
+        }
+        let tail = argmax(&answers[accepted]) as u32;
+        state.tokens.extend_from_slice(&chunk[..=accepted]);
+        out.push(tail);
+        state.tokens.push(tail);
+        next = tail;
+        k = if accepted == 0 {
+            k.saturating_sub(1).max(1)
+        } else if accepted == draft.len() {
+            (k + 1).min(8)
+        } else {
+            k
+        };
+    }
+    out.truncate(steps);
+    out
+}
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn speculative_decode_wins() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let prompt: Vec<u32> = (0..64).map(|at| 1000 + (at % 12) as u32).collect();
+    const STEPS: usize = 32;
+    // Room for the prompt plus every token both loops may compute, including drafts that are
+    // thrown away.
+    let mut state = State::with_room(config, prompt.len() + 4 * STEPS, KvCacheType::F16);
+    let logits = backend
+        .logits(&mut state.context(&prompt))
+        .expect("prompt fits");
+    state.tokens.extend_from_slice(&prompt);
+    let first = argmax(&logits) as u32;
+
+    let mut plain_state = state.clone();
+    let start = Instant::now();
+    let plain = decode_plain(&mut backend, &mut plain_state, first, STEPS);
+    let plain_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut best = (f64::INFINITY, 0, 0, Vec::new());
+    for (n, k) in [(1, 1), (1, 2), (1, 3), (2, 2)] {
+        let mut spec_state = state.clone();
+        let start = Instant::now();
+        let stream = decode_speculative(&mut backend, &mut spec_state, first, STEPS, n, k);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "  draft n={n} k={k}: {ms:.1} ms ({:.1} t/s), identical {}",
+            STEPS as f64 * 1000.0 / ms,
+            stream == plain
+        );
+        assert_eq!(stream, plain, "speculation changed the greedy stream");
+        if ms < best.0 {
+            best = (ms, n, k, stream);
+        }
+    }
+    let mut adaptive_state = state.clone();
+    let start = Instant::now();
+    let adaptive = decode_adaptive(&mut backend, &mut adaptive_state, first, STEPS);
+    let adaptive_ms = start.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "  adaptive: {adaptive_ms:.1} ms ({:.1} t/s), identical {}",
+        STEPS as f64 * 1000.0 / adaptive_ms,
+        adaptive == plain
+    );
+    assert_eq!(
+        adaptive, plain,
+        "adaptive speculation changed the greedy stream"
+    );
+
+    let (spec_ms, n, k, speculative) = best;
+    println!("  best draft n={n} k={k}");
+
+    println!(
+        "decode {STEPS} tokens: plain {plain_ms:.1} ms ({:.1} t/s), speculative {spec_ms:.1} ms \
+         ({:.1} t/s), speedup {:.2}x, identical tokens {}",
+        STEPS as f64 * 1000.0 / plain_ms,
+        STEPS as f64 * 1000.0 / spec_ms,
+        plain_ms / spec_ms,
+        plain == speculative
+    );
+    assert_eq!(plain, speculative, "speculation changed the greedy stream");
+}

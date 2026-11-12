@@ -651,6 +651,46 @@ impl CpuBackend {
         Ok(logits)
     }
 
+    /// Every position's logits from one batched pass over `context.new_tokens`.
+    ///
+    /// Prompt-lookup speculation needs the target model's answer after each token it is checking,
+    /// not only after the last one. The batch path already computes every entry; this asks it not
+    /// to throw them away. Entry `i` gets its own single new token, exactly as prefill hands it
+    /// over, so each answer is the same one a separate pass would produce.
+    pub fn logits_each(
+        &mut self,
+        context: &mut ForwardContext<'_>,
+    ) -> Result<Vec<Vec<f32>>, ViperaError> {
+        let tokens = context.new_tokens;
+        if tokens.is_empty() {
+            return Err(ViperaError::invalid_argument(
+                "a chunk needs at least one token",
+            ));
+        }
+        let first = context.first_position;
+        let kv = std::mem::take(&mut context.kv);
+        let mut entries: Vec<BatchEntry<'_>> = (0..tokens.len())
+            .map(|index| BatchEntry {
+                tokens: context.tokens,
+                new_tokens: &tokens[index..index + 1],
+                first_position: first + index as u32,
+                block_table: context.block_table,
+                tokens_per_block: context.tokens_per_block,
+                bytes_per_token: context.bytes_per_token,
+            })
+            .collect();
+        let results = self.run_batch(
+            &mut BatchContext {
+                kv: &mut *kv,
+                entries: &mut entries,
+            },
+            true,
+            false,
+        );
+        context.kv = kv;
+        results
+    }
+
     /// A batched decode step, one new token per sequence.
     ///
     /// Anything that is not a single new token per context — a prefill, or a draft run — falls back

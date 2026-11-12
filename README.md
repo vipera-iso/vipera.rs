@@ -43,11 +43,11 @@ Requires stable Rust (edition 2024). No system libraries, no network, no GPU.
 
 ```bash
 cargo build --release
-cargo test --workspace        # 187 tests; model-dependent ones skip when no model is present
+cargo test --workspace        # 278 tests; model-dependent ones skip when no model is present
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-CI runs exactly those three checks on every push (`.github/workflows/ci.yml`).
+CI runs format, lint and test on every push (`.github/workflows/ci.yml`).
 
 ## Run a model
 
@@ -75,34 +75,16 @@ curl -s localhost:8080/v1/chat/completions \
 
 The server is single-conversation and serialized behind one engine; there is no rate limiting yet.
 
-## Measured
-
-On the machine this was developed on, Qwen2.5-1.5B-Instruct Q4_K_M, at temperature 0:
-
-| | |
-|---|---|
-| Compute for 12 tokens | 0.98-1.03 s (11.7-12.2 tok/s, three runs) |
-| Compute for 24 tokens | 1.76-1.83 s (13.1-13.6 tok/s, three runs) |
-| KV cache at `--ctx 2048`, `f16` | 58.7 MB |
-| Same cache at `q8_0` | 31.2 MB (53%) |
-
-Time to first token is not in this table because the streaming path does not stamp it; the earlier
-1.64 s figure was read from a run that no longer exists and is not repeated here.
-
-Numbers are machine-bound, not a benchmark claim; `generate --json` is how they were read.
-
-## Not there yet
+## Limitations
 
 - **GPU**: there is no CUDA, Metal or Vulkan backend. `verify` reports host memory only.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
 - **Server**: no rate limiting, no request logging, no concurrent conversations.
-- **llama.cpp parity**: the tokenizer and continuation checks skip unless `llama-server` is
-  installed; they are the intended proof of numeric agreement.
-- **Speed**: 12-13 tok/s greedy on this class of CPU. Reusing a thread pool across a token's
-  matvecs, instead of spawning four threads per matvec, was worth about 11%: 11.9-12.1 tok/s before
-  it, 13.1-13.6 after, same 24-token run. Q4_K activations are multiplied as `i8`, so outputs agree
-  with the `f32` path on the checked prompts but are not bit-identical to it.
+- **Parity checks**: the tokenizer and continuation tests skip unless `llama-server` is installed.
+- **Speed**: the CPU path is usable for a single conversation, not a throughput claim. Q4_K
+  activations are multiplied as `i8`, so outputs agree with the `f32` path on the checked prompts
+  but are not bit-identical to it.
 
 ## License
 
