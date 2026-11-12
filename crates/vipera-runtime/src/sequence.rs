@@ -84,6 +84,7 @@ pub struct Sequence {
     snapshots: Vec<Snapshot>,
     next_snapshot: u32,
     pending_reused: usize,
+    wants_logprobs: bool,
 }
 
 impl Sequence {
@@ -99,7 +100,18 @@ impl Sequence {
             snapshots: Vec::new(),
             next_snapshot: 0,
             pending_reused: 0,
+            wants_logprobs: false,
         }
+    }
+
+    /// Ask this sequence to record a log-probability for every token it generates.
+    pub fn set_logprobs(&mut self, wants: bool) {
+        self.wants_logprobs = wants;
+    }
+
+    /// Whether this sequence records token log-probabilities.
+    pub const fn wants_logprobs(&self) -> bool {
+        self.wants_logprobs
     }
 
     /// Identifier.

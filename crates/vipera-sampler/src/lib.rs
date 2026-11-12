@@ -264,6 +264,44 @@ impl Sampler {
         self.rng.reseed(seed);
     }
 
+    /// Pick the next token id and its log-probability under the same distribution.
+    ///
+    /// This costs one extra pass over the vocabulary to build the softmax denominator, so the
+    /// engine only takes this path when a caller asked for logprobs.
+    pub fn sample_with_logprob(
+        &mut self,
+        logits: &[f32],
+        recent: &[u32],
+    ) -> Result<(u32, f32), ViperaError> {
+        let token = self.sample(logits, recent)?;
+        let penalty = RepetitionPenalty::new(recent, self.config.repetition_penalty);
+        let temperature = if self.config.temperature > 0.0 {
+            self.config.temperature
+        } else {
+            1.0
+        };
+        let scaled = |id: usize, logit: f32| penalty.apply(id, logit) / temperature;
+        let mut max = f32::NEG_INFINITY;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                max = max.max(scaled(id, *logit));
+            }
+        }
+        if !max.is_finite() {
+            return Err(ViperaError::invalid_argument(
+                "every logit is NaN or infinite",
+            ));
+        }
+        let mut mass = 0.0f32;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                mass += (scaled(id, *logit) - max).exp();
+            }
+        }
+        let chosen = scaled(token as usize, logits[token as usize]);
+        Ok((token, chosen - max - mass.ln()))
+    }
+
     /// Pick the next token id.
     ///
     /// `recent` is the context used by the repetition penalty; pass the most recent ids in any
@@ -621,6 +659,16 @@ mod tests {
         let mut s = sampler(0.0, 0, 1.0, 0.0, 2.0);
         assert_eq!(s.sample(&[5.0, 4.0], &[]).unwrap(), 0);
         assert_eq!(s.sample(&[5.0, 4.0], &[0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn the_chosen_token_logprob_matches_the_distribution() {
+        let mut s = sampler(1.0, 0, 1.0, 0.0, 1.0);
+        let (_token, logprob) = s.sample_with_logprob(&[0.0, 0.0], &[]).unwrap();
+        assert!((logprob - 0.5f32.ln()).abs() < 1e-6, "{logprob}");
+        // A token that dominates the distribution has a logprob close to zero.
+        let (_token, logprob) = s.sample_with_logprob(&[20.0, 0.0], &[]).unwrap();
+        assert!(logprob > -1e-6, "{logprob}");
     }
 
     #[test]
