@@ -103,6 +103,24 @@ fn serve_answers_chat_completions_and_streams() {
         "{streamed}"
     );
 
+    let completion = http(
+        port,
+        "POST",
+        "/v1/completions",
+        r#"{"model":"test","prompt":"The capital of France is","max_tokens":2,"temperature":0,"stop":["\n"]}"#,
+    )
+    .expect("completion endpoint");
+    assert!(completion.starts_with("HTTP/1.1 200"), "{completion}");
+    assert!(
+        completion.contains(r#""object":"text_completion""#),
+        "{completion}"
+    );
+    assert!(
+        completion.contains(r#""finish_reason":"stop""#)
+            || completion.contains(r#""finish_reason":"length""#),
+        "{completion}"
+    );
+
     let metrics = http(port, "GET", "/metrics", "").expect("metrics");
     assert!(metrics.contains("vipera_requests_total{"), "{metrics}");
     assert!(metrics.contains("vipera_kv_blocks_in_use"), "{metrics}");
