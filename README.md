@@ -17,7 +17,7 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
 - **Generation** on the CPU, with a KV cache in `f16` or `q8_0`, streamed to stdout token by token.
 - **Prompt-lookup speculation** (`VIPERA_SPECULATIVE=1`, greedy): verifies a longest-match n-gram
   draft in one weight read, growing the draft while it lands, and keeps the token stream
-  bit-identical; measured 1.8x on repetitive prompts and 1.05-1.1x on quoted text.
+  bit-identical; measured 1.6-1.7x on repetitive prompts and 1.02-1.05x on quoted text.
 - **HTTP server** (`vipera serve`): `POST /v1/chat/completions` and `POST /v1/completions`
   (streaming SSE and non-streaming), request `stop` sequences, streamed usage
   (`stream_options.include_usage`), token logprobs with top alternatives (chat streaming and

@@ -889,11 +889,6 @@ pub(crate) fn fill_rows(
     out: &mut [f32],
 ) {
     for (offset, slot) in out.iter_mut().enumerate() {
-        // Prefetch 4 rows ahead while current row unpacks (decode-stream).
-        #[cfg(target_arch = "x86_64")]
-        if let Some(ahead) = offset.checked_add(4).map(|o| (first_row + o) * stride) {
-            crate::simd::prefetch_ahead(data, ahead);
-        }
         let start = (first_row + offset) * stride;
         *slot = dot(ty, &data[start..start + stride], activation);
     }
@@ -947,14 +942,12 @@ pub(crate) fn fill_rows_batch<const B: usize>(
             return;
         }
     }
+    // No explicit prefetch here. A `_MM_HINT_T0` four rows ahead used to sit in this loop; it made
+    // the stream slower, not faster: 31.5 GB/s against 40.3 GB/s with the hint removed, on a 200 MB
+    // Q4_K tensor at eight threads. The hardware streamer already runs ahead of this loop, and
+    // pulling weight lines into L1 evicts the activation block the kernel rereads every row.
     let mut row = [0.0_f32; B];
     for offset in 0..count {
-        // Prefetch 4 rows ahead (prefill-tiled Decode). The unpack loop is instruction-bound,
-        // not load-bound, so this is a pure hint: it never changes results.
-        #[cfg(target_arch = "x86_64")]
-        if let Some(ahead) = offset.checked_add(4).map(|o| (first_row + o) * stride) {
-            crate::simd::prefetch_ahead(data, ahead);
-        }
         let start = (first_row + offset) * stride;
         dot_batch(ty, &data[start..start + stride], activation, &mut row);
         for (entry, value) in row.iter().enumerate() {
