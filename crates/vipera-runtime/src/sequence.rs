@@ -85,6 +85,7 @@ pub struct Sequence {
     next_snapshot: u32,
     pending_reused: usize,
     wants_logprobs: bool,
+    top_logprobs: usize,
 }
 
 impl Sequence {
@@ -101,6 +102,7 @@ impl Sequence {
             next_snapshot: 0,
             pending_reused: 0,
             wants_logprobs: false,
+            top_logprobs: 0,
         }
     }
 
@@ -112,6 +114,16 @@ impl Sequence {
     /// Whether this sequence records token log-probabilities.
     pub const fn wants_logprobs(&self) -> bool {
         self.wants_logprobs
+    }
+
+    /// How many alternative tokens each generated position should report.
+    pub fn set_top_logprobs(&mut self, top: usize) {
+        self.top_logprobs = top;
+    }
+
+    /// Alternative tokens to report per generated position; `0` means none.
+    pub const fn top_logprobs(&self) -> usize {
+        self.top_logprobs
     }
 
     /// Identifier.

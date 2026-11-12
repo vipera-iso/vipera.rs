@@ -22,6 +22,12 @@ use vipera_traits::{
 
 pub use rng::Rng;
 
+/// A token id and its log-probability.
+pub type TokenLogprob = (u32, f32);
+
+/// A draw: chosen token, its log-probability, and the requested alternatives.
+pub type SampleDetails = (u32, f32, Vec<TokenLogprob>);
+
 /// Sampling knobs. Defaults are the ones the CLI advertises.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplerConfig {
@@ -273,6 +279,20 @@ impl Sampler {
         logits: &[f32],
         recent: &[u32],
     ) -> Result<(u32, f32), ViperaError> {
+        let (token, logprob, _) = self.sample_with_details(logits, recent, 0)?;
+        Ok((token, logprob))
+    }
+
+    /// Draw, and also return the `top_n` most likely tokens with their log-probabilities.
+    ///
+    /// `top_n = 0` skips the candidate scan. The chosen token is included when it ranks inside the
+    /// cut, as OpenAI's `top_logprobs` expects.
+    pub fn sample_with_details(
+        &mut self,
+        logits: &[f32],
+        recent: &[u32],
+        top_n: usize,
+    ) -> Result<SampleDetails, ViperaError> {
         let token = self.sample(logits, recent)?;
         let penalty = RepetitionPenalty::new(recent, self.config.repetition_penalty);
         let temperature = if self.config.temperature > 0.0 {
@@ -298,8 +318,28 @@ impl Sampler {
                 mass += (scaled(id, *logit) - max).exp();
             }
         }
+        let log_mass = mass.ln();
         let chosen = scaled(token as usize, logits[token as usize]);
-        Ok((token, chosen - max - mass.ln()))
+        let chosen = chosen - max - log_mass;
+        let mut top = Vec::new();
+        if top_n > 0 {
+            for (id, logit) in logits.iter().enumerate() {
+                if !logit.is_finite() {
+                    continue;
+                }
+                let logprob = scaled(id, *logit) - max - log_mass;
+                if !logprob.is_finite() {
+                    continue;
+                }
+                let at = top
+                    .iter()
+                    .position(|(_, value): &(u32, f32)| logprob > *value)
+                    .unwrap_or(top.len());
+                top.insert(at, (id as u32, logprob));
+                top.truncate(top_n);
+            }
+        }
+        Ok((token, chosen, top))
     }
 
     /// Pick the next token id.
@@ -659,6 +699,19 @@ mod tests {
         let mut s = sampler(0.0, 0, 1.0, 0.0, 2.0);
         assert_eq!(s.sample(&[5.0, 4.0], &[]).unwrap(), 0);
         assert_eq!(s.sample(&[5.0, 4.0], &[0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn top_logprobs_returns_the_ranked_candidates() {
+        let mut s = sampler(1.0, 0, 1.0, 0.0, 1.0);
+        let (token, logprob, top) = s.sample_with_details(&[0.0, 0.0, 0.0], &[], 3).unwrap();
+        assert_eq!(top.len(), 3);
+        assert!(top.iter().any(|(id, _)| *id == token));
+        let expected = (1.0f32 / 3.0).ln();
+        for (_, probability) in &top {
+            assert!((probability - expected).abs() < 1e-6, "{probability}");
+        }
+        assert!((logprob - expected).abs() < 1e-6);
     }
 
     #[test]

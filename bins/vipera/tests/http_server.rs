@@ -93,7 +93,7 @@ fn serve_answers_chat_completions_and_streams() {
         port,
         "POST",
         "/v1/chat/completions",
-        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":2,"temperature":0,"logprobs":true}"#,
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":2,"temperature":0,"logprobs":true,"top_logprobs":2}"#,
     )
     .expect("logprobs");
     assert!(with_logprobs.starts_with("HTTP/1.1 200"), "{with_logprobs}");
@@ -102,6 +102,10 @@ fn serve_answers_chat_completions_and_streams() {
         "{with_logprobs}"
     );
     assert!(with_logprobs.contains(r#""logprob":"#), "{with_logprobs}");
+    assert!(
+        with_logprobs.contains(r#""top_logprobs":[{"token""#),
+        "{with_logprobs}"
+    );
 
     let two_choices = http(
         port,

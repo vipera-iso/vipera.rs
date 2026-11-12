@@ -694,30 +694,31 @@ fn chat(
         .get("logprobs")
         .and_then(Json::as_bool)
         .unwrap_or(false);
-    if wants_logprobs {
-        if streaming {
-            respond_error(
-                stream,
-                400,
-                "invalid_request",
-                "logprobs needs stream: false",
-            )?;
-            return Ok(400);
-        }
-        if parsed
-            .get("top_logprobs")
-            .and_then(Json::as_u32)
-            .unwrap_or(0)
-            > 0
-        {
-            respond_error(
-                stream,
-                400,
-                "invalid_request",
-                "top_logprobs is not supported yet; omit it or set it to 0",
-            )?;
-            return Ok(400);
-        }
+    let top_n = parsed
+        .get("top_logprobs")
+        .and_then(Json::as_u32)
+        .unwrap_or(0) as usize;
+    if top_n > 5 {
+        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
+        return Ok(400);
+    }
+    if top_n > 0 && !wants_logprobs {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "top_logprobs needs logprobs: true",
+        )?;
+        return Ok(400);
+    }
+    if wants_logprobs && streaming {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "logprobs needs stream: false",
+        )?;
+        return Ok(400);
     }
 
     let id = format!("chatcmpl-{}", request_id());
@@ -738,7 +739,8 @@ fn chat(
         )?;
         return Ok(400);
     }
-    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs) {
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
+    {
         Ok(turns) => turns,
         Err((status, code, message)) => {
             respond_error(stream, status, code, &message)?;
@@ -948,6 +950,7 @@ fn chat(
                 &served.tokenizer,
                 &generation.tokens,
                 &generation.logprobs,
+                &generation.top_logprobs,
                 text,
             )
         } else {
@@ -1063,30 +1066,31 @@ fn completions(
         .get("logprobs")
         .and_then(Json::as_bool)
         .unwrap_or(false);
-    if wants_logprobs {
-        if streaming {
-            respond_error(
-                stream,
-                400,
-                "invalid_request",
-                "logprobs needs stream: false",
-            )?;
-            return Ok(400);
-        }
-        if parsed
-            .get("top_logprobs")
-            .and_then(Json::as_u32)
-            .unwrap_or(0)
-            > 0
-        {
-            respond_error(
-                stream,
-                400,
-                "invalid_request",
-                "top_logprobs is not supported yet; omit it or set it to 0",
-            )?;
-            return Ok(400);
-        }
+    let top_n = parsed
+        .get("top_logprobs")
+        .and_then(Json::as_u32)
+        .unwrap_or(0) as usize;
+    if top_n > 5 {
+        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
+        return Ok(400);
+    }
+    if top_n > 0 && !wants_logprobs {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "top_logprobs needs logprobs: true",
+        )?;
+        return Ok(400);
+    }
+    if wants_logprobs && streaming {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "logprobs needs stream: false",
+        )?;
+        return Ok(400);
     }
 
     let id = format!("cmpl-{}", request_id());
@@ -1107,7 +1111,8 @@ fn completions(
         )?;
         return Ok(400);
     }
-    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs) {
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
+    {
         Ok(turns) => turns,
         Err((status, code, message)) => {
             respond_error(stream, status, code, &message)?;
@@ -1311,6 +1316,7 @@ fn completions(
                 &served.tokenizer,
                 &generation.tokens,
                 &generation.logprobs,
+                &generation.top_logprobs,
                 text,
             )
         } else {
@@ -1483,10 +1489,11 @@ fn attach_turns(
     sampler: SamplerConfig,
     n: usize,
     logprobs: bool,
+    top_n: usize,
 ) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
     let mut turns = Vec::with_capacity(n);
     for _ in 0..n {
-        match attach_turn(served, ids, max_tokens, sampler, logprobs) {
+        match attach_turn(served, ids, max_tokens, sampler, logprobs, top_n) {
             Ok(turn) => turns.push(turn),
             Err(error) => {
                 for (sequence, _) in turns.drain(..) {
@@ -1505,6 +1512,7 @@ fn attach_turn(
     max_tokens: u32,
     sampler: SamplerConfig,
     logprobs: bool,
+    top_n: usize,
 ) -> Result<QueuedTurn, (u16, &'static str, String)> {
     let (sender, receiver) = mpsc::channel();
     let sequence = {
@@ -1521,6 +1529,10 @@ fn attach_turn(
             (status, code, error.to_string())
         })?;
         engine.set_logprobs(sequence, logprobs).map_err(|error| {
+            let (status, code) = map_engine_error(&error);
+            (status, code, error.to_string())
+        })?;
+        engine.set_top_logprobs(sequence, top_n).map_err(|error| {
             let (status, code) = map_engine_error(&error);
             (status, code, error.to_string())
         })?;
@@ -1602,7 +1614,13 @@ fn chunk(
 /// OpenAI's `logprobs.content`: one entry per generated token, decoding each token as the delta
 /// from the text shown so far. Entries stop before any text past `visible`, so a stop sequence is
 /// not reported as a generated token.
-fn logprobs_json(tokenizer: &Tokenizer, tokens: &[u32], logprobs: &[f32], visible: &str) -> String {
+fn logprobs_json(
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    logprobs: &[f32],
+    top: &[Vec<(u32, f32)>],
+    visible: &str,
+) -> String {
     let mut entries = String::new();
     let mut shown = String::new();
     for (index, _) in tokens.iter().enumerate() {
@@ -1619,11 +1637,29 @@ fn logprobs_json(tokenizer: &Tokenizer, tokens: &[u32], logprobs: &[f32], visibl
         } else {
             "null".to_owned()
         };
+        let mut alternatives = String::new();
+        for (id, probability) in top.get(index).map(Vec::as_slice).unwrap_or(&[]) {
+            let Ok(token_text) = tokenizer.decode(&[*id]) else {
+                continue;
+            };
+            let probability = if probability.is_finite() {
+                format!("{probability}")
+            } else {
+                "null".to_owned()
+            };
+            if !alternatives.is_empty() {
+                alternatives.push(',');
+            }
+            alternatives.push_str(&format!(
+                r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
+                quote(&token_text)
+            ));
+        }
         if !entries.is_empty() {
             entries.push(',');
         }
         entries.push_str(&format!(
-            r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[]}}"#,
+            r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
             quote(delta)
         ));
         shown = text;

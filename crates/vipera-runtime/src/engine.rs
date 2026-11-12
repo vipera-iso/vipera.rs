@@ -66,6 +66,8 @@ pub struct Generation {
     pub processed_tokens: u64,
     /// Log-probability of each generated token, when the caller asked for them; empty otherwise.
     pub logprobs: Vec<f32>,
+    /// Alternative tokens and their log-probabilities for each position, when requested.
+    pub top_logprobs: Vec<Vec<(u32, f32)>>,
     /// Per-stage timings for the whole turn.
     pub timings: StageTimings,
     /// One structured log line describing the turn.
@@ -136,6 +138,10 @@ struct Turn {
     collect_logprobs: bool,
     /// Log-probabilities recorded so far, aligned with `generated`.
     logprobs: Vec<f32>,
+    /// Top alternatives recorded so far, aligned with `generated`.
+    top_logprobs: Vec<Vec<(u32, f32)>>,
+    /// How many alternatives each position reports; `0` disables the scan.
+    top_n: usize,
     timings: StageTimings,
 }
 
@@ -312,6 +318,17 @@ impl<F: ForwardPass> Engine<F> {
         Ok(())
     }
 
+    /// Ask sequence `id` to report the `top` most likely alternatives for each generated token.
+    ///
+    /// Implies [`Engine::set_logprobs`]; call both between admit and enqueue.
+    pub fn set_top_logprobs(&mut self, id: u64, top: usize) -> Result<(), ViperaError> {
+        let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
+            ViperaError::invalid_argument(format!("sequence {id} does not exist"))
+        })?;
+        sequence.set_top_logprobs(top);
+        Ok(())
+    }
+
     /// Add a follow-up prompt, reusing the retained prefix.
     ///
     /// Returns how many leading tokens were already resident. The cache is cut back to the common
@@ -427,6 +444,7 @@ impl<F: ForwardPass> Engine<F> {
         let reused = sequence.take_reused();
         let prompt_tokens = sequence.len().saturating_sub(reused);
         let collect_logprobs = sequence.wants_logprobs();
+        let top_n = sequence.top_logprobs();
         // Nothing new to prefill, as after a restore or a repeated turn: sampling still needs the
         // logits of the last retained token, so the turn starts by computing that one position.
         let phase = if sequence.processed() < sequence.len() {
@@ -446,6 +464,8 @@ impl<F: ForwardPass> Engine<F> {
             processed: 0,
             collect_logprobs,
             logprobs: Vec::new(),
+            top_logprobs: Vec::new(),
+            top_n,
             timings: StageTimings::new(),
         });
         Ok(())
@@ -656,8 +676,11 @@ impl<F: ForwardPass> Engine<F> {
         let started = Instant::now();
         let recent = &sequence.tokens()[recent_start..];
         let token = if turn.collect_logprobs {
-            let (token, logprob) = turn.sampler.sample_with_logprob(&turn.logits, recent)?;
+            let (token, logprob, top) =
+                turn.sampler
+                    .sample_with_details(&turn.logits, recent, turn.top_n)?;
             turn.logprobs.push(logprob);
+            turn.top_logprobs.push(top);
             token
         } else {
             turn.sampler.sample(&turn.logits, recent)?
@@ -817,6 +840,7 @@ fn end_turn(sequence: &mut Sequence, turn: &mut Turn, reason: FinishReason) -> G
         reused_tokens: turn.reused,
         processed_tokens: turn.processed,
         logprobs: std::mem::take(&mut turn.logprobs),
+        top_logprobs: std::mem::take(&mut turn.top_logprobs),
         timings: turn.timings,
         log_line: log.to_json(),
     }
