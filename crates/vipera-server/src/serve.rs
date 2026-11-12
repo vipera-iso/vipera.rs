@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -384,6 +385,10 @@ struct Router {
     /// Whether a turn was queued since the scheduler last looked.
     pending: Mutex<bool>,
     wake: Condvar,
+    /// Handlers waiting for the engine lock to queue a new turn. The scheduler yields the engine
+    /// while this is above zero: `std::sync::Mutex` is unfair, and a scheduler that reacquires it
+    /// at once can keep a new request out for a whole prompt.
+    admitting: AtomicUsize,
 }
 
 impl Router {
@@ -392,7 +397,19 @@ impl Router {
             routes: Mutex::new(HashMap::new()),
             pending: Mutex::new(false),
             wake: Condvar::new(),
+            admitting: AtomicUsize::new(0),
         }
+    }
+
+    /// Note that a handler is about to queue a turn, and undo it when done.
+    fn admitting(&self) -> AdmitGuard<'_> {
+        self.admitting.fetch_add(1, Ordering::SeqCst);
+        AdmitGuard { router: self }
+    }
+
+    /// Whether a handler is waiting to queue a turn right now.
+    fn someone_is_admitting(&self) -> bool {
+        self.admitting.load(Ordering::SeqCst) > 0
     }
 
     /// Point `sequence`'s tokens at `sender`. Called before the turn is queued, so a step can never
@@ -504,6 +521,12 @@ fn schedule(engine: Arc<Mutex<Engine<CpuBackend>>>, router: Arc<Router>, eos: Ve
                     router.fail(&error.to_string());
                     break;
                 }
+            }
+            // The lock is free again, but a handler that wants to queue a turn may be waiting on it.
+            // Pause for a moment so it can attach: a prefill chunk takes hundreds of milliseconds,
+            // and a starving admit would wait out the whole prompt instead of one chunk.
+            if router.someone_is_admitting() {
+                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
     }
@@ -1687,6 +1710,7 @@ fn attach_turn(
     top_n: usize,
 ) -> Result<QueuedTurn, (u16, &'static str, String)> {
     let (sender, receiver) = mpsc::channel();
+    let _admitting = served.router.admitting();
     let sequence = {
         // The lock is held only long enough to attach this request's sampler and queue its turn. The
         // scheduler does the work, so other requests can join the same forward pass instead of
@@ -1721,6 +1745,17 @@ fn attach_turn(
     };
     served.router.wake();
     Ok((sequence, receiver))
+}
+
+/// Keeps the router's admit count honest on every path out of [`attach_turn`].
+struct AdmitGuard<'a> {
+    router: &'a Router,
+}
+
+impl Drop for AdmitGuard<'_> {
+    fn drop(&mut self) {
+        self.router.admitting.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Whether the caller asked for the final usage chunk on a stream.

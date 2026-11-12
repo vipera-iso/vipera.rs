@@ -300,6 +300,9 @@ pub struct Engine<F: ForwardPass> {
     turns: BTreeMap<u64, Turn>,
     next_sequence: u64,
     counters: Counters,
+    /// True when the previous step served a prompt chunk while decode turns were waiting, so the
+    /// next step owes them theirs. Only meaningful while a batch is mid-prefill.
+    owe_decode: bool,
 }
 
 impl<F: ForwardPass> Engine<F> {
@@ -314,6 +317,7 @@ impl<F: ForwardPass> Engine<F> {
             turns: BTreeMap::new(),
             next_sequence: 0,
             counters: Counters::default(),
+            owe_decode: false,
         }
     }
 
@@ -569,10 +573,11 @@ impl<F: ForwardPass> Engine<F> {
             }
         }
 
-        // One kind of forward pass per step. A prompt chunk is more than one token, and a batch that
-        // mixes chunks with decode steps makes the backend compute every entry on its own, so decode
-        // steps wait for a step that holds only decode steps. A chunk is at most one block, so the
-        // wait is bounded.
+        // One kind of forward pass per step: a batch that mixes a multi-token chunk with single-token
+        // decode entries makes the CPU backend fall back to one forward per entry, which gives up the
+        // shared weight read that batching exists for. Fairness is therefore step-level: while a long
+        // prompt is still chunking, each prompt chunk is followed by one step for the decode turns
+        // that are waiting, so a prompt costs them two chunk times instead of the whole prompt.
         let prefill: Vec<u64> = self
             .turns
             .iter()
@@ -598,13 +603,22 @@ impl<F: ForwardPass> Engine<F> {
         } else {
             Vec::new()
         };
+        let decode: Vec<u64> = self
+            .turns
+            .iter()
+            .filter(|(_, turn)| turn.phase == Phase::Decode && !(alone && turn.speculative))
+            .map(|(id, _)| *id)
+            .collect();
         let batch: Vec<u64> = if prefill.is_empty() {
-            self.turns
-                .iter()
-                .filter(|(_, turn)| turn.phase == Phase::Decode && !(alone && turn.speculative))
-                .map(|(id, _)| *id)
-                .collect()
+            self.owe_decode = false;
+            decode
+        } else if decode.is_empty() {
+            prefill
+        } else if self.owe_decode {
+            self.owe_decode = false;
+            decode
         } else {
+            self.owe_decode = true;
             prefill
         };
         if !batch.is_empty()
@@ -1253,6 +1267,49 @@ mod tests {
         }
     }
 
+    /// Answers like [`ToyForward`] and records the width of every batched call in order: a prompt
+    /// chunk carries more than one token, a decode step carries exactly one.
+    struct WidthRecording {
+        inner: ToyForward,
+        widths: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl WidthRecording {
+        fn new(vocab: usize) -> (Self, Rc<RefCell<Vec<usize>>>) {
+            let widths = Rc::new(RefCell::new(Vec::new()));
+            (
+                Self {
+                    inner: ToyForward::new(vocab),
+                    widths: Rc::clone(&widths),
+                },
+                widths,
+            )
+        }
+    }
+
+    impl ForwardPass for WidthRecording {
+        fn logits(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+            self.inner.logits(context)
+        }
+
+        fn logits_batch(
+            &mut self,
+            batch: &mut BatchContext<'_, '_>,
+        ) -> Result<Vec<Vec<f32>>, ViperaError> {
+            let width = batch
+                .entries
+                .first()
+                .map_or(0, |entry| entry.new_tokens.len());
+            self.widths.borrow_mut().push(width);
+            let mut results = Vec::with_capacity(batch.entries.len());
+            for entry in batch.entries.iter() {
+                let mut context = entry.context(&mut *batch.kv);
+                results.push(self.inner.logits(&mut context)?);
+            }
+            Ok(results)
+        }
+    }
+
     /// Step until nothing is queued or running, collecting tokens in the order they were drawn.
     fn drain<F: ForwardPass>(engine: &mut Engine<F>) -> (BTreeMap<u64, Vec<u32>>, Vec<Generation>) {
         let mut tokens: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -1646,6 +1703,49 @@ mod tests {
             batches.borrow().contains(&2),
             "the late arrival never shared a step: {:?}",
             batches.borrow()
+        );
+    }
+
+    #[test]
+    fn a_long_prompt_does_not_starve_a_decode_turn() {
+        let (forward, widths) = WidthRecording::new(32);
+        let mut config = greedy();
+        config.max_batch = 2;
+        let mut engine = engine_with_forward(config, forward, 128);
+
+        // Ten prompt chunks of four tokens each, next to a turn that only has to decode.
+        let prompt: Vec<u32> = (1..=40).collect();
+        let long = engine.admit(&prompt, 2).unwrap();
+        let short = engine.admit(&[7, 8], 4).unwrap();
+        engine.enqueue(long).unwrap();
+        engine.enqueue(short).unwrap();
+
+        let mut short_draws = 0;
+        for _ in 0..1000 {
+            let report = engine.step().unwrap();
+            short_draws += report
+                .tokens
+                .iter()
+                .filter(|token| token.sequence == short)
+                .count();
+            if engine.turns.is_empty() && engine.waiting.is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(short_draws, 4, "the short turn kept its budget");
+        let widths = widths.borrow();
+        let first_decode = widths
+            .iter()
+            .position(|&width| width == 1)
+            .expect("no decode step ran");
+        let last_chunk = widths
+            .iter()
+            .rposition(|&width| width > 1)
+            .expect("the prompt never chunked");
+        assert!(
+            first_decode < last_chunk,
+            "decode waited for the whole prompt: {widths:?}"
         );
     }
 
