@@ -361,7 +361,11 @@ impl Served {
 
 /// What a handler receives from the scheduler: one token, the end of its turn, or a failure.
 enum Event {
-    Token(u32),
+    Token {
+        token: u32,
+        logprob: Option<f32>,
+        top_logprobs: Vec<(u32, f32)>,
+    },
     Finished(Box<Generation>),
     Failed(String),
 }
@@ -433,12 +437,16 @@ impl Router {
         let Ok(mut routes) = self.routes.lock() else {
             return;
         };
-        for (sequence, token) in report.tokens {
-            if eos.contains(&token) {
+        for step in report.tokens {
+            if eos.contains(&step.token) {
                 continue;
             }
-            if let Some(sender) = routes.get(&sequence) {
-                let _ = sender.send(Event::Token(token));
+            if let Some(sender) = routes.get(&step.sequence) {
+                let _ = sender.send(Event::Token {
+                    token: step.token,
+                    logprob: step.logprob,
+                    top_logprobs: step.top_logprobs,
+                });
             }
         }
         for generation in report.finished {
@@ -711,16 +719,6 @@ fn chat(
         )?;
         return Ok(400);
     }
-    if wants_logprobs && streaming {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "logprobs needs stream: false",
-        )?;
-        return Ok(400);
-    }
-
     let id = format!("chatcmpl-{}", request_id());
     let created = now_seconds();
     let n = match choices_of(&parsed) {
@@ -764,8 +762,12 @@ fn chat(
         let mut finished: Option<Generation> = None;
         let mut failure: Option<String> = None;
         for event in receiver {
-            let token = match event {
-                Event::Token(token) => token,
+            let (token, logprob, top) = match event {
+                Event::Token {
+                    token,
+                    logprob,
+                    top_logprobs,
+                } => (token, logprob, top_logprobs),
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -795,7 +797,16 @@ fn chat(
             };
             if cut > shown.len() {
                 let delta = &text[shown.len()..cut];
-                let frame = chunk(&id, created, &served.model, Some(delta), None);
+                let entry = logprob
+                    .map(|logprob| stream_logprob_json(&served.tokenizer, delta, logprob, &top));
+                let frame = chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    Some(delta),
+                    None,
+                    entry.as_deref(),
+                );
                 if sse(stream, &frame).is_err() {
                     // The client is gone: stop the turn instead of generating into a dead socket.
                     disconnected = true;
@@ -836,7 +847,7 @@ fn chat(
             return Ok(200);
         }
         if stopped {
-            let frame = chunk(&id, created, &served.model, None, Some("stop"));
+            let frame = chunk(&id, created, &served.model, None, Some("stop"), None);
             let _ = sse(stream, &frame);
             if include_usage {
                 let usage = usage_chunk(
@@ -870,11 +881,12 @@ fn chat(
                     &served.model,
                     Some(&text[shown.len()..]),
                     None,
+                    None,
                 ),
             );
         }
         let reason = finish_reason(&finished.finish);
-        let final_frame = chunk(&id, created, &served.model, None, Some(reason));
+        let final_frame = chunk(&id, created, &served.model, None, Some(reason), None);
         let _ = sse(stream, &final_frame);
         if include_usage {
             let usage = usage_chunk(
@@ -903,7 +915,7 @@ fn chat(
         for event in receiver {
             match event {
                 // A non-streaming caller only needs the generation; the tokens are in it.
-                Event::Token(_) => {}
+                Event::Token { .. } => {}
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -1136,8 +1148,12 @@ fn completions(
         let mut finished: Option<Generation> = None;
         let mut failure: Option<String> = None;
         for event in receiver {
-            let token = match event {
-                Event::Token(token) => token,
+            let (token, _, _) = match event {
+                Event::Token {
+                    token,
+                    logprob,
+                    top_logprobs,
+                } => (token, logprob, top_logprobs),
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -1269,7 +1285,7 @@ fn completions(
         let mut failure: Option<String> = None;
         for event in receiver {
             match event {
-                Event::Token(_) => {}
+                Event::Token { .. } => {}
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -1595,6 +1611,7 @@ fn chunk(
     model: &str,
     content: Option<&str>,
     finish: Option<&str>,
+    logprob: Option<&str>,
 ) -> String {
     let delta = match content {
         Some(text) => format!(r#"{{"role":"assistant","content":{}}}"#, quote(text)),
@@ -1604,10 +1621,40 @@ fn chunk(
         Some(reason) => quote(reason),
         None => "null".to_owned(),
     };
+    let logprobs = match logprob {
+        Some(entry) => format!(r#"{{"content":[{entry}]}}"#),
+        None => "null".to_owned(),
+    };
     format!(
-        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"finish_reason":{reason}}}]}}"#,
+        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"logprobs":{logprobs},"finish_reason":{reason}}}]}}"#,
         quote(id),
         quote(model)
+    )
+}
+
+/// One streaming token's logprob entry, shaped like an entry of the non-streaming array.
+fn stream_logprob_json(
+    tokenizer: &Tokenizer,
+    delta: &str,
+    logprob: f32,
+    top: &[(u32, f32)],
+) -> String {
+    let mut alternatives = String::new();
+    for (id, probability) in top {
+        let Ok(token_text) = tokenizer.decode(&[*id]) else {
+            continue;
+        };
+        if !alternatives.is_empty() {
+            alternatives.push(',');
+        }
+        alternatives.push_str(&format!(
+            r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
+            quote(&token_text)
+        ));
+    }
+    format!(
+        r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
+        quote(delta)
     )
 }
 
@@ -2083,7 +2130,7 @@ mod tests {
 
     #[test]
     fn stream_frames_parse_as_json() {
-        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None);
+        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None, None);
         let parsed = Json::parse(&frame).expect("valid frame");
         assert_eq!(
             parsed
@@ -2094,7 +2141,7 @@ mod tests {
                 .and_then(Json::as_str),
             Some("hi \"there\"")
         );
-        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"));
+        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"), None);
         assert_eq!(
             Json::parse(&final_frame)
                 .unwrap()

@@ -202,11 +202,24 @@ pub fn speculative_accept(draft: &[u32], target: &[u32]) -> usize {
         .count()
 }
 
+/// A token drawn this step, with the logprob data its sequence asked to record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepToken {
+    /// Sequence that drew the token.
+    pub sequence: u64,
+    /// The drawn token id.
+    pub token: u32,
+    /// Log-probability of the token when the sequence requested logprobs.
+    pub logprob: Option<f32>,
+    /// Alternatives in descending order when the sequence requested `top_logprobs`.
+    pub top_logprobs: Vec<(u32, f32)>,
+}
+
 /// What one step did.
 #[derive(Debug, Clone, Default)]
 pub struct StepReport {
-    /// Tokens drawn this step, in the order they were drawn, as `(sequence, token)`.
-    pub tokens: Vec<(u64, u32)>,
+    /// Tokens drawn this step, in the order they were drawn.
+    pub tokens: Vec<StepToken>,
     /// Turns that ended this step, with their generations.
     pub finished: Vec<Generation>,
     /// Turns that failed this step, as `(sequence, message)`. A failure is
@@ -384,9 +397,9 @@ impl<F: ForwardPass> Engine<F> {
         self.enqueue(id)?;
         loop {
             let report = self.step()?;
-            for (sequence, token) in &report.tokens {
-                if *sequence == id && !self.config.eos.contains(token) {
-                    (on_token)(*token);
+            for step in &report.tokens {
+                if step.sequence == id && !self.config.eos.contains(&step.token) {
+                    (on_token)(step.token);
                 }
             }
             if let Some(generation) = report
@@ -675,21 +688,26 @@ impl<F: ForwardPass> Engine<F> {
         let recent_start = sequence.len().saturating_sub(config.recent_window);
         let started = Instant::now();
         let recent = &sequence.tokens()[recent_start..];
-        let token = if turn.collect_logprobs {
+        let (token, logprob, top) = if turn.collect_logprobs {
             let (token, logprob, top) =
                 turn.sampler
                     .sample_with_details(&turn.logits, recent, turn.top_n)?;
             turn.logprobs.push(logprob);
-            turn.top_logprobs.push(top);
-            token
+            turn.top_logprobs.push(top.clone());
+            (token, Some(logprob), top)
         } else {
-            turn.sampler.sample(&turn.logits, recent)?
+            (turn.sampler.sample(&turn.logits, recent)?, None, Vec::new())
         };
         turn.timings.record(Stage::Sample, started.elapsed());
         sequence.begin_decode();
         sequence.push_generated(token);
         turn.generated.push(token);
-        report.tokens.push((id, token));
+        report.tokens.push(StepToken {
+            sequence: id,
+            token,
+            logprob,
+            top_logprobs: top,
+        });
 
         let finish = if config.eos.contains(&token) {
             Some(FinishReason::EndOfSequence)
@@ -993,8 +1011,8 @@ mod tests {
         let mut finished = Vec::new();
         for _ in 0..1000 {
             let report = engine.step().expect("a step");
-            for (id, token) in report.tokens {
-                tokens.entry(id).or_default().push(token);
+            for step in report.tokens {
+                tokens.entry(step.sequence).or_default().push(step.token);
             }
             finished.extend(report.finished);
             if engine.turns.is_empty() && engine.waiting.is_empty() {
@@ -1203,7 +1221,7 @@ mod tests {
         let report = engine.step().expect("step must succeed for the good turn");
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, bad);
-        assert!(report.tokens.iter().any(|(id, _)| *id == good));
+        assert!(report.tokens.iter().any(|step| step.sequence == good));
         // bad is failed and no longer active; good is still mid-turn, so drive
         // it to completion with steps (generate would re-enqueue it).
         assert!(engine.generate(bad).is_err());
@@ -1363,7 +1381,7 @@ mod tests {
         engine.enqueue(first).unwrap();
         let opening = engine.step().unwrap();
         assert_eq!(opening.tokens.len(), 1, "the first turn prefills and draws");
-        assert_eq!(opening.tokens[0].0, first);
+        assert_eq!(opening.tokens[0].sequence, first);
 
         let second = engine.admit(&[4, 5], 3).unwrap();
         engine.enqueue(second).unwrap();
