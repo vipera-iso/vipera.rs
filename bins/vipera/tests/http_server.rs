@@ -145,6 +145,34 @@ fn serve_answers_chat_completions_and_streams() {
         "{streamed_logprobs}"
     );
 
+    let streamed_json_mode = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":2,"stream":true,"response_format":{"type":"json_object"}}"#,
+    )
+    .expect("streamed json mode");
+    assert!(
+        streamed_json_mode.starts_with("HTTP/1.1 400"),
+        "{streamed_json_mode}"
+    );
+
+    let invalid_json_output = http(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Say hi"}],"max_tokens":1,"temperature":0,"response_format":{"type":"json_object"}}"#,
+    )
+    .expect("invalid json output");
+    assert!(
+        invalid_json_output.starts_with("HTTP/1.1 422"),
+        "{invalid_json_output}"
+    );
+    assert!(
+        invalid_json_output.contains("invalid_json_output"),
+        "{invalid_json_output}"
+    );
+
     let two_choices = http(
         port,
         "POST",

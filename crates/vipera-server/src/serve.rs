@@ -718,6 +718,22 @@ fn chat(
             return Ok(400);
         }
     };
+    let json_mode = match json_mode_of(&parsed) {
+        Ok(mode) => mode,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    if json_mode && streaming {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "response_format json_object needs stream: false",
+        )?;
+        return Ok(400);
+    }
     let wants_logprobs = parsed
         .get("logprobs")
         .and_then(Json::as_bool)
@@ -971,6 +987,18 @@ fn chat(
             .decode(&generation.tokens)
             .unwrap_or_default();
         let (text, stopped) = without_stop(&text, &stops);
+        if json_mode && !is_json_object(text) {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(
+                stream,
+                422,
+                "invalid_json_output",
+                "model output is not a valid JSON object",
+            )?;
+            return Ok(422);
+        }
         let reason = if stopped {
             "stop"
         } else {
@@ -1100,6 +1128,22 @@ fn completions(
         .and_then(Json::as_bool)
         .unwrap_or(false);
     let include_usage = include_usage_of(&parsed);
+    let json_mode = match json_mode_of(&parsed) {
+        Ok(mode) => mode,
+        Err(message) => {
+            respond_error(stream, 400, "invalid_request", &message)?;
+            return Ok(400);
+        }
+    };
+    if json_mode && streaming {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "response_format json_object needs stream: false",
+        )?;
+        return Ok(400);
+    }
     let wants_logprobs = parsed
         .get("logprobs")
         .and_then(Json::as_bool)
@@ -1347,6 +1391,18 @@ fn completions(
             .decode(&generation.tokens)
             .unwrap_or_default();
         let (text, stopped) = without_stop(&text, &stops);
+        if json_mode && !is_json_object(text) {
+            for (sequence, _) in turns.drain(..) {
+                release_sequence(served, sequence);
+            }
+            respond_error(
+                stream,
+                422,
+                "invalid_json_output",
+                "model output is not a valid JSON object",
+            )?;
+            return Ok(422);
+        }
         let reason = if stopped {
             "stop"
         } else {
@@ -1427,6 +1483,27 @@ fn messages_of(request: &Json) -> Result<Vec<ChatMessage>, String> {
 
 /// Sampling knobs from the request. Unknown or out-of-range values fall back to the defaults;
 /// malformed `logit_bias` is an error because silently dropping a ban changes what is generated.
+/// Whether the request asks for JSON-only output.
+///
+/// Only `text` and `json_object` are understood; anything else is rejected rather than silently
+/// treated as plain text.
+fn json_mode_of(request: &Json) -> Result<bool, String> {
+    let Some(format) = request.get("response_format") else {
+        return Ok(false);
+    };
+    let kind = format.get("type").and_then(Json::as_str).unwrap_or("text");
+    match kind {
+        "text" => Ok(false),
+        "json_object" => Ok(true),
+        other => Err(format!("response_format type {other:?} is not supported")),
+    }
+}
+
+/// A JSON-mode reply must be one complete object, not just any JSON value.
+fn is_json_object(text: &str) -> bool {
+    matches!(Json::parse(text), Ok(Json::Object(_)))
+}
+
 fn sampler_of(request: &Json) -> Result<SamplerConfig, String> {
     let mut sampler = SamplerConfig::default();
     if let Some(value) = request.get("temperature").and_then(Json::as_f64) {
@@ -2218,6 +2295,25 @@ mod tests {
         assert_eq!(sampler.min_p, 0.0);
         assert_eq!(sampler.seed, 7);
         assert!((sampler.repetition_penalty - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn json_mode_understands_text_and_object() {
+        let object = Json::parse(r#"{"response_format":{"type":"json_object"}}"#).unwrap();
+        assert!(json_mode_of(&object).unwrap());
+        let text = Json::parse(r#"{"response_format":{"type":"text"}}"#).unwrap();
+        assert!(!json_mode_of(&text).unwrap());
+        assert!(!json_mode_of(&Json::parse("{}").unwrap()).unwrap());
+        let schema = Json::parse(r#"{"response_format":{"type":"json_schema"}}"#).unwrap();
+        assert!(json_mode_of(&schema).is_err());
+    }
+
+    #[test]
+    fn json_validation_requires_one_complete_object() {
+        assert!(is_json_object(r#"{"a":1}"#));
+        assert!(!is_json_object("[1]"));
+        assert!(!is_json_object(r#"{"a":1"#));
+        assert!(!is_json_object("Hi"));
     }
 
     #[test]
