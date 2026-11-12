@@ -202,15 +202,25 @@ pub fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
 ///
 /// A longer needle is a stronger promise: four trailing tokens that repeated before are more
 /// likely to repeat again than two, which is what keeps drafts landing on quoted or structured
-/// text. There is deliberately no bigram fallback: on ordinary prose a two-token match almost
-/// never continues as drafted, and every drafted position is a position the verify pass computes
-/// before throwing it away. Dropping the fallback measured +2-5% on prose while keeping the
-/// quoted-text gain. The continuation is bounded by `max_draft` for the same reason.
+/// text. The three-token minimum is what keeps ordinary prose from paying for a two-token match
+/// that almost never continues as drafted; the caller can lower it to two while its draft window
+/// is open, for the tail of a quotation. The continuation is bounded by `max_draft` because every
+/// drafted position is a position the verify pass computes.
 pub fn longest_ngram_draft(context: &[u32], max_draft: usize) -> Vec<u32> {
+    longest_ngram_draft_from(context, max_draft, 3)
+}
+
+/// [`longest_ngram_draft`] with the shortest needle the caller will accept.
+///
+/// A two-token needle is only worth paying for while the draft window is open, which is the signal
+/// that the context is repeating: there it catches the tail of a quoted phrase that a three-token
+/// needle misses. In ordinary prose the window closes after the first miss, so the cheap three-token
+/// rule takes over again and no positions are verified for nothing.
+fn longest_ngram_draft_from(context: &[u32], max_draft: usize, min_needle: usize) -> Vec<u32> {
     if max_draft == 0 {
         return Vec::new();
     }
-    for n in (3..=4).rev() {
+    for n in (min_needle.max(2)..=4).rev() {
         if context.len() < 2 * n {
             continue;
         }
@@ -766,7 +776,8 @@ impl<F: ForwardPass> Engine<F> {
         // One slot is always left for the model's own token after the accepted prefix.
         let room = (capacity - sequence.len() as u64).min(remaining.saturating_sub(1));
         let cap = turn.draft_cap.max(2);
-        let mut draft = longest_ngram_draft(sequence.tokens(), cap);
+        let min_needle = if cap >= 4 { 2 } else { 3 };
+        let mut draft = longest_ngram_draft_from(sequence.tokens(), cap, min_needle);
         draft.truncate(usize::try_from(room).unwrap_or(0));
         let mut all = sequence.tokens().to_vec();
         all.extend_from_slice(&draft);
@@ -1682,7 +1693,7 @@ mod tests {
 
 #[cfg(test)]
 mod speculation {
-    use super::{longest_ngram_draft, ngram_draft, speculative_accept};
+    use super::{longest_ngram_draft, longest_ngram_draft_from, ngram_draft, speculative_accept};
 
     #[test]
     fn draft_follows_the_last_repeat() {
@@ -1707,6 +1718,11 @@ mod speculation {
         assert!(longest_ngram_draft(&[1_u32, 2, 1, 2], 8).is_empty());
         assert!(longest_ngram_draft(&[1_u32, 2, 3], 8).is_empty());
         assert!(longest_ngram_draft(&[1_u32, 2, 3, 1, 2, 3], 0).is_empty());
+        // While the draft window is open a bigram is allowed, which is what catches the tail of a
+        // quote; the strict rule is the default.
+        let quoted = [1_u32, 2, 1, 2];
+        assert!(longest_ngram_draft(&quoted, 8).is_empty());
+        assert_eq!(longest_ngram_draft_from(&quoted, 8, 2), vec![1, 2]);
     }
 
     #[test]
