@@ -927,6 +927,16 @@ fn sampler_of(request: &Json) -> SamplerConfig {
     {
         sampler.repetition_penalty = value as f32;
     }
+    for (key, target) in [
+        ("presence_penalty", &mut sampler.presence_penalty),
+        ("frequency_penalty", &mut sampler.frequency_penalty),
+    ] {
+        if let Some(value) = request.get(key).and_then(Json::as_f64)
+            && value.is_finite()
+        {
+            *target = value.clamp(-2.0, 2.0) as f32;
+        }
+    }
     sampler
 }
 
@@ -1330,10 +1340,12 @@ mod tests {
     #[test]
     fn sampler_fields_are_clamped() {
         let request = Json::parse(
-            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2}"#,
+            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2,"presence_penalty":5,"frequency_penalty":-5}"#,
         )
         .unwrap();
         let sampler = sampler_of(&request);
+        assert_eq!(sampler.presence_penalty, 2.0);
+        assert_eq!(sampler.frequency_penalty, -2.0);
         assert_eq!(sampler.temperature, 2.0);
         assert_eq!(sampler.top_p, 1.0);
         assert_eq!(sampler.top_k, 5);
