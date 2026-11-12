@@ -22,6 +22,12 @@ use vipera_traits::{
 
 pub use rng::Rng;
 
+/// A token id and its log-probability.
+pub type TokenLogprob = (u32, f32);
+
+/// A draw: chosen token, its log-probability, and the requested alternatives.
+pub type SampleDetails = (u32, f32, Vec<TokenLogprob>);
+
 /// Sampling knobs. Defaults are the ones the CLI advertises.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplerConfig {
@@ -278,6 +284,83 @@ impl Sampler {
     pub fn reseed(&mut self, seed: u64) {
         self.config.seed = seed;
         self.rng.reseed(seed);
+    }
+
+    /// Pick the next token id and its log-probability under the same distribution.
+    ///
+    /// This costs one extra pass over the vocabulary to build the softmax denominator, so the
+    /// engine only takes this path when a caller asked for logprobs.
+    pub fn sample_with_logprob(
+        &mut self,
+        logits: &[f32],
+        recent: &[u32],
+    ) -> Result<(u32, f32), ViperaError> {
+        let (token, logprob, _) = self.sample_with_details(logits, recent, 0)?;
+        Ok((token, logprob))
+    }
+
+    /// Draw, and also return the `top_n` most likely tokens with their log-probabilities.
+    ///
+    /// `top_n = 0` skips the candidate scan. The chosen token is included when it ranks inside the
+    /// cut, as OpenAI's `top_logprobs` expects.
+    pub fn sample_with_details(
+        &mut self,
+        logits: &[f32],
+        recent: &[u32],
+        top_n: usize,
+    ) -> Result<SampleDetails, ViperaError> {
+        let token = self.sample(logits, recent)?;
+        let penalty = RepetitionPenalty::new(
+            recent,
+            self.config.repetition_penalty,
+            self.config.presence_penalty,
+            self.config.frequency_penalty,
+        );
+        let temperature = if self.config.temperature > 0.0 {
+            self.config.temperature
+        } else {
+            1.0
+        };
+        let scaled = |id: usize, logit: f32| penalty.apply(id, logit) / temperature;
+        let mut max = f32::NEG_INFINITY;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                max = max.max(scaled(id, *logit));
+            }
+        }
+        if !max.is_finite() {
+            return Err(ViperaError::invalid_argument(
+                "every logit is NaN or infinite",
+            ));
+        }
+        let mut mass = 0.0f32;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                mass += (scaled(id, *logit) - max).exp();
+            }
+        }
+        let log_mass = mass.ln();
+        let chosen = scaled(token as usize, logits[token as usize]);
+        let chosen = chosen - max - log_mass;
+        let mut top = Vec::new();
+        if top_n > 0 {
+            for (id, logit) in logits.iter().enumerate() {
+                if !logit.is_finite() {
+                    continue;
+                }
+                let logprob = scaled(id, *logit) - max - log_mass;
+                if !logprob.is_finite() {
+                    continue;
+                }
+                let at = top
+                    .iter()
+                    .position(|(_, value): &(u32, f32)| logprob > *value)
+                    .unwrap_or(top.len());
+                top.insert(at, (id as u32, logprob));
+                top.truncate(top_n);
+            }
+        }
+        Ok((token, chosen, top))
     }
 
     /// Pick the next token id.
@@ -673,6 +756,29 @@ mod tests {
         let mut s = sampler(0.0, 0, 1.0, 0.0, 2.0);
         assert_eq!(s.sample(&[5.0, 4.0], &[]).unwrap(), 0);
         assert_eq!(s.sample(&[5.0, 4.0], &[0]).unwrap(), 1);
+    }
+
+    #[test]
+    fn top_logprobs_returns_the_ranked_candidates() {
+        let mut s = sampler(1.0, 0, 1.0, 0.0, 1.0);
+        let (token, logprob, top) = s.sample_with_details(&[0.0, 0.0, 0.0], &[], 3).unwrap();
+        assert_eq!(top.len(), 3);
+        assert!(top.iter().any(|(id, _)| *id == token));
+        let expected = (1.0f32 / 3.0).ln();
+        for (_, probability) in &top {
+            assert!((probability - expected).abs() < 1e-6, "{probability}");
+        }
+        assert!((logprob - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_chosen_token_logprob_matches_the_distribution() {
+        let mut s = sampler(1.0, 0, 1.0, 0.0, 1.0);
+        let (_token, logprob) = s.sample_with_logprob(&[0.0, 0.0], &[]).unwrap();
+        assert!((logprob - 0.5f32.ln()).abs() < 1e-6, "{logprob}");
+        // A token that dominates the distribution has a logprob close to zero.
+        let (_token, logprob) = s.sample_with_logprob(&[20.0, 0.0], &[]).unwrap();
+        assert!(logprob > -1e-6, "{logprob}");
     }
 
     #[test]

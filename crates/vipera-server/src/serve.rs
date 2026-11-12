@@ -361,7 +361,11 @@ impl Served {
 
 /// What a handler receives from the scheduler: one token, the end of its turn, or a failure.
 enum Event {
-    Token(u32),
+    Token {
+        token: u32,
+        logprob: Option<f32>,
+        top_logprobs: Vec<(u32, f32)>,
+    },
     Finished(Box<Generation>),
     Failed(String),
 }
@@ -433,12 +437,16 @@ impl Router {
         let Ok(mut routes) = self.routes.lock() else {
             return;
         };
-        for (sequence, token) in report.tokens {
-            if eos.contains(&token) {
+        for step in report.tokens {
+            if eos.contains(&step.token) {
                 continue;
             }
-            if let Some(sender) = routes.get(&sequence) {
-                let _ = sender.send(Event::Token(token));
+            if let Some(sender) = routes.get(&step.sequence) {
+                let _ = sender.send(Event::Token {
+                    token: step.token,
+                    logprob: step.logprob,
+                    top_logprobs: step.top_logprobs,
+                });
             }
         }
         for generation in report.finished {
@@ -704,7 +712,27 @@ fn chat(
             return Ok(400);
         }
     };
-
+    let wants_logprobs = parsed
+        .get("logprobs")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let top_n = parsed
+        .get("top_logprobs")
+        .and_then(Json::as_u32)
+        .unwrap_or(0) as usize;
+    if top_n > 5 {
+        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
+        return Ok(400);
+    }
+    if top_n > 0 && !wants_logprobs {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "top_logprobs needs logprobs: true",
+        )?;
+        return Ok(400);
+    }
     let id = format!("chatcmpl-{}", request_id());
     let created = now_seconds();
     let n = match choices_of(&parsed) {
@@ -723,7 +751,8 @@ fn chat(
         )?;
         return Ok(400);
     }
-    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n) {
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
+    {
         Ok(turns) => turns,
         Err((status, code, message)) => {
             respond_error(stream, status, code, &message)?;
@@ -747,8 +776,12 @@ fn chat(
         let mut finished: Option<Generation> = None;
         let mut failure: Option<String> = None;
         for event in receiver {
-            let token = match event {
-                Event::Token(token) => token,
+            let (token, logprob, top) = match event {
+                Event::Token {
+                    token,
+                    logprob,
+                    top_logprobs,
+                } => (token, logprob, top_logprobs),
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -778,7 +811,16 @@ fn chat(
             };
             if cut > shown.len() {
                 let delta = &text[shown.len()..cut];
-                let frame = chunk(&id, created, &served.model, Some(delta), None);
+                let entry = logprob
+                    .map(|logprob| stream_logprob_json(&served.tokenizer, delta, logprob, &top));
+                let frame = chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    Some(delta),
+                    None,
+                    entry.as_deref(),
+                );
                 if sse(stream, &frame).is_err() {
                     // The client is gone: stop the turn instead of generating into a dead socket.
                     disconnected = true;
@@ -819,7 +861,7 @@ fn chat(
             return Ok(200);
         }
         if stopped {
-            let frame = chunk(&id, created, &served.model, None, Some("stop"));
+            let frame = chunk(&id, created, &served.model, None, Some("stop"), None);
             let _ = sse(stream, &frame);
             if include_usage {
                 let usage = usage_chunk(
@@ -853,11 +895,12 @@ fn chat(
                     &served.model,
                     Some(&text[shown.len()..]),
                     None,
+                    None,
                 ),
             );
         }
         let reason = finish_reason(&finished.finish);
-        let final_frame = chunk(&id, created, &served.model, None, Some(reason));
+        let final_frame = chunk(&id, created, &served.model, None, Some(reason), None);
         let _ = sse(stream, &final_frame);
         if include_usage {
             let usage = usage_chunk(
@@ -886,7 +929,7 @@ fn chat(
         for event in receiver {
             match event {
                 // A non-streaming caller only needs the generation; the tokens are in it.
-                Event::Token(_) => {}
+                Event::Token { .. } => {}
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -928,11 +971,22 @@ fn chat(
             finish_reason(&generation.finish)
         };
         completion_tokens += generation.tokens.len();
+        let choice_logprobs = if wants_logprobs {
+            logprobs_json(
+                &served.tokenizer,
+                &generation.tokens,
+                &generation.logprobs,
+                &generation.top_logprobs,
+                text,
+            )
+        } else {
+            "null".to_owned()
+        };
         if !choices.is_empty() {
             choices.push(',');
         }
         choices.push_str(&format!(
-            r#"{{"index":{},"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}"#,
+            r#"{{"index":{},"message":{{"role":"assistant","content":{}}},"logprobs":{choice_logprobs},"finish_reason":{}}}"#,
             index,
             quote(text),
             quote(reason)
@@ -1034,6 +1088,36 @@ fn completions(
         .and_then(Json::as_bool)
         .unwrap_or(false);
     let include_usage = include_usage_of(&parsed);
+    let wants_logprobs = parsed
+        .get("logprobs")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    let top_n = parsed
+        .get("top_logprobs")
+        .and_then(Json::as_u32)
+        .unwrap_or(0) as usize;
+    if top_n > 5 {
+        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
+        return Ok(400);
+    }
+    if top_n > 0 && !wants_logprobs {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "top_logprobs needs logprobs: true",
+        )?;
+        return Ok(400);
+    }
+    if wants_logprobs && streaming {
+        respond_error(
+            stream,
+            400,
+            "invalid_request",
+            "logprobs needs stream: false",
+        )?;
+        return Ok(400);
+    }
 
     let id = format!("cmpl-{}", request_id());
     let created = now_seconds();
@@ -1053,7 +1137,8 @@ fn completions(
         )?;
         return Ok(400);
     }
-    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n) {
+    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
+    {
         Ok(turns) => turns,
         Err((status, code, message)) => {
             respond_error(stream, status, code, &message)?;
@@ -1077,8 +1162,12 @@ fn completions(
         let mut finished: Option<Generation> = None;
         let mut failure: Option<String> = None;
         for event in receiver {
-            let token = match event {
-                Event::Token(token) => token,
+            let (token, _, _) = match event {
+                Event::Token {
+                    token,
+                    logprob,
+                    top_logprobs,
+                } => (token, logprob, top_logprobs),
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -1210,7 +1299,7 @@ fn completions(
         let mut failure: Option<String> = None;
         for event in receiver {
             match event {
-                Event::Token(_) => {}
+                Event::Token { .. } => {}
                 Event::Finished(generation) => {
                     finished = Some(*generation);
                     break;
@@ -1252,11 +1341,22 @@ fn completions(
             finish_reason(&generation.finish)
         };
         completion_tokens += generation.tokens.len();
+        let choice_logprobs = if wants_logprobs {
+            logprobs_json(
+                &served.tokenizer,
+                &generation.tokens,
+                &generation.logprobs,
+                &generation.top_logprobs,
+                text,
+            )
+        } else {
+            "null".to_owned()
+        };
         if !choices.is_empty() {
             choices.push(',');
         }
         choices.push_str(&format!(
-            r#"{{"text":{},"index":{},"logprobs":null,"finish_reason":{}}}"#,
+            r#"{{"text":{},"index":{},"logprobs":{choice_logprobs},"finish_reason":{}}}"#,
             quote(text),
             index,
             quote(reason)
@@ -1428,10 +1528,19 @@ fn attach_turns(
     max_tokens: u32,
     sampler: SamplerConfig,
     n: usize,
+    logprobs: bool,
+    top_n: usize,
 ) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
     let mut turns = Vec::with_capacity(n);
     for choice in 0..n {
-        match attach_turn(served, ids, max_tokens, seed_for_choice(sampler, choice)) {
+        match attach_turn(
+            served,
+            ids,
+            max_tokens,
+            seed_for_choice(sampler, choice),
+            logprobs,
+            top_n,
+        ) {
             Ok(turn) => turns.push(turn),
             Err(error) => {
                 for (sequence, _) in turns.drain(..) {
@@ -1459,6 +1568,8 @@ fn attach_turn(
     ids: &[u32],
     max_tokens: u32,
     sampler: SamplerConfig,
+    logprobs: bool,
+    top_n: usize,
 ) -> Result<QueuedTurn, (u16, &'static str, String)> {
     let (sender, receiver) = mpsc::channel();
     let sequence = {
@@ -1471,6 +1582,14 @@ fn attach_turn(
             .map_err(|_| (500, "internal_error", "engine lock was poisoned".to_owned()))?;
         engine.set_sampler(sampler);
         let sequence = engine.admit(ids, max_tokens).map_err(|error| {
+            let (status, code) = map_engine_error(&error);
+            (status, code, error.to_string())
+        })?;
+        engine.set_logprobs(sequence, logprobs).map_err(|error| {
+            let (status, code) = map_engine_error(&error);
+            (status, code, error.to_string())
+        })?;
+        engine.set_top_logprobs(sequence, top_n).map_err(|error| {
             let (status, code) = map_engine_error(&error);
             (status, code, error.to_string())
         })?;
@@ -1533,6 +1652,7 @@ fn chunk(
     model: &str,
     content: Option<&str>,
     finish: Option<&str>,
+    logprob: Option<&str>,
 ) -> String {
     let delta = match content {
         Some(text) => format!(r#"{{"role":"assistant","content":{}}}"#, quote(text)),
@@ -1542,11 +1662,97 @@ fn chunk(
         Some(reason) => quote(reason),
         None => "null".to_owned(),
     };
+    let logprobs = match logprob {
+        Some(entry) => format!(r#"{{"content":[{entry}]}}"#),
+        None => "null".to_owned(),
+    };
     format!(
-        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"finish_reason":{reason}}}]}}"#,
+        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"logprobs":{logprobs},"finish_reason":{reason}}}]}}"#,
         quote(id),
         quote(model)
     )
+}
+
+/// One streaming token's logprob entry, shaped like an entry of the non-streaming array.
+fn stream_logprob_json(
+    tokenizer: &Tokenizer,
+    delta: &str,
+    logprob: f32,
+    top: &[(u32, f32)],
+) -> String {
+    let mut alternatives = String::new();
+    for (id, probability) in top {
+        let Ok(token_text) = tokenizer.decode(&[*id]) else {
+            continue;
+        };
+        if !alternatives.is_empty() {
+            alternatives.push(',');
+        }
+        alternatives.push_str(&format!(
+            r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
+            quote(&token_text)
+        ));
+    }
+    format!(
+        r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
+        quote(delta)
+    )
+}
+
+/// OpenAI's `logprobs.content`: one entry per generated token, decoding each token as the delta
+/// from the text shown so far. Entries stop before any text past `visible`, so a stop sequence is
+/// not reported as a generated token.
+fn logprobs_json(
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    logprobs: &[f32],
+    top: &[Vec<(u32, f32)>],
+    visible: &str,
+) -> String {
+    let mut entries = String::new();
+    let mut shown = String::new();
+    for (index, _) in tokens.iter().enumerate() {
+        let Ok(text) = tokenizer.decode(&tokens[..=index]) else {
+            continue;
+        };
+        if text.len() > visible.len() || !text.starts_with(shown.as_str()) {
+            break;
+        }
+        let delta = &text[shown.len()..];
+        let logprob = logprobs.get(index).copied().unwrap_or(f32::NAN);
+        let logprob = if logprob.is_finite() {
+            format!("{logprob}")
+        } else {
+            "null".to_owned()
+        };
+        let mut alternatives = String::new();
+        for (id, probability) in top.get(index).map(Vec::as_slice).unwrap_or(&[]) {
+            let Ok(token_text) = tokenizer.decode(&[*id]) else {
+                continue;
+            };
+            let probability = if probability.is_finite() {
+                format!("{probability}")
+            } else {
+                "null".to_owned()
+            };
+            if !alternatives.is_empty() {
+                alternatives.push(',');
+            }
+            alternatives.push_str(&format!(
+                r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
+                quote(&token_text)
+            ));
+        }
+        if !entries.is_empty() {
+            entries.push(',');
+        }
+        entries.push_str(&format!(
+            r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
+            quote(delta)
+        ));
+        shown = text;
+    }
+    format!(r#"{{"content":[{entries}]}}"#)
 }
 
 /// The extra chunk OpenAI clients expect when `stream_options.include_usage` is set: no choices,
@@ -1993,7 +2199,7 @@ mod tests {
 
     #[test]
     fn stream_frames_parse_as_json() {
-        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None);
+        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None, None);
         let parsed = Json::parse(&frame).expect("valid frame");
         assert_eq!(
             parsed
@@ -2004,7 +2210,7 @@ mod tests {
                 .and_then(Json::as_str),
             Some("hi \"there\"")
         );
-        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"));
+        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"), None);
         assert_eq!(
             Json::parse(&final_frame)
                 .unwrap()
