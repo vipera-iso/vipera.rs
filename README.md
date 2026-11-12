@@ -17,8 +17,9 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
 - **Generation** on the CPU, with a KV cache in `f16` or `q8_0`, streamed to stdout token by token.
 - **HTTP server** (`vipera serve`): `POST /v1/chat/completions` and `POST /v1/completions`
   (streaming SSE and non-streaming), request `stop` sequences, streamed usage
-  (`stream_options.include_usage`), token logprobs with top alternatives (chat streaming and
-  non-streaming) and up to four `n` choices on the non-streaming path,
+  (`stream_options.include_usage`), token logprobs with top alternatives on both
+  endpoints (streaming chat plus legacy completions arrays, and non-streaming), and up to four `n`
+  choices on the non-streaming path,
   `GET /v1/models`, `/health`, `/ready`, `/metrics`, bearer auth, error envelopes, opt-in per-key
   rate limiting.
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the

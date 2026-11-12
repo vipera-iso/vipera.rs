@@ -145,6 +145,26 @@ fn serve_answers_chat_completions_and_streams() {
         "{streamed_logprobs}"
     );
 
+    let streamed_completion_logprobs = http(
+        port,
+        "POST",
+        "/v1/completions",
+        r#"{"model":"test","prompt":"Say hi","max_tokens":3,"temperature":0,"stream":true,"logprobs":true,"top_logprobs":2}"#,
+    )
+    .expect("streamed completion logprobs");
+    assert!(
+        streamed_completion_logprobs.starts_with("HTTP/1.1 200"),
+        "{streamed_completion_logprobs}"
+    );
+    assert!(
+        streamed_completion_logprobs.contains(r#""logprobs":{"tokens":["#),
+        "{streamed_completion_logprobs}"
+    );
+    assert!(
+        streamed_completion_logprobs.contains(r#""token_logprobs":[-0."#),
+        "{streamed_completion_logprobs}"
+    );
+
     let two_choices = http(
         port,
         "POST",

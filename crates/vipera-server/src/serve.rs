@@ -1121,16 +1121,6 @@ fn completions(
         )?;
         return Ok(400);
     }
-    if wants_logprobs && streaming {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "logprobs needs stream: false",
-        )?;
-        return Ok(400);
-    }
-
     let id = format!("cmpl-{}", request_id());
     let created = now_seconds();
     let n = match choices_of(&parsed) {
@@ -1174,7 +1164,7 @@ fn completions(
         let mut finished: Option<Generation> = None;
         let mut failure: Option<String> = None;
         for event in receiver {
-            let (token, _, _) = match event {
+            let (token, logprob, top) = match event {
                 Event::Token {
                     token,
                     logprob,
@@ -1206,7 +1196,17 @@ fn completions(
             };
             if cut > shown.len() {
                 let delta = &text[shown.len()..cut];
-                let frame = completion_chunk(&id, created, &served.model, Some(delta), None);
+                let entry = logprob.map(|logprob| {
+                    completion_logprob_json(&served.tokenizer, shown.len(), delta, logprob, &top)
+                });
+                let frame = completion_chunk(
+                    &id,
+                    created,
+                    &served.model,
+                    Some(delta),
+                    None,
+                    entry.as_deref(),
+                );
                 if sse(stream, &frame).is_err() {
                     disconnected = true;
                     break;
@@ -1246,7 +1246,7 @@ fn completions(
             return Ok(200);
         }
         if stopped {
-            let frame = completion_chunk(&id, created, &served.model, None, Some("stop"));
+            let frame = completion_chunk(&id, created, &served.model, None, Some("stop"), None);
             let _ = sse(stream, &frame);
             if include_usage {
                 let usage = usage_chunk(
@@ -1279,11 +1279,12 @@ fn completions(
                     &served.model,
                     Some(&text[shown.len()..]),
                     None,
+                    None,
                 ),
             );
         }
         let reason = finish_reason(&finished.finish);
-        let frame = completion_chunk(&id, created, &served.model, None, Some(reason));
+        let frame = completion_chunk(&id, created, &served.model, None, Some(reason), None);
         let _ = sse(stream, &frame);
         if include_usage {
             let usage = usage_chunk(
@@ -1815,6 +1816,7 @@ fn completion_chunk(
     model: &str,
     content: Option<&str>,
     finish: Option<&str>,
+    logprobs: Option<&str>,
 ) -> String {
     let text = match content {
         Some(text) => quote(text),
@@ -1824,10 +1826,36 @@ fn completion_chunk(
         Some(reason) => quote(reason),
         None => "null".to_owned(),
     };
+    let logprobs = logprobs.unwrap_or("null");
     format!(
-        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{{"text":{text},"index":0,"logprobs":null,"finish_reason":{reason}}}]}}"#,
+        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{{"text":{text},"index":0,"logprobs":{logprobs},"finish_reason":{reason}}}]}}"#,
         quote(id),
         quote(model)
+    )
+}
+
+/// One streaming token's logprob entry in the legacy completions shape: parallel arrays rather than
+/// chat's `content` objects.
+fn completion_logprob_json(
+    tokenizer: &Tokenizer,
+    offset: usize,
+    delta: &str,
+    logprob: f32,
+    top: &[(u32, f32)],
+) -> String {
+    let mut alternatives = String::new();
+    for (id, probability) in top {
+        let Ok(token_text) = tokenizer.decode(&[*id]) else {
+            continue;
+        };
+        if !alternatives.is_empty() {
+            alternatives.push(',');
+        }
+        alternatives.push_str(&format!("{}:{probability}", quote(&token_text)));
+    }
+    format!(
+        r#"{{"tokens":[{}],"token_logprobs":[{logprob}],"top_logprobs":[{{{alternatives}}}],"text_offset":[{offset}]}}"#,
+        quote(delta)
     )
 }
 
@@ -2372,7 +2400,7 @@ mod tests {
 
     #[test]
     fn completion_frames_parse_as_json() {
-        let frame = completion_chunk("cmpl-1", 42, "qwen2", Some("hi"), None);
+        let frame = completion_chunk("cmpl-1", 42, "qwen2", Some("hi"), None, None);
         let parsed = Json::parse(&frame).expect("valid frame");
         assert_eq!(
             parsed.get("object").and_then(Json::as_str),
@@ -2386,7 +2414,7 @@ mod tests {
                 .and_then(Json::as_str),
             Some("hi")
         );
-        let final_frame = completion_chunk("cmpl-1", 42, "qwen2", None, Some("stop"));
+        let final_frame = completion_chunk("cmpl-1", 42, "qwen2", None, Some("stop"), None);
         assert_eq!(
             Json::parse(&final_frame)
                 .unwrap()
