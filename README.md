@@ -13,7 +13,7 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
   actually costs.
 - **Tokenizer** from the model's own vocabulary, with chat templates and generation prompts.
 - **Sampling**: greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
-  penalties, seeded RNG.
+  penalties, per-token `logit_bias`, seeded RNG.
 - **Generation** on the CPU, with a KV cache in `f16` or `q8_0`, streamed to stdout token by token.
 - **HTTP server** (`vipera serve`): `POST /v1/chat/completions` (streaming SSE and non-streaming),
   `GET /v1/models`, `/health`, `/ready`, `/metrics`, bearer auth, error envelopes.
