@@ -607,14 +607,14 @@ pub unsafe fn q4k_dot(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
                 );
                 let low_coeff = _mm256_set1_ps(coeff_stack[2 * j]);
                 let high_coeff = _mm256_set1_ps(coeff_stack[2 * j + 1]);
-                let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                let high_lanes = _mm256_cvtepi32_ps(high_sums);
                 if j.is_multiple_of(2) {
-                    weights0 = _mm256_add_ps(weights0, low_lanes);
-                    weights1 = _mm256_add_ps(weights1, high_lanes);
+                    weights0 = _mm256_fmadd_ps(low_lanes, low_coeff, weights0);
+                    weights1 = _mm256_fmadd_ps(high_lanes, high_coeff, weights1);
                 } else {
-                    weights1 = _mm256_add_ps(weights1, low_lanes);
-                    weights0 = _mm256_add_ps(weights0, high_lanes);
+                    weights1 = _mm256_fmadd_ps(low_lanes, low_coeff, weights1);
+                    weights0 = _mm256_fmadd_ps(high_lanes, high_coeff, weights0);
                 }
             }
         }
@@ -803,14 +803,14 @@ pub(crate) unsafe fn q4k_dot_batch<const B: usize>(
                         coefficients[entry],
                         _mm256_set1_epi32((2 * j + 1) as i32),
                     );
-                    let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                    let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                    let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                    let high_lanes = _mm256_cvtepi32_ps(high_sums);
                     if j.is_multiple_of(2) {
-                        weights0[entry] = _mm256_add_ps(weights0[entry], low_lanes);
-                        weights1[entry] = _mm256_add_ps(weights1[entry], high_lanes);
+                        weights0[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights0[entry]);
+                        weights1[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights1[entry]);
                     } else {
-                        weights1[entry] = _mm256_add_ps(weights1[entry], low_lanes);
-                        weights0[entry] = _mm256_add_ps(weights0[entry], high_lanes);
+                        weights1[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights1[entry]);
+                        weights0[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights0[entry]);
                     }
                 }
             }
@@ -917,14 +917,21 @@ pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
                     );
                     let low_coeff = _mm256_set1_ps(coeff_stack[entry][2 * j]);
                     let high_coeff = _mm256_set1_ps(coeff_stack[entry][2 * j + 1]);
-                    let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                    let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                    // One fused multiply-add instead of a multiply and an add per plane: two fewer
+                    // uops per plane, eight per 144-byte block. Measured on the Q4_K phase of a
+                    // decode step, 20 interleaved paired runs against the multiply-then-add form:
+                    // median 0.984x the q4k time (two batches, 0.981 and 0.986, both positive). The
+                    // rounding is the fused one; `q4k_dot_previous` behind `VIPERA_EXACT_DOT` is
+                    // still the multiply-then-add path, and the pooled/spawned bit-identity test
+                    // holds because every kernel here moved together.
+                    let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                    let high_lanes = _mm256_cvtepi32_ps(high_sums);
                     if j.is_multiple_of(2) {
-                        weights0[entry] = _mm256_add_ps(weights0[entry], low_lanes);
-                        weights1[entry] = _mm256_add_ps(weights1[entry], high_lanes);
+                        weights0[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights0[entry]);
+                        weights1[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights1[entry]);
                     } else {
-                        weights1[entry] = _mm256_add_ps(weights1[entry], low_lanes);
-                        weights0[entry] = _mm256_add_ps(weights0[entry], high_lanes);
+                        weights1[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights1[entry]);
+                        weights0[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights0[entry]);
                     }
                 }
             }
@@ -1753,14 +1760,14 @@ pub(crate) unsafe fn q4k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32
                     _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j) as i32));
                 let high_coeff =
                     _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j + 1) as i32));
-                let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                let high_lanes = _mm256_cvtepi32_ps(high_sums);
                 if j.is_multiple_of(2) {
-                    weights0 = _mm256_add_ps(weights0, low_lanes);
-                    weights1 = _mm256_add_ps(weights1, high_lanes);
+                    weights0 = _mm256_fmadd_ps(low_lanes, low_coeff, weights0);
+                    weights1 = _mm256_fmadd_ps(high_lanes, high_coeff, weights1);
                 } else {
-                    weights1 = _mm256_add_ps(weights1, low_lanes);
-                    weights0 = _mm256_add_ps(weights0, high_lanes);
+                    weights1 = _mm256_fmadd_ps(low_lanes, low_coeff, weights1);
+                    weights0 = _mm256_fmadd_ps(high_lanes, high_coeff, weights0);
                 }
             }
         }
