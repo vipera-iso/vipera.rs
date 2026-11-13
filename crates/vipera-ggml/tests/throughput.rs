@@ -61,3 +61,42 @@ fn q4k_gemv_throughput() {
         );
     }
 }
+
+/// The number that decides whether a repacked GEMM is worth wiring in: llama.cpp's prefill
+/// reads the same weights with the same kernel, and this engine's tiled kernel measured
+/// about 230 GFLOPS on the reference machine.
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn repacked_gemm_throughput() {
+    use vipera_ggml::{gemm_q4_k_8x8, quantize_mat_q8_k_4x8, repack_q4_k_8x8};
+
+    for &(columns, cols, rows) in &[(8960usize, 1536usize, 128usize), (1536, 8960, 128)] {
+        let raw: Vec<u8> = (0..columns).flat_map(|row| q4k_row(cols, row)).collect();
+        let packed = repack_q4_k_8x8(columns, cols, &raw);
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|at| ((at % 977) as f32 * 0.011).sin())
+            .collect();
+        let activations = quantize_mat_q8_k_4x8(&x, rows, cols).expect("quantize mat");
+
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let out =
+                unsafe { gemm_q4_k_8x8(cols, rows, columns, &packed, &activations).expect("gemm") };
+            std::hint::black_box(&out);
+            samples.push(start.elapsed().as_secs_f64());
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
+        let seconds = samples[samples.len() / 2];
+        let gflops = 2.0 * (columns * cols * rows) as f64 / seconds / 1e9;
+        println!(
+            "gemm q4_K {:>6}x{:<5} x {:>3} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS  {:>5.1} GB/s weights",
+            columns,
+            cols,
+            rows,
+            seconds * 1e3,
+            gflops,
+            packed.len() as f64 / 1e9 / seconds,
+        );
+    }
+}

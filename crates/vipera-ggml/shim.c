@@ -132,6 +132,42 @@ int vp_vec_dot_q4_k_q8_k(int64_t cols, const void * q4k_row, const void * q8k, f
     return 0;
 }
 
+// Repacked-weight entry points: the layout is `block_q4_Kx8`, eight rows interleaved
+// per 256-column block. x86 kernels read it directly, which is what makes llama.cpp's
+// prefill GEMM fast: no per-call unpack.
+void ggml_quantize_mat_q8_K_4x8(const float * x, void * vy, int64_t k);
+void ggml_gemv_q4_K_8x8_q8_K(int n, float * s, size_t bs, const void * vx,
+                             const void * vy, int nr, int nc);
+void ggml_gemm_q4_K_8x8_q8_K(int n, float * s, size_t bs, const void * vx,
+                             const void * vy, int nr, int nc);
+
+int vp_quantize_mat_q8_k_4x8(const float * x, void * out, int64_t cols) {
+    if (cols <= 0 || cols % 256 != 0) {
+        return 1;
+    }
+    ggml_quantize_mat_q8_K_4x8(x, out, cols);
+    return 0;
+}
+
+int vp_gemv_q4_k_8x8_q8_k(int cols, float * out, const void * repacked,
+                          const void * activations, int rows) {
+    if (cols <= 0 || cols % 256 != 0 || rows <= 0 || rows % 8 != 0) {
+        return 1;
+    }
+    // nr is the number of activation rows (one) and nc the number of weight rows.
+    ggml_gemv_q4_K_8x8_q8_K(cols, out, 0, repacked, activations, 1, rows);
+    return 0;
+}
+
+int vp_gemm_q4_k_8x8_q8_k(int cols, float * out, size_t stride, const void * repacked,
+                          const void * activations, int rows, int columns) {
+    if (cols <= 0 || cols % 256 != 0 || rows <= 0 || columns <= 0) {
+        return 1;
+    }
+    ggml_gemm_q4_K_8x8_q8_K(cols, out, stride, repacked, activations, rows, columns);
+    return 0;
+}
+
 // Build stamp, so a measurement can say which kernel it ran.
 const char * vp_kernel_build(void) {
 #if defined(__AVX512VNNI__)

@@ -52,6 +52,8 @@ fn main() {
     let sources = [
         root.join("ggml/src/ggml-quants.c"),
         root.join("ggml/src/ggml-cpu/arch/x86/quants.c"),
+        // The repacked 8x8 GEMM, which is where llama.cpp's prefill throughput comes from.
+        root.join("ggml/src/ggml-cpu/arch/x86/repack.cpp"),
     ];
     for source in &sources {
         if !source.exists() {
@@ -87,7 +89,13 @@ fn main() {
     ];
     let mut objects = Vec::new();
 
-    let mut units: Vec<(PathBuf, &str)> = sources.iter().map(|p| (p.clone(), "c")).collect();
+    let mut units: Vec<(PathBuf, &str)> = sources
+        .iter()
+        .map(|p| {
+            let cxx = p.extension().is_some_and(|ext| ext == "cpp");
+            (p.clone(), if cxx { "cxx" } else { "c" })
+        })
+        .collect();
     units.push((PathBuf::from("shim.c"), "c"));
     for (source, language) in units {
         let stem = source
@@ -96,12 +104,16 @@ fn main() {
             .to_string_lossy()
             .into_owned();
         let object = out.join(format!("{stem}.o"));
-        let mut cmd = Command::new("cc");
-        cmd.args(["-c", "-O3", "-std=c11", "-fPIC", "-DNDEBUG"])
-            .args(level.0)
-            .arg("-o")
-            .arg(&object)
-            .arg(&source);
+        let mut cmd = if language == "cxx" {
+            let mut cmd = Command::new("c++");
+            cmd.args(["-c", "-O3", "-std=c++17", "-fPIC", "-DNDEBUG"]);
+            cmd
+        } else {
+            let mut cmd = Command::new("cc");
+            cmd.args(["-c", "-O3", "-std=c11", "-fPIC", "-DNDEBUG"]);
+            cmd
+        };
+        cmd.args(level.0).arg("-o").arg(&object).arg(&source);
         for include in &includes {
             cmd.arg("-I").arg(include);
         }
@@ -119,6 +131,7 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=vipera_ggml_q4k");
     println!("cargo:rustc-link-lib=m");
+    println!("cargo:rustc-link-lib=stdc++");
 }
 
 fn run(cmd: &mut Command, what: &Path) {

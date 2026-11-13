@@ -20,6 +20,23 @@ const Q8_K_BLOCK_BYTES: usize = 292;
 
 extern "C" {
     fn vp_init_tables();
+    fn vp_gemv_q4_k_8x8_q8_k(
+        cols: i32,
+        out: *mut f32,
+        repacked: *const u8,
+        activations: *const u8,
+        rows: i32,
+    ) -> i32;
+    fn vp_quantize_mat_q8_k_4x8(x: *const f32, out: *mut u8, cols: i64) -> i32;
+    fn vp_gemm_q4_k_8x8_q8_k(
+        cols: i32,
+        out: *mut f32,
+        stride: usize,
+        repacked: *const u8,
+        activations: *const u8,
+        rows: i32,
+        columns: i32,
+    ) -> i32;
     fn vp_quantize_row_q8_k(cols: i64, x: *const f32, out: *mut u8) -> i32;
     fn vp_vec_dot_q4_k_q8_k(cols: i64, q4k_row: *const u8, q8k: *const u8, out: *mut f32) -> i32;
     fn vp_kernel_build() -> *const c_char;
@@ -30,6 +47,128 @@ extern "C" {
 fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe { vp_init_tables() });
+}
+
+/// Bytes one repacked block of eight rows occupies: `block_q4_Kx8`.
+pub const Q4K8_BLOCK_BYTES: usize = 1152;
+
+/// Rows a repacked block covers, and the group that must share one.
+pub const REPACK_ROWS: usize = 8;
+
+/// Repack `rows` Q4_K rows of `cols` weights into ggml's `block_q4_Kx8` layout.
+///
+/// The layout is what lets the x86 kernels skip the per-call unpack: for every 256-column
+/// block, eight rows share one 1152-byte record of `d[8]`, `dmin[8]`, `scales[96]` and a
+/// `qs[1024]` that interleaves the eight rows' nibbles. It is a permutation of the raw
+/// bytes, so it costs one pass at load and nothing afterwards.
+pub fn repack_q4_k_8x8(rows: usize, cols: usize, raw: &[u8]) -> Vec<u8> {
+    assert!(
+        rows.is_multiple_of(REPACK_ROWS),
+        "rows must be a multiple of {REPACK_ROWS}"
+    );
+    assert!(
+        cols.is_multiple_of(QK_K),
+        "cols must be a multiple of {QK_K}"
+    );
+    let stride = q4_k_bytes(cols);
+    assert_eq!(raw.len(), stride * rows, "raw must hold every row");
+    let blocks = cols / QK_K;
+    let mut out = vec![0u8; (rows / REPACK_ROWS) * blocks * Q4K8_BLOCK_BYTES];
+    for group in 0..rows / REPACK_ROWS {
+        for block in 0..blocks {
+            let base = (group * blocks + block) * Q4K8_BLOCK_BYTES;
+            let record = &mut out[base..base + Q4K8_BLOCK_BYTES];
+            for row in 0..REPACK_ROWS {
+                let source = &raw[(group * REPACK_ROWS + row) * stride + block * 144..];
+                record[row * 2..row * 2 + 2].copy_from_slice(&source[0..2]);
+                record[16 + row * 2..16 + row * 2 + 2].copy_from_slice(&source[2..4]);
+                record[32 + row * 12..32 + row * 12 + 12].copy_from_slice(&source[4..16]);
+                for k in 0..16 {
+                    for i in 0..8 {
+                        // `k` walks 8-value runs across the row, `j` the eight rows, so the
+                        // record holds eight rows per run — the order `dpbusd` reads.
+                        let from = (k / 4) * 32 + (k % 4) * 8 + i;
+                        record[128 + k * 64 + row * 8 + i] = source[16 + from];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One repacked weight block against `rows` activations.
+///
+/// # Safety
+/// `repacked` must come from [`repack_q4_k_8x8`] for the same `cols` and `rows`, and
+/// `activations` must be a Q8_K row for the same `cols`.
+pub unsafe fn gemv_q4_k_8x8(
+    cols: usize,
+    rows: usize,
+    repacked: &[u8],
+    activations: &[u8],
+) -> Result<Vec<f32>, i32> {
+    init();
+    assert_eq!(
+        repacked.len(),
+        rows / REPACK_ROWS * (cols / QK_K) * Q4K8_BLOCK_BYTES
+    );
+    assert_eq!(activations.len(), q8_k_bytes(cols));
+    let mut out = vec![0.0f32; rows];
+    let code = unsafe {
+        vp_gemv_q4_k_8x8_q8_k(
+            cols as i32,
+            out.as_mut_ptr(),
+            repacked.as_ptr(),
+            activations.as_ptr(),
+            rows as i32,
+        )
+    };
+    (code == 0).then_some(out).ok_or(code)
+}
+
+/// Bytes four interleaved activation rows of `cols` values occupy: `block_q8_Kx4`.
+pub fn q8_k_mat_bytes(rows: usize, cols: usize) -> usize {
+    assert!(rows.is_multiple_of(4) && cols.is_multiple_of(QK_K));
+    rows / 4 * (cols / QK_K) * 1168
+}
+
+/// Quantize `rows` activation rows into the interleaved layout the GEMM reads.
+pub fn quantize_mat_q8_k_4x8(x: &[f32], rows: usize, cols: usize) -> Result<Vec<u8>, i32> {
+    init();
+    assert_eq!(x.len(), rows * cols);
+    let mut out = vec![0u8; q8_k_mat_bytes(rows, cols)];
+    let code = unsafe { vp_quantize_mat_q8_k_4x8(x.as_ptr(), out.as_mut_ptr(), cols as i64) };
+    (code == 0).then_some(out).ok_or(code)
+}
+
+/// `rows` activation rows against `columns` repacked weight rows.
+///
+/// # Safety
+/// `repacked` must come from [`repack_q4_k_8x8`] with those dimensions, `activations` from
+/// [`quantize_mat_q8_k_4x8`], and `rows` a multiple of four.
+pub unsafe fn gemm_q4_k_8x8(
+    cols: usize,
+    rows: usize,
+    columns: usize,
+    repacked: &[u8],
+    activations: &[u8],
+) -> Result<Vec<f32>, i32> {
+    init();
+    assert_eq!(activations.len(), q8_k_mat_bytes(rows, cols));
+    let mut out = vec![0.0f32; rows * columns];
+    let code = unsafe {
+        vp_gemm_q4_k_8x8_q8_k(
+            cols as i32,
+            out.as_mut_ptr(),
+            columns,
+            repacked.as_ptr(),
+            activations.as_ptr(),
+            rows as i32,
+            columns as i32,
+        )
+    };
+    (code == 0).then_some(out).ok_or(code)
 }
 
 /// Which ggml kernel this build selected, from its own preprocessor.
@@ -164,6 +303,60 @@ mod tests {
             (bound - reference).abs() <= tolerance,
             "ggml dot {bound} vs reference {reference} (tolerance {tolerance})"
         );
+    }
+
+    #[test]
+    fn repack_alone_has_the_expected_size() {
+        let cols = 512;
+        let rows = 16;
+        let raw: Vec<u8> = (0..rows)
+            .flat_map(|row| synthetic_q4k_with_salt(cols, row))
+            .collect();
+        let packed = repack_q4_k_8x8(rows, cols, &raw);
+        assert_eq!(packed.len(), 2 * 2 * Q4K8_BLOCK_BYTES);
+        assert_eq!(packed, repack_q4_k_8x8(rows, cols, &raw));
+    }
+
+    /// The repack is a permutation of the raw bytes: if it is right, eight repacked rows
+    /// through ggml's own GEMV must equal eight separate dots through the row kernel.
+    #[test]
+    fn repacked_gemv_matches_row_dots() {
+        let cols = 512;
+        let rows = 16;
+        let raw: Vec<u8> = (0..rows)
+            .flat_map(|row| synthetic_q4k_with_salt(cols, row))
+            .collect();
+        let x: Vec<f32> = (0..cols).map(|at| (at as f32 * 0.017).cos()).collect();
+        let mut q8k = vec![0u8; q8_k_bytes(cols)];
+        unsafe { quantize_q8_k(&x, &mut q8k).expect("quantize") };
+
+        let packed = repack_q4_k_8x8(rows, cols, &raw);
+        let got = unsafe { gemv_q4_k_8x8(cols, rows, &packed, &q8k).expect("gemv") };
+
+        let stride = q4_k_bytes(cols);
+        for row in 0..rows {
+            let want = unsafe {
+                dot_q4_k_q8_k(cols, &raw[row * stride..(row + 1) * stride], &q8k).expect("dot")
+            };
+            let tolerance = want.abs().max(got[row].abs()) * 1e-3 + 1e-3;
+            assert!(
+                (got[row] - want).abs() <= tolerance,
+                "row {row}: repacked {} vs row kernel {want}",
+                got[row]
+            );
+        }
+    }
+
+    fn synthetic_q4k_with_salt(cols: usize, salt: usize) -> Vec<u8> {
+        let mut row = synthetic_q4k(cols);
+        for (block_index, block) in row.as_chunks_mut::<144>().0.iter_mut().enumerate() {
+            for (index, byte) in block[16..].iter_mut().enumerate() {
+                let low = ((index + salt + block_index) % 15 + 1) as u8;
+                let high = ((index + salt + block_index + 4) % 15 + 1) as u8;
+                *byte = low | (high << 4);
+            }
+        }
+        row
     }
 
     fn half_to_f32(bytes: [u8; 2]) -> f32 {
