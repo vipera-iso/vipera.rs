@@ -45,9 +45,26 @@
 //! tok/s on one thread, 19.8 vs 20.0 on four, 19.1 vs 19.5 GB/s on `ffn_down`.
 //!
 //! Neither loop is limited by vector width. The Q4_K kernel spends its time on per-block scalar
-//! work, and the Q6_K shapes are bound by the memory system: the 190 MB `output` tensor runs at
-//! 27 GB/s here, which is what the four cores can stream from DRAM, not what the multiplier can do.
-//! A wider instruction only changes which unit waits for memory.
+//! work. Whether these shapes are memory-bound is measured, not assumed: STREAM 5.10 (McCalpin)
+//! and a read-only kernel on this machine — i5-11300H, arrays far above the 8 MiB L3, best of 10
+//! timed passes — give
+//!
+//! | kernel | 4 threads | 8 threads |
+//! |---|---|---|
+//! | Copy (1 read, 1 write) | 39.7 GB/s | 38.8 GB/s |
+//! | Triad (2 reads, 1 write) | 29.6 GB/s | 30.5 GB/s |
+//! | read-only | 42.8 GB/s | 41.7 GB/s |
+//!
+//! SMT adds nothing to a bandwidth stream: 8 threads is not faster than 4. A decode step reads
+//! 0.980 GB — the 1.111 GB of tensors minus the 125 MB token embedding, which decode never reads —
+//! so the ceiling that applies to it is the read-only one, ~43 GB/s (a 22.8 ms floor per token).
+//! vipera's 35.2 ms/step is 28 GB/s and llama.cpp's 34.7 tok/s is 34 GB/s, so the Q6_K shapes are
+//! memory-bound and there is still headroom under the ceiling; what closes the gap is the access
+//! pattern, not the multiplier and not the language. The 512-bit results show width did not help
+//! on this core. Tiger Lake client cores are documented as having
+//! one 512-bit FMA/VNNI unit (ports 0 and 1 fused), so a `zmm` instruction would retire no more
+//! integer work per cycle than two `ymm`; that is not verified here and says nothing about Zen 5
+//! or Xeon cores with two 512-bit units.
 //!
 //! # Safety
 //!
