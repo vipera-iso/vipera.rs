@@ -100,6 +100,97 @@ pub fn note(phase: Phase, start: Option<Instant>) {
     }
 }
 
+/// One shape's totals, for the per-call breakdown printed once a decode run is warm.
+struct Shape {
+    label: &'static str,
+    batch: usize,
+    rows: usize,
+    cols: usize,
+    calls: u64,
+    nanos: u64,
+}
+
+/// Every shape seen so far, in first-seen order. A mutex is fine here: this only runs when the
+/// phase timers are on, which is a debugging switch, and the lock is uncontended.
+static SHAPES: std::sync::Mutex<Vec<Shape>> = std::sync::Mutex::new(Vec::new());
+
+/// Add one matvec call to its shape's total.
+///
+/// `label` is the weight format (`Q4_K`, ...), `batch` is the number of activations the call
+/// carried (1 for a decode step), and `rows` × `cols` is the tensor. The report is per pass: the
+/// counters are divided by the number of decode passes when printed, so a call's cost is comparable
+/// with the `rest` line of the phase split.
+pub fn record_shape(
+    label: &'static str,
+    batch: usize,
+    rows: usize,
+    cols: usize,
+    elapsed: std::time::Duration,
+) {
+    let nanos = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let mut shapes = SHAPES.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(slot) = shapes.iter_mut().find(|slot| {
+        slot.label == label && slot.batch == batch && slot.rows == rows && slot.cols == cols
+    }) {
+        slot.calls += 1;
+        slot.nanos += nanos;
+    } else if shapes.len() < 32 {
+        shapes.push(Shape {
+            label,
+            batch,
+            rows,
+            cols,
+            calls: 1,
+            nanos,
+        });
+    }
+}
+
+/// Bits per weight for the formats this backend runs, so the table can report a rate.
+fn bits_per_weight(label: &str) -> f64 {
+    match label {
+        "Q4_K" => 4.5,
+        "Q6_K" => 6.5625,
+        "Q8_0" => 8.5,
+        "F32" => 32.0,
+        "F16" | "Bf16" => 16.0,
+        _ => 4.5,
+    }
+}
+
+/// Print the per-shape table, biggest total first, as an average over the decode passes timed.
+fn print_shapes(steps: u64) {
+    let shapes = SHAPES.lock().unwrap_or_else(|error| error.into_inner());
+    if shapes.is_empty() {
+        return;
+    }
+    let mut ordered: Vec<&Shape> = shapes.iter().collect();
+    ordered.sort_by_key(|shape| std::cmp::Reverse(shape.nanos));
+    eprintln!("SHAPES over {steps} decode passes (ms per pass, ms per call, GB/s):");
+    for shape in ordered {
+        if steps == 0 {
+            continue;
+        }
+        let bytes = shape.rows as f64 * shape.cols as f64 * bits_per_weight(shape.label) / 8.0;
+        let per_call = shape.nanos as f64 / shape.calls as f64 / 1e6;
+        if shape.batch > 1 {
+            // A chunk pass carries `batch` activations, so its cost is compute per activation, not
+            // a stream of this tensor: per-pass and GB/s would both describe nothing.
+            eprintln!(
+                "SHAPE {:>6} b{:<3} {:>6}x{:<6} {:>4} calls  {:>6.3} ms/call  (batch)",
+                shape.label, shape.batch, shape.rows, shape.cols, shape.calls, per_call
+            );
+            continue;
+        }
+        let per_pass = shape.nanos as f64 / steps as f64 / 1e6;
+        let gbps = bytes / (per_call / 1e3) / 1e9;
+        eprintln!(
+            "SHAPE {:>6} b{:<3} {:>6}x{:<6} {:>4} calls  {:>7.2} ms/pass  {:>6.3} ms/call  {:>5.1} GB/s",
+            shape.label, shape.batch, shape.rows, shape.cols, shape.calls, per_pass, per_call, gbps
+        );
+    }
+}
+
 /// Record a whole pass and print the running split.
 ///
 /// The numbers are averages over every pass of that kind timed so far, which keeps a single noisy
@@ -136,4 +227,9 @@ pub fn finish_pass(start: Option<Instant>) {
         rest as f64 / average as f64 * 100.0
     ));
     eprintln!("{line}");
+    // One table per run, once the caches and the pool are warm: the first passes carry the fault-in
+    // cost of the weights, which is not what a steady-state question is about.
+    if !prefill && steps == 20 {
+        print_shapes(steps);
+    }
 }

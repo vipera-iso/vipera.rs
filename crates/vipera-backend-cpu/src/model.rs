@@ -223,6 +223,15 @@ impl Tensor {
         let at = crate::profile::stamp();
         let result =
             quant::matvec_pooled(pool, self.ty, self.data(file), self.cols, self.rows, x, out);
+        if let Some(at) = at {
+            crate::profile::record_shape(
+                shape_name(self.ty),
+                1,
+                self.rows,
+                self.cols,
+                at.elapsed(),
+            );
+        }
         crate::profile::note(dot_phase(self.ty), at);
         result
     }
@@ -245,6 +254,15 @@ impl Tensor {
             activations,
             out,
         );
+        if let Some(at) = at {
+            crate::profile::record_shape(
+                shape_name(self.ty),
+                B,
+                self.rows,
+                self.cols,
+                at.elapsed(),
+            );
+        }
         crate::profile::note(dot_phase(self.ty), at);
         result
     }
@@ -255,6 +273,20 @@ impl Tensor {
 }
 
 /// The phase a matrix product belongs to, by weight format.
+/// The weight format's name, for the per-shape profile table. Borrowed, because it is recorded on a
+/// per-call path.
+fn shape_name(ty: GgmlType) -> &'static str {
+    match ty {
+        GgmlType::F32 => "F32",
+        GgmlType::F16 => "F16",
+        GgmlType::Bf16 => "Bf16",
+        GgmlType::Q8_0 => "Q8_0",
+        GgmlType::Q4K => "Q4_K",
+        GgmlType::Q6K => "Q6_K",
+        _ => "other",
+    }
+}
+
 fn dot_phase(ty: GgmlType) -> crate::profile::Phase {
     use crate::profile::Phase;
     match ty {
@@ -295,9 +327,7 @@ struct BatchScratch {
     gate: Vec<f32>,
     up: Vec<f32>,
     logits: Vec<f32>,
-    k_all: Vec<f32>,
-    v_all: Vec<f32>,
-    scores: Vec<f32>,
+    attn_scratch: AttnScratch,
 }
 
 impl BatchScratch {
@@ -314,9 +344,7 @@ impl BatchScratch {
             gate: vec![0.0; MAX_BATCH * config.ffn],
             up: vec![0.0; MAX_BATCH * config.ffn],
             logits: vec![0.0; MAX_BATCH * config.vocab],
-            k_all: Vec::new(),
-            v_all: Vec::new(),
-            scores: Vec::new(),
+            attn_scratch: AttnScratch::default(),
         }
     }
 }
@@ -339,9 +367,7 @@ pub struct CpuBackend {
     attn: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
-    scores: Vec<f32>,
-    k_all: Vec<f32>,
-    v_all: Vec<f32>,
+    attn_scratch: AttnScratch,
     logits: Vec<f32>,
     batch: BatchScratch,
     /// Set while a prompt chunk runs through the batch path, so the profile can tell a chunk from a
@@ -445,9 +471,7 @@ impl CpuBackend {
             attn: vec![0.0; config.hidden],
             gate: vec![0.0; config.ffn],
             up: vec![0.0; config.ffn],
-            scores: Vec::new(),
-            k_all: Vec::new(),
-            v_all: Vec::new(),
+            attn_scratch: AttnScratch::default(),
             logits: vec![0.0; config.vocab],
             chunk_pass: false,
             batch: BatchScratch::new(config),
@@ -522,9 +546,7 @@ impl CpuBackend {
             attn,
             gate,
             up,
-            scores,
-            k_all,
-            v_all,
+            attn_scratch,
             logits,
             ..
         } = self;
@@ -580,9 +602,8 @@ impl CpuBackend {
                     );
                     kv.write(position, index, shape, k, v)?;
 
-                    kv.load_layer(index, shape, position + 1, k_all, v_all)?;
                     let at = crate::profile::stamp();
-                    attention(q, k_all, v_all, position + 1, shape, scores, attn);
+                    attend(q, &kv, index, position + 1, shape, attn_scratch, attn)?;
                     crate::profile::note(crate::profile::Phase::Attention, at);
 
                     layer.wo.matvec(&pool, file, attn, h)?;
@@ -917,23 +938,16 @@ impl CpuBackend {
                         &batch.k[entry * kv_width..][..kv_width],
                         &batch.v[entry * kv_width..][..kv_width],
                     )?;
-                    kv.load_layer(
-                        index,
-                        shape,
-                        position + 1,
-                        &mut batch.k_all,
-                        &mut batch.v_all,
-                    )?;
                     let at = crate::profile::stamp();
-                    attention(
+                    attend(
                         &batch.q[entry * query..][..query],
-                        &batch.k_all,
-                        &batch.v_all,
+                        &kv,
+                        index,
                         position + 1,
                         shape,
-                        &mut batch.scores,
+                        &mut batch.attn_scratch,
                         &mut batch.attn[entry * hidden..][..hidden],
-                    );
+                    )?;
                     crate::profile::note(crate::profile::Phase::Attention, at);
                 }
 
@@ -1212,6 +1226,45 @@ impl KvView<'_> {
             .encode(&mut self.storage[base + layer_bytes..end], v)
     }
 
+    /// Call `visit(position, base)` for every position below `positions`; `base` is the byte
+    /// offset of `layer`'s K row at that position, and its V row follows `layer_bytes` later.
+    ///
+    /// The block table is consulted once per block, not once per position.
+    fn for_each_row(
+        &self,
+        layer: usize,
+        layer_bytes: usize,
+        positions: usize,
+        mut visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
+    ) -> Result<(), ViperaError> {
+        let per_block = self.tokens_per_block.max(1);
+        let mut position = 0;
+        while position < positions {
+            let block = *self
+                .table
+                .get(position / per_block)
+                .ok_or_else(|| ViperaError::internal("position has no KV block"))?
+                as usize;
+            let in_block = (per_block - position % per_block).min(positions - position);
+            let mut base = (block * per_block + position % per_block) * self.bytes_per_token
+                + layer * 2 * layer_bytes;
+            for offset in 0..in_block {
+                if base + 2 * layer_bytes > self.storage.len() {
+                    return Err(ViperaError::internal(
+                        "KV read would fall outside the cache buffer",
+                    ));
+                }
+                visit(position + offset, base)?;
+                base += self.bytes_per_token;
+            }
+            position += in_block;
+        }
+        Ok(())
+    }
+
+    /// The whole layer decoded to `f32`. Used for short histories (see [`STREAMING_MIN_POSITIONS`]),
+    /// where the buffers are small, and kept as the oracle that [`attention_streaming`] is tested
+    /// against, bit for bit.
     fn load_layer(
         &self,
         layer: usize,
@@ -1272,7 +1325,10 @@ struct AttnShape {
     head_dim: usize,
 }
 
-/// Causal grouped-query attention over every position up to and including `positions - 1`.
+/// Causal grouped-query attention over every position up to and including `positions - 1`, on
+/// K/V already decoded to `f32`.
+///
+/// This is the short-history path and the oracle for [`attention_streaming`].
 fn attention(
     q: &[f32],
     k_all: &[f32],
@@ -1322,6 +1378,150 @@ fn attention(
             crate::simd::axpy_f32(output, weight * inverse, &v_all[base..base + head_dim]);
         }
     }
+}
+
+/// Working memory for [`attention_streaming`], kept between calls so a token allocates nothing.
+#[derive(Debug, Default)]
+struct AttnScratch {
+    /// `heads * positions` scores, head-major.
+    scores: Vec<f32>,
+    /// One decoded K or V row, `kv_heads * head_dim` values.
+    row: Vec<f32>,
+    /// Per head: the running maximum, then its softmax normalizer.
+    head_state: Vec<f32>,
+    /// The whole layer decoded to `f32`, for [`attend`]'s short-history path. Empty until a rule
+    /// with fewer than [`STREAMING_MIN_POSITIONS`] positions runs.
+    k_all: Vec<f32>,
+    /// The matching V rows. Same lifecycle as [`Self::k_all`].
+    v_all: Vec<f32>,
+}
+
+/// Below this many positions, [`attend`] decodes the layer once and uses the buffered kernel;
+/// at or above it, it reads the KV blocks twice through [`attention_streaming`].
+///
+/// The threshold is a memory decision, not a speed one. Speed was measured and the two arms are
+/// the same end to end below it: on the Qwen2.5-1.5B / i5-11300H rig, `pp128` runs 45.0 tok/s with
+/// the gate and 44.4 tok/s with the buffered kernel alone, which is run-to-run spread (a 47.1
+/// sample taken earlier does not reproduce). What the gate buys is that the buffered arm's two
+/// `positions * width` buffers stay small: end to end decode at ctx 1024 is 51.0 ms/step through
+/// [`attention_streaming`] against 56.1 ms/step through the buffered path, and the streaming arm
+/// needs no history buffer at all.
+const STREAMING_MIN_POSITIONS: usize = 256;
+
+/// Causal grouped-query attention read straight from the KV blocks.
+///
+/// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
+/// head sees the same values, and sums them in the same order. What changes is the traffic. Each
+/// K and V row is decoded once into a one-row buffer that stays in L1 while every query head of
+/// its group uses it, instead of the whole history being decoded into two `positions * width`
+/// buffers that every head then re-reads from L2 or L3.
+fn attention_streaming(
+    q: &[f32],
+    kv: &KvView<'_>,
+    layer: usize,
+    positions: usize,
+    shape: AttnShape,
+    scratch: &mut AttnScratch,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let width = shape.kv_heads * head_dim;
+    let layer_bytes = kv.layout.bytes_per_row(width);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sequential = quant::exact_dot_requested();
+    let AttnScratch {
+        scores,
+        row,
+        head_state,
+        ..
+    } = scratch;
+    scores.resize(shape.heads * positions, 0.0);
+    row.resize(width, 0.0);
+    head_state.clear();
+    head_state.resize(shape.heads, f32::NEG_INFINITY);
+
+    // Pass 1: every score, and each head's maximum, in increasing position order.
+    kv.for_each_row(layer, layer_bytes, positions, |position, base| {
+        kv.layout
+            .decode(&kv.storage[base..base + layer_bytes], row)?;
+        for kv_head in 0..shape.kv_heads {
+            let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+            for member in 0..group {
+                let head = kv_head * group + member;
+                let query = &q[head * head_dim..(head + 1) * head_dim];
+                let dot = if sequential {
+                    query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
+                } else {
+                    crate::simd::dot_f32(query, key)
+                };
+                let score = dot * scale;
+                scores[head * positions + position] = score;
+                head_state[head] = head_state[head].max(score);
+            }
+        }
+        Ok(())
+    })?;
+
+    // Softmax per head, summed in increasing position order.
+    for head in 0..shape.heads {
+        let best = head_state[head];
+        let window = &mut scores[head * positions..(head + 1) * positions];
+        let mut total = 0.0_f32;
+        for score in window.iter_mut() {
+            *score = (*score - best).exp();
+            total += *score;
+        }
+        head_state[head] = 1.0 / total;
+    }
+
+    // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
+    out[..shape.heads * head_dim].fill(0.0);
+    kv.for_each_row(layer, layer_bytes, positions, |position, base| {
+        let v_base = base + layer_bytes;
+        kv.layout
+            .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;
+        for kv_head in 0..shape.kv_heads {
+            let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+            for member in 0..group {
+                let head = kv_head * group + member;
+                crate::simd::axpy_f32(
+                    &mut out[head * head_dim..(head + 1) * head_dim],
+                    scores[head * positions + position] * head_state[head],
+                    value,
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Attention for one layer, choosing the kernel by history length.
+///
+/// Both arms compute the same values, bit for bit: they see the same K/V rows in the same order.
+/// Only the traffic differs. [`STREAMING_MIN_POSITIONS`] records why the choice is by length and
+/// what the two measured ends are.
+fn attend(
+    q: &[f32],
+    kv: &KvView<'_>,
+    layer: usize,
+    positions: usize,
+    shape: AttnShape,
+    scratch: &mut AttnScratch,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    if positions >= STREAMING_MIN_POSITIONS {
+        return attention_streaming(q, kv, layer, positions, shape, scratch, out);
+    }
+    let AttnScratch {
+        k_all,
+        v_all,
+        scores,
+        ..
+    } = scratch;
+    kv.load_layer(layer, shape, positions, k_all, v_all)?;
+    attention(q, k_all, v_all, positions, shape, scores, out);
+    Ok(())
 }
 
 /// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
@@ -1618,6 +1818,263 @@ mod tests {
                 round(positions),
                 dot_round(positions)
             );
+        }
+    }
+
+    /// A KV cache of `blocks` physical blocks, two layers, filled with a fixed pseudo-random
+    /// stream through the same `write` the engine uses.
+    fn filled_kv(
+        storage: &mut Vec<u8>,
+        layout: KvLayout,
+        shape: AttnShape,
+        tokens_per_block: usize,
+        table: &[u32],
+        positions: usize,
+    ) {
+        let width = shape.kv_heads * shape.head_dim;
+        let layers = 2;
+        let bytes_per_token = layers * 2 * layout.bytes_per_row(width);
+        let blocks = table
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |max| max as usize + 1);
+        storage.clear();
+        storage.resize(blocks * tokens_per_block * bytes_per_token, 0);
+        let mut state = 0x9E37_79B9_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1 << 24) as f32 * 2.0 - 1.0
+        };
+        let mut kv = KvView {
+            storage,
+            table,
+            tokens_per_block,
+            bytes_per_token,
+            layout,
+        };
+        for position in 0..positions {
+            for layer in 0..layers {
+                let k: Vec<f32> = (0..width).map(|_| next()).collect();
+                let v: Vec<f32> = (0..width).map(|_| next()).collect();
+                kv.write(position, layer, shape, &k, &v).expect("write");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_attention_is_bit_identical_to_decoding_the_layer_first() {
+        let shape = AttnShape {
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        // Physical blocks are not in logical order, as when sequences share one buffer.
+        let table = [3_u32, 0, 2, 1];
+        for layout in [KvLayout::F16, KvLayout::Q8_0] {
+            let mut storage = Vec::new();
+            filled_kv(&mut storage, layout, shape, 16, &table, 61);
+            let width = shape.kv_heads * shape.head_dim;
+            let kv = KvView {
+                bytes_per_token: 2 * 2 * layout.bytes_per_row(width),
+                storage: &mut storage,
+                table: &table,
+                tokens_per_block: 16,
+                layout,
+            };
+            for layer in 0..2 {
+                // One position, a block boundary on each side, and a partial last block.
+                for positions in [1, 15, 16, 17, 32, 61] {
+                    let (mut k_all, mut v_all, mut scores) = (Vec::new(), Vec::new(), Vec::new());
+                    kv.load_layer(layer, shape, positions, &mut k_all, &mut v_all)
+                        .expect("load");
+                    let mut expected = vec![0.0_f32; shape.heads * shape.head_dim];
+                    attention(
+                        &q,
+                        &k_all,
+                        &v_all,
+                        positions,
+                        shape,
+                        &mut scores,
+                        &mut expected,
+                    );
+
+                    let mut scratch = AttnScratch::default();
+                    let mut actual = vec![f32::NAN; shape.heads * shape.head_dim];
+                    attention_streaming(
+                        &q,
+                        &kv,
+                        layer,
+                        positions,
+                        shape,
+                        &mut scratch,
+                        &mut actual,
+                    )
+                    .expect("attention");
+                    let bits = |values: &[f32]| -> Vec<u32> {
+                        values.iter().map(|value| value.to_bits()).collect()
+                    };
+                    assert_eq!(
+                        bits(&actual),
+                        bits(&expected),
+                        "{layout:?} layer {layer} positions {positions}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_attention_reports_a_position_with_no_block() {
+        let shape = AttnShape {
+            heads: 2,
+            kv_heads: 1,
+            head_dim: 32,
+        };
+        let table = [0_u32];
+        let mut storage = Vec::new();
+        filled_kv(&mut storage, KvLayout::F16, shape, 4, &table, 4);
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(32),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block: 4,
+            layout: KvLayout::F16,
+        };
+        let q = vec![0.5_f32; 64];
+        let mut out = vec![0.0_f32; 64];
+        let error =
+            attention_streaming(&q, &kv, 0, 5, shape, &mut AttnScratch::default(), &mut out);
+        assert!(
+            error.is_err(),
+            "position 4 has no block in a one-block table"
+        );
+    }
+
+    /// The gate in [`attend`] must not change a number, including when one scratch crosses the
+    /// threshold: the short-history arm fills `k_all`/`v_all`, and the streaming arm must not leave
+    /// anything behind that the next short write reads.
+    #[test]
+    fn attend_crosses_the_streaming_threshold_without_changing_the_result() {
+        let shape = AttnShape {
+            heads: 4,
+            kv_heads: 2,
+            head_dim: 32,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let tokens_per_block = 16;
+        let deepest = STREAMING_MIN_POSITIONS + 5;
+        let table: Vec<u32> = (0..deepest.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            deepest,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 5 % 19) as f32 - 9.0) * 0.1)
+            .collect();
+        let mut scratch = AttnScratch::default();
+        let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+        for positions in [1, 8, STREAMING_MIN_POSITIONS - 1, deepest] {
+            attend(&q, &kv, 0, positions, shape, &mut scratch, &mut out).expect("attention");
+        }
+
+        let (mut k_all, mut v_all, mut scores) = (Vec::new(), Vec::new(), Vec::new());
+        kv.load_layer(0, shape, deepest, &mut k_all, &mut v_all)
+            .expect("load");
+        let mut expected = vec![0.0_f32; shape.heads * shape.head_dim];
+        attention(
+            &q,
+            &k_all,
+            &v_all,
+            deepest,
+            shape,
+            &mut scores,
+            &mut expected,
+        );
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&out), bits(&expected));
+    }
+
+    /// What one layer of one decode step pays for its K/V: decode the history, then attend.
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib kv_attention_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn kv_attention_cost_per_layer() {
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        for layout in [KvLayout::F16, KvLayout::Q8_0] {
+            for positions in [32_usize, 256, 1024, 4096] {
+                let tokens_per_block = 16;
+                let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+                let mut storage = Vec::new();
+                filled_kv(
+                    &mut storage,
+                    layout,
+                    shape,
+                    tokens_per_block,
+                    &table,
+                    positions,
+                );
+                let kv = KvView {
+                    bytes_per_token: 2 * 2 * layout.bytes_per_row(width),
+                    storage: &mut storage,
+                    table: &table,
+                    tokens_per_block,
+                    layout,
+                };
+                let rounds = (2_000_000 / positions).clamp(20, 400) as u32;
+                let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+                let (mut k_all, mut v_all, mut scores) = (Vec::new(), Vec::new(), Vec::new());
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    kv.load_layer(0, shape, positions, &mut k_all, &mut v_all)
+                        .expect("load");
+                    attention(&q, &k_all, &v_all, positions, shape, &mut scores, &mut out);
+                }
+                let before = started.elapsed().as_secs_f64() / f64::from(rounds) * 1e3;
+                let mut scratch = AttnScratch::default();
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    attention_streaming(&q, &kv, 0, positions, shape, &mut scratch, &mut out)
+                        .expect("attention");
+                }
+                let after = started.elapsed().as_secs_f64() / f64::from(rounds) * 1e3;
+                println!(
+                    "{layout:?} positions {positions:>5}: load+attention {before:.3} ms, \
+                     streaming {after:.3} ms, {:.2}x",
+                    before / after
+                );
+            }
         }
     }
 
