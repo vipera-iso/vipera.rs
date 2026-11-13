@@ -667,16 +667,17 @@ impl<F: ForwardPass> Engine<F> {
             ..
         } = self;
         let tokens_per_block = kv.config().tokens_per_block as usize;
-        // A turn on its own may prefill wider than one KV block, because the per-chunk cost that is
-        // not the kernel — reserving KV, materializing logits, the pool round trip — is paid once
-        // per chunk. Measured over the whole run on the reference prompt: 2180 against 1982 ms for
-        // 126 positions (nine chunks against three), and 7968 against 7395 ms for 512. The kernel
-        // itself does not get faster at 64, so this is overhead removal, not a wider tile.
+        // A turn on its own prefills in as few chunks as the backend can take, because the cost
+        // that is not the kernel — reserving KV, materializing logits, the pool round trip — is
+        // paid once per chunk. Measured over the whole run on the reference prompt, same binary,
+        // five interleaved runs of a 512-position prompt: 7968 ms at one KV block per chunk, 7370
+        // at 64, 6989 at 128. The kernel itself does not get faster with the wider batch, so this
+        // is overhead removal, not a wider tile, and 128 is simply `MAX_BATCH`.
         //
         // When another turn shares the engine the chunk stays one block: the wider one is paid for
         // by whoever is waiting for a decode step.
         let prefill_chunk = if turns.len() == 1 {
-            tokens_per_block.max(64)
+            tokens_per_block.max(128)
         } else {
             tokens_per_block
         };
