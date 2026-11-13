@@ -136,13 +136,17 @@ pub(crate) fn q4k_scale_min(scales: &[u8], j: usize) -> (u8, u8) {
 /// weight, and one add per sub-block from every row. Each sum is the pair of 16-value partial sums
 /// added in the order the kernels used before, so the value is unchanged to the bit.
 pub(crate) fn x_sums(x: &[f32]) -> Vec<f32> {
+    x_sums_iter(x).collect()
+}
+
+/// [`x_sums`] without the `Vec`, so a caller that already owns a buffer can extend it directly.
+fn x_sums_iter(x: &[f32]) -> impl Iterator<Item = f32> + '_ {
     x.as_chunks::<16>()
         .0
         .as_chunks::<2>()
         .0
         .iter()
         .map(|pair| pair[0].iter().sum::<f32>() + pair[1].iter().sum::<f32>())
-        .collect()
 }
 
 /// `x` rounded to `i8`, one scale per 32 values.
@@ -194,22 +198,43 @@ impl QuantizedX {
     /// Quantize `x` in groups of 32. A trailing partial group is ignored, and every caller in this
     /// module passes a length that is a whole number of groups.
     pub(crate) fn new(x: &[f32]) -> Self {
-        let mut q = Vec::with_capacity(x.len());
-        let mut d = Vec::with_capacity(x.len() / 32);
-        for group in x.as_chunks::<32>().0 {
-            let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
-            if largest == 0.0 {
-                d.push(0.0);
-                q.extend(std::iter::repeat_n(0, 32));
-                continue;
-            }
-            let scale = largest / 127.0;
-            d.push(scale);
-            for value in group {
-                q.push((value / scale).round().clamp(-127.0, 127.0) as i8);
-            }
+        let groups = x.len() / 32;
+        let mut q = vec![0_i8; groups * 32];
+        let mut d = vec![0.0_f32; groups];
+        // The AVX2 path produces exactly the values `quantize_group` does, so which one ran cannot
+        // change a result; it only changes how long the activation takes to build. At 1536 values
+        // the scalar loop is ~8 us, which a decode step pays on every one of its ~200 matvecs.
+        #[cfg(target_arch = "x86_64")]
+        if crate::simd::quantize_groups(x, &mut q, &mut d) {
+            return Self { q, d };
+        }
+        for ((group, scale), values) in x
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(&mut d)
+            .zip(q.as_chunks_mut::<32>().0.iter_mut())
+        {
+            *scale = Self::quantize_group(group, values);
         }
         Self { q, d }
+    }
+
+    /// Quantize one group of 32 into `out` and return its scale (0 for an all-zero group).
+    ///
+    /// The definition the AVX2 path in [`crate::simd::quantize_groups`] is tested against, and the
+    /// path it falls back to for a group holding a NaN, an infinity or a subnormal scale.
+    pub(crate) fn quantize_group(group: &[f32; 32], out: &mut [i8]) -> f32 {
+        let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+        if largest == 0.0 {
+            out.fill(0);
+            return 0.0;
+        }
+        let scale = largest / 127.0;
+        for (slot, value) in out.iter_mut().zip(group) {
+            *slot = (value / scale).round().clamp(-127.0, 127.0) as i8;
+        }
+        scale
     }
 
     /// The dot this struct stands for, evaluated in `f32` against the original `x`.
@@ -459,50 +484,17 @@ pub(crate) struct OwnedActivation {
 
 impl OwnedActivation {
     pub(crate) fn new(ty: GgmlType, x: &[f32]) -> Self {
-        // Single buffer for x+sums+xq interleaved to cut allocs per matvec.
         let groups = x.len() / 32;
-        let mut buf = Vec::with_capacity(x.len() + groups + x.len() + 1);
+        // `x` and its group sums share one buffer: one allocation instead of two.
+        let mut buf = Vec::with_capacity(x.len() + groups);
         buf.extend_from_slice(x);
         let sums_off = buf.len();
-        buf.extend_from_slice(&x_sums(x));
-        let q_off = buf.len();
-        // Quantize directly into the tail of the buffer (no second Vec).
-        if quantizes(ty) {
-            for group in x.as_chunks::<32>().0 {
-                let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
-                if largest == 0.0 {
-                    buf.extend_from_slice(&[0.0f32; 1][..0]);
-                    // keep layout: q bytes are i8, stored after sums as f32 slot trick
-                    buf.resize(buf.len() + 32, 0.0);
-                    continue;
-                }
-                let scale = largest / 127.0;
-                for value in group {
-                    buf.push((value / scale).round().clamp(-127.0, 127.0));
-                }
-            }
-        }
-        // Re-derive q view from the tail: groups*32 entries holding q as f32-cast i8 bits.
-        let q = quantizes(ty).then(|| {
-            let q_slice = &buf[q_off..q_off + x.len()];
-            let q_bytes: Vec<i8> = q_slice.iter().map(|v| *v as i8).collect();
-            // d per group computed from x (cheap, kept for parity)
-            let d: Vec<f32> = x
-                .as_chunks::<32>()
-                .0
-                .iter()
-                .map(|group| {
-                    let largest = group.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
-                    if largest == 0.0 { 0.0 } else { largest / 127.0 }
-                })
-                .collect();
-            QuantizedX { q: q_bytes, d }
-        });
+        buf.extend(x_sums_iter(x));
         Self {
             x: buf,
             sums_off,
             sums_len: groups,
-            q,
+            q: quantizes(ty).then(|| QuantizedX::new(x)),
         }
     }
 
