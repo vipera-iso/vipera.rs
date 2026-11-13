@@ -28,5 +28,6 @@
 /docs/design/*
 !/docs/design/*.md
 
-# Build output is large and reproducible.
-/target/
+# Build output is large and reproducible. The pattern is not anchored so the
+# out-of-workspace prototype under crates/ does not drag its own target/ in.
+target/

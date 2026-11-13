@@ -1,0 +1,11 @@
+[package]
+name = "vipera-ggml"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Prototype bind to ggml's Q4_K x Q8_K kernels (ADR-001, EXC-001)"
+
+# Deliberately outside the workspace: the gate (`cargo test --workspace`) must not
+# need a C toolchain or a ggml checkout. This crate is built only by hand, when the
+# ADR-001 numbers are being taken.
+[workspace]
