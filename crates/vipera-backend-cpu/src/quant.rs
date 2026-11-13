@@ -836,7 +836,12 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
             format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
         ));
     }
-    if crate::tiled::tiled_serves::<B>() && matches!(ty, GgmlType::F32 | GgmlType::F16) {
+    // The float tile is a diagnostic and stays behind `VIPERA_TILED=1`: the integer prefill
+    // path below is the default, and it should not change how the few float tensors sum.
+    if crate::tiled::scalar_tiled_enabled()
+        && crate::tiled::tiled_serves::<B>()
+        && matches!(ty, GgmlType::F32 | GgmlType::F16)
+    {
         return crate::tiled::matvec_tiled_batch(ty, data, stride, cols, rows, activations, out);
     }
     let owned: std::sync::Arc<[OwnedActivation; B]> =
@@ -907,10 +912,11 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     out: &mut [f32],
 ) {
     let count = out.len() / B;
-    // Integer tiled path: with VIPERA_TILED=1 and an AVX-512 VNNI CPU, a
-    // Q4_K batch reuses one activation tile across 32 weight rows (8-row
-    // bands inside), which is the prefill lever. Exact mode keeps the old
-    // summation order, so it stays on the row kernel. A batch of one keeps
+    // Integer tiled path, the prefill default: on an AVX-512 VNNI CPU a Q4_K
+    // batch reuses one activation tile across 32 weight rows (8-row bands
+    // inside). Measured on the reference machine at B=16 it cuts a prefill
+    // chunk from 360 to 229 ms. `VIPERA_TILED=0` and exact mode keep the old
+    // summation order and stay on the row kernel. A batch of one keeps
     // the row kernel: its VNNI-256 path is already the faster one here (a
     // column-parallel 512-bit port measured 6.95 vs 11.87 GB/s), because the
     // sixteen-entry tile wastes fifteen lanes but the 512-bit form is
@@ -919,7 +925,7 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     if !exact_dot_requested()
         && crate::tiled::tiled_enabled()
         && crate::simd::vnni512_available()
-        && (8..=128).contains(&B)
+        && (crate::tiled::TILE_MIN_BATCH..=128).contains(&B)
     {
         if ty == GgmlType::Q4K
             && let Some(xs) = activation.quantized()
