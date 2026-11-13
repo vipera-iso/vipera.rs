@@ -107,6 +107,117 @@ pub fn available() -> bool {
     std::is_x86_feature_detected!("avx2")
 }
 
+/// Round half away from zero, as `f32::round` does, in eight lanes at once.
+///
+/// `trunc(v + copysign(0.49999997, v))` where `0.49999997` is the largest `f32` below one half.
+/// Adding exactly `0.5` is wrong for `0.49999997`, which would round up to one; adding the value
+/// just under it gets every tie and every near-tie right for `|v| < 2^23`. The exhaustive test
+/// `round_half_away_matches_f32_round_for_every_value_in_range` checks it against `f32::round`
+/// for every value that matters here.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn round_half_away_x8(v: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::{
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm256_add_ps, _mm256_and_ps, _mm256_or_ps,
+        _mm256_round_ps, _mm256_set1_ps,
+    };
+    let sign = _mm256_set1_ps(-0.0);
+    let just_under_half = _mm256_set1_ps(f32::from_bits(0x3EFF_FFFF));
+    let signed = _mm256_or_ps(just_under_half, _mm256_and_ps(v, sign));
+    _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(_mm256_add_ps(v, signed))
+}
+
+/// Quantize `x` in groups of 32 into `q` (32 values per group) and `d` (one scale per group),
+/// giving exactly what [`QuantizedX::quantize_group`] gives for every group.
+///
+/// Returns `false`, having written nothing, when this CPU has no AVX2 or the slices are too short.
+///
+/// Safe to call: it detects AVX2 itself and touches only `groups * 32` values of `x` and `q` and
+/// `groups` values of `d`.
+pub(crate) fn quantize_groups(x: &[f32], q: &mut [i8], d: &mut [f32]) -> bool {
+    let groups = x.len() / 32;
+    if !available() || q.len() < groups * 32 || d.len() < groups {
+        return false;
+    }
+    // SAFETY: AVX2 is available, and the length checks above bound every load and store.
+    unsafe { quantize_groups_avx2(x, q, d, groups) };
+    true
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_groups_avx2(x: &[f32], q: &mut [i8], d: &mut [f32], groups: usize) {
+    use std::arch::x86_64::{
+        __m256i, _CMP_UNORD_Q, _mm_cvtss_f32, _mm_max_ps, _mm_max_ss, _mm_movehl_ps,
+        _mm_shuffle_ps, _mm256_and_ps, _mm256_castps256_ps128, _mm256_castsi256_ps, _mm256_cmp_ps,
+        _mm256_cvttps_epi32, _mm256_div_ps, _mm256_extractf128_ps, _mm256_loadu_ps,
+        _mm256_max_epi32, _mm256_max_ps, _mm256_min_epi32, _mm256_movemask_ps, _mm256_or_ps,
+        _mm256_packs_epi16, _mm256_packs_epi32, _mm256_permutevar8x32_epi32, _mm256_set1_epi32,
+        _mm256_set1_ps, _mm256_setr_epi32, _mm256_setzero_ps, _mm256_setzero_si256,
+        _mm256_storeu_si256,
+    };
+    // SAFETY: the caller guarantees AVX2 and that `x` and `q` hold `groups * 32` values and `d`
+    // holds `groups`; every load and store below is inside one 32-value group.
+    unsafe {
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
+        let low = _mm256_set1_epi32(-127);
+        let high = _mm256_set1_epi32(127);
+        // After two 16-bit-lane packs the dwords sit as 0,4,1,5,2,6,3,7 of the order wanted.
+        let reorder = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for (index, group) in x.as_chunks::<32>().0.iter().enumerate().take(groups) {
+            let at = group.as_ptr();
+            let v = [
+                _mm256_loadu_ps(at),
+                _mm256_loadu_ps(at.add(8)),
+                _mm256_loadu_ps(at.add(16)),
+                _mm256_loadu_ps(at.add(24)),
+            ];
+            // `acc.max(v.abs())` ignores a NaN `v`; `_mm256_max_ps(a, b)` returns `b` when either is
+            // NaN, so the new value goes first and the running maximum second.
+            let mut largest = _mm256_setzero_ps();
+            let mut unordered = _mm256_setzero_ps();
+            for lane in v {
+                largest = _mm256_max_ps(_mm256_and_ps(lane, abs_mask), largest);
+                unordered = _mm256_or_ps(unordered, _mm256_cmp_ps::<_CMP_UNORD_Q>(lane, lane));
+            }
+            let halves = _mm_max_ps(
+                _mm256_castps256_ps128(largest),
+                _mm256_extractf128_ps::<1>(largest),
+            );
+            let halves = _mm_max_ps(halves, _mm_movehl_ps(halves, halves));
+            let largest = _mm_cvtss_f32(_mm_max_ss(halves, _mm_shuffle_ps::<0x55>(halves, halves)));
+
+            let out = &mut q[index * 32..index * 32 + 32];
+            if largest == 0.0 {
+                d[index] = 0.0;
+                out.fill(0);
+                continue;
+            }
+            let scale = largest / 127.0;
+            // A NaN, an infinity or a scale too small to divide by cleanly is rare and not worth
+            // reproducing lane by lane: the scalar definition handles it.
+            if _mm256_movemask_ps(unordered) != 0
+                || !largest.is_finite()
+                || scale < f32::MIN_POSITIVE
+            {
+                d[index] = QuantizedX::quantize_group(group, out);
+                continue;
+            }
+            d[index] = scale;
+            let divisor = _mm256_set1_ps(scale);
+            let mut lanes = [_mm256_setzero_si256(); 4];
+            for (slot, lane) in lanes.iter_mut().zip(v) {
+                let rounded = round_half_away_x8(_mm256_div_ps(lane, divisor));
+                let integers = _mm256_cvttps_epi32(rounded);
+                *slot = _mm256_min_epi32(_mm256_max_epi32(integers, low), high);
+            }
+            let first = _mm256_packs_epi32(lanes[0], lanes[1]);
+            let second = _mm256_packs_epi32(lanes[2], lanes[3]);
+            let packed = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(first, second), reorder);
+            _mm256_storeu_si256(out.as_mut_ptr().cast::<__m256i>(), packed);
+        }
+    }
+}
+
 /// Prefetch `data[ahead_byte ..]` into L1, hint T0.
 ///
 /// Streaming rows from DRAM is bandwidth-bound; the hint found by Genesis (one PREFETCHNTA)
@@ -2949,5 +3060,202 @@ mod tests {
             unsafe { q6k_dot_batch(&row, xs, &mut actual) };
             assert_eq!(actual, expected, "trial {trial}");
         }
+    }
+}
+
+#[cfg(test)]
+mod quantize_tests {
+    use super::*;
+    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_storeu_ps};
+
+    /// `round_half_away_x8` on eight values.
+    #[target_feature(enable = "avx2")]
+    unsafe fn round_eight(values: [f32; 8]) -> [f32; 8] {
+        // SAFETY: AVX2 is guaranteed by the caller; the loads and stores cover exactly the arrays.
+        unsafe {
+            let rounded = round_half_away_x8(_mm256_loadu_ps(values.as_ptr()));
+            let mut out = [0.0_f32; 8];
+            _mm256_storeu_ps(out.as_mut_ptr(), rounded);
+            out
+        }
+    }
+
+    fn check_round(values: [f32; 8]) {
+        // SAFETY: callers return early when AVX2 is missing.
+        let got = unsafe { round_eight(values) };
+        for (value, got) in values.iter().zip(got) {
+            assert!(
+                value.round() == got,
+                "round({value:e}) = {:e} but the AVX2 form gave {got:e}",
+                value.round()
+            );
+        }
+    }
+
+    #[test]
+    fn round_half_away_matches_f32_round_on_ties_near_ties_and_a_stride_of_everything_else() {
+        if !available() {
+            return;
+        }
+        // Every tie and the values one ulp either side of it, which is where a naive `+ 0.5` fails.
+        let mut batch = Vec::new();
+        for whole in 0..=130_u32 {
+            let tie = whole as f32 + 0.5;
+            for value in [
+                tie,
+                f32::from_bits(tie.to_bits() - 1),
+                f32::from_bits(tie.to_bits() + 1),
+            ] {
+                batch.push(value);
+                batch.push(-value);
+            }
+        }
+        batch.extend([
+            0.0,
+            -0.0,
+            0.49999997,
+            -0.49999997,
+            0.5,
+            -0.5,
+            1.0e-30,
+            -1.0e-45,
+        ]);
+        while batch.len() % 8 != 0 {
+            batch.push(0.0);
+        }
+        for chunk in batch.as_chunks::<8>().0 {
+            check_round(*chunk);
+        }
+        // A stride through every bit pattern from zero to 200.0, both signs.
+        let end = 200.0_f32.to_bits();
+        let mut bits = 0_u32;
+        while bits + 8 * 4093 <= end {
+            let values = std::array::from_fn(|lane| f32::from_bits(bits + lane as u32 * 4093));
+            check_round(values);
+            check_round(values.map(|value| -value));
+            bits += 8 * 4093;
+        }
+    }
+
+    /// Every `f32` whose magnitude is at most 200, which covers all `x / scale` the quantizer
+    /// can produce (at most about 127), against `f32::round`.
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib round_half_away_matches_f32_round_for_every -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "exhaustive: about 2.3e9 values, ten seconds or so in release"]
+    fn round_half_away_matches_f32_round_for_every_value_in_range() {
+        if !available() {
+            return;
+        }
+        let end = 200.0_f32.to_bits();
+        let mut bits = 0_u32;
+        while bits <= end {
+            let values = std::array::from_fn(|lane| f32::from_bits(bits + lane as u32));
+            check_round(values);
+            check_round(values.map(|value| -value));
+            bits += 8;
+        }
+    }
+
+    /// Groups chosen to break a careless vector form: exact ties, ties one ulp off, subnormal
+    /// scales, NaN, infinities, all-zero and all-equal groups, and magnitudes from 1e-3 to 3e7.
+    fn adversarial(groups: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        let mut x = Vec::with_capacity(groups * 32);
+        for _ in 0..groups {
+            let magnitude = [1e-3_f32, 0.7, 1.0, 127.0, 5e3, 3e7][next() as usize % 6];
+            let random = |value: u32| value as f32 / (1 << 24) as f32 * 2.0 - 1.0;
+            let mut group = [0.0_f32; 32];
+            match next() % 10 {
+                0 => {}
+                1 | 2 => {
+                    // The largest value is 127 * scale with scale a power of two, so every other
+                    // value divides to an exact `whole + 0.5`.
+                    let scale = 2.0_f32.powi(-(next() as i32 % 12));
+                    for slot in &mut group {
+                        let tie = ((next() % 126) as f32 + 0.5) * scale;
+                        *slot = if next() % 2 == 0 { tie } else { -tie };
+                    }
+                    group[(next() % 32) as usize] = 127.0 * scale;
+                    if next() % 2 == 0 {
+                        for slot in group.iter_mut().filter(|slot| **slot != 127.0 * scale) {
+                            *slot = f32::from_bits(slot.to_bits() + 1);
+                        }
+                    }
+                }
+                3 => {
+                    for slot in &mut group {
+                        *slot = random(next()) * 1e-40;
+                    }
+                }
+                4 => {
+                    for slot in &mut group {
+                        *slot = random(next()) * magnitude;
+                    }
+                    group[(next() % 32) as usize] = f32::NAN;
+                }
+                5 => {
+                    for slot in &mut group {
+                        *slot = random(next()) * magnitude;
+                    }
+                    group[(next() % 32) as usize] =
+                        f32::INFINITY * if next() % 2 == 0 { 1.0 } else { -1.0 };
+                }
+                6 => group = [random(next()) * magnitude; 32],
+                7 => {
+                    for slot in &mut group {
+                        *slot = random(next()) * magnitude * 1e-3;
+                    }
+                    group[(next() % 32) as usize] = magnitude;
+                }
+                _ => {
+                    for slot in &mut group {
+                        *slot = random(next()) * magnitude;
+                    }
+                }
+            }
+            x.extend(group);
+        }
+        x
+    }
+
+    #[test]
+    fn quantize_groups_gives_exactly_what_the_scalar_definition_gives() {
+        if !available() {
+            return;
+        }
+        for seed in 1..=40_u32 {
+            let x = adversarial(64, seed);
+            let groups = x.len() / 32;
+            let (mut q, mut d) = (vec![0_i8; groups * 32], vec![0.0_f32; groups]);
+            assert!(quantize_groups(&x, &mut q, &mut d));
+            for (index, group) in x.as_chunks::<32>().0.iter().enumerate() {
+                let mut expected = [0_i8; 32];
+                let scale = QuantizedX::quantize_group(group, &mut expected);
+                assert_eq!(
+                    &q[index * 32..index * 32 + 32],
+                    &expected,
+                    "seed {seed} group {index}: {group:?}"
+                );
+                assert_eq!(
+                    d[index].to_bits(),
+                    scale.to_bits(),
+                    "seed {seed} group {index} scale"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_groups_refuses_slices_that_are_too_short() {
+        let x = vec![1.0_f32; 64];
+        assert!(!quantize_groups(&x, &mut [0_i8; 63], &mut [0.0_f32; 2]));
+        assert!(!quantize_groups(&x, &mut [0_i8; 64], &mut [0.0_f32; 1]));
     }
 }
