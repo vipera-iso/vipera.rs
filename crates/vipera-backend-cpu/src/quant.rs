@@ -836,7 +836,12 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
             format!("{needed} bytes are needed for a {rows}x{cols} matrix"),
         ));
     }
-    if crate::tiled::tiled_serves::<B>() && matches!(ty, GgmlType::F32 | GgmlType::F16) {
+    // The float tile is a diagnostic and stays behind `VIPERA_TILED=1`: the integer prefill
+    // path below is the default, and it should not change how the few float tensors sum.
+    if crate::tiled::scalar_tiled_enabled()
+        && crate::tiled::tiled_serves::<B>()
+        && matches!(ty, GgmlType::F32 | GgmlType::F16)
+    {
         return crate::tiled::matvec_tiled_batch(ty, data, stride, cols, rows, activations, out);
     }
     let owned: std::sync::Arc<[OwnedActivation; B]> =
@@ -907,10 +912,11 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     out: &mut [f32],
 ) {
     let count = out.len() / B;
-    // Integer tiled path: with VIPERA_TILED=1 and an AVX-512 VNNI CPU, a
-    // Q4_K batch reuses one activation tile across 32 weight rows (8-row
-    // bands inside), which is the prefill lever. Exact mode keeps the old
-    // summation order, so it stays on the row kernel. A batch of one keeps
+    // Integer tiled path, the prefill default: on an AVX-512 VNNI CPU a Q4_K
+    // batch reuses one activation tile across 32 weight rows (8-row bands
+    // inside). Measured on the reference machine at B=16 it cuts a prefill
+    // chunk from 360 to 229 ms. `VIPERA_TILED=0` and exact mode keep the old
+    // summation order and stay on the row kernel. A batch of one keeps
     // the row kernel: its VNNI-256 path is already the faster one here (a
     // column-parallel 512-bit port measured 6.95 vs 11.87 GB/s), because the
     // sixteen-entry tile wastes fifteen lanes but the 512-bit form is
@@ -919,7 +925,7 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     if !exact_dot_requested()
         && crate::tiled::tiled_enabled()
         && crate::simd::vnni512_available()
-        && (8..=128).contains(&B)
+        && (crate::tiled::TILE_MIN_BATCH..=128).contains(&B)
     {
         if ty == GgmlType::Q4K
             && let Some(xs) = activation.quantized()
@@ -942,10 +948,15 @@ pub(crate) fn fill_rows_batch<const B: usize>(
             return;
         }
     }
-    // No explicit prefetch here. A `_MM_HINT_T0` four rows ahead used to sit in this loop; it made
-    // the stream slower, not faster: 31.5 GB/s against 40.3 GB/s with the hint removed, on a 200 MB
-    // Q4_K tensor at eight threads. The hardware streamer already runs ahead of this loop, and
-    // pulling weight lines into L1 evicts the activation block the kernel rereads every row.
+    // No gap-blocked prefetch here: a `_MM_HINT_T0` four rows ahead made a 200 MB stream slower,
+    // not faster (31.5 against 40.3 GB/s at eight threads), because the hardware streamer already
+    // runs ahead and the hint evicts the activation block the kernel rereads every row.
+    //
+    // The small-tensor case was tried too, on the theory that 0.22 MB is 55 pages read once and
+    // cannot build memory-level parallelism: rows two ahead, two lines each, gated on
+    // `data.len() < 1 MB`. It measured 1.006x the q4k phase and 1.017x the q6k phase — no help, so
+    // the hint stays out. A first attempt gated on the worker's chunk instead of the whole tensor
+    // and cost 15% on q4k, which is the same eviction effect as the 200 MB run.
     let mut row = [0.0_f32; B];
     for offset in 0..count {
         let start = (first_row + offset) * stride;
@@ -1257,6 +1268,132 @@ mod tests {
         measure("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 60);
         measure("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 60);
         measure("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 8);
+    }
+
+    /// Measurement, not a correctness check: where the 39 us of a 0.22 MB call goes.
+    ///
+    /// The same pooled call is run twice: over 280 distinct copies of the 256x1536 shape (cold, the
+    /// way a decode step reads it) and over one copy 280 times (hot — 0.22 MB stays in the 8 MB L3).
+    /// Cold minus hot is the DRAM share; hot is the dispatch-and-wake floor. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture small_shape
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn small_shape_call_cost_hot_and_cold() {
+        fn run(rows: usize, cols: usize, windows: usize, mode: &str) {
+            let stride = row_bytes(GgmlType::Q4K, cols).expect("stride");
+            let per_window = rows * stride;
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let data: Vec<u8> = (0..per_window * windows)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect();
+            let x: Vec<f32> = (0..cols).map(|at| (at % 17) as f32 / 17.0 - 0.5).collect();
+            let mut out = vec![0.0_f32; rows];
+            let threads = thread_budget(rows, rows * cols);
+            thread::scope(|scope| {
+                let pool = crate::pool::Pool::new(scope, threads);
+                // Warm-up: faults the pages in and starts the workers.
+                matvec_pooled(
+                    &pool,
+                    GgmlType::Q4K,
+                    &data[..per_window],
+                    cols,
+                    rows,
+                    &x,
+                    &mut out,
+                )
+                .expect("shapes are consistent");
+                let started = std::time::Instant::now();
+                for window in data.chunks_exact(per_window) {
+                    let slice = if mode == "hot" {
+                        &data[..per_window]
+                    } else {
+                        window
+                    };
+                    matvec_pooled(&pool, GgmlType::Q4K, slice, cols, rows, &x, &mut out)
+                        .expect("shapes are consistent");
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                println!(
+                    "{rows}x{cols} {mode:>4}: {:>6.2} us/call, {:>5.2} GB/s (threads={threads}, {} MB of data)",
+                    elapsed * 1e6 / windows as f64,
+                    (per_window * windows) as f64 / elapsed / 1e9,
+                    data.len() >> 20
+                );
+            });
+        }
+
+        for mode in ["hot", "cold"] {
+            run(256, 1536, 280, mode);
+        }
+        // A call with almost no work at all: the dispatch-and-wake floor.
+        run(4, 1536, 280, "hot");
+    }
+
+    /// Measurement, not a correctness check: Q6_K at the two shapes a decode step calls it with.
+    ///
+    /// `wd` is 1536x8960 read once per layer (355 MB a token, 28 calls) and measured 28.7 GB/s in
+    /// the step; `output` is 151936x1536 in one call and measured 37.1. This runs both through the
+    /// pool on a flat buffer, so the difference is the shape and the call size rather than where the
+    /// bytes live. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture q6k_shape
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn q6k_shape_call_throughput() {
+        fn run(rows: usize, cols: usize, windows: usize, label: &str) {
+            let stride = row_bytes(GgmlType::Q6K, cols).expect("stride");
+            let per_window = rows * stride;
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            let data: Vec<u8> = (0..per_window * windows)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state >> 24) as u8
+                })
+                .collect();
+            let x: Vec<f32> = (0..cols).map(|at| (at % 17) as f32 / 17.0 - 0.5).collect();
+            let mut out = vec![0.0_f32; rows];
+            let threads = thread_budget(rows, rows * cols);
+            thread::scope(|scope| {
+                let pool = crate::pool::Pool::new(scope, threads);
+                matvec_pooled(
+                    &pool,
+                    GgmlType::Q6K,
+                    &data[..per_window],
+                    cols,
+                    rows,
+                    &x,
+                    &mut out,
+                )
+                .expect("shapes are consistent");
+                let started = std::time::Instant::now();
+                for window in data.chunks_exact(per_window) {
+                    matvec_pooled(&pool, GgmlType::Q6K, window, cols, rows, &x, &mut out)
+                        .expect("shapes are consistent");
+                }
+                let elapsed = started.elapsed().as_secs_f64();
+                println!(
+                    "{label:>16} {rows}x{cols}: {:>6.2} ms/call, {:>5.2} GB/s (threads={threads}, {} MB)",
+                    elapsed * 1e3 / windows as f64,
+                    (per_window * windows) as f64 / elapsed / 1e9,
+                    data.len() >> 20
+                );
+            });
+        }
+
+        run(1536, 8960, 28, "wd (28 calls)");
+        run(151_936, 1536, 1, "output (1 call)");
     }
 
     /// Measurement, not a correctness check: what one weight read shared by `B` activations buys at

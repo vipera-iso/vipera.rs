@@ -468,6 +468,14 @@ Two things measured along the way, both negative, both worth not repeating:
   round trip is inside the noise, so the pool is not what is holding scaling back; the 3.0x the kernel
   does get at four threads (9.6 -> 29.0 GB/s) is the memory system, and the token adds its serial
   share on top.
+- **Grouped projections.** `wq`, `wk` and `wv` multiply the same activation, as do `wg` and `wu`, so
+  they were issued as one pool dispatch instead of one per tensor: seven dispatches a layer became
+  five. Bit-identical (a pooled unit test compares every output's bits against the per-tensor path,
+  and 32 generated tokens match to the last id) and inert: 24 interleaved 32-token runs, alternating
+  which binary ran first, gave a paired `group / base` median of **0.999** on `compute` micros (min
+  0.927, max 1.097). The ceiling was visible before the attempt — the whole non-dot remainder of a
+  step, all 197 dispatches included, is 0.90-1.5 ms of a 35-45 ms step — so two dispatches a layer
+  are under 0.3 ms. Reverted; the idea is recorded so it is not rebuilt from scratch.
 
 ## Correctness plan
 

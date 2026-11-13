@@ -45,9 +45,26 @@
 //! tok/s on one thread, 19.8 vs 20.0 on four, 19.1 vs 19.5 GB/s on `ffn_down`.
 //!
 //! Neither loop is limited by vector width. The Q4_K kernel spends its time on per-block scalar
-//! work, and the Q6_K shapes are bound by the memory system: the 190 MB `output` tensor runs at
-//! 27 GB/s here, which is what the four cores can stream from DRAM, not what the multiplier can do.
-//! A wider instruction only changes which unit waits for memory.
+//! work. Whether these shapes are memory-bound is measured, not assumed: STREAM 5.10 (McCalpin)
+//! and a read-only kernel on this machine — i5-11300H, arrays far above the 8 MiB L3, best of 10
+//! timed passes — give
+//!
+//! | kernel | 4 threads | 8 threads |
+//! |---|---|---|
+//! | Copy (1 read, 1 write) | 39.7 GB/s | 38.8 GB/s |
+//! | Triad (2 reads, 1 write) | 29.6 GB/s | 30.5 GB/s |
+//! | read-only | 42.8 GB/s | 41.7 GB/s |
+//!
+//! SMT adds nothing to a bandwidth stream: 8 threads is not faster than 4. A decode step reads
+//! 0.980 GB — the 1.111 GB of tensors minus the 125 MB token embedding, which decode never reads —
+//! so the ceiling that applies to it is the read-only one, ~43 GB/s (a 22.8 ms floor per token).
+//! vipera's 35.2 ms/step is 28 GB/s and llama.cpp's 34.7 tok/s is 34 GB/s, so the Q6_K shapes are
+//! memory-bound and there is still headroom under the ceiling; what closes the gap is the access
+//! pattern, not the multiplier and not the language. The 512-bit results show width did not help
+//! on this core. Tiger Lake client cores are documented as having
+//! one 512-bit FMA/VNNI unit (ports 0 and 1 fused), so a `zmm` instruction would retire no more
+//! integer work per cycle than two `ymm`; that is not verified here and says nothing about Zen 5
+//! or Xeon cores with two 512-bit units.
 //!
 //! # Safety
 //!
@@ -590,14 +607,14 @@ pub unsafe fn q4k_dot(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
                 );
                 let low_coeff = _mm256_set1_ps(coeff_stack[2 * j]);
                 let high_coeff = _mm256_set1_ps(coeff_stack[2 * j + 1]);
-                let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                let high_lanes = _mm256_cvtepi32_ps(high_sums);
                 if j.is_multiple_of(2) {
-                    weights0 = _mm256_add_ps(weights0, low_lanes);
-                    weights1 = _mm256_add_ps(weights1, high_lanes);
+                    weights0 = _mm256_fmadd_ps(low_lanes, low_coeff, weights0);
+                    weights1 = _mm256_fmadd_ps(high_lanes, high_coeff, weights1);
                 } else {
-                    weights1 = _mm256_add_ps(weights1, low_lanes);
-                    weights0 = _mm256_add_ps(weights0, high_lanes);
+                    weights1 = _mm256_fmadd_ps(low_lanes, low_coeff, weights1);
+                    weights0 = _mm256_fmadd_ps(high_lanes, high_coeff, weights0);
                 }
             }
         }
@@ -786,14 +803,14 @@ pub(crate) unsafe fn q4k_dot_batch<const B: usize>(
                         coefficients[entry],
                         _mm256_set1_epi32((2 * j + 1) as i32),
                     );
-                    let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                    let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                    let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                    let high_lanes = _mm256_cvtepi32_ps(high_sums);
                     if j.is_multiple_of(2) {
-                        weights0[entry] = _mm256_add_ps(weights0[entry], low_lanes);
-                        weights1[entry] = _mm256_add_ps(weights1[entry], high_lanes);
+                        weights0[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights0[entry]);
+                        weights1[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights1[entry]);
                     } else {
-                        weights1[entry] = _mm256_add_ps(weights1[entry], low_lanes);
-                        weights0[entry] = _mm256_add_ps(weights0[entry], high_lanes);
+                        weights1[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights1[entry]);
+                        weights0[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights0[entry]);
                     }
                 }
             }
@@ -900,14 +917,21 @@ pub(crate) unsafe fn q4k_dot_batch_vnni<const B: usize>(
                     );
                     let low_coeff = _mm256_set1_ps(coeff_stack[entry][2 * j]);
                     let high_coeff = _mm256_set1_ps(coeff_stack[entry][2 * j + 1]);
-                    let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                    let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                    // One fused multiply-add instead of a multiply and an add per plane: two fewer
+                    // uops per plane, eight per 144-byte block. Measured on the Q4_K phase of a
+                    // decode step, 20 interleaved paired runs against the multiply-then-add form:
+                    // median 0.984x the q4k time (two batches, 0.981 and 0.986, both positive). The
+                    // rounding is the fused one; `q4k_dot_previous` behind `VIPERA_EXACT_DOT` is
+                    // still the multiply-then-add path, and the pooled/spawned bit-identity test
+                    // holds because every kernel here moved together.
+                    let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                    let high_lanes = _mm256_cvtepi32_ps(high_sums);
                     if j.is_multiple_of(2) {
-                        weights0[entry] = _mm256_add_ps(weights0[entry], low_lanes);
-                        weights1[entry] = _mm256_add_ps(weights1[entry], high_lanes);
+                        weights0[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights0[entry]);
+                        weights1[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights1[entry]);
                     } else {
-                        weights1[entry] = _mm256_add_ps(weights1[entry], low_lanes);
-                        weights0[entry] = _mm256_add_ps(weights0[entry], high_lanes);
+                        weights1[entry] = _mm256_fmadd_ps(low_lanes, low_coeff, weights1[entry]);
+                        weights0[entry] = _mm256_fmadd_ps(high_lanes, high_coeff, weights0[entry]);
                     }
                 }
             }
@@ -1017,6 +1041,10 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         let mut wq = vec![0_u8; ROW_WIN * 256];
         let mut scales = vec![[0_i32; 8]; ROW_WIN];
         let mut mins = vec![[0_i32; 8]; ROW_WIN];
+        // `d * scale` and `dmin * min` are fixed for a row and sub-block once the block is read, and
+        // the band loop visits them four times per window, so the products are made once here.
+        let mut scale_f = vec![[0.0_f32; 8]; ROW_WIN];
+        let mut min_f = vec![[0.0_f32; 8]; ROW_WIN];
         let mut dvec = [0.0_f32; ROW_WIN];
         let mut dminvec = [0.0_f32; ROW_WIN];
         // Activation tile in (half, group, entry, 4) order: one 64-byte ZMM
@@ -1087,6 +1115,8 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                         let (scale, min) = crate::quant::q4k_scale_min(scale_bytes, s);
                         scales[r][s] = i32::from(scale);
                         mins[r][s] = i32::from(min);
+                        scale_f[r][s] = dvec[r] * f32::from(scale);
+                        min_f[r][s] = dminvec[r] * f32::from(min);
                     }
                     let wrow = wq.as_mut_ptr().add(r * 256);
                     for j in 0..4 {
@@ -1129,18 +1159,14 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                                 acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
                             {
                                 let row = band + t;
-                                let raw = _mm512_mullo_epi32(
-                                    *acc_slot,
-                                    _mm512_set1_epi32(scales[row][s]),
-                                );
                                 let main = _mm512_mul_ps(
-                                    _mm512_mul_ps(_mm512_cvtepi32_ps(raw), dxv),
-                                    _mm512_set1_ps(dvec[row]),
+                                    _mm512_mul_ps(
+                                        _mm512_cvtepi32_ps(*acc_slot),
+                                        _mm512_set1_ps(scale_f[row][s]),
+                                    ),
+                                    dxv,
                                 );
-                                let minterm = _mm512_mul_ps(
-                                    sumv,
-                                    _mm512_set1_ps(dminvec[row] * mins[row][s] as f32),
-                                );
+                                let minterm = _mm512_mul_ps(sumv, _mm512_set1_ps(min_f[row][s]));
                                 *facc_slot =
                                     _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
                             }
@@ -1736,14 +1762,14 @@ pub(crate) unsafe fn q4k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32
                     _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j) as i32));
                 let high_coeff =
                     _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j + 1) as i32));
-                let low_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(low_sums), low_coeff);
-                let high_lanes = _mm256_mul_ps(_mm256_cvtepi32_ps(high_sums), high_coeff);
+                let low_lanes = _mm256_cvtepi32_ps(low_sums);
+                let high_lanes = _mm256_cvtepi32_ps(high_sums);
                 if j.is_multiple_of(2) {
-                    weights0 = _mm256_add_ps(weights0, low_lanes);
-                    weights1 = _mm256_add_ps(weights1, high_lanes);
+                    weights0 = _mm256_fmadd_ps(low_lanes, low_coeff, weights0);
+                    weights1 = _mm256_fmadd_ps(high_lanes, high_coeff, weights1);
                 } else {
-                    weights1 = _mm256_add_ps(weights1, low_lanes);
-                    weights0 = _mm256_add_ps(weights0, high_lanes);
+                    weights1 = _mm256_fmadd_ps(low_lanes, low_coeff, weights1);
+                    weights0 = _mm256_fmadd_ps(high_lanes, high_coeff, weights0);
                 }
             }
         }

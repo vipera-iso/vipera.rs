@@ -1,4 +1,4 @@
-//! Tiled scalar matmul for prefill, gated by `VIPERA_TILED=1`.
+//! Tiled matmul for prefill: on by default, `VIPERA_TILED=0` turns it off.
 //!
 //! Portable Rust only (no `unsafe`): a K-tile of 256 columns is unpacked once
 //! into a `[16][256]` `f32` tile and reused for every activation in the batch,
@@ -9,29 +9,47 @@
 //!   bytes tile by tile and never materializes the whole tensor as `f32`
 //!   (the old version allocated ~5 GB for the 191 MB `output` tensor).
 //!
-//! The default path (gate off) stays bit-exact via `dot`/`dot_batch`.
-//! The tiled path changes summation order and is approximate
-//! (`max_abs <= 1e-3 + 1e-4 * max|ref|`).
+//! The tiled path changes summation order and is therefore approximate
+//! (`max_abs <= 1e-3 + 1e-4 * max|ref|`). It is the default because the trade is a
+//! prefill chunk of 229 ms against 360 ms on the reference machine, for a deviation that
+//! does not move a single greedy token over 24 generated tokens (checked by hashing the
+//! output of both paths). `VIPERA_TILED=0` restores the bit-exact pooled path, which is
+//! what the parity work against llama.cpp should use.
 
 use vipera_core::gguf::GgmlType;
 use vipera_errors::ViperaError;
 
 use crate::quant::{f16_to_f32, q4k_scale_min};
 
-/// Whether the tiled path is requested. `VIPERA_TILED=1` turns it on;
-/// anything else (unset included) keeps the existing pooled-bit-exact path.
+/// Whether the tiled path is enabled. It is the default; `VIPERA_TILED=0` asks for the
+/// bit-exact pooled path instead.
 pub(crate) fn tiled_enabled() -> bool {
+    !std::env::var("VIPERA_TILED").is_ok_and(|value| value == "0")
+}
+
+/// Whether the scalar tiled path for `F32`/`F16` weights is requested.
+///
+/// That path dequantizes into a scalar tile and was only ever a diagnostic: it stays behind
+/// `VIPERA_TILED=1` so turning the integer prefill path on by default does not also change
+/// how the few small float tensors are summed.
+pub(crate) fn scalar_tiled_enabled() -> bool {
     std::env::var("VIPERA_TILED").is_ok_and(|value| value == "1")
 }
 
 /// Whether `B`-entry batches may take the tiled path (`B >= 8`).
 ///
-/// The point of the tile is to share one unpack across many activations, so
-/// a wide batch is where it pays; narrow batches keep the bit-exact pooled
-/// kernel, which stays the default.
+/// The point of the tile is to share one unpack across many activations, so a wide batch is
+/// where it pays. Decode is a batch of one and keeps the pooled kernel, bit for bit.
 pub(crate) fn tiled_serves<const B: usize>() -> bool {
-    tiled_enabled() && B >= 8
+    tiled_enabled() && B >= TILE_MIN_BATCH
 }
+
+/// Batch width from which the tile pays, which is also the width of its activation block.
+///
+/// Below it the 16-wide micro-tile spends most of its lanes on nothing, and the pooled kernel is
+/// both bit-exact and faster, so narrow batches keep the old summation order: a batch of eight is
+/// how a speculative verify pass runs, and it still has to match single passes bit for bit.
+pub(crate) const TILE_MIN_BATCH: usize = 16;
 
 /// Tile row height: larger than the microtile 16 so a K-tile walk reuses
 /// one unpacked tile across many output rows without holding a 256-row
