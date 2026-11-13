@@ -21,7 +21,9 @@ use vipera_errors::ViperaError;
 use vipera_sampler::{Sampler, SamplerConfig};
 
 use crate::kv::KvCache;
-use crate::pipeline::{BatchContext, BatchEntry, ForwardPass, RequestLog, Stage, StageTimings};
+use crate::pipeline::{
+    BatchContext, BatchEntry, ForwardContext, ForwardPass, RequestLog, Stage, StageTimings,
+};
 use crate::sequence::{FinishReason, Sequence};
 
 /// Runtime knobs that are not per-request.
@@ -35,6 +37,10 @@ pub struct EngineConfig {
     pub recent_window: usize,
     /// Turns one step drives at once. Beyond this, requests wait their turn in the queue.
     pub max_batch: usize,
+    /// Whether greedy turns may verify n-gram drafts in one pass. Off in the library default so a
+    /// backend without a range override is never asked for one; the CLI and server turn it on.
+    /// `VIPERA_SPECULATIVE=0` disables it and `VIPERA_SPECULATIVE=1` forces it on.
+    pub speculative: bool,
 }
 
 impl Default for EngineConfig {
@@ -47,6 +53,7 @@ impl Default for EngineConfig {
             },
             recent_window: 64,
             max_batch: 4,
+            speculative: false,
         }
     }
 }
@@ -142,6 +149,12 @@ struct Turn {
     top_logprobs: Vec<Vec<(u32, f32)>>,
     /// How many alternatives each position reports; `0` disables the scan.
     top_n: usize,
+    /// Whether this turn may verify n-gram drafts in one pass instead of decoding one token at a time.
+    speculative: bool,
+    /// Longest draft this turn will verify, raised while drafts keep landing and lowered when they
+    /// stop. A long draft costs more positions in the verify pass, so it is only paid for while it
+    /// is being accepted.
+    draft_cap: usize,
     timings: StageTimings,
 }
 
@@ -157,14 +170,20 @@ impl fmt::Debug for Turn {
     }
 }
 
-/// Whether speculative decoding is requested (`VIPERA_SPECULATIVE=1`).
-pub fn speculative_enabled() -> bool {
+/// Whether speculative decoding runs, given what the host asked for in [`EngineConfig`].
+///
+/// The verified tokens are the same ones plain decoding produces, so a greedy turn has nothing to
+/// lose on prose and up to 1.7x to gain where the text repeats. The host opts in through the config;
+/// `VIPERA_SPECULATIVE` overrides it (`0`/`false` off, anything else on) so an A/B run needs no
+/// rebuild. Turns that batch with another request do not speculate regardless, because the verify
+/// pass takes its turn out of the batch.
+pub fn speculative_enabled(config: bool) -> bool {
     std::env::var("VIPERA_SPECULATIVE")
         .map(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "0"
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
         })
-        .unwrap_or(false)
+        .unwrap_or(config)
 }
 
 /// Draft tokens proposed from the latest repeated n-gram in `context`.
@@ -185,6 +204,47 @@ pub fn ngram_draft(context: &[u32], n: usize) -> Vec<u32> {
                 return context[after..end].to_vec();
             }
             return Vec::new();
+        }
+    }
+    Vec::new()
+}
+
+/// The longest continuation of the context's trailing tokens, up to `max_draft`.
+///
+/// A longer needle is a stronger promise: four trailing tokens that repeated before are more
+/// likely to repeat again than two, which is what keeps drafts landing on quoted or structured
+/// text. The three-token minimum is what keeps ordinary prose from paying for a two-token match
+/// that almost never continues as drafted; the caller can lower it to two while its draft window
+/// is open, for the tail of a quotation. The continuation is bounded by `max_draft` because every
+/// drafted position is a position the verify pass computes.
+pub fn longest_ngram_draft(context: &[u32], max_draft: usize) -> Vec<u32> {
+    longest_ngram_draft_from(context, max_draft, 3)
+}
+
+/// [`longest_ngram_draft`] with the shortest needle the caller will accept.
+///
+/// A two-token needle is only worth paying for while the draft window is open, which is the signal
+/// that the context is repeating: there it catches the tail of a quoted phrase that a three-token
+/// needle misses. In ordinary prose the window closes after the first miss, so the cheap three-token
+/// rule takes over again and no positions are verified for nothing.
+fn longest_ngram_draft_from(context: &[u32], max_draft: usize, min_needle: usize) -> Vec<u32> {
+    if max_draft == 0 {
+        return Vec::new();
+    }
+    for n in (min_needle.max(2)..=4).rev() {
+        if context.len() < 2 * n {
+            continue;
+        }
+        let needle = &context[context.len() - n..];
+        for start in (0..=context.len() - n - 1).rev() {
+            if &context[start..start + n] == needle {
+                let after = start + n;
+                if after < context.len() {
+                    let end = (after + max_draft).min(context.len());
+                    return context[after..end].to_vec();
+                }
+                break;
+            }
         }
     }
     Vec::new()
@@ -439,6 +499,8 @@ impl<F: ForwardPass> Engine<F> {
             )));
         }
         let sampler = Sampler::new(self.config.sampler)?;
+        let speculative_allowed =
+            speculative_enabled(self.config.speculative) && self.config.sampler.temperature == 0.0;
         let sequence = self.sequences.get_mut(&id).ok_or_else(|| {
             ViperaError::invalid_argument(format!("sequence {id} does not exist"))
         })?;
@@ -465,6 +527,9 @@ impl<F: ForwardPass> Engine<F> {
         } else {
             Phase::Decode
         };
+        // Drafts are only sound for greedy decoding, and a turn that must report logprobs produces
+        // one entry per sampled token, which the verify path does not build.
+        let speculative = speculative_allowed && !collect_logprobs && top_n == 0;
         sequence.begin_prefill();
         self.waiting.push_back(Turn {
             id,
@@ -479,6 +544,8 @@ impl<F: ForwardPass> Engine<F> {
             logprobs: Vec::new(),
             top_logprobs: Vec::new(),
             top_n,
+            speculative,
+            draft_cap: 4,
             timings: StageTimings::new(),
         });
         Ok(())
@@ -512,10 +579,29 @@ impl<F: ForwardPass> Engine<F> {
             .filter(|(_, turn)| turn.phase == Phase::Prefill)
             .map(|(id, _)| *id)
             .collect();
+        // A speculative turn needs its own range call so it gets every position's logits, which the
+        // batch call does not return. It leaves the batch and is handled one step at a time, so it
+        // only does that when it is the only turn decoding: with company, the batch reads the
+        // weights once for everybody and speculation would give that up.
+        let decode_turns = self
+            .turns
+            .values()
+            .filter(|turn| turn.phase == Phase::Decode)
+            .count();
+        let alone = decode_turns == 1;
+        let speculative: Vec<u64> = if prefill.is_empty() && alone {
+            self.turns
+                .iter()
+                .filter(|(_, turn)| turn.phase == Phase::Decode && turn.speculative)
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let batch: Vec<u64> = if prefill.is_empty() {
             self.turns
                 .iter()
-                .filter(|(_, turn)| turn.phase == Phase::Decode)
+                .filter(|(_, turn)| turn.phase == Phase::Decode && !(alone && turn.speculative))
                 .map(|(id, _)| *id)
                 .collect()
         } else {
@@ -531,6 +617,13 @@ impl<F: ForwardPass> Engine<F> {
                 report.failed.push((*id, message.clone()));
             }
             return Ok(report);
+        }
+
+        for id in speculative {
+            if let Err(error) = self.step_speculative(id, &mut report) {
+                self.fail(id);
+                report.failed.push((id, error.to_string()));
+            }
         }
 
         // One draw per turn that has logits, in id order.
@@ -654,6 +747,161 @@ impl<F: ForwardPass> Engine<F> {
             } else {
                 Phase::Prefill
             };
+        }
+        Ok(())
+    }
+
+    /// Verify an n-gram draft for `id` in one range pass.
+    ///
+    /// The sequence's trailing token is still unprocessed, so the chunk is that token followed by up
+    /// to four drafted ids. Every position's logits come back from the same weight read: the prefix
+    /// that matches the draft is kept, and the model's own pick after it becomes the next
+    /// unprocessed token. The greedy stream is unchanged, which is what makes this safe to measure.
+    fn step_speculative(&mut self, id: u64, report: &mut StepReport) -> Result<(), ViperaError> {
+        let Engine {
+            kv,
+            forward,
+            config,
+            sequences,
+            turns,
+            counters,
+            ..
+        } = self;
+        let capacity = kv.config().capacity_tokens();
+        let sequence = sequences
+            .get_mut(&id)
+            .ok_or_else(|| ViperaError::internal("a speculative turn lost its sequence"))?;
+        let turn = turns
+            .get_mut(&id)
+            .ok_or_else(|| ViperaError::internal("a speculative turn lost its state"))?;
+
+        if sequence.len() as u64 >= capacity {
+            let generation = end_turn(sequence, turn, FinishReason::Length);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+            return Ok(());
+        }
+        let remaining =
+            u64::from(sequence.max_new_tokens()).saturating_sub(turn.generated.len() as u64);
+        if remaining == 0 {
+            let generation = end_turn(sequence, turn, FinishReason::Length);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+            return Ok(());
+        }
+
+        let processed = sequence.processed();
+        // One slot is always left for the model's own token after the accepted prefix.
+        let room = (capacity - sequence.len() as u64).min(remaining.saturating_sub(1));
+        let cap = turn.draft_cap.max(2);
+        let min_needle = if cap >= 4 { 2 } else { 3 };
+        let mut draft = longest_ngram_draft_from(sequence.tokens(), cap, min_needle);
+        draft.truncate(usize::try_from(room).unwrap_or(0));
+        let mut all = sequence.tokens().to_vec();
+        all.extend_from_slice(&draft);
+
+        let tokens_per_block = kv.config().tokens_per_block as usize;
+        let bytes_per_token = kv.config().bytes_per_token;
+        let allocate = Instant::now();
+        kv.reserve(id, all.len() as u64)?;
+        // Only after `reserve`: the table copy has to include the blocks it just grew.
+        let table = kv.table(id).unwrap_or(&[]).to_vec();
+        turn.timings.record(Stage::Allocate, allocate.elapsed());
+
+        let started = Instant::now();
+        let answers = {
+            let mut context = ForwardContext {
+                tokens: &all,
+                new_tokens: &all[processed..],
+                first_position: u32::try_from(processed)
+                    .map_err(|_| ViperaError::internal("sequence position exceeds 32 bits"))?,
+                block_table: &table,
+                tokens_per_block: tokens_per_block as u64,
+                bytes_per_token,
+                kv: kv.storage_mut(),
+            };
+            forward.logits_range(&mut context)
+        };
+        turn.timings.record(Stage::Compute, started.elapsed());
+        let verify = Instant::now();
+        let answers = answers?;
+        if answers.len() != all.len() - processed {
+            return Err(ViperaError::internal(format!(
+                "the verify pass returned {} results for {} positions",
+                answers.len(),
+                all.len() - processed
+            )));
+        }
+
+        // The drafts were proposed from the context; acceptance is the same greedy rule a plain
+        // decode would apply, with the turn's own sampler and recent window.
+        let recent_start = |len: usize| len.saturating_sub(config.recent_window);
+        let mut accepted = 0_usize;
+        let mut emit: Vec<u32> = Vec::with_capacity(draft.len() + 1);
+        for index in 0..draft.len() {
+            let upto = processed + 1 + index;
+            let recent = &all[recent_start(upto)..upto];
+            let pick = turn.sampler.sample(&answers[index], recent)?;
+            if pick != draft[index] {
+                break;
+            }
+            accepted += 1;
+            emit.push(pick);
+            if config.eos.contains(&pick) {
+                break;
+            }
+        }
+        let eos = emit.last().is_some_and(|token| config.eos.contains(token));
+        if !eos {
+            let upto = processed + 1 + accepted;
+            let recent = &all[recent_start(upto)..upto];
+            emit.push(turn.sampler.sample(&answers[accepted], recent)?);
+        }
+
+        // A draft that lands completely means the context is repeating, so the next pass may verify
+        // more positions; a draft that dies immediately means the compute is wasted, so it shrinks.
+        if !draft.is_empty() {
+            if accepted == draft.len() {
+                turn.draft_cap = (turn.draft_cap + 1).min(8);
+            } else if accepted == 0 {
+                turn.draft_cap = 2;
+            }
+        }
+
+        sequence.begin_decode();
+        for token in &emit {
+            sequence.push_generated(*token);
+        }
+        // The KV holds every verified position; only the rejected suffix is abandoned.
+        sequence.set_processed(processed + 1 + accepted);
+        turn.generated.extend(emit.iter().copied());
+        for token in &emit {
+            report.tokens.push(StepToken {
+                sequence: id,
+                token: *token,
+                logprob: None,
+                top_logprobs: Vec::new(),
+            });
+        }
+        turn.timings.record(Stage::Speculative, Duration::ZERO);
+        turn.timings.record(Stage::Verify, verify.elapsed());
+
+        let eos = emit.last().is_some_and(|token| config.eos.contains(token));
+        let length = u64::from(sequence.max_new_tokens()) <= turn.generated.len() as u64;
+        if eos || length {
+            let reason = if eos {
+                FinishReason::EndOfSequence
+            } else {
+                FinishReason::Length
+            };
+            let generation = end_turn(sequence, turn, reason);
+            counters.generations = counters.generations.saturating_add(1);
+            turns.remove(&id);
+            report.finished.push(generation);
+        } else {
+            turn.phase = Phase::Decode;
         }
         Ok(())
     }
@@ -1465,7 +1713,7 @@ mod tests {
 
 #[cfg(test)]
 mod speculation {
-    use super::{ngram_draft, speculative_accept};
+    use super::{longest_ngram_draft, longest_ngram_draft_from, ngram_draft, speculative_accept};
 
     #[test]
     fn draft_follows_the_last_repeat() {
@@ -1476,6 +1724,25 @@ mod speculation {
         // No earlier repeat: nothing to draft, never a stale guess.
         assert!(ngram_draft(&[1_u32, 2, 3], 2).is_empty());
         assert!(ngram_draft(&[], 1).is_empty());
+    }
+
+    #[test]
+    fn longest_draft_prefers_the_longer_needle_and_respects_its_cap() {
+        // Four trailing tokens recur at the front, so the continuation there is the draft; the
+        // shorter "1 2" match would have picked a different one.
+        let context = [1_u32, 2, 3, 4, 8, 9, 1, 2, 3, 4];
+        assert_eq!(longest_ngram_draft(&context, 8), vec![8, 9, 1, 2, 3, 4]);
+        assert_eq!(longest_ngram_draft(&context, 1), vec![8]);
+        // Repeating a bigram is not enough to draft from: prose does that constantly and the
+        // draft is thrown away, so no needle means no draft.
+        assert!(longest_ngram_draft(&[1_u32, 2, 1, 2], 8).is_empty());
+        assert!(longest_ngram_draft(&[1_u32, 2, 3], 8).is_empty());
+        assert!(longest_ngram_draft(&[1_u32, 2, 3, 1, 2, 3], 0).is_empty());
+        // While the draft window is open a bigram is allowed, which is what catches the tail of a
+        // quote; the strict rule is the default.
+        let quoted = [1_u32, 2, 1, 2];
+        assert!(longest_ngram_draft(&quoted, 8).is_empty());
+        assert_eq!(longest_ngram_draft_from(&quoted, 8, 2), vec![1, 2]);
     }
 
     #[test]

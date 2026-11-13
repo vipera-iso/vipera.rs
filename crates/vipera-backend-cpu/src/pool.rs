@@ -61,7 +61,14 @@ impl<'d, const B: usize> Pool<'d, B> {
         Self { workers, replies }
     }
 
-    /// Spread the rows of `out` over at most `threads` workers and fill them.
+    /// Spread the rows of `out` over at most `threads` participants and fill them.
+    ///
+    /// One of those participants is the calling thread, which computes the last chunk instead of
+    /// blocking on the replies. That is not just saved idle time: a pass that wakes eight workers
+    /// and waits leaves nine runnable threads for eight logical CPUs, and the work they lose is
+    /// measured. On a 200 MB Q4_K read the workers-only form streamed 28.5 GB/s and handing the
+    /// caller one chunk made it 31.1; the rest of the gap to the 42 GB/s the kernel reaches on its
+    /// own came from the explicit prefetch, which `fill_rows_batch` no longer issues.
     ///
     /// `out` holds `B * rows` values, token-major: entry `entry`'s `rows` results start at
     /// `entry * rows`. That layout makes copying a worker's reply back `B` memcpys instead of one
@@ -102,7 +109,9 @@ impl<'d, const B: usize> Pool<'d, B> {
         let mut dispatched = 0;
         let mut chunk = 0;
         let mut first_row = 0;
-        while first_row < rows {
+        // Leave the final chunk for this thread: the workers start on theirs while it runs, so all
+        // `threads` CPUs are doing kernel work instead of one waiting on channels.
+        while first_row < rows && chunk + 1 < threads {
             let count = per_thread.min(rows - first_row);
             let job = Job {
                 data,
@@ -124,6 +133,22 @@ impl<'d, const B: usize> Pool<'d, B> {
             }
             chunk += 1;
             first_row += count;
+        }
+        if first_row < rows {
+            let count = rows - first_row;
+            let activation = BatchActivation::new(activations);
+            let mut values = vec![0.0_f32; count * B];
+            // The caller's chunk has to fail the same way a worker's does: a shape mismatch is a
+            // panic in the kernel, and the contract is an error, not an unwind through the engine.
+            let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                quant::fill_rows_batch(ty, data, stride, first_row, &activation, &mut values);
+            }));
+            if computed.is_err() {
+                return Err(ViperaError::internal(
+                    "a matvec chunk panicked; refusing to return partial results",
+                ));
+            }
+            copy_back::<B>(out, rows, first_row, &values)?;
         }
 
         let mut worker_panicked = false;
