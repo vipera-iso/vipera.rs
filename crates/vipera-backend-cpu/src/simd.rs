@@ -1041,6 +1041,10 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         let mut wq = vec![0_u8; ROW_WIN * 256];
         let mut scales = vec![[0_i32; 8]; ROW_WIN];
         let mut mins = vec![[0_i32; 8]; ROW_WIN];
+        // `d * scale` and `dmin * min` are fixed for a row and sub-block once the block is read, and
+        // the band loop visits them four times per window, so the products are made once here.
+        let mut scale_f = vec![[0.0_f32; 8]; ROW_WIN];
+        let mut min_f = vec![[0.0_f32; 8]; ROW_WIN];
         let mut dvec = [0.0_f32; ROW_WIN];
         let mut dminvec = [0.0_f32; ROW_WIN];
         // Activation tile in (half, group, entry, 4) order: one 64-byte ZMM
@@ -1111,6 +1115,8 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                         let (scale, min) = crate::quant::q4k_scale_min(scale_bytes, s);
                         scales[r][s] = i32::from(scale);
                         mins[r][s] = i32::from(min);
+                        scale_f[r][s] = dvec[r] * f32::from(scale);
+                        min_f[r][s] = dminvec[r] * f32::from(min);
                     }
                     let wrow = wq.as_mut_ptr().add(r * 256);
                     for j in 0..4 {
@@ -1153,18 +1159,14 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                                 acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
                             {
                                 let row = band + t;
-                                let raw = _mm512_mullo_epi32(
-                                    *acc_slot,
-                                    _mm512_set1_epi32(scales[row][s]),
-                                );
                                 let main = _mm512_mul_ps(
-                                    _mm512_mul_ps(_mm512_cvtepi32_ps(raw), dxv),
-                                    _mm512_set1_ps(dvec[row]),
+                                    _mm512_mul_ps(
+                                        _mm512_cvtepi32_ps(*acc_slot),
+                                        _mm512_set1_ps(scale_f[row][s]),
+                                    ),
+                                    dxv,
                                 );
-                                let minterm = _mm512_mul_ps(
-                                    sumv,
-                                    _mm512_set1_ps(dminvec[row] * mins[row][s] as f32),
-                                );
+                                let minterm = _mm512_mul_ps(sumv, _mm512_set1_ps(min_f[row][s]));
                                 *facc_slot =
                                     _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
                             }
