@@ -117,3 +117,34 @@ generated fixtures cannot rot or hide licensing problems.
 
 **Alternatives**: committed binary fixtures (rejected: opaque diffs, size); mocking the parser
 (rejected: tests the mock).
+
+## R11. Admission of `cc` and the vendored ggml kernels (EXC-001)
+
+**Decision**: `cc` may enter `[build-dependencies]` of `vipera-backend-cpu`, and a pinned ggml source
+tree may live under `vendor/ggml/`, for exactly one purpose: bind `ggml_gemm_q4_K_8x8_q8_K` behind the
+`ggml-q4k` feature, default **off**. Nothing else in the workspace may use either.
+
+**Rationale**: Q4_K dots are 64% of a decode step and 74% of a prefill chunk on the measured model; the
+prefill gap to llama.cpp is 4.6x (44.4-45.0 vs 209.06 tok/s on `pp128`; llama.cpp 5676dfb, same
+machine, measured 2026-11-13) and three in-repo prototypes were falsified by measurement (tiled
+scalar 0.04 GB/s, packed VNNI 5.00 vs 5.52 GB/s). The winning kernel is
+ledgered as a library, so the mechanism that buys it is a bind, not a rewrite. Recorded as EXC-001 in
+`CONSTRAINTS.md` and specified in `docs/design/ADR-001-ggml-q4k-bind.md`.
+
+**Cost recorded before admission**: `cc` is a build-time-only crate (no runtime code, no `links`
+namespace used by anything else). The vendored kernel is ~11.7k lines of C++ in two translation units
+(`ggml/src/ggml-cpu/repack.cpp` 5 283, `ggml/src/ggml-cpu/arch/x86/repack.cpp` 6 407) plus headers it
+includes from `ggml-base`; it needs a C++ compiler, not a C compiler.
+
+**Alternatives**: rewrite the same kernels in Rust (rejected: same instruction stream, 2-4 dev-months,
+measured VNNI-vs-maddubs spread is only 0.91-1.14x); bind the whole ggml graph (rejected: replaces the
+runtime and the KV ownership the spec fixes); call llama.cpp over a pipe (rejected: ~1 ms per call vs a
+35 ms step, and it is the project's benchmark rival, not a library dependency).
+
+**Admission condition**: a dependency here is admitted only with an exception ID in `CONSTRAINTS.md`,
+an owner, an expiry, a rollback path, and a test that the feature-**off** build stays green. Missing any
+one of those, the change does not merge. This entry is not a blanket permission for other crates.
+
+**Pending before first merge of code**: the pinned ggml commit SHA, the licence/size audit of the vendored
+subset (gate: compiled object < 5 MB), and a re-measured llama.cpp baseline. Until those three exist, the
+feature is design only.

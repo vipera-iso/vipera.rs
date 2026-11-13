@@ -8,6 +8,9 @@
 !/rust-toolchain.toml
 !/README.md
 !/CONTRIBUTING.md
+# The written quality bar and its exception table (EXC-001) must travel with the code: an ADR
+# that points at an exception nobody else can see is not a record.
+!/CONSTRAINTS.md
 !/LICENSE-MIT
 !/LICENSE-APACHE
 !/crates/
