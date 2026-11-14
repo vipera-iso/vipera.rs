@@ -352,3 +352,28 @@ steps after it unchanged at `af6c31d79d0e4777`), then measured: attention per ch
 about 2 ms of a 580 ms chunk, which is the noise here, and the reason is visible in the sizes: at
 512 positions a layer's K/V is 256 KB per half and stays in L2, so decoding it again costs nearly
 nothing. Reverted rather than shipped as a second code path with no measured payoff.
+
+### Why the Q6_K kernel reads 34 GB/s where a plain read gets 44 — 2026-11-14
+
+Same 191 MB Q6_K buffer, same 8 threads: `matvec` 34.4-38.0 GB/s, a byte-sum over the same buffer
+44.2 GB/s. The buffer, the thread count and the read pattern are identical, so the difference is
+inside the kernel. Throughput against working-set size, which separates the kernel's own ceiling
+(data in L2) from the DRAM rate, `VIPERA_THREADS=1` and 8:
+
+| Q6_K working set | 1 thread | 8 threads |
+|---|---|---|
+| 0.65 MB (L2) | 11.3 GB/s | 7.5 |
+| 5.2 MB (L2/L3) | 10.8 | 24.9 |
+| 191 MB (DRAM) | 9.6 | 38.0 |
+
+One core tops out at ~11 GB/s whether the data is in L2 or streaming from DRAM, and the DRAM figure
+is 85% of that ceiling: this kernel is bound by its own instructions per byte, not by memory. Eight
+threads on four cores buy little because both siblings share the same execution ports, which is why
+the 4-core model lands well under the 44 GB/s a plain read reaches. The gap to llama.cpp is therefore
+a leaner 6-bit unpack, not traffic.
+
+What was tried: the trick that worked for Q4_K, one `hsum` per row instead of one per block, with the
+block scale folded into the lane scale. Per core it does help — 0.65 MB 11.3 -> 12.6 GB/s, 191 MB 9.6
+-> 10.7, +11% — but in the model nothing moves: `q6k` per chunk 109.2 / 110.1 ms before and 109.2 /
+113.5 after, decode 32.3 -> 33.1 ms/step. It also reorders float adds, which would have needed the
+`VIPERA_EXACT_DOT` escape hatch as a second kernel. Reverted; the measurement is the result.
