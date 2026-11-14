@@ -422,3 +422,77 @@ Same chunk (`pp512`, third chunk), `VIPERA_THREADS` 4 against 8, two runs each:
 Prefill is compute-heavy enough that the sibling threads pay for themselves (q4k 1.21x, chunk 1.19x),
 so the default of using every logical CPU is right for a prompt chunk even though the same choice buys
 only 9% on a decode step, where the work is bandwidth-bound.
+
+### A polling window between pool dispatches: measured, slower — 2026-11-14
+
+The old `pool_dispatch_cost` was measuring the wrong thing. It timed an 8-row product through
+`matvec_pooled`, and `thread_budget` gives a product that small one thread, so no worker was ever
+woken: what it timed was building the activation. The replacement hands the thread count straight to
+`fill_batch`, builds the activation outside the loop, and inserts a spin gap between products to stand
+in for the rope, norms and attention a decode step does between two of its 197 products.
+
+What one product costs the caller then, 64 rows, 8 participants:
+
+| work between two products | per product |
+|---|---|
+| none | 8.8 us |
+| 30 us | 8.9 us |
+| 300 us | 37.2 us |
+
+So a dispatch whose workers have gone idle costs 28 us more than one they are still around for, and
+197 of those is 5.5 ms of a 33 ms token. That is the size of the headroom behind the Q6_K kernel gap
+above, and it is a wake-up cost, not arithmetic.
+
+The obvious fix — let workers poll their queue for `VIPERA_SPIN_US` out of the last 45 us of the gap
+— moved the dispatch bench the right way (40.3 us at no polling against 9.0 us with a 200 us window)
+and the model the wrong way:
+
+| `VIPERA_SPIN_US` | decode ctx32 | `pp512` |
+|---|---|---|
+| 0 (blocking) | 33.0 / 33.6 ms | 3142 / 3207 ms (163.0 / 159.7 tok/s) |
+| 50 | 37.5 / 37.0 | 3258 / 3273 (157.1 / 156.4) |
+| 200 | 40.0 / 37.8 | 3360 / 3376 (152.4 / 151.7) |
+| 500 | 37.8 / 41.7 | 3476 / 3497 (147.3 / 146.4) |
+
+At 4 threads, 0 against 200 us is inside this machine's noise (42.2 / 33.7 against 31.3 / 33.1). The
+loss is contention, not the idea: eight workers polling hold their logical CPUs against the four
+physical ones, and the sibling threads that made prefill 1.21x faster lose as much as the wake-up
+saves. Reverted, including the window plumbing. The corrected bench stays, because a benchmark that
+measures the wrong thing is worse than none.
+
+### Correcting the last section: that 28 us is a C-state, not a wake — 2026-11-14
+
+The dispatch bench above sleeps between products, and a benchmark that sleeps measures the laptop's
+power management as much as the pool. Repeated with the gap spent spinning on the calling thread
+instead, one 1536x1536 Q4_K product at 8 participants:
+
+| work between two products | sleeping | busy |
+|---|---|---|
+| none | 26.9 us | 28.6 us |
+| 30 us | 27.1 | 28.4 |
+| 167 us | 28.5 | 28.5 |
+| 300 us | 70.0 | 61.0 |
+
+Flat to 167 us in both cases, and only past ~200 us does the cost jump — that is the core reaching a
+deeper idle state, and no amount of polling in the pool fixes it. A decode step averages 167 us per
+dispatch, so the 5.5 ms of "headroom" claimed above does not exist: the 28 us at a warm dispatch is
+the work (1.33 MB at ~47 GB/s while the buffer is in L3), not overhead.
+
+What that leaves is honest but dull: decode reads ~1.0 GB per token in 33 ms, 30 GB/s against the
+41.8 GB/s this machine reaches on a streaming read, and the shorter products cannot saturate DRAM
+however they are split — the 0.22 MB ones are 8 KB per worker at 8 participants and are already
+faster that way than on one core, and the 7.7 MB ones run at 43-61 GB/s.
+
+### Splitting small products across fewer workers: reverted
+
+The corollary looked obvious: if a dispatch that a single core finishes in 20 us costs 28 us, do not
+wake eight workers for it. `thread_budget` got a floor of 2M multiply-adds per worker, so a 1536x1536
+product (2.4M) went to one participant and the 8960-column ones to six. Decode went from 33.0 / 33.6
+ms to 40.5 / 40.7 ms and the q4k phase from 19.8 to 28.1-29.6 ms — worse by a third, and by more than
+the wake it saved. One core reads 1.33 MB in ~120 us; eight read it in ~28 us, of which the wake is
+nothing at this gap. Reverted.
+
+(Halfway through this round the machine picked up external load — `freebuff` at ~115% CPU, load
+average 3.1 — which slowed every configuration by about 20% and made the 5/6/7/8-thread decode
+comparison inconclusive. The two results above were taken back to back before that drift, and the
+A/B ones are within one process.)
