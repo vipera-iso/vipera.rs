@@ -285,3 +285,22 @@ microbench overstates what the copy costs inside the model, where the same buffe
 the allocator and stay in cache. Reverted: an API split with no measured payoff is not worth its
 surface. What would move this properly is one allocation for the whole batch instead of 128 per
 call, which the standalone number says is worth at most 20 ms of a 780 ms chunk anyway.
+
+### Head-to-head, llama.cpp rebuilt for the same window — 2026-11-14
+
+llama.cpp `9183a552e` rebuilt here (`GGML_NATIVE=ON`, Release) and run minutes apart from the engine,
+so the two columns see the same load and the same clock. `llama-bench -r 3` for the reference,
+best of two `prefill_vs_decode` runs for the engine.
+
+| test | llama.cpp, 4 threads | vipera, 8 threads | ratio |
+|---|---|---|---|
+| pp128 | 199.18 ± 0.77 tok/s | 167.7 tok/s (763.2 ms) | 0.84 |
+| pp512 | 194.18 ± 1.12 tok/s | 128.2 tok/s (3993 ms) | 0.66 |
+| tg64 | 38.69 ± 0.07 tok/s | 30.3 tok/s (33.0 ms/step) | 0.78 |
+
+Two things the table does not show. `llama-bench` runs a 512-token prompt as one pass, while the
+engine spreads it over four 128-token chunks, which is why its `pp512` falls from 199 to 194 tok/s
+and ours from 168 to 128: per 128 tokens llama needs 641 ms and the engine 763 ms at short context,
+and the gap widens only because the engine's later chunks pay for a longer attention window. On
+decode, llama reads the 1.117 GB of weights in 25.9 ms (43.2 GB/s, 97% of the 44.7 GB/s ceiling
+measured in section 1); the engine reads them in 33.0 ms (33.8 GB/s, 76%).
