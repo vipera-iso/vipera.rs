@@ -339,8 +339,16 @@ spread a decode step's attention, made decode at ctx 1024 slower (45.3 -> 48.7 m
 worker decodes the same KV rows again and eight spawns per layer cost more than twelve heads divide.
 Attention is therefore split by entry only, and a lone decode step keeps the serial kernel.
 
-What is left on the table: each entry still decodes its own copy of the KV history to `f32` (the
-streaming arm twice per layer), so a chunk of `pp512` decodes the same rows about 128 times. One
-decode per layer shared by every entry — every entry's history is a prefix of the chunk's — would cut
-that traffic by the batch size; it needs a buffer of `2 * positions * width` f32 per layer and is not
-in yet.
+### One KV decode shared by the whole chunk — measured, not shipped
+
+Every entry of a chunk decodes its own copy of the layer to `f32` (the streaming arm twice over), so
+a 128-token chunk reads each row of the same history about 128 times, and the entries' histories are
+prefixes of one another: one `load_layer` of the chunk's longest history could serve all of them, at
+`2 * positions * width` f32 of buffer (16 MB of ceiling was chosen for a 4096-token history).
+
+Built, hashed against the previous build (identical: `e9bf2869cdfc7212` for `pp512`, and the decode
+steps after it unchanged at `af6c31d79d0e4777`), then measured: attention per chunk 30.8 / 32.3 /
+33.8 ms before, 28.5 / 30.4 / 31.8 ms after, `pp512` 3188 ms against 3214-3259 ms. The saving is
+about 2 ms of a 580 ms chunk, which is the noise here, and the reason is visible in the sizes: at
+512 positions a layer's K/V is 256 KB per half and stays in L2, so decoding it again costs nearly
+nothing. Reverted rather than shipped as a second code path with no measured payoff.
