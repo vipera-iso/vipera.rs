@@ -304,3 +304,43 @@ and ours from 168 to 128: per 128 tokens llama needs 641 ms and the engine 763 m
 and the gap widens only because the engine's later chunks pay for a longer attention window. On
 decode, llama reads the 1.117 GB of weights in 25.9 ms (43.2 GB/s, 97% of the 44.7 GB/s ceiling
 measured in section 1); the engine reads them in 33.0 ms (33.8 GB/s, 76%).
+
+### Attention in a prompt chunk: one worker per position — shipped, 2026-11-14
+
+A chunk ran its matvecs on the pool and its attention on the caller, one entry at a time: at `pp512`
+that was 66-75 ms of a 576-615 ms chunk (11-12%), and it was the part of the chunk that grew with
+context. The rows of a chunk are independent, and so are the writes each produces, so the work now
+goes to `min(VIPERA_THREADS, entries)` workers, each with its own scratch, in one `thread::scope` per
+layer. Nothing about the arithmetic changed: every row does the same sums in the same order as a lone
+`attend` call.
+
+Measured with `prefill_vs_decode`, three runs each side, minutes apart, best of each:
+
+| quantity | before | after |
+|---|---|---|
+| attention, chunk of `pp512` | 66.1 / 70.9 / 74.9 ms | 30.8 / 32.3 / 33.8 ms |
+| chunk wall time | 575.8 / 596.6 / 614.9 ms | 555.7 / 574.6 / 590.6 ms |
+| `pp512` | 4140 ms, 123.8 tok/s | 3188 ms, 160.6 tok/s |
+| `pp128` | 757.9 ms, 168.9 tok/s | 707.0 ms, 181.0 tok/s |
+| `pp64` | 375.3 ms, 170.5 tok/s | 360.0 ms, 177.8 tok/s |
+| decode, ctx 32 | 31.7 ms/step | 31.5 ms/step |
+
+The end-to-end gain at 512 is larger than the 35 ms the chunk profile gives back, which is what the
+old chunk-by-chunk lines looked like under a different split; the wall-clock column is the one to
+quote. Chunk speedup over token-by-token prefill went from 4.75x to 6.31x.
+
+Bit-identity was checked against the pre-change build on a 512-token prompt: the logits hash over the
+whole vocabulary is `e9bf2869cdfc7212` on both, and a three-step decode after it hashes to
+`af6c31d79d0e4777` on both. The in-tree `logits_each_matches_single_passes` still passes with the
+model set.
+
+What was measured and rejected: splitting one entry's **heads** instead, which is the only way to
+spread a decode step's attention, made decode at ctx 1024 slower (45.3 -> 48.7 ms/step) because each
+worker decodes the same KV rows again and eight spawns per layer cost more than twelve heads divide.
+Attention is therefore split by entry only, and a lone decode step keeps the serial kernel.
+
+What is left on the table: each entry still decodes its own copy of the KV history to `f32` (the
+streaming arm twice per layer), so a chunk of `pp512` decodes the same rows about 128 times. One
+decode per layer shared by every entry — every entry's history is a prefix of the chunk's — would cut
+that traffic by the batch size; it needs a buffer of `2 * positions * width` f32 per layer and is not
+in yet.

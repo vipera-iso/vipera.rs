@@ -860,6 +860,14 @@ pub(crate) fn thread_budget(rows: usize, product: usize) -> usize {
     if product < PARALLEL_MIN_PRODUCT {
         return 1;
     }
+    max_threads().min(rows.max(1))
+}
+
+/// The thread count this process was configured with: `VIPERA_THREADS` when set, else what the OS
+/// reports.
+///
+/// Attention takes its worker count from here too, so one knob describes the whole backend.
+pub(crate) fn max_threads() -> usize {
     static REQUESTED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let requested = *REQUESTED.get_or_init(|| {
         std::env::var("VIPERA_THREADS")
@@ -874,7 +882,6 @@ pub(crate) fn thread_budget(rows: usize, product: usize) -> usize {
                 .map(|count| count.get())
         })
         .unwrap_or(1)
-        .min(rows.max(1))
 }
 
 pub(crate) fn fill_rows(
