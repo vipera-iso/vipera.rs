@@ -836,6 +836,7 @@ impl CpuBackend {
             tokens[entry] = context.new_tokens[0];
         }
 
+        let counts: Vec<usize> = positions.iter().map(|position| position + 1).collect();
         let Self {
             bytes,
             tok_embd,
@@ -924,32 +925,48 @@ impl CpuBackend {
                         config.rope_base,
                     );
                     let context = &contexts[entry];
-                    let mut kv = KvView {
-                        storage: &mut *kv,
+                    let mut view = KvView {
+                        storage: kv,
                         table: context.block_table,
                         tokens_per_block: context.tokens_per_block as usize,
                         bytes_per_token: context.bytes_per_token as usize,
                         layout: config.kv_layout(context.bytes_per_token as usize)?,
                     };
-                    kv.write(
+                    view.write(
                         position,
                         index,
                         shape,
                         &batch.k[entry * kv_width..][..kv_width],
                         &batch.v[entry * kv_width..][..kv_width],
                     )?;
-                    let at = crate::profile::stamp();
-                    attend(
-                        &batch.q[entry * query..][..query],
-                        &kv,
-                        index,
-                        position + 1,
-                        shape,
-                        &mut batch.attn_scratch,
-                        &mut batch.attn[entry * hidden..][..hidden],
-                    )?;
-                    crate::profile::note(crate::profile::Phase::Attention, at);
                 }
+
+                // Every row of the chunk is in the cache now, so the whole chunk's attention is one
+                // call that can use every core instead of one entry at a time on the caller.
+                let at = crate::profile::stamp();
+                let storage: &[u8] = kv;
+                let reads = contexts
+                    .iter()
+                    .map(|context| {
+                        Ok(KvRead {
+                            storage,
+                            table: context.block_table,
+                            tokens_per_block: context.tokens_per_block as usize,
+                            bytes_per_token: context.bytes_per_token as usize,
+                            layout: config.kv_layout(context.bytes_per_token as usize)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ViperaError>>()?;
+                attend_entries(
+                    &batch.q[..B * query],
+                    &reads,
+                    &counts,
+                    index,
+                    shape,
+                    &mut batch.attn_scratch,
+                    &mut batch.attn[..B * hidden],
+                )?;
+                crate::profile::note(crate::profile::Phase::Attention, at);
 
                 layer.wo.matvec_batch::<B>(
                     &pool,
@@ -1226,45 +1243,11 @@ impl KvView<'_> {
             .encode(&mut self.storage[base + layer_bytes..end], v)
     }
 
-    /// Call `visit(position, base)` for every position below `positions`; `base` is the byte
-    /// offset of `layer`'s K row at that position, and its V row follows `layer_bytes` later.
-    ///
-    /// The block table is consulted once per block, not once per position.
-    fn for_each_row(
-        &self,
-        layer: usize,
-        layer_bytes: usize,
-        positions: usize,
-        mut visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
-    ) -> Result<(), ViperaError> {
-        let per_block = self.tokens_per_block.max(1);
-        let mut position = 0;
-        while position < positions {
-            let block = *self
-                .table
-                .get(position / per_block)
-                .ok_or_else(|| ViperaError::internal("position has no KV block"))?
-                as usize;
-            let in_block = (per_block - position % per_block).min(positions - position);
-            let mut base = (block * per_block + position % per_block) * self.bytes_per_token
-                + layer * 2 * layer_bytes;
-            for offset in 0..in_block {
-                if base + 2 * layer_bytes > self.storage.len() {
-                    return Err(ViperaError::internal(
-                        "KV read would fall outside the cache buffer",
-                    ));
-                }
-                visit(position + offset, base)?;
-                base += self.bytes_per_token;
-            }
-            position += in_block;
-        }
-        Ok(())
-    }
-
     /// The whole layer decoded to `f32`. Used for short histories (see [`STREAMING_MIN_POSITIONS`]),
     /// where the buffers are small, and kept as the oracle that [`attention_streaming`] is tested
-    /// against, bit for bit.
+    /// against, bit for bit. The forward pass reads through [`KvRead`]; this form is what the tests
+    /// that build a `KvView` directly use.
+    #[cfg(test)]
     fn load_layer(
         &self,
         layer: usize,
@@ -1273,49 +1256,173 @@ impl KvView<'_> {
         k_all: &mut Vec<f32>,
         v_all: &mut Vec<f32>,
     ) -> Result<(), ViperaError> {
-        let width = shape.kv_heads * shape.head_dim;
-        let layer_bytes = self.layout.bytes_per_row(width);
-        k_all.resize(positions * width, 0.0);
-        v_all.resize(positions * width, 0.0);
-        // Positions inside one block are a fixed distance apart, so the block table is consulted once
-        // per block instead of once per position: at 1024 positions that was a division and a
-        // bounds-checked lookup for every row of every layer.
-        let per_block = self.tokens_per_block.max(1);
-        let mut position = 0;
-        while position < positions {
-            let slot = position / per_block;
-            // The table holds the physical block, which is not the index whenever two sequences share
-            // one buffer.
-            let block = *self
-                .table
-                .get(slot)
-                .ok_or_else(|| ViperaError::internal("position has no KV block"))?
-                as usize;
-            let in_block = (per_block - position % per_block).min(positions - position);
-            let mut base = (block * per_block + position % per_block) * self.bytes_per_token
-                + layer * 2 * layer_bytes;
-            for offset in 0..in_block {
-                let end = base + 2 * layer_bytes;
-                if end > self.storage.len() {
-                    return Err(ViperaError::internal(
-                        "KV read would fall outside the cache buffer",
-                    ));
-                }
-                let at = (position + offset) * width;
-                self.layout.decode(
-                    &self.storage[base..base + layer_bytes],
-                    &mut k_all[at..][..width],
-                )?;
-                self.layout.decode(
-                    &self.storage[base + layer_bytes..end],
-                    &mut v_all[at..][..width],
-                )?;
-                base += self.bytes_per_token;
-            }
-            position += in_block;
-        }
-        Ok(())
+        load_layer(
+            self.storage,
+            self.table,
+            self.tokens_per_block,
+            self.bytes_per_token,
+            self.layout,
+            layer,
+            shape,
+            positions,
+            k_all,
+            v_all,
+        )
     }
+}
+
+/// [`KvView`]'s rows without the write permission, so the attention workers can read the same
+/// buffer from several threads at once.
+struct KvRead<'a> {
+    storage: &'a [u8],
+    table: &'a [u32],
+    tokens_per_block: usize,
+    bytes_per_token: usize,
+    layout: KvLayout,
+}
+
+impl<'a> KvRead<'a> {
+    /// A read-only view of the same blocks `view` describes.
+    fn of(view: &'a KvView<'a>) -> Self {
+        Self {
+            storage: view.storage,
+            table: view.table,
+            tokens_per_block: view.tokens_per_block,
+            bytes_per_token: view.bytes_per_token,
+            layout: view.layout,
+        }
+    }
+
+    fn for_each_row(
+        &self,
+        layer: usize,
+        layer_bytes: usize,
+        positions: usize,
+        visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
+    ) -> Result<(), ViperaError> {
+        for_each_row(
+            self.storage,
+            self.table,
+            self.tokens_per_block,
+            self.bytes_per_token,
+            layer,
+            layer_bytes,
+            positions,
+            visit,
+        )
+    }
+
+    fn load_layer(
+        &self,
+        layer: usize,
+        shape: AttnShape,
+        positions: usize,
+        k_all: &mut Vec<f32>,
+        v_all: &mut Vec<f32>,
+    ) -> Result<(), ViperaError> {
+        load_layer(
+            self.storage,
+            self.table,
+            self.tokens_per_block,
+            self.bytes_per_token,
+            self.layout,
+            layer,
+            shape,
+            positions,
+            k_all,
+            v_all,
+        )
+    }
+}
+
+/// [`KvRead::for_each_row`], over a buffer both views can reach.
+#[allow(clippy::too_many_arguments)]
+fn for_each_row(
+    storage: &[u8],
+    table: &[u32],
+    tokens_per_block: usize,
+    bytes_per_token: usize,
+    layer: usize,
+    layer_bytes: usize,
+    positions: usize,
+    mut visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
+) -> Result<(), ViperaError> {
+    let per_block = tokens_per_block.max(1);
+    let mut position = 0;
+    while position < positions {
+        let block = *table
+            .get(position / per_block)
+            .ok_or_else(|| ViperaError::internal("position has no KV block"))?
+            as usize;
+        let in_block = (per_block - position % per_block).min(positions - position);
+        let mut base =
+            (block * per_block + position % per_block) * bytes_per_token + layer * 2 * layer_bytes;
+        for offset in 0..in_block {
+            if base + 2 * layer_bytes > storage.len() {
+                return Err(ViperaError::internal(
+                    "KV read would fall outside the cache buffer",
+                ));
+            }
+            visit(position + offset, base)?;
+            base += bytes_per_token;
+        }
+        position += in_block;
+    }
+    Ok(())
+}
+
+/// [`KvView::load_layer`], over a buffer both views can reach.
+#[allow(clippy::too_many_arguments)]
+fn load_layer(
+    storage: &[u8],
+    table: &[u32],
+    tokens_per_block: usize,
+    bytes_per_token: usize,
+    layout: KvLayout,
+    layer: usize,
+    shape: AttnShape,
+    positions: usize,
+    k_all: &mut Vec<f32>,
+    v_all: &mut Vec<f32>,
+) -> Result<(), ViperaError> {
+    let width = shape.kv_heads * shape.head_dim;
+    let layer_bytes = layout.bytes_per_row(width);
+    k_all.resize(positions * width, 0.0);
+    v_all.resize(positions * width, 0.0);
+    // Positions inside one block are a fixed distance apart, so the block table is consulted once
+    // per block instead of once per position: at 1024 positions that was a division and a
+    // bounds-checked lookup for every row of every layer.
+    let per_block = tokens_per_block.max(1);
+    let mut position = 0;
+    while position < positions {
+        let slot = position / per_block;
+        // The table holds the physical block, which is not the index whenever two sequences share
+        // one buffer.
+        let block = *table
+            .get(slot)
+            .ok_or_else(|| ViperaError::internal("position has no KV block"))?
+            as usize;
+        let in_block = (per_block - position % per_block).min(positions - position);
+        let mut base =
+            (block * per_block + position % per_block) * bytes_per_token + layer * 2 * layer_bytes;
+        for offset in 0..in_block {
+            let end = base + 2 * layer_bytes;
+            if end > storage.len() {
+                return Err(ViperaError::internal(
+                    "KV read would fall outside the cache buffer",
+                ));
+            }
+            let at = (position + offset) * width;
+            layout.decode(
+                &storage[base..base + layer_bytes],
+                &mut k_all[at..][..width],
+            )?;
+            layout.decode(&storage[base + layer_bytes..end], &mut v_all[at..][..width])?;
+            base += bytes_per_token;
+        }
+        position += in_block;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1328,13 +1435,40 @@ struct AttnShape {
 /// Causal grouped-query attention over every position up to and including `positions - 1`, on
 /// K/V already decoded to `f32`.
 ///
-/// This is the short-history path and the oracle for [`attention_streaming`].
+/// This is the oracle the streaming kernels are tested against, bit for bit.
+#[cfg(test)]
 fn attention(
     q: &[f32],
     k_all: &[f32],
     v_all: &[f32],
     positions: usize,
     shape: AttnShape,
+    scores: &mut Vec<f32>,
+    out: &mut [f32],
+) {
+    attention_heads(
+        q,
+        k_all,
+        v_all,
+        positions,
+        shape,
+        0..shape.heads,
+        scores,
+        out,
+    );
+}
+
+/// [`attention`] for `heads` alone: `q` is indexed by the absolute head number and `out` starts at
+/// head `heads.start`, so the per-head arithmetic and its order are the ones the whole-heads form
+/// uses.
+#[allow(clippy::too_many_arguments)]
+fn attention_heads(
+    q: &[f32],
+    k_all: &[f32],
+    v_all: &[f32],
+    positions: usize,
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
     scores: &mut Vec<f32>,
     out: &mut [f32],
 ) {
@@ -1349,7 +1483,7 @@ fn attention(
     // exp and divide in the same loop eliminates one full O(positions) pass.
     // Total must be accumulated in the same (increasing position) order as
     // before so rounding is unchanged.
-    for head in 0..shape.heads {
+    for head in heads.clone() {
         let kv_head = head / group;
         let query = &q[head * head_dim..(head + 1) * head_dim];
         let mut best = f32::NEG_INFINITY;
@@ -1371,7 +1505,7 @@ fn attention(
             total += *score;
         }
         let inverse = 1.0 / total;
-        let output = &mut out[head * head_dim..(head + 1) * head_dim];
+        let output = &mut out[(head - heads.start) * head_dim..][..head_dim];
         output.fill(0.0);
         for (position, weight) in scores.iter().take(positions).enumerate() {
             let base = (position * shape.kv_heads + kv_head) * head_dim;
@@ -1408,6 +1542,10 @@ struct AttnScratch {
 /// needs no history buffer at all.
 const STREAMING_MIN_POSITIONS: usize = 256;
 
+/// Score lanes (entries times heads times positions) below which attention stays on the calling
+/// thread, because starting the workers costs more than the split saves.
+const PARALLEL_ATTENTION_MIN: usize = 4096;
+
 /// Causal grouped-query attention read straight from the KV blocks.
 ///
 /// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
@@ -1415,6 +1553,7 @@ const STREAMING_MIN_POSITIONS: usize = 256;
 /// K and V row is decoded once into a one-row buffer that stays in L1 while every query head of
 /// its group uses it, instead of the whole history being decoded into two `positions * width`
 /// buffers that every head then re-reads from L2 or L3.
+#[cfg(test)]
 fn attention_streaming(
     q: &[f32],
     kv: &KvView<'_>,
@@ -1424,22 +1563,55 @@ fn attention_streaming(
     scratch: &mut AttnScratch,
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
-    let head_dim = shape.head_dim;
-    let group = shape.heads / shape.kv_heads;
-    let width = shape.kv_heads * head_dim;
-    let layer_bytes = kv.layout.bytes_per_row(width);
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let sequential = quant::exact_dot_requested();
     let AttnScratch {
         scores,
         row,
         head_state,
         ..
     } = scratch;
-    scores.resize(shape.heads * positions, 0.0);
+    attention_streaming_heads(
+        q,
+        &KvRead::of(kv),
+        layer,
+        positions,
+        shape,
+        0..shape.heads,
+        scores,
+        row,
+        head_state,
+        out,
+    )
+}
+
+/// [`attention_streaming`] for `heads` alone, writing their own scratch buffers so several
+/// workers can run at once. Everything each head sums is unchanged, in the same order, so a head
+/// computes the same bits whichever worker holds it.
+#[allow(clippy::too_many_arguments)]
+fn attention_streaming_heads(
+    q: &[f32],
+    kv: &KvRead<'_>,
+    layer: usize,
+    positions: usize,
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
+    scores: &mut Vec<f32>,
+    row: &mut Vec<f32>,
+    head_state: &mut Vec<f32>,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let width = shape.kv_heads * head_dim;
+    let layer_bytes = kv.layout.bytes_per_row(width);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sequential = quant::exact_dot_requested();
+    let count = heads.end - heads.start;
+    scores.clear();
+    scores.resize(count * positions, 0.0);
+    row.clear();
     row.resize(width, 0.0);
     head_state.clear();
-    head_state.resize(shape.heads, f32::NEG_INFINITY);
+    head_state.resize(count, f32::NEG_INFINITY);
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
     kv.for_each_row(layer, layer_bytes, positions, |position, base| {
@@ -1449,6 +1621,10 @@ fn attention_streaming(
             let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
             for member in 0..group {
                 let head = kv_head * group + member;
+                if head < heads.start || head >= heads.end {
+                    continue;
+                }
+                let local = head - heads.start;
                 let query = &q[head * head_dim..(head + 1) * head_dim];
                 let dot = if sequential {
                     query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
@@ -1456,27 +1632,27 @@ fn attention_streaming(
                     crate::simd::dot_f32(query, key)
                 };
                 let score = dot * scale;
-                scores[head * positions + position] = score;
-                head_state[head] = head_state[head].max(score);
+                scores[local * positions + position] = score;
+                head_state[local] = head_state[local].max(score);
             }
         }
         Ok(())
     })?;
 
     // Softmax per head, summed in increasing position order.
-    for head in 0..shape.heads {
-        let best = head_state[head];
-        let window = &mut scores[head * positions..(head + 1) * positions];
+    for local in 0..count {
+        let best = head_state[local];
+        let window = &mut scores[local * positions..(local + 1) * positions];
         let mut total = 0.0_f32;
         for score in window.iter_mut() {
             *score = (*score - best).exp();
             total += *score;
         }
-        head_state[head] = 1.0 / total;
+        head_state[local] = 1.0 / total;
     }
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
-    out[..shape.heads * head_dim].fill(0.0);
+    out[..count * head_dim].fill(0.0);
     kv.for_each_row(layer, layer_bytes, positions, |position, base| {
         let v_base = base + layer_bytes;
         kv.layout
@@ -1485,9 +1661,13 @@ fn attention_streaming(
             let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
             for member in 0..group {
                 let head = kv_head * group + member;
+                if head < heads.start || head >= heads.end {
+                    continue;
+                }
+                let local = head - heads.start;
                 crate::simd::axpy_f32(
-                    &mut out[head * head_dim..(head + 1) * head_dim],
-                    scores[head * positions + position] * head_state[head],
+                    &mut out[local * head_dim..(local + 1) * head_dim],
+                    scores[local * positions + position] * head_state[local],
                     value,
                 );
             }
@@ -1510,17 +1690,154 @@ fn attend(
     scratch: &mut AttnScratch,
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
-    if positions >= STREAMING_MIN_POSITIONS {
-        return attention_streaming(q, kv, layer, positions, shape, scratch, out);
+    let read = KvRead::of(kv);
+    attend_entries(
+        q,
+        std::slice::from_ref(&read),
+        std::slice::from_ref(&positions),
+        layer,
+        shape,
+        scratch,
+        out,
+    )
+}
+
+/// A chunk's worth of attention: one output row per entry, each with its own history length.
+///
+/// The rows are independent, and so are the heads inside one row, so the work goes to
+/// `min(VIPERA_THREADS, rows or heads)` workers. Each worker writes a disjoint output slice and
+/// keeps its own scratch, and every row does the same arithmetic in the same order as a lone
+/// [`attend`] call, so a chunk's logits still match a token-by-token run bit for bit.
+///
+/// Until this, attention was the one part of a prompt chunk that ran on a single thread while the
+/// matvecs used the pool: at a 512-token prompt it is 11-12% of a chunk's time.
+fn attend_entries(
+    q: &[f32],
+    kv: &[KvRead<'_>],
+    positions: &[usize],
+    layer: usize,
+    shape: AttnShape,
+    scratch: &mut AttnScratch,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let entries = positions.len();
+    let query = shape.heads * shape.head_dim;
+    if entries == 0 {
+        return Ok(());
     }
-    let AttnScratch {
-        k_all,
-        v_all,
-        scores,
-        ..
-    } = scratch;
-    kv.load_layer(layer, shape, positions, k_all, v_all)?;
-    attention(q, k_all, v_all, positions, shape, scores, out);
+    if cfg!(debug_assertions) {
+        assert_eq!(kv.len(), entries, "one KV view per entry");
+        assert_eq!(out.len(), entries * query, "one output row per entry");
+    }
+    let last = positions.iter().copied().max().unwrap_or(0);
+    let lanes = entries.saturating_mul(shape.heads).saturating_mul(last);
+    // Only the entries are split. Splitting a single entry's heads was measured too: at ctx 1024 a
+    // decode step went from 45.3 to 48.7 ms, because every worker decodes the same KV rows again and
+    // the workers cost more than the twelve heads they divide.
+    let wanted = if lanes < PARALLEL_ATTENTION_MIN {
+        1
+    } else {
+        quant::max_threads().min(entries)
+    };
+
+    if wanted <= 1 {
+        for entry in 0..entries {
+            attend_entry(
+                &q[entry * query..][..query],
+                &kv[entry],
+                layer,
+                positions[entry],
+                shape,
+                0..shape.heads,
+                scratch,
+                &mut out[entry * query..][..query],
+            )?;
+        }
+        return Ok(());
+    }
+
+    // One worker per contiguous run of entries: the output rows are already in that order.
+    let mut jobs = Vec::with_capacity(wanted);
+    let mut cursor: &mut [f32] = out;
+    for part in 0..wanted {
+        let first = entries * part / wanted;
+        let end = entries * (part + 1) / wanted;
+        let (slot, rest) = cursor.split_at_mut((end - first) * query);
+        cursor = rest;
+        jobs.push((first, slot));
+    }
+    let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(jobs.len());
+        for (first, slot) in jobs {
+            handles.push(scope.spawn(move || -> Result<(), ViperaError> {
+                let mut local = AttnScratch::default();
+                for (offset, row) in slot.chunks_mut(query).enumerate() {
+                    let entry = first + offset;
+                    attend_entry(
+                        &q[entry * query..][..query],
+                        &kv[entry],
+                        layer,
+                        positions[entry],
+                        shape,
+                        0..shape.heads,
+                        &mut local,
+                        row,
+                    )?;
+                }
+                Ok(())
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("an attention worker panicked"))
+            .collect()
+    });
+    results.into_iter().collect()
+}
+
+/// One entry's attention, over `heads` only, choosing the kernel by history length.
+#[allow(clippy::too_many_arguments)]
+fn attend_entry(
+    q: &[f32],
+    kv: &KvRead<'_>,
+    layer: usize,
+    positions: usize,
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
+    scratch: &mut AttnScratch,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    if positions >= STREAMING_MIN_POSITIONS {
+        return attention_streaming_heads(
+            q,
+            kv,
+            layer,
+            positions,
+            shape,
+            heads,
+            &mut scratch.scores,
+            &mut scratch.row,
+            &mut scratch.head_state,
+            out,
+        );
+    }
+    kv.load_layer(
+        layer,
+        shape,
+        positions,
+        &mut scratch.k_all,
+        &mut scratch.v_all,
+    )?;
+    attention_heads(
+        q,
+        &scratch.k_all,
+        &scratch.v_all,
+        positions,
+        shape,
+        heads,
+        &mut scratch.scores,
+        out,
+    );
     Ok(())
 }
 

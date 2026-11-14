@@ -304,3 +304,76 @@ and ours from 168 to 128: per 128 tokens llama needs 641 ms and the engine 763 m
 and the gap widens only because the engine's later chunks pay for a longer attention window. On
 decode, llama reads the 1.117 GB of weights in 25.9 ms (43.2 GB/s, 97% of the 44.7 GB/s ceiling
 measured in section 1); the engine reads them in 33.0 ms (33.8 GB/s, 76%).
+
+### Attention in a prompt chunk: one worker per position — shipped, 2026-11-14
+
+A chunk ran its matvecs on the pool and its attention on the caller, one entry at a time: at `pp512`
+that was 66-75 ms of a 576-615 ms chunk (11-12%), and it was the part of the chunk that grew with
+context. The rows of a chunk are independent, and so are the writes each produces, so the work now
+goes to `min(VIPERA_THREADS, entries)` workers, each with its own scratch, in one `thread::scope` per
+layer. Nothing about the arithmetic changed: every row does the same sums in the same order as a lone
+`attend` call.
+
+Measured with `prefill_vs_decode`, three runs each side, minutes apart, best of each:
+
+| quantity | before | after |
+|---|---|---|
+| attention, chunk of `pp512` | 66.1 / 70.9 / 74.9 ms | 30.8 / 32.3 / 33.8 ms |
+| chunk wall time | 575.8 / 596.6 / 614.9 ms | 555.7 / 574.6 / 590.6 ms |
+| `pp512` | 4140 ms, 123.8 tok/s | 3188 ms, 160.6 tok/s |
+| `pp128` | 757.9 ms, 168.9 tok/s | 707.0 ms, 181.0 tok/s |
+| `pp64` | 375.3 ms, 170.5 tok/s | 360.0 ms, 177.8 tok/s |
+| decode, ctx 32 | 31.7 ms/step | 31.5 ms/step |
+
+The end-to-end gain at 512 is larger than the 35 ms the chunk profile gives back, which is what the
+old chunk-by-chunk lines looked like under a different split; the wall-clock column is the one to
+quote. Chunk speedup over token-by-token prefill went from 4.75x to 6.31x.
+
+Bit-identity was checked against the pre-change build on a 512-token prompt: the logits hash over the
+whole vocabulary is `e9bf2869cdfc7212` on both, and a three-step decode after it hashes to
+`af6c31d79d0e4777` on both. The in-tree `logits_each_matches_single_passes` still passes with the
+model set.
+
+What was measured and rejected: splitting one entry's **heads** instead, which is the only way to
+spread a decode step's attention, made decode at ctx 1024 slower (45.3 -> 48.7 ms/step) because each
+worker decodes the same KV rows again and eight spawns per layer cost more than twelve heads divide.
+Attention is therefore split by entry only, and a lone decode step keeps the serial kernel.
+
+### One KV decode shared by the whole chunk — measured, not shipped
+
+Every entry of a chunk decodes its own copy of the layer to `f32` (the streaming arm twice over), so
+a 128-token chunk reads each row of the same history about 128 times, and the entries' histories are
+prefixes of one another: one `load_layer` of the chunk's longest history could serve all of them, at
+`2 * positions * width` f32 of buffer (16 MB of ceiling was chosen for a 4096-token history).
+
+Built, hashed against the previous build (identical: `e9bf2869cdfc7212` for `pp512`, and the decode
+steps after it unchanged at `af6c31d79d0e4777`), then measured: attention per chunk 30.8 / 32.3 /
+33.8 ms before, 28.5 / 30.4 / 31.8 ms after, `pp512` 3188 ms against 3214-3259 ms. The saving is
+about 2 ms of a 580 ms chunk, which is the noise here, and the reason is visible in the sizes: at
+512 positions a layer's K/V is 256 KB per half and stays in L2, so decoding it again costs nearly
+nothing. Reverted rather than shipped as a second code path with no measured payoff.
+
+### Why the Q6_K kernel reads 34 GB/s where a plain read gets 44 — 2026-11-14
+
+Same 191 MB Q6_K buffer, same 8 threads: `matvec` 34.4-38.0 GB/s, a byte-sum over the same buffer
+44.2 GB/s. The buffer, the thread count and the read pattern are identical, so the difference is
+inside the kernel. Throughput against working-set size, which separates the kernel's own ceiling
+(data in L2) from the DRAM rate, `VIPERA_THREADS=1` and 8:
+
+| Q6_K working set | 1 thread | 8 threads |
+|---|---|---|
+| 0.65 MB (L2) | 11.3 GB/s | 7.5 |
+| 5.2 MB (L2/L3) | 10.8 | 24.9 |
+| 191 MB (DRAM) | 9.6 | 38.0 |
+
+One core tops out at ~11 GB/s whether the data is in L2 or streaming from DRAM, and the DRAM figure
+is 85% of that ceiling: this kernel is bound by its own instructions per byte, not by memory. Eight
+threads on four cores buy little because both siblings share the same execution ports, which is why
+the 4-core model lands well under the 44 GB/s a plain read reaches. The gap to llama.cpp is therefore
+a leaner 6-bit unpack, not traffic.
+
+What was tried: the trick that worked for Q4_K, one `hsum` per row instead of one per block, with the
+block scale folded into the lane scale. Per core it does help — 0.65 MB 11.3 -> 12.6 GB/s, 191 MB 9.6
+-> 10.7, +11% — but in the model nothing moves: `q6k` per chunk 109.2 / 110.1 ms before and 109.2 /
+113.5 after, decode 32.3 -> 33.1 ms/step. It also reorders float adds, which would have needed the
+`VIPERA_EXACT_DOT` escape hatch as a second kernel. Reverted; the measurement is the result.
