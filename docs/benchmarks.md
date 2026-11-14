@@ -422,3 +422,40 @@ Same chunk (`pp512`, third chunk), `VIPERA_THREADS` 4 against 8, two runs each:
 Prefill is compute-heavy enough that the sibling threads pay for themselves (q4k 1.21x, chunk 1.19x),
 so the default of using every logical CPU is right for a prompt chunk even though the same choice buys
 only 9% on a decode step, where the work is bandwidth-bound.
+
+### A polling window between pool dispatches: measured, slower — 2026-11-14
+
+The old `pool_dispatch_cost` was measuring the wrong thing. It timed an 8-row product through
+`matvec_pooled`, and `thread_budget` gives a product that small one thread, so no worker was ever
+woken: what it timed was building the activation. The replacement hands the thread count straight to
+`fill_batch`, builds the activation outside the loop, and inserts a spin gap between products to stand
+in for the rope, norms and attention a decode step does between two of its 197 products.
+
+What one product costs the caller then, 64 rows, 8 participants:
+
+| work between two products | per product |
+|---|---|
+| none | 8.8 us |
+| 30 us | 8.9 us |
+| 300 us | 37.2 us |
+
+So a dispatch whose workers have gone idle costs 28 us more than one they are still around for, and
+197 of those is 5.5 ms of a 33 ms token. That is the size of the headroom behind the Q6_K kernel gap
+above, and it is a wake-up cost, not arithmetic.
+
+The obvious fix — let workers poll their queue for `VIPERA_SPIN_US` out of the last 45 us of the gap
+— moved the dispatch bench the right way (40.3 us at no polling against 9.0 us with a 200 us window)
+and the model the wrong way:
+
+| `VIPERA_SPIN_US` | decode ctx32 | `pp512` |
+|---|---|---|
+| 0 (blocking) | 33.0 / 33.6 ms | 3142 / 3207 ms (163.0 / 159.7 tok/s) |
+| 50 | 37.5 / 37.0 | 3258 / 3273 (157.1 / 156.4) |
+| 200 | 40.0 / 37.8 | 3360 / 3376 (152.4 / 151.7) |
+| 500 | 37.8 / 41.7 | 3476 / 3497 (147.3 / 146.4) |
+
+At 4 threads, 0 against 200 us is inside this machine's noise (42.2 / 33.7 against 31.3 / 33.1). The
+loss is contention, not the idea: eight workers polling hold their logical CPUs against the four
+physical ones, and the sibling threads that made prefill 1.21x faster lose as much as the wake-up
+saves. Reverted, including the window plumbing. The corrected bench stays, because a benchmark that
+measures the wrong thing is worse than none.
