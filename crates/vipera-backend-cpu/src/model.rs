@@ -1598,19 +1598,27 @@ fn exp(value: f32) -> f32 {
                                     * (0.009_618_129
                                         + fraction
                                             * (0.001_333_355_8 + fraction * 0.000_154_035_3)))));
-    // Exponents outside this range are already zero or infinity in `f32`.
+    // Exponents outside this range are already zero or infinity in `f32`. The bound is applied to
+    // `whole` in the float domain rather than left to the integer clamp: above 2^22 the cast
+    // saturates to `i32::MAX` and the `+ 127` then wraps to a large negative, which turned a huge
+    // positive exponent into a zero. Clamping here is a no-op for every input whose exponent is
+    // already pinned at 0 or 254, and it is what the vector kernel in `simd` does, so both paths
+    // stay bit-identical.
+    let whole = whole.clamp(-127.0, 128.0);
     let exponent = (whole as i32 + 127).clamp(0, 254) as u32;
     polynomial * f32::from_bits(exponent << 23)
 }
 
-fn silu(value: f32) -> f32 {
+/// `x * sigmoid(x)`, the scalar definition the vector kernel reproduces bit for bit.
+///
+/// Visible to the crate so `simd`'s test can compare against it; the vectorized path lives in
+/// [`crate::simd::silu_mul`], which is where the profile's `rest` bucket goes.
+pub(crate) fn silu(value: f32) -> f32 {
     value / (1.0 + exp(-value))
 }
 
 fn silu_mul(up: &mut [f32], gate: &[f32]) {
-    for (out, gate) in up.iter_mut().zip(gate) {
-        *out *= silu(*gate);
-    }
+    crate::simd::silu_mul(up, gate);
 }
 
 #[inline]
