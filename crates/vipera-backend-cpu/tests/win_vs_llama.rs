@@ -685,9 +685,12 @@ fn decode_speculative(
         }
         // The token after the last accepted draft is the model's own answer, always usable.
         let tail = argmax(&answers[accepted]) as u32;
+        // `chunk[0]` is `next`, which the previous round already emitted: only the accepted part
+        // of the chunk joins the context, and `tail` stays pending until the next round feeds it
+        // as that round's `chunk[0]`. Pushing it here would append it twice — the context would
+        // then be one token longer than the KV that was filled for it, and logits drift.
         state.tokens.extend_from_slice(&chunk[..=accepted]);
         out.push(tail);
-        state.tokens.push(tail);
         next = tail;
     }
     out.truncate(steps);
@@ -726,9 +729,10 @@ fn decode_adaptive(
             }
         }
         let tail = argmax(&answers[accepted]) as u32;
+        // As in `decode_speculative`: `next` is already in the context, so only the accepted part
+        // of the chunk is appended, and `tail` is fed as the next round's first token.
         state.tokens.extend_from_slice(&chunk[..=accepted]);
         out.push(tail);
-        state.tokens.push(tail);
         next = tail;
         k = if accepted == 0 {
             k.saturating_sub(1).max(1)
