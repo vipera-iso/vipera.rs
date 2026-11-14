@@ -21,12 +21,18 @@
 !/scripts/parity-tokenize.sh
 !/specs/
 # Design notes for the engine itself live beside the specs. Only this directory is part of the
-# repository; the other trees under docs/ (benchmark output, graph dumps, scratch notes) are not.
+# repository; the other trees under docs/ (graph dumps, scratch notes) are not.
 !/docs/
 /docs/*
 !/docs/design/
 /docs/design/*
 !/docs/design/*.md
+# The measurement record travels with the code: a claim in a comment or an ADR points at these
+# numbers, and a number that only exists on one machine's disk cannot be checked by anyone else.
+!/docs/benchmarks.md
+!/docs/benchmarks/
+/docs/benchmarks/*
+!/docs/benchmarks/*.md
 
 # Build output is large and reproducible. The pattern is not anchored so the
 # out-of-workspace prototype under crates/ does not drag its own target/ in.
