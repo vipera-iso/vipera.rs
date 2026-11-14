@@ -377,3 +377,48 @@ block scale folded into the lane scale. Per core it does help — 0.65 MB 11.3 -
 -> 10.7, +11% — but in the model nothing moves: `q6k` per chunk 109.2 / 110.1 ms before and 109.2 /
 113.5 after, decode 32.3 -> 33.1 ms/step. It also reorders float adds, which would have needed the
 `VIPERA_EXACT_DOT` escape hatch as a second kernel. Reverted; the measurement is the result.
+
+### A leaner Q6_K unpack: 39% faster per core, invisible end to end — 2026-11-14
+
+The Q6_K decode kernel rebuilt its scales from scalars for every 32-value run and computed the
+6-bit bias with a second `maddubs`. Both can go: build the block's eight scales once as a vector,
+spread a run's pair with one `permutevar8x32_ps` and one broadcast of the activation scale, and let
+`vpdpbusd` do the four products and the bias subtraction in two instructions. The integer sums and
+the float associations are unchanged, so the kernel is bit-identical to the AVX2 one (checked: the
+`pp512` logits hash `e9bf2869cdfc7212` and the three-step decode `05437e1e5c745384` are the same on
+both builds).
+
+Throughput of the kernel, same buffers as the section above:
+
+| Q6_K working set | before | after |
+|---|---|---|
+| 0.65 MB (L2), 1 thread | 11.3 GB/s | 15.7 (+39%) |
+| 5.2 MB, 1 thread | 10.8 | 15.2 |
+| 191 MB (DRAM), 1 thread | 9.6 | 12.4 |
+| 191 MB (DRAM), 8 threads | 38.0 | 41.8 (+10%) |
+
+End to end: decode `q6k` 10.0-11.2 ms per step before and 10.0-11.2 after, step 33.3 / 33.2 / 34.7 ms
+against 32.3 / 33.2 / 33.5, `pp512` 3161-3295 ms against 3259-3279 (prefill uses the batched Q6_K
+kernel, which this did not touch). Reverted: a second kernel with no measured payoff.
+
+The number that matters from the exercise is the gap it exposes. In a decode step the Q6_K phase reads
+253 MB and takes 10.2 ms — 27 GB/s — while the same kernel over the same shapes standalone reaches
+41.8 GB/s. At 41.8 that phase would be 6.1 ms, so ~4 ms of a 33 ms token is spent outside the kernel:
+the per-layer Q6_K calls are 0.32 MB and 1.9 MB, and the 197 `matvec` calls of a step are where that
+time goes. That is the next thing to measure, not the kernel.
+
+### Is SMT worth it for the q4k phase? — measured, yes
+
+Same chunk (`pp512`, third chunk), `VIPERA_THREADS` 4 against 8, two runs each:
+
+| phase | 4 threads | 8 threads |
+|---|---|---|
+| q4k | 499.7 / 527.4 ms | 415.8 / 419.9 ms |
+| q6k | 128.4 / 130.8 ms | 115.1 / 115.2 ms |
+| attention | 41.1 / 42.0 ms | 34.9 / 35.1 ms |
+| chunk | 720.3 / 751.5 ms | 621.3 / 625.3 ms |
+| `pp512` | 3880 / 3936 ms (132 / 130 tok/s) | 3259 / 3279 ms (157 / 156 tok/s) |
+
+Prefill is compute-heavy enough that the sibling threads pay for themselves (q4k 1.21x, chunk 1.19x),
+so the default of using every logical CPU is right for a prompt chunk even though the same choice buys
+only 9% on a decode step, where the work is bandwidth-bound.
