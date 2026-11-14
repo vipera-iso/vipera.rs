@@ -251,3 +251,37 @@ The share is frequency-independent, so it survives the noise the absolute times 
 about 55 ms off a 1.0 s chunk. The `exp` helper also saturated `whole as i32` before adding the
 exponent bias, so inputs beyond 2^22 wrapped to an exponent field of 0 and returned 0 instead of inf;
 the vector path hit that in testing and both paths now clamp first.
+
+### Where a prefill chunk's time goes, and what the kernel does inside it — 2026-11-14
+
+A 128-token chunk on this machine splits as q4k 63%, q6k 17%, attention 12%, norm 2%, rest 6%. The
+question that matters is whether the Q4_K phase is slow because of the kernel or because of the
+bookkeeping around it, so both were timed separately with temporary counters (since reverted):
+
+| quantity | measured |
+|---|---|
+| Q4_K batched products, whole call | 607 GFLOPS |
+| ... the tiled kernel call alone | 786 GFLOPS |
+| ... building the activation it reads | 830 ms against 6065 ms of kernel |
+| the same kernel standalone, 8 threads | 776 GFLOPS |
+
+The kernel in the model runs at the rate it runs at on its own, so there is no hidden overhead to
+recover inside the Q4_K phase: 75% of a chunk is kernel work already at its measured ceiling, and the
+gap to llama.cpp at the same prompt length (641 ms per chunk against 780) is not in this phase.
+
+### Reusing one prepared activation across projections — measured, not shipped
+
+`q`, `k` and `v` read the same normalised vector, and `gate` and `up` another, yet each product
+rebuilt the activation: a copy of 128x1536 f32, its 32-value sums, and the `i8` rounding. Built once
+per group instead — `prepare_batch` plus `matvec_pooled_batch_prepared` — the prefill chunk should
+have dropped by the 32 ms per chunk that four saved preparations per layer come to, on a
+`prepare_batch` measured at 0.29 ms per 128x1536 batch (1.5 ns/value, of which 0.08 ms is the
+rounding and 0.20 ms the copy and sums).
+
+It did not. Six alternating pairs, best of each: `pp128` 754.3 ms before, 758.1 ms after; `pp512`
+4095 ms before, 4117 ms after. The medians lean the other way (782.5 -> 762.0 ms on `pp128`), which
+is the size of the noise here, so the honest reading is "no measurable change" — and the isolated
+microbench overstates what the copy costs inside the model, where the same buffers are recycled by
+the allocator and stay in cache. Reverted: an API split with no measured payoff is not worth its
+surface. What would move this properly is one allocation for the whole batch instead of 128 per
+call, which the standalone number says is worth at most 20 ms of a 780 ms chunk anyway.
