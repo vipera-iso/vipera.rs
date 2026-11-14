@@ -75,22 +75,21 @@
 //! safe entry point that checks the CPU.
 #![allow(unsafe_code)]
 
-#[cfg(test)]
-use std::arch::x86_64::_mm256_add_epi32;
 use std::arch::x86_64::{
     __m128i, __m256, __m256i, __m512, __m512i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss,
     _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps,
-    _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm256_add_ps, _mm256_and_si256,
-    _mm256_castps256_ps128, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32, _mm256_cvtph_ps,
-    _mm256_dpbusd_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps, _mm256_or_si256,
-    _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256, _mm256_slli_epi16,
-    _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps, _mm256_storeu_si256,
-    _mm256_sub_epi16, _mm256_sub_epi32, _mm512_add_ps, _mm512_cvtepi32_ps, _mm512_dpbusd_epi32,
-    _mm512_loadu_ps, _mm512_loadu_si512, _mm512_mul_ps, _mm512_mullo_epi32, _mm512_set1_epi32,
-    _mm512_set1_ps, _mm512_setzero_ps, _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_epi32,
-    _mm512_sub_ps,
+    _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
+    _mm256_castps256_ps128, _mm256_castsi256_ps, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
+    _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32,
+    _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16,
+    _mm256_maddubs_epi16, _mm256_max_epi32, _mm256_max_ps, _mm256_min_epi32, _mm256_min_ps,
+    _mm256_mul_ps, _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8,
+    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256,
+    _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps,
+    _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32, _mm256_sub_ps, _mm512_add_ps,
+    _mm512_cvtepi32_ps, _mm512_dpbusd_epi32, _mm512_loadu_ps, _mm512_loadu_si512, _mm512_mul_ps,
+    _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps, _mm512_setzero_si512,
+    _mm512_storeu_ps, _mm512_sub_epi32, _mm512_sub_ps,
 };
 
 use vipera_core::gguf::GgmlType;
@@ -279,6 +278,109 @@ pub(crate) fn half_to_float(source: &[u8], values: &mut [f32]) {
     {
         *value = f16_to_f32(u16::from_le_bytes(*chunk));
     }
+}
+
+/// The SwiGLU multiply `out *= silu(g)` in eight-lane steps.
+///
+/// Every arithmetic operation is the scalar one in [`crate::model::silu`]'s `exp` (see
+/// [`exp_x8`]), lane by lane and in the same order, so the bits are identical rather than close:
+/// the test below compares `to_bits` over a dense sweep, random patterns and the special values.
+/// The scalar path is a quarter of a prefill chunk's `rest` bucket, so this is worth the
+/// duplication.
+///
+/// Safe to call: it detects AVX2 itself, applies the shorter of the two lengths, and finishes the
+/// tail one value at a time.
+pub(crate) fn silu_mul(up: &mut [f32], gate: &[f32]) {
+    let length = up.len().min(gate.len());
+    if length == 0 {
+        return;
+    }
+    if available() && length >= 8 {
+        // SAFETY: AVX2 was just detected and the kernel stays inside `length`.
+        unsafe { silu_mul_avx2(&mut up[..length], &gate[..length]) };
+        return;
+    }
+    for (out, gate) in up[..length].iter_mut().zip(&gate[..length]) {
+        *out *= crate::model::silu(*gate);
+    }
+}
+
+/// [`silu_mul`] in eight-value steps.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, and both slices must have the same length.
+#[target_feature(enable = "avx2")]
+unsafe fn silu_mul_avx2(up: &mut [f32], gate: &[f32]) {
+    // SAFETY: the caller guarantees AVX2 and equal lengths; every load and store is at `at < len`
+    // and reads or writes eight values, which the loop condition guarantees are in range.
+    unsafe {
+        let len = up.len();
+        let out = up.as_mut_ptr();
+        let input = gate.as_ptr();
+        let mut at = 0;
+        while at + 8 <= len {
+            let g = _mm256_loadu_ps(input.add(at));
+            let exponentiated = exp_x8(_mm256_sub_ps(_mm256_setzero_ps(), g));
+            // `g / (1 + exp(-g))`, the scalar definition.
+            let silu = _mm256_div_ps(g, _mm256_add_ps(_mm256_set1_ps(1.0), exponentiated));
+            let value = _mm256_mul_ps(_mm256_loadu_ps(out.add(at)), silu);
+            _mm256_storeu_ps(out.add(at), value);
+            at += 8;
+        }
+        while at < len {
+            *out.add(at) *= crate::model::silu(*input.add(at));
+            at += 1;
+        }
+    }
+}
+
+/// `exp` from [`crate::model`], in eight lanes.
+///
+/// The polynomial, the rounding trick and the exponent clamp are the scalar constants in
+/// [`crate::model::silu`]'s helper, so a lane gets exactly the scalar result. `whole` is clamped in
+/// the float domain before the integer conversion because a cast of a huge float saturates, while
+/// `cvttps2dq` does not; clamping first makes both paths agree, and only for inputs whose exponent
+/// is already pinned to 254.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[target_feature(enable = "avx2")]
+unsafe fn exp_x8(value: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    const LOG2_E: f32 = std::f32::consts::LOG2_E;
+    const LN_2: f32 = std::f32::consts::LN_2;
+    let scaled = _mm256_mul_ps(value, _mm256_set1_ps(LOG2_E));
+    let magic = _mm256_set1_ps(12_582_912.0);
+    let whole = _mm256_sub_ps(_mm256_add_ps(scaled, magic), magic);
+    let fraction = _mm256_sub_ps(scaled, whole);
+    let mut polynomial = _mm256_set1_ps(0.000_154_035_3);
+    for coefficient in [
+        0.001_333_355_8,
+        0.009_618_129,
+        0.055_504_11,
+        0.240_226_5,
+        LN_2,
+        1.0,
+    ] {
+        polynomial = _mm256_add_ps(
+            _mm256_set1_ps(coefficient),
+            _mm256_mul_ps(fraction, polynomial),
+        );
+    }
+    let bounded = _mm256_min_ps(
+        _mm256_max_ps(whole, _mm256_set1_ps(-127.0)),
+        _mm256_set1_ps(128.0),
+    );
+    let exponent = _mm256_add_epi32(_mm256_cvttps_epi32(bounded), _mm256_set1_epi32(127));
+    let exponent = _mm256_slli_epi32(
+        _mm256_min_epi32(
+            _mm256_max_epi32(exponent, _mm256_setzero_si256()),
+            _mm256_set1_epi32(254),
+        ),
+        23,
+    );
+    _mm256_mul_ps(polynomial, _mm256_castsi256_ps(exponent))
 }
 
 /// [`half_to_float`] in eight-value steps.
@@ -2949,6 +3051,71 @@ mod tests {
             // SAFETY: as above; the batch kernel has the same contract as the single one.
             unsafe { q6k_dot_batch_q8(&row, xs, &mut actual) };
             assert_eq!(actual, expected, "trial {trial}");
+        }
+    }
+
+    /// The SwiGLU multiply must be bit-identical to the scalar definition, lane for lane: it runs
+    /// over every activation of a chunk, and a changed bit would move the sampling. Checked on a
+    /// dense sweep, on random bit patterns (which reach the subnormals and the huge magnitudes), and
+    /// on the special values.
+    #[test]
+    fn silu_mul_matches_the_scalar_one_bit_for_bit() {
+        if !available() {
+            eprintln!("skipped: this CPU has no AVX2");
+            return;
+        }
+        let mut inputs: Vec<f32> = (-200 * 256..=200 * 256)
+            .map(|step| step as f32 / 256.0)
+            .collect();
+        let mut bits = 0x1234_5678_u32;
+        for _ in 0..200_000 {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            inputs.push(f32::from_bits(bits));
+        }
+        inputs.extend_from_slice(&[
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::MIN,
+            f32::MAX,
+            -f32::MAX,
+            1e-45,
+            -1e-45,
+        ]);
+        // Padded to a multiple of eight so the vector path and the tail both run.
+        while !inputs.len().is_multiple_of(8) {
+            inputs.push(0.5);
+        }
+        let gate = inputs.clone();
+        let mut up: Vec<f32> = (0..inputs.len())
+            .map(|at| 0.25 + at as f32 * 1e-6)
+            .collect();
+        let mut expected = up.clone();
+        for (out, gate) in expected.iter_mut().zip(&gate) {
+            *out *= crate::model::silu(*gate);
+        }
+        silu_mul(&mut up, &gate);
+        for (at, (actual, expected)) in up.iter().zip(&expected).enumerate() {
+            if expected.is_nan() {
+                assert!(
+                    actual.is_nan(),
+                    "input {:#x} should be NaN",
+                    gate[at].to_bits()
+                );
+            } else {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "input {:#x} ({} -> {}) differed: {actual} vs {expected}",
+                    gate[at].to_bits(),
+                    gate[at],
+                    expected / (0.25 + at as f32 * 1e-6),
+                );
+            }
         }
     }
 
