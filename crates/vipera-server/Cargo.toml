@@ -12,6 +12,7 @@ vipera-errors.workspace = true
 vipera-runtime.workspace = true
 vipera-sampler.workspace = true
 vipera-tokenizer.workspace = true
+vipera-traits.workspace = true
 
 [lints]
 workspace = true
