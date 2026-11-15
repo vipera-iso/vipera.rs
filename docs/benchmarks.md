@@ -575,7 +575,9 @@ fix before another kernel is written.
 ## Against a clean upstream llama.cpp, e574a17 — 2026-11-15
 
 The section above compares against `vipera.cpp/build-clang`, and that binary understates the gap:
-its prefill path is roughly 30% below a clean upstream build of the same date. Built here instead:
+its prefill path is 30-35% below a clean upstream build of the same date (`pp128` 147.2 against 225.3,
+`pp512` 156.6 against 224.3), so a comparison against it credits the engine with prefill it does not
+have. Built here instead:
 
 ```bash
 # upstream, newest at the time of measuring, CPU only, no local patches
