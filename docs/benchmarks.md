@@ -643,3 +643,25 @@ End to end, two alternating pairs: decode 28.9/28.9 ms off against 29.1/29.2 ms 
 patch removes is not there at 256 rows — the product is bound by the rows it has, not by the last
 worker to wake — and the counter costs slightly more than it saves. **Reverted**; it also needed a
 `#[allow(clippy::too_many_arguments)]`, which `CONSTRAINTS.md` does not allow.
+
+### Four positions per attention value pass: bit-exact, no faster — 2026-11-15
+
+The value pass calls `axpy_f32` once per `(head, position)`, and each call reads and writes the
+`head_dim` output buffer — 512 B in and 512 B out, 344k times per token at depth 1024 (12 heads x
+1024 positions x 28 layers). Grouping four positions into one pass looks like a 2.4x cut in that
+traffic: one load and one store per four positions instead of four each.
+
+Implemented as `simd::axpy4_f32`, adding the four products to the running vector one at a time in
+position order (grouping the four sums first rounds 1 ULP differently and broke the two
+bit-identical attention tests). A/B at depth 1024, three alternating pairs behind `VIPERA_ATTN4`:
+
+| | pair 1 | pair 2 | pair 3 | median |
+|---|---|---|---|---|
+| 1024 ms/step, four axpy per position | 43.4 | 43.9 | 42.8 | 43.4 |
+| 1024 ms/step, four positions per pass | 44.0 | 44.1 | 42.6 | 44.0 |
+
+Neutral. The output buffer is 512 B and stays in L1, so moving it was never the cost: the pass is
+multiply-add throughput plus the V row loads, and the same number of those is paid either way.
+**Reverted.** The attention gap to upstream at this depth stays at ~2.6x (`4.16 ms` against
+`10.8 ms`), and closing it needs the flash-attention shape — online softmax over a block of
+positions with the scaling folded in — not a wider accumulation of the same work.
