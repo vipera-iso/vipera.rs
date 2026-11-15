@@ -2880,6 +2880,40 @@ mod tests {
         }
     }
 
+    /// Median seconds of one `B`-wide tiled call over `count` rows starting at
+    /// `first_row`, five samples.
+    fn time_tiled<const B: usize>(
+        matrix: &[u8],
+        stride: usize,
+        blocks: usize,
+        first_row: usize,
+        count: usize,
+    ) -> f64 {
+        let cols = blocks * 256;
+        let mut rng = Rng(0x5eed_0d07_0000_0003);
+        let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+            .map(|_| {
+                let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+                (QuantizedX::new(&x), crate::quant::x_sums(&x))
+            })
+            .collect();
+        let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+        let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+        let mut out = vec![0.0f32; B * count];
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let ok = try_q4k_matvec_tiled_range::<B>(
+                matrix, stride, first_row, count, &xs, &sums, &mut out,
+            );
+            assert!(ok, "tiled kernel must accept this shape");
+            std::hint::black_box(&out);
+            samples.push(start.elapsed().as_secs_f64());
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
+        samples[samples.len() / 2]
+    }
+
     /// The tiled kernel at prefill batch, single thread, on the two shapes
     /// ADR-001 measures for the ggml repacked GEMM: the number that decides
     /// whether binding that kernel is worth a second toolchain.
@@ -2900,26 +2934,7 @@ mod tests {
             let mut rng = Rng(0x5eed_0d07_0000_0002);
             let row = q4k_row(&mut rng, blocks);
             let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
-            let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
-                .map(|_| {
-                    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
-                    (QuantizedX::new(&x), crate::quant::x_sums(&x))
-                })
-                .collect();
-            let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
-            let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
-            let mut out = vec![0.0f32; B * rows];
-            let mut samples = Vec::new();
-            for _ in 0..5 {
-                let start = std::time::Instant::now();
-                let ok =
-                    try_q4k_matvec_tiled_range::<B>(&matrix, stride, 0, rows, &xs, &sums, &mut out);
-                assert!(ok, "tiled kernel must accept this shape");
-                std::hint::black_box(&out);
-                samples.push(start.elapsed().as_secs_f64());
-            }
-            samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
-            let seconds = samples[samples.len() / 2];
+            let seconds = time_tiled::<B>(&matrix, stride, blocks, 0, rows);
             let gflops = 2.0 * (rows * cols * B) as f64 / seconds / 1e9;
             println!(
                 "tiled q4_K {:>6}x{:<5} x {B} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS",
@@ -2929,6 +2944,104 @@ mod tests {
                 gflops
             );
         }
+    }
+
+    /// Does the batch-wide activation tile cost throughput? Its size is
+    /// `blocks * halves * 64 * 16 * 4` bytes — 192 KB at B=128 on the 6-block
+    /// shape, 1.5 MB across eight threads — so if residency is the limiter the
+    /// rate should rise as the batch (and the tile) shrinks.
+    ///
+    /// Reuse falls with the batch too, so a flat curve is the interesting
+    /// answer: it would mean the tile is not what caps the kernel.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_batch_sweep() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        let (rows, blocks) = (8960usize, 6usize);
+        let cols = blocks * 256;
+        let stride = blocks * 144;
+        let mut rng = Rng(0x5eed_0d07_0000_0004);
+        let row = q4k_row(&mut rng, blocks);
+        let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+        for b in [16usize, 32, 64, 128] {
+            let seconds = match b {
+                16 => time_tiled::<16>(&matrix, stride, blocks, 0, rows),
+                32 => time_tiled::<32>(&matrix, stride, blocks, 0, rows),
+                64 => time_tiled::<64>(&matrix, stride, blocks, 0, rows),
+                _ => time_tiled::<128>(&matrix, stride, blocks, 0, rows),
+            };
+            // `act` + `dxs` + `sumt`, the per-thread tile buffers.
+            let tile_kb = blocks * b.div_ceil(16) * 4096 / 1024;
+            let gflops = 2.0 * (rows * cols * b) as f64 / seconds / 1e9;
+            println!(
+                "sweep B={b:>3} act tile {tile_kb:>4} KB/thread: {:>7.1} ms  {:>6.1} GFLOPS",
+                seconds * 1e3,
+                gflops
+            );
+        }
+    }
+
+    /// The same kernel on a weight sweep bigger than L3: 127 copies of the
+    /// 6-block gate shape, 0.98 GB, the size one prefill chunk reads from RAM.
+    /// The L3-resident figure above prices the microkernel; this one prices the
+    /// stream, and the ratio between them is the headroom prefill leaves on the
+    /// table when the weights are not cached.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_streaming_throughput() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        const COPIES: usize = 127;
+        let (rows, blocks) = (8960usize, 6usize);
+        let cols = blocks * 256;
+        let stride = blocks * 144;
+        let mut rng = Rng(0x5eed_0d07_0000_0005);
+        let row = q4k_row(&mut rng, blocks);
+        let matrix: Vec<u8> = (0..rows * COPIES).flat_map(|_| row.clone()).collect();
+        let cols_b = blocks * 256;
+        let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+            .map(|_| {
+                let x: Vec<f32> = (0..cols_b).map(|_| rng.unit()).collect();
+                (QuantizedX::new(&x), crate::quant::x_sums(&x))
+            })
+            .collect();
+        let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+        let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+        let mut out = vec![0.0f32; B * rows];
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for copy in 0..COPIES {
+                let ok = try_q4k_matvec_tiled_range::<B>(
+                    &matrix,
+                    stride,
+                    copy * rows,
+                    rows,
+                    &xs,
+                    &sums,
+                    &mut out,
+                );
+                assert!(ok, "tiled kernel must accept this shape");
+                std::hint::black_box(&out);
+            }
+            samples.push(start.elapsed().as_secs_f64());
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
+        let seconds = samples[samples.len() / 2];
+        let bytes = (rows * COPIES * stride) as f64;
+        let gflops = 2.0 * (rows * COPIES * cols * B) as f64 / seconds / 1e9;
+        println!(
+            "stream 0.98 GB q4_K 8960x1536 x{B} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS  {:>5.2} GB/s",
+            seconds * 1e3,
+            gflops,
+            bytes / seconds / 1e9
+        );
     }
 
     #[test]

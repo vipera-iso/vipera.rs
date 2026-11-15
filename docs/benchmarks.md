@@ -697,3 +697,100 @@ Two things this also says:
 - Both figures are L3-resident (7.7 MB matrix), so they price the microkernel, not the stream. The
   gap between 154 GFLOPS here and the ~42 GFLOPS/thread prefill actually sustains end to end is
   the real headroom, and it lives outside the inner loop.
+
+### Where the "27% of kernel rate" went: SMT, not the tile and not the stream — 2026-11-15
+
+Follow-up on the last paragraph above. Three candidates, three measurements, all single thread
+unless stated, on the 6-block gate shape (8960x1536).
+
+**(a) The activation tile.** `q4k_matvec_tiled_range` builds `act`/`dxs`/`sumt` per thread:
+`blocks * halves * 64 * 16 * 4` bytes = **192 KB at B=128** (not the 786 KB first reported to the
+user — that multiplied by 16 twice), 1.5 MB across eight threads. Sweep (`q4k_tiled_batch_sweep`):
+
+| B | act tile | ms | GFLOPS |
+|---|---|---|---|
+| 16 | 24 KB | 6.3 / 6.5 | 70.1 / 68.0 |
+| 32 | 48 KB | 6.2 / 6.3 | 143.1 / 140.7 |
+| 64 | 96 KB | 13.5 / 13.1 | 130.9 / 134.9 |
+| 128 | 192 KB | 27.8 / 26.7 | 126.8 / 132.0 |
+
+No residency cliff: 32 is the best point (143) and 128 costs ~8% against it, which is the reuse
+trade-off, not a spill. The tile is not the limiter.
+
+**(b) The stream.** `q4k_tiled_streaming_throughput` runs the kernel over 127 copies of the shape —
+0.98 GB, the weight bytes one prefill chunk reads — B=128, one thread:
+**3000 / 3044 ms, 147.0–149.2 GFLOPS, 0.32–0.33 GB/s.** The rate *rises* against the L3-resident
+figure (127–132 in the same window). Streaming from RAM is free here: 256 FLOP per weight byte
+means the kernel never gets near the 43 GB/s ceiling.
+
+**(c) The pool.** End to end, pp512 chunked, alternating 4 and 8 threads:
+
+| | run 1 | run 2 |
+|---|---|---|
+| 4 threads | 105.8 tok/s | 95.3 tok/s |
+| 8 threads | 99.9 tok/s | 95.8 tok/s |
+
+Four threads equal eight: on this 4C/8T part the second hyperthread of a core buys nothing in
+prefill. That is the whole explanation for the 27%: one thread alone gets a full core (126–154
+GFLOPS), and a prefill thread shares its core's execution units, so per-thread rate halves. Eight
+threads x ~66 GFLOPS is the four-core ceiling, not headroom.
+
+**Consequence.** Prefill on this CPU is within a few percent of the core-limited ceiling, so the
+18% gap to llama.cpp cannot be closed by making this kernel wider: at 209 tok/s and ~3.05 GFLOP
+per token upstream would need ~159 GFLOPS/core, which is already at our single-thread kernel rate.
+Any further prefill work has to reduce work or threads, not tighten the loop. Tile split, cache
+blocking and more threads are all closed by the above.
+
+### Prompt chunk size 128 against 64 and 32: within noise — 2026-11-15
+
+With the tile sweep showing 143 GFLOPS at B=32 against 127-132 at B=128, the prompt chunk was made
+a named constant and swept end to end (pp512, chunked, 4 threads):
+
+| chunk | samples (tok/s) |
+|---|---|
+| 128 | 134.5, 146.3 |
+| 64 | 138.8, 138.6 |
+| 32 | 129.1 |
+
+The kernel's B=32 advantage does not survive the pass: four times as many chunks means four times
+the weight sweeps, and that costs more than the tile saves. 64 against 128 flips order between
+runs, so both stay inside this machine's noise. **Constant reverted**, chunking stays at
+`MAX_BATCH`.
+
+### Pool on-demand chunking: neutral at the kernel and neutral end to end — 2026-11-15
+
+Hypothesis: `fill_batch` hands each thread a fixed slice per product, so a product finishes only
+when the slowest-woken worker finishes its slice; llama.cpp instead takes chunks from an atomic
+counter on demand. The patch under test (`0001-pool-on-demand-chunks.patch`, from the external
+contributor) adds `Split::Dynamic { per_participant }`, defaults off, `VIPERA_POOL_CHUNKS=N`
+enables N chunks per participant for B<8 only, so the tiled prefill path is untouched. Every
+product stayed bit-identical to the sequential kernel in their suite (288 tests, 2 more than
+baseline).
+
+Dispatch cost, 8 participants, same binary (`quant::tests::pool_dispatch_cost`):
+
+| rows | between products | fixed | on demand x4 |
+|---|---|---|---|
+| 256 | 0 us | 9.4 us | 11.2 us |
+| 256 | 100 us | 13.2 us | 13.1 us |
+| 1536 | 0 us | 29.2 us | 29.3 us |
+| 1536 | 100 us | 31.4 us | 31.5 us |
+| 8960 | 0 us | 136.2 us | 134.5 us |
+| 8960 | 100 us | 144.9 us | 134.8 us |
+
+Decode end to end, pp32 decode, 8 threads, interleaved in one binary:
+
+| run | fixed | on demand x4 |
+|---|---|---|
+| 1 (cold weights) | 45.0 ms/step | 33.6 ms/step |
+| 2 | 33.8 ms/step | 33.7 ms/step |
+
+The two columns are the same to within 0.3%, and the kernel-level comparison is flat at every
+shape. The wake-up tail this was meant to remove is not visible on this part, which matches the
+earlier finding that the sleep-window cost attributed to wake-ups was really a core C-state. **The
+patch is not carried**: revert, as the contributor asked for a neutral result.
+
+Worth recording for whoever picks this up: a 256-row product is 9.4 us at eight threads, so the
+twelve small products of a decode step (wk/wv 256 rows, wq/wo 1536 rows, x28 layers) are ~0.3 ms
+of a 33.8 ms step. Even a perfect tail fix there is worth under 1%, which is why the end-to-end
+number cannot move: the 25% of Q4_K time in those products is real work, not dispatch overhead.
