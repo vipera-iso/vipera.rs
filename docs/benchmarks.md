@@ -665,3 +665,35 @@ multiply-add throughput plus the V row loads, and the same number of those is pa
 **Reverted.** The attention gap to upstream at this depth stays at ~2.6x (`4.16 ms` against
 `10.8 ms`), and closing it needs the flash-attention shape — online softmax over a block of
 positions with the scaling folded in — not a wider accumulation of the same work.
+
+### The ggml repacked GEMM is slower than the tiled Rust kernel — 2026-11-15
+
+ADR-001 rested on one premise: the prefill gap is *kernel quality*, and the way to buy ggml's
+repacked `block_q4_Kx8` GEMM is a C++ bind. That premise had never been measured at the kernel
+level — the ADR compares whole-engine tok/s. So: same shapes (8960x1536 and 1536x8960), same
+batch (128 activations), same thread count (1), alternating pairs in one window, synthetic Q4_K
+weights in both. ggml is the `vipera-ggml` prototype, compiled for `avx512vnni` from
+`llama-latest`, calling `ggml_gemm_q4_K_8x8_q8_K` on repacked weights and `ggml_quantize_mat_q8_K_4x8`
+activations; the Rust side is `simd::q4k_matvec_tiled_range` behind the new
+`q4k_tiled_batch128_throughput` bench.
+
+| Kernel, 1 thread, B=128 | 8960x1536 | 1536x8960 |
+|---|---|---|
+| Rust tiled, `q4k_matvec_tiled_range` | **154.1 / 152.5 / 153.7 GFLOPS** (median 153.7) | **173.3 / 174.4 / 175.6** (median 174.4) |
+| ggml repacked, `ggml_gemm_q4_K_8x8_q8_K` | 125.1 / 125.5 / 124.8 (median 125.1) | 128.8 / 128.5 / 128.9 (median 128.8) |
+
+The Rust kernel is **23% faster** on the gate shape and **35%** faster on the 35-block projection
+shape. Binding ggml's GEMM would make prefill slower, not faster, before a single line of seam
+code is written: the 2-4 dev-month cost stays unpaid and so does the second toolchain. **ADR-001
+implementation is closed**; the policy exception (EXC-001) stays until its expiry for the Q6_K
+question only.
+
+Two things this also says:
+
+- The 18% prefill gap to llama.cpp (171 against 209 tok/s pp512) is **not** the Q4_K GEMM kernel.
+  llama.cpp's kernel is the slower one per thread, so its win comes from elsewhere in the pass —
+  the streaming/residency behaviour of the real 0.98 GB weight sweep, or its threading, not the
+  microkernel. That is the next hypothesis to test, and this harness is where to test it.
+- Both figures are L3-resident (7.7 MB matrix), so they price the microkernel, not the stream. The
+  gap between 154 GFLOPS here and the ~42 GFLOPS/thread prefill actually sustains end to end is
+  the real headroom, and it lives outside the inner loop.

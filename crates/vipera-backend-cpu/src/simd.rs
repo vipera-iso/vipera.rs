@@ -2880,6 +2880,57 @@ mod tests {
         }
     }
 
+    /// The tiled kernel at prefill batch, single thread, on the two shapes
+    /// ADR-001 measures for the ggml repacked GEMM: the number that decides
+    /// whether binding that kernel is worth a second toolchain.
+    ///
+    /// Single-threaded on purpose: ggml's figure in `vipera-ggml` is
+    /// single-threaded too, and the pool would hide the kernel difference.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_batch128_throughput() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        for &(rows, blocks) in &[(8960usize, 6usize), (1536, 35)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let mut rng = Rng(0x5eed_0d07_0000_0002);
+            let row = q4k_row(&mut rng, blocks);
+            let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+            let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+                .map(|_| {
+                    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+                    (QuantizedX::new(&x), crate::quant::x_sums(&x))
+                })
+                .collect();
+            let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+            let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+            let mut out = vec![0.0f32; B * rows];
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let ok =
+                    try_q4k_matvec_tiled_range::<B>(&matrix, stride, 0, rows, &xs, &sums, &mut out);
+                assert!(ok, "tiled kernel must accept this shape");
+                std::hint::black_box(&out);
+                samples.push(start.elapsed().as_secs_f64());
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
+            let seconds = samples[samples.len() / 2];
+            let gflops = 2.0 * (rows * cols * B) as f64 / seconds / 1e9;
+            println!(
+                "tiled q4_K {:>6}x{:<5} x {B} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS",
+                rows,
+                cols,
+                seconds * 1e3,
+                gflops
+            );
+        }
+    }
+
     #[test]
     fn avx2_q4k_matches_scalar_on_quantized_activation() {
         if !available() {
