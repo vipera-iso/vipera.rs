@@ -794,3 +794,28 @@ Worth recording for whoever picks this up: a 256-row product is 9.4 us at eight 
 twelve small products of a decode step (wk/wv 256 rows, wq/wo 1536 rows, x28 layers) are ~0.3 ms
 of a 33.8 ms step. Even a perfect tail fix there is worth under 1%, which is why the end-to-end
 number cannot move: the 25% of Q4_K time in those products is real work, not dispatch overhead.
+
+### Prefix cache: 2791 ms of prompt work becomes 61 ms, with the same tokens — 2026-11-16
+
+The contributor's `0001-prefix-cache-park-and-copy.patch` keeps a finished request's prompt KV
+parked (LRU, at most 32 prompts, given back to any allocation that needs the blocks) and copies
+the longest shared prompt prefix into a later request instead of computing it. Off by default
+(`VIPERA_PREFIX_CACHE=1` or `Engine::set_prefix_cache(true)`), because it changes what a request
+computes.
+
+Measured on Qwen2.5-1.5B Q4_K_M with `tests/prefix_cache.rs`: a 480-token shared prompt plus four
+tokens that differ, one generated token, same engine handling both requests.
+
+| | ms | processed | reused |
+|---|---|---|---|
+| cache off | 2790.7 | 484 | 0 |
+| cache on | 61.0 | 4 | 480 |
+
+46x on that request, and the twelve-token continuation of the warm request is identical to the
+cold one (`[11, 220, 16, 15, ...]`), so the copied KV is the KV the prompt pass would have written
+there — including the case where the donor's prefix was computed in 128-token chunks and the copy
+covers all but four tokens.
+
+Every workspace test passes (runtime engine tests 48 -> 64). Not a kernel change, so nothing here
+touches the prefill ceiling above: it removes prompt work rather than speeding it up, which is why
+it is the only change in this batch that moves a number by more than a few percent.

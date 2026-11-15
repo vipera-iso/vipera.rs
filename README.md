@@ -20,6 +20,11 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
   token stream bit-identical; measured 1.6-1.7x on repetitive prompts and 1.02-1.05x on quoted
   text. A turn only speculates when it is the only one decoding, so concurrent requests keep
   sharing weight reads through the batch.
+- **Prefix cache** (off; `VIPERA_PREFIX_CACHE=1` or `Engine::set_prefix_cache(true)` turns it on):
+  a request that finishes normally keeps the KV of its prompt, and a later request copies the
+  longest prompt prefix it shares with one, at least a block long, instead of computing it. Kept
+  blocks are given back to any allocation that needs them, so they never cause a refusal; at most
+  32 prompts are kept. Only prompt positions are offered, never tokens a request generated.
 - **HTTP server** (`vipera serve`): `POST /v1/chat/completions` and `POST /v1/completions`
   (streaming SSE and non-streaming), request `stop` sequences, streamed usage
   (`stream_options.include_usage`), token logprobs with top alternatives (chat streaming and
