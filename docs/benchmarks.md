@@ -571,3 +571,73 @@ the prototype), numbers kept here so it is not rebuilt a third time.
 What would move decode instead: fewer calls or less traffic, not a narrower instruction stream. The
 `BatchScratch` logits buffer (`MAX_BATCH * vocab`, 78 MB at `MAX_BATCH = 128`) is the kind of thing to
 fix before another kernel is written.
+
+## Against a clean upstream llama.cpp, e574a17 — 2026-11-15
+
+The section above compares against `vipera.cpp/build-clang`, and that binary understates the gap:
+its prefill path is roughly 30% below a clean upstream build of the same date. Built here instead:
+
+```bash
+# upstream, newest at the time of measuring, CPU only, no local patches
+git clone --depth 400 https://github.com/ggml-org/llama.cpp llama-latest
+cd llama-latest && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DGGML_CUDA=OFF \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+cmake --build build -j8 --target llama-bench
+
+llama-latest/build/bin/llama-bench -m ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  -p 128,512 -n 64 -t 8 -r 3 -ngl 0
+```
+
+Median of three paired rounds, 8 threads, same model, `e574a17` (build 466):
+
+| workload | vipera | llama.cpp e574a17 | ratio |
+|---|---|---|---|
+| pp128 | 186 (182–193) | 217 (216–222) | 0.86 |
+| pp512 | 171 (169–174) | 217 (216–223) | 0.79 |
+| pp512, same `ubatch` 128 | 171 | 208 | 0.82 |
+| decode, depth 0 | 34.3 tok/s (29.1 ms) | 37.5 (26.6 ms) | 0.91 |
+| decode, depth 256 | 32.8 (30.5 ms) | 35.6 (28.1 ms) | 0.92 |
+| decode, depth 1024 | 24.9 (40.1 ms) | 33.4 (29.9 ms) | 0.75 |
+
+What the three columns separate:
+
+- **The prefill gap is kernel work, not batch width.** Sweeping upstream's `-ub` on `pp512` gives
+  207.6 (128), 209.5 (256), 215.6 (512): widening the batch buys 4%, and at the engine's own width
+  of 128 it still loses 18%. Upstream repacks Q4_K at load into an interleaved blocked layout
+  (`ggml/src/ggml-cpu/repack.cpp`, `tiled/tiled-kernel.cpp`) and its inner loop reads packed nibbles
+  contiguously; the engine unpacks a 256-column slab per 32-row window from the GGUF layout in
+  `simd::q4k_matvec_tiled_range`. The tiling itself is load-bearing here — `VIPERA_TILED=0` drops
+  `pp512` from 168 to 49.7 tok/s — so the remaining 18% is the unpack and the strided row reads, not
+  a missing tile.
+- **Decode loses little until context arrives, then loses a quarter.** Upstream's own depth curve
+  (`-d`) is 37.58 → 35.63 → 33.42 → 30.07 tok/s at depth 0/256/1024/2048, i.e. attention costs
+  1.95 ms at 256 and 4.16 ms at 1024. The engine's curve over the same depths is 34.3 → 32.8 → 24.9,
+  i.e. 1.4 ms at 256 and 10.8 ms at 1024 — 2.6x upstream's attention cost. `model::attention_heads`
+  walks one `(head, position)` at a time: a `dot_f32`, a scalar `exp`, and an `axpy_f32` per
+  position, with `PARALLEL_ATTENTION_MIN = 4096` score lanes leaving everything below ~342 positions
+  on one thread. Upstream uses a flash-attention-style kernel over F16 KV.
+- **The old upstream column was low.** `9183a55` at 199.67/200.39/35.26 and the fork's 149.88/153.09
+  are both under a clean build of their own date: upstream `45b6604` (2026-11-06), the fork's base
+  date, measures 225.3/224.3/37.8 here. So the honest summary to date is **−14% `pp128`, −21%
+  `pp512`, −9% decode, −25% at 1k context**, not "parity except a 10% decode gap".
+
+Spread on this box is 8-15% between windows (a `powersave` governor on 4 cores/8 threads, plus other
+load), so single lines are not comparable across sections; the paired tables are.
+
+### On-demand pool chunks: no change — 2026-11-15
+
+A patch replaced the fixed row split with chunks claimed from an atomic counter, on the theory that
+a decode product waits on a worker that has not left its idle state yet. Measured at the locus it
+targets, `pool_dispatch_cost`, best of 200 dispatches:
+
+| rows | fixed, 0 µs gap | on demand x4, 0 µs gap | fixed, 100 µs gap | on demand x4, 100 µs gap |
+|---|---|---|---|---|
+| 256 | 9.7 µs | 11.2 µs | 12.0 µs | 12.0 µs |
+| 1536 | 27.1 | 27.9 | 28.3 | 29.1 |
+| 8960 | 132.1 | 131.6 | 125.4 | 126.6 |
+
+End to end, two alternating pairs: decode 28.9/28.9 ms off against 29.1/29.2 ms on. The tail the
+patch removes is not there at 256 rows — the product is bound by the rows it has, not by the last
+worker to wake — and the counter costs slightly more than it saves. **Reverted**; it also needed a
+`#[allow(clippy::too_many_arguments)]`, which `CONSTRAINTS.md` does not allow.
