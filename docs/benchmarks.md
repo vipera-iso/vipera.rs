@@ -496,3 +496,78 @@ nothing at this gap. Reverted.
 average 3.1 — which slowed every configuration by about 20% and made the 5/6/7/8-thread decode
 comparison inconclusive. The two results above were taken back to back before that drift, and the
 A/B ones are within one process.)
+
+## Re-measure 2026-11-15 — the 2026-11-14 gap does not reproduce
+
+Same machine, same model (`qwen2.5-1.5b-instruct-q4_k_m.gguf`), 8 threads, governor still `powersave`.
+This section exists because the 1.62x `pp512` gap above is quoted as the reason to widen the prefill
+chunk, and on this build it is no longer there.
+
+Commands:
+
+```bash
+VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf VIPERA_THREADS=8 \
+  cargo test -p vipera-backend-cpu --release --test win_vs_llama prefill_vs_decode -- --ignored --nocapture
+
+# CPU-only llama.cpp binary on this disk (the fork, not upstream): backend CPU, build 49e1485.
+./vipera.cpp/build-clang/bin/llama-bench -m ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  -p 128,512 -n 64 -t 8 -r 3 -ngl 0
+```
+
+| test | vipera, run 1 | vipera, run 2 | llama.cpp fork 49e1485 (CPU) | ratio (vipera / fork) |
+|---|---|---|---|---|
+| pp64 | 181.9 | 196.6 | — | — |
+| pp128 | 179.0 | 194.2 | 149.88 ± 1.13 | 1.19–1.30 |
+| pp512 | 169.9 | 174.7 | 153.09 ± 1.98 | 1.11–1.14 |
+| decode ctx 32 | 33.9 (29.5 ms) | 35.0 (28.6 ms) | 38.65 ± 0.26 (`tg64`) | 0.88–0.91 |
+
+What this says:
+
+- **The prefill lever is nearly exhausted at the chunk width the engine already uses.** `pp128` is one
+  128-token chunk and `pp512` is four of them, so the four-pass weight traffic costs only 5-10%
+  (179 → 170, 194 → 175), not the 1.6x the 2026-11-14 table implies. Widening the chunk to 512 has a
+  ceiling of roughly 10% here; it is not the missing 4.6x.
+- **Against upstream 9183a55** (the numbers earlier in this file, not re-runnable on this disk) the
+  picture is pp128 ≈ parity (194.2 vs 199.67), `pp512` ~11% behind (174.7 vs 200.39), decode ≈ parity
+  (35.0 vs 35.26). The comparison above is against the fork, which is a different binary from the
+  upstream build used earlier; do not mix the two columns.
+- **Decode is the remaining gap to the fork** (about 10%), and it is the kernel, not the chunking.
+  See the Q6_K section above: the phase reads 27 GB/s inside the model against 41.8 GB/s standalone.
+
+Run-to-run spread on this box is 8-15% (governor), so the two vipera columns are the honest unit of
+comparison — one sample against one llama-bench line is not.
+
+### Two Q6_K blocks per `zmm`: 22-26% at the kernel, nothing end to end — 2026-11-15
+
+llama.cpp PR #27590 puts two K-quant blocks in the two 256-bit halves of one `zmm` (Q6_K/`Q8_K` dot
+1.44x, `PP512` +16.7%, `TG` unchanged there). Built here as a prototype: block `b` in the low half and
+`b + 1` in the high half, one `maddubs`/`madd` pair for both, and each block's eight lanes still go
+through the old `hsum` in block order, so the result is bit-identical to `q6k_dot_q8` (checked with
+`to_bits` over 12 random rows).
+
+Kernel, `ffn_down` shape (8960 rows x 1536 cols, one thread, best of three each, same session):
+
+| working set | 256-bit | two blocks per `zmm` |
+|---|---|---|
+| 10 MB | 10.82 GB/s | 13.66 (+26%) |
+| 182 MB | 10.37 GB/s | 12.68 (+22%) |
+
+End to end, `prefill_vs_decode`, three alternating pairs with the kernel behind `VIPERA_Q6K_ZMM`:
+
+| | pair 1 | pair 2 | pair 3 | median |
+|---|---|---|---|---|
+| decode ms/step, off | 28.0 | 30.0 | 28.9 | 28.9 |
+| decode ms/step, on | 28.6 | 28.7 | 29.4 | 28.7 |
+| `pp128` tok/s, off | 190.3 | 185.3 | 183.6 | 185.3 |
+| `pp128` tok/s, on | 185.6 | 187.9 | 184.7 | 185.6 |
+
+The 0.2 ms difference is inside this machine's noise (the same configuration moves 28.0-30.0), and
+`pp128` is flat because prefill uses the tiled Q6_K kernel. Why a 22% kernel does not reach the step:
+in the model the Q6_K calls are 0.32 MB and 1.9 MB spread over 197 `matvec`s at eight threads, where
+the phase is shared bandwidth and per-call work, not one thread's instruction count — the same reason
+the `hsum`-per-row and leaner-unpack experiments above came back neutral. **Removed** (the gate and
+the prototype), numbers kept here so it is not rebuilt a third time.
+
+What would move decode instead: fewer calls or less traffic, not a narrower instruction stream. The
+`BatchScratch` logits buffer (`MAX_BATCH * vocab`, 78 MB at `MAX_BATCH = 128`) is the kind of thing to
+fix before another kernel is written.
