@@ -14,8 +14,11 @@
 //! What Phase 1 does not do, stated here rather than implied: request bodies must be `Content-Length`
 //! framed (chunked bodies are refused with `invalid_request`), `stop` sequences are parsed and ignored,
 //! and a client that disconnects mid-stream still lets the current turn finish before the
-//! connection is dropped. Per-key rate limiting is opt-in via `--rate-limit` (requests per minute
-//! per client, `429` + `Retry-After` when exceeded); without the flag there is no limit.
+//! connection is dropped. Rate limiting is opt-in via `--rate-limit` (requests per minute, `429` +
+//! `Retry-After` when exceeded); without the flag there is no limit. A limit is per authenticated
+//! key when `--api-key` is set, and per peer otherwise: without a key every `authorization` value
+//! is caller-chosen, so it cannot name a client. At most [`MAX_CONNECTIONS`] connections are served at
+//! once; past that the server answers `503` instead of spawning another thread.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -23,17 +26,19 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use vipera_backend_cpu::CpuBackend;
 use vipera_core::gguf::GgufFile;
 use vipera_core::planner::KvCacheType;
+use vipera_core::{PlacementPlan, PlanRequest, SystemProbe, plan};
 use vipera_errors::ViperaError;
 use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, Generation, KvCache, KvConfig, StepReport,
 };
 use vipera_sampler::{MAX_LOGIT_BIAS, SamplerConfig};
 use vipera_tokenizer::{ChatMessage, Tokenizer};
+use vipera_traits::HardwareProbe;
 
 use crate::json::{Json, quote};
 
@@ -41,6 +46,17 @@ use crate::json::{Json, quote};
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Request line plus headers must fit here; anything larger is not a chat request.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+
+/// Connections that may be open at once. Each one owns a thread and up to [`MAX_BODY_BYTES`], so this
+/// is a memory bound rather than a concurrency target.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Bytes kept free beyond the model file when deciding whether it can be read into memory at all.
+const LOAD_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Clients the rate limiter tracks at once. Beyond this the map is pruned, then its oldest bucket is
+/// dropped: an unbounded map is a memory leak with a network trigger.
+const MAX_BUCKETS: usize = 4096;
 
 /// OpenAI accepts at most four stop sequences per request.
 const MAX_STOP_SEQUENCES: usize = 4;
@@ -153,13 +169,26 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
         let _ = out.flush();
     }
 
+    let connections = Arc::new(ConnectionBudget::new(MAX_CONNECTIONS));
     for incoming in listener.incoming() {
         match incoming {
-            Ok(stream) => {
+            Ok(mut stream) => {
+                let Some(slot) = connections.try_acquire() else {
+                    // Refuse instead of spawning a thread the box cannot back with memory.
+                    let _ = respond_error(
+                        &mut stream,
+                        503,
+                        "overloaded",
+                        "too many concurrent connections",
+                    );
+                    continue;
+                };
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
                 let served = Arc::clone(&served);
                 match std::thread::Builder::new().spawn(move || {
+                    // The slot lives as long as the connection's thread and frees itself on exit.
+                    let _slot = slot;
                     if let Err(error) = handle(&served, stream) {
                         eprintln!("vipera: connection ended: {error}");
                     }
@@ -222,6 +251,34 @@ fn resolve_model_path(path: &str) -> Result<String, ViperaError> {
     }
 }
 
+/// Refuse a model file that cannot be held in RAM, before the read allocates it.
+///
+/// The planner can only answer after the header is parsed, and by then the bytes are already
+/// resident. This check runs on the file length alone, so an oversized model is a usage error
+/// instead of an OOM kill.
+fn check_file_fits(file_bytes: u64, ram_total_bytes: u64) -> Result<(), ViperaError> {
+    if file_bytes.saturating_add(LOAD_RESERVE_BYTES) > ram_total_bytes {
+        return Err(ViperaError::infeasible(format!(
+            "the model file is {file_bytes} bytes and this machine has {ram_total_bytes} bytes of RAM; \
+             it cannot be read into memory"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a placement the planner calls infeasible, quoting the reasons it gave.
+fn check_placement(placement: &PlacementPlan) -> Result<(), ViperaError> {
+    if placement.feasible {
+        return Ok(());
+    }
+    let reasons: Vec<&str> = placement
+        .violations
+        .iter()
+        .map(|violation| violation.message.as_str())
+        .collect();
+    Err(ViperaError::infeasible(reasons.join("; ")))
+}
+
 fn next_number<T: std::str::FromStr>(
     args: &[String],
     index: usize,
@@ -230,6 +287,78 @@ fn next_number<T: std::str::FromStr>(
     let raw = next_value(args, index, flag)?;
     raw.parse::<T>()
         .map_err(|_| ViperaError::usage(format!("{flag} needs a number, got \"{raw}\"")))
+}
+
+/// What a rate limit counts against.
+///
+/// With a configured key, the key is the identity: it is the only value authentication accepts. With
+/// no key, the caller chooses the `authorization` value freely, so the peer address is the identity —
+/// keying on an unauthenticated bearer would hand out a new bucket per request and grow the map
+/// without bound.
+fn rate_limit_client(api_key: Option<&str>, request: &Request, peer: &str) -> String {
+    if api_key.is_some()
+        && let Some(key) = request
+            .header("authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        let key = key.trim();
+        if !key.is_empty() {
+            return key.to_owned();
+        }
+    }
+    peer.to_owned()
+}
+
+/// Counts open connections and refuses past its limit.
+///
+/// Every accepted socket owns a thread and can buffer [`MAX_BODY_BYTES`] of request, so an unbounded
+/// accept loop is an unbounded allocation with a network trigger.
+struct ConnectionBudget {
+    limit: usize,
+    active: AtomicUsize,
+}
+
+impl ConnectionBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    /// Take a slot, or `None` when every slot is busy. The slot returns its count when dropped.
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionSlot> {
+        let mut active = self.active.load(Ordering::Relaxed);
+        loop {
+            if active >= self.limit {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionSlot {
+                        budget: Arc::clone(self),
+                    });
+                }
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+/// One connection's slot in a [`ConnectionBudget`].
+struct ConnectionSlot {
+    budget: Arc<ConnectionBudget>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.budget.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Token bucket per client, shared across handler threads.
@@ -255,6 +384,21 @@ impl RateLimiter {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if !buckets.contains_key(client) && buckets.len() >= MAX_BUCKETS {
+            // Drop buckets that have already refilled; if the map is still full every client is
+            // active, so evict the least recently seen one.
+            buckets.retain(|_, (_, last)| {
+                now.saturating_duration_since(*last) < Duration::from_secs(60)
+            });
+            if buckets.len() >= MAX_BUCKETS
+                && let Some(oldest) = buckets
+                    .iter()
+                    .min_by_key(|(_, (_, last))| *last)
+                    .map(|(key, _)| key.clone())
+            {
+                buckets.remove(&oldest);
+            }
+        }
         let entry = buckets
             .entry(client.to_owned())
             .or_insert((self.per_minute, now));
@@ -292,8 +436,30 @@ impl Served {
         kv_type: KvCacheType,
         rate_limit: Option<u32>,
     ) -> Result<Served, ViperaError> {
-        let bytes = std::fs::read(resolve_model_path(path)?)?;
+        let path = resolve_model_path(path)?;
+        // This build has no device backend, so plan the placement this process will actually run:
+        // the same profile `verify --cpu` uses. Planning after the read would be too late for a file
+        // the machine cannot hold, so the length is checked first.
+        let mut hardware = SystemProbe::new().profile();
+        hardware.devices.clear();
+        let file_bytes = std::fs::metadata(&path)?.len();
+        check_file_fits(file_bytes, hardware.ram_total_bytes)?;
+
+        let bytes = std::fs::read(&path)?;
         let file = GgufFile::parse(&bytes)?;
+        let limit = file.describe().context_limit.unwrap_or(2048);
+        let context_length = ctx.unwrap_or(limit.min(2048));
+        let placement = plan(
+            &file,
+            &hardware,
+            &PlanRequest {
+                ctx: context_length,
+                kv_type,
+                batch_size: 1,
+            },
+        )?;
+        check_placement(&placement)?;
+
         let tokenizer = Tokenizer::from_gguf(&file)?;
         let backend = CpuBackend::from_bytes(bytes, &file)?;
         let config = backend.config();
@@ -304,8 +470,6 @@ impl Served {
                 kv_type.as_str()
             ))
         })?;
-        let limit = file.describe().context_limit.unwrap_or(2048);
-        let context_length = ctx.unwrap_or(limit.min(2048));
         let budget = context_length
             .checked_mul(bytes_per_token)
             .ok_or_else(|| ViperaError::invalid_argument("--ctx is too large for this model"))?;
@@ -582,13 +746,7 @@ fn route(
     if let Some(limiter) = &served.rate_limit
         && !matches!(request.path.as_str(), "/health")
     {
-        let client = request
-            .header("authorization")
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| peer.to_owned());
+        let client = rate_limit_client(served.api_key.as_deref(), request, peer);
         if let Err(retry) = limiter.allow(&client) {
             respond_error_retry(
                 stream,
@@ -2275,6 +2433,103 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_with_bearer(value: Option<&str>) -> Request {
+        Request {
+            method: "POST".to_owned(),
+            path: "/v1/chat/completions".to_owned(),
+            headers: value
+                .map(|value| vec![("authorization".to_owned(), value.to_owned())])
+                .unwrap_or_default(),
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_unauthenticated_bearer_cannot_choose_its_rate_limit_bucket() {
+        // No --api-key: every request is the same peer, and a bearer string it made up must not
+        // buy a fresh bucket (which is both a bypass and unbounded memory).
+        let request = request_with_bearer(Some("Bearer make-believe"));
+        assert_eq!(rate_limit_client(None, &request, "127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn an_authenticated_key_is_the_rate_limit_identity() {
+        let request = request_with_bearer(Some("Bearer sk-local"));
+        assert_eq!(
+            rate_limit_client(Some("sk-local"), &request, "127.0.0.1"),
+            "sk-local"
+        );
+    }
+
+    #[test]
+    fn the_rate_limiter_keeps_its_bucket_map_bounded() {
+        let limiter = RateLimiter::new(60);
+        let start = Instant::now();
+        for index in 0..(MAX_BUCKETS + 16) {
+            let client = format!("peer-{index}");
+            assert!(limiter.allow_at(&client, start).is_ok());
+        }
+        let buckets = limiter.buckets.lock().expect("bucket map").len();
+        assert!(
+            buckets <= MAX_BUCKETS,
+            "{buckets} buckets is over the {MAX_BUCKETS} cap"
+        );
+        assert!(
+            limiter.allow_at("the-newest-client", start).is_ok(),
+            "a new client still gets its own bucket"
+        );
+    }
+
+    #[test]
+    fn a_file_larger_than_ram_is_refused_before_it_is_read() {
+        let error = check_file_fits(15 << 30, 15 << 30).expect_err("15 GB does not fit in 15 GB");
+        assert!(error.to_string().contains("RAM"), "{error}");
+        assert!(check_file_fits(1 << 30, 15 << 30).is_ok());
+    }
+
+    #[test]
+    fn an_infeasible_placement_is_refused_with_the_planner_reason() {
+        let mut hardware = SystemProbe::new().profile();
+        hardware.devices.clear();
+        hardware.ram_total_bytes = 1 << 30;
+        let shape = vipera_core::ModelShape {
+            n_layer: 28,
+            n_embd: 1536,
+            n_head: 12,
+            n_head_kv: 2,
+            max_context: Some(4096),
+            weights_bytes: 4 << 30,
+            non_layer_bytes: 0,
+        };
+        let placement = vipera_core::plan_shape("test-model", &hardware, &shape, &plan_request())
+            .expect("plan");
+        assert!(!placement.feasible, "4 GB of weights cannot fit in 1 GB");
+        let error = check_placement(&placement).expect_err("infeasible placement must be refused");
+        assert!(error.to_string().contains("host memory"), "{error}");
+    }
+
+    fn plan_request() -> PlanRequest {
+        PlanRequest {
+            ctx: 2048,
+            kv_type: KvCacheType::F16,
+            batch_size: 1,
+        }
+    }
+
+    #[test]
+    fn a_connection_budget_refuses_once_it_is_full_and_frees_on_drop() {
+        let budget = Arc::new(ConnectionBudget::new(2));
+        let first = budget.try_acquire().expect("first connection");
+        let second = budget.try_acquire().expect("second connection");
+        assert!(budget.try_acquire().is_none(), "the third must be refused");
+        drop(first);
+        assert!(
+            budget.try_acquire().is_some(),
+            "a closed connection frees its slot"
+        );
+        drop(second);
+    }
 
     #[test]
     fn rejects_roles_the_contract_does_not_define() {

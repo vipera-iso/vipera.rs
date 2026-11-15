@@ -69,6 +69,7 @@ dependencies = [
  "vipera-runtime",
  "vipera-sampler",
  "vipera-tokenizer",
+ "vipera-traits",
 ]
 
 [[package]]

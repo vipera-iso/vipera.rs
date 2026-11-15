@@ -1110,43 +1110,64 @@ mod tests {
         assert!(zeros.q[32..64].iter().all(|value| *value == 0));
     }
 
-    /// What one pool dispatch costs, so the per-step dispatch overhead can be counted.
+    /// What one pooled product costs the caller, from handing the work out to the last reply being
+    /// in, for several amounts of other work between two products.
     ///
-    /// A decode step issues one pooled product per weight matrix — 196 of them for this model — and
-    /// each one wakes every worker and waits for the replies. Timing a tiny product (8 rows) gives
-    /// that fixed cost almost without the work.
+    /// A decode step issues one pooled product per weight matrix, 196 of them for this model, with
+    /// rope, norms and attention between them. The gap column stands in for that work: it is spent
+    /// on the calling thread, so the workers are idle for as long as it lasts and the next product
+    /// pays to wake them.
+    ///
+    /// This replaces a version that timed an 8-row product through `matvec_pooled`. `thread_budget`
+    /// gives a product that small one thread, so that version never woke a worker: what it timed
+    /// was building the activation, which is a real cost but not the cost of a dispatch. Here the
+    /// thread count goes straight to `fill_batch`, and the activation is built outside the timing.
     ///
     /// Ignored by default. Run it with
-    /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture pool_dispatch_cost`.
+    /// `cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture pool_dispatch_cost`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement, not a correctness check"]
     fn pool_dispatch_cost() {
+        use std::time::{Duration, Instant};
         let blocks = 6;
-        let rows = 8;
+        let rows = 64;
+        let stride = blocks * 144;
         // 144 bytes per superblock; the contents do not matter for a dispatch measurement.
-        let data = vec![0_u8; rows * blocks * 144];
+        let data = vec![0_u8; rows * stride];
         let x = vec![0.01_f32; blocks * 256];
+        let activations = std::sync::Arc::new([OwnedActivation::new(GgmlType::Q4K, &x)]);
         let mut out = vec![0.0_f32; rows];
+        let participants = max_threads().min(8);
+        println!("{participants} participants");
         std::thread::scope(|scope| {
-            for workers in [1_usize, 4] {
-                let pool = crate::pool::Pool::<1>::new(scope, workers);
+            let pool = crate::pool::Pool::<1>::new(scope, participants);
+            for gap_us in [0_u64, 30, 300] {
                 let mut best = f64::MAX;
                 for _ in 0..5 {
-                    let start = std::time::Instant::now();
+                    let mut inside = Duration::ZERO;
                     for _ in 0..200 {
-                        let _ = super::matvec_pooled(
-                            &pool,
+                        let until = Instant::now() + Duration::from_micros(gap_us);
+                        while Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+                        let started = Instant::now();
+                        pool.fill_batch(
                             GgmlType::Q4K,
                             &data,
-                            blocks * 256,
-                            rows,
-                            &x,
+                            stride,
+                            participants,
+                            &activations,
                             &mut out,
-                        );
+                        )
+                        .expect("dispatch");
+                        inside += started.elapsed();
                     }
-                    best = best.min(start.elapsed().as_secs_f64() / 200.0);
+                    best = best.min(inside.as_secs_f64() / 200.0);
                 }
-                println!("{workers} workers: {:.1} us per dispatch", best * 1e6);
+                println!(
+                    "{gap_us:>3} us between products: {:>6.1} us per product",
+                    best * 1e6
+                );
             }
         });
     }
