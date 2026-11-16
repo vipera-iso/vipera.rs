@@ -870,9 +870,10 @@ sends its 12 heads to `min(threads, heads)` workers, each with its own scratch a
 | split off | 15.0, 15.2, 15.0, 15.4, 14.5, 13.0, 11.5 (median 15.0) | median 46.9 |
 | split on | 11.0, 11.2, 11.3, 12.0, 13.0, 13.1, 15.0 (median 12.0) | median 44.6 |
 
-20% off attention and ~5% off the step, with the same bits: a head's arithmetic and its order do
-not depend on which worker holds it, and every attention test still compares bit for bit against
-the decoded oracle.
+20% off attention and ~5% off the step in that window, with the same bits: a head's arithmetic and
+its order do not depend on which worker holds it, and every attention test still compares bit for
+bit against the decoded oracle. Measured again later on cores the agent was not using, it is 29%
+off attention and 4% off the step — see the section below, which supersedes these samples.
 
 **Not the 5 ms target.** Attention is arithmetic-bound at roughly 13-15 GFLOPS of one core here;
 the next step is a blocked, head-major score pass (Q x K^T as a small GEMM with the positions
@@ -895,19 +896,32 @@ built from a row layout where consecutive positions are `bytes_per_token` apart 
 model). The same arithmetic says the head split was the right lever, and that the remaining cost is
 the strided walk, not the loop.
 
-### Prefetching the KV walk: ~10% of attention, unproven on a loaded machine — 2026-11-16
+### The head split and the prefetch, measured on cores the agent is not using — 2026-11-16
 
-Attention prefetches eight positions ahead on both passes (`VIPERA_ATTN_PREFETCH=0` turns it off).
-Alternating in one binary, load average 3.9-5.9 throughout:
+The earlier samples for both were taken while this session's own harness held a core (100% of one
+logical CPU), so load average never fell below ~1.6 and the samples spanned 6.2-15.0 ms. Rather than
+wait for an idle machine that cannot exist while the agent runs, the benchmark was pinned to the
+three physical cores the agent is not on (`taskset -c 2-7`, six threads) and the two switches were
+alternated in one binary, three rounds each:
 
-| | attention+KV samples | median |
-|---|---|---|
-| off | 12.8, 13.3, 11.2, 12.1, 13.0 | 12.8 |
-| on | 11.5, 12.8, 11.3, 6.2, 12.3 | 11.5 |
+| | attention+KV | median | step | median |
+|---|---|---|---|---|
+| head split off | 10.6, 11.6, 12.1 | 11.6 | 44.0, 45.6, 45.6 | 45.6 |
+| head split on | 7.7, 8.2, 9.1 | 8.2 | 42.2, 43.7, 43.7 | 43.7 |
+| prefetch off | 9.4, 9.5, 9.3 | 9.4 | 44.1, 43.6, 44.2 | 44.1 |
+| prefetch on | 8.6, 9.0, 10.5 | 9.0 | 43.5, 43.8, 45.2 | 43.8 |
 
-The medians favour it by 10% and the step times (45.2 against 44.9 ms) do not separate. The 6.2 ms
-sample was not reproduced. This is worth one re-measurement on a quiet machine before it is trusted
-or reverted; it is not a claim yet.
+**Head split: confirmed, and better than the loaded window suggested** — 29% off attention (11.6
+to 8.2 ms) and 4% off the step. Kept.
+
+**Prefetch: 4% off attention, nothing at the step boundary** (44.1 against 43.8 is inside the
+spread), and one of the three rounds regressed. That does not clear the bar the other changes were
+held to, so it is **reverted**: `simd::prefetch` and the two calls in `model.rs` are gone, and the
+`VIPERA_ATTN_PREFETCH` switch with them. `simd::prefetch_ahead` stays where it was, in the matvec
+kernels, where it has a measurement behind it.
+
+Method note for the next measurement here: `taskset -c 2-7` plus `VIPERA_THREADS=6` is what makes
+this repeatable. Without it the same binaries spread by 2x.
 
 ### Prefix cache: the KV headroom a burst needs — 2026-11-16
 

@@ -528,36 +528,6 @@ unsafe fn axpy_f32_avx2(target: &mut [f32], weight: f32, source: &[f32]) {
     }
 }
 
-/// Ask the hardware to start fetching `bytes` into L1.
-///
-/// Attention walks one 512-byte K row and one V row per position, and consecutive positions are
-/// `bytes_per_token` apart — 28 KB on a 28-layer model — so the rows of a single layer are a
-/// strided walk the prefetcher follows badly. A layer's arithmetic is only 0.24 ms of a 12 ms
-/// attention step, so what this is for is the walk, not the loop.
-///
-/// Safe to call: it reads no memory the caller did not hand it, and does nothing when the CPU has
-/// no prefetch instruction to offer.
-pub(crate) fn prefetch(bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    if available() {
-        // SAFETY: AVX2 implies SSE, so `_mm_prefetch` is available; it touches no memory the CPU
-        // could fault on, and the pointer is inside a slice the caller holds.
-        unsafe { prefetch_t0(bytes.as_ptr()) }
-    }
-}
-
-/// # Safety
-///
-/// The CPU must support SSE, which AVX2 implies.
-#[target_feature(enable = "avx2")]
-unsafe fn prefetch_t0(at: *const u8) {
-    // A prefetch hint never faults, whatever the address, so there is nothing to guard here.
-    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-    _mm_prefetch(at as *const i8, _MM_HINT_T0);
-}
-
 /// [`dot_f32`] over a row the KV cache stores as `f16`, converting inside the loop.
 ///
 /// The conversion is exact and the reduction tree is [`dot_f32_avx2`]'s, so this gives the bits
