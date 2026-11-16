@@ -881,3 +881,48 @@ equality with the buffered oracle. That is a tolerance policy for attention, not
 so it is not taken here.
 
 Knobs for a same-binary A/B: `VIPERA_INPLACE_KV=0` and `VIPERA_ATTN_HEAD_SPLIT=0`.
+
+### Where a depth-1024 attention layer's time is not: the arithmetic — 2026-11-16
+
+`simd::tests::attention_phase_cost` times one layer's two phases at their own shape (1024
+positions x 12 heads x 128 values, f16 rows, L1-hot): **score 0.13 ms, weighted sum 0.11 ms,
+0.24 ms together**. Twenty-eight layers of that is 6.7 ms, against the 12-15 ms an attention step
+actually takes at ctx 1024 in the same window.
+
+So a blocked, position-vectorised score pass (Q x K^T as a small GEMM) cannot pay for itself here:
+it would shorten 0.13 ms of a layer and add a transpose of every K row, and the transpose has to be
+built from a row layout where consecutive positions are `bytes_per_token` apart (28 KB on this
+model). The same arithmetic says the head split was the right lever, and that the remaining cost is
+the strided walk, not the loop.
+
+### Prefetching the KV walk: ~10% of attention, unproven on a loaded machine — 2026-11-16
+
+Attention prefetches eight positions ahead on both passes (`VIPERA_ATTN_PREFETCH=0` turns it off).
+Alternating in one binary, load average 3.9-5.9 throughout:
+
+| | attention+KV samples | median |
+|---|---|---|
+| off | 12.8, 13.3, 11.2, 12.1, 13.0 | 12.8 |
+| on | 11.5, 12.8, 11.3, 6.2, 12.3 | 11.5 |
+
+The medians favour it by 10% and the step times (45.2 against 44.9 ms) do not separate. The 6.2 ms
+sample was not reproduced. This is worth one re-measurement on a quiet machine before it is trusted
+or reverted; it is not a claim yet.
+
+### Prefix cache: the KV headroom a burst needs — 2026-11-16
+
+Same burst as above (seed parks a 480-token prompt, eight concurrent requests share it), one round
+per context size:
+
+| `--ctx` | cache off | cache on | gain |
+|---|---|---|---|
+| 2048 | 16.70 s | 7.34 s | 2.3x |
+| 4096 | 37.05 s | 4.64 s | 7.9x |
+| 8192 | 33.83 s | 1.15 s | 29x |
+| 16384 | 37.17 s | 1.25 s | 28x |
+
+At 4096 the eight requests split into two groups (1.39 s and 4.5 s): the first four copy the
+parked prompt, then the cache fills and the rest recompute. The threshold is arithmetic — the
+budget has to hold the concurrent prompted sequences plus the parked copy, so ~8 x 500 tokens plus
+one prompt needs 8192 and has nothing to spare at 4096. Past that the gain is flat, so 8192 is the
+size to recommend for this burst shape.

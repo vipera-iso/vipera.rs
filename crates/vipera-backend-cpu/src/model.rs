@@ -1552,6 +1552,15 @@ const PARALLEL_ATTENTION_MIN: usize = 4096;
 /// `false`, `off` or `no` turns it off so both arms can be timed in one binary.
 /// Whether a single entry's heads are split across the pool. `0`/`false`/`off`/`no` keeps them on
 /// the calling thread, for an A/B in one binary.
+/// Whether attention prefetches the rows it is about to read. `0` keeps the walk plain, for an
+/// A/B in one binary.
+fn prefetch_enabled() -> bool {
+    std::env::var("VIPERA_ATTN_PREFETCH").map_or(true, |value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
 fn head_split_enabled() -> bool {
     std::env::var("VIPERA_ATTN_HEAD_SPLIT").map_or(true, |value| {
         let value = value.trim().to_ascii_lowercase();
@@ -1639,7 +1648,24 @@ fn attention_streaming_heads(
     head_state.resize(count, f32::NEG_INFINITY);
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
+    let ahead = if prefetch_enabled() {
+        // Forward enough to cover the memory latency of a strided walk; 8 positions is 8 x 28 KB of
+        // address, which is six prefetches per row and one row of slack.
+        kv.bytes_per_token * 8
+    } else {
+        0
+    };
+    let storage = kv.storage;
+    let prefetch_row = |from: usize| {
+        if ahead > 0
+            && let Some(tail) = storage.get(from + ahead..from + ahead + 64)
+        {
+            crate::simd::prefetch(tail);
+        }
+    };
+
     kv.for_each_row(layer, layer_bytes, positions, |position, base| {
+        prefetch_row(base);
         if !in_place {
             kv.layout
                 .decode(&kv.storage[base..base + layer_bytes], row)?;
@@ -1685,6 +1711,7 @@ fn attention_streaming_heads(
     out[..count * head_dim].fill(0.0);
     kv.for_each_row(layer, layer_bytes, positions, |position, base| {
         let v_base = base + layer_bytes;
+        prefetch_row(v_base);
         if !in_place {
             kv.layout
                 .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;

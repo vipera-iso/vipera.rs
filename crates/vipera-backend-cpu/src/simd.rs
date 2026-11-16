@@ -528,6 +528,36 @@ unsafe fn axpy_f32_avx2(target: &mut [f32], weight: f32, source: &[f32]) {
     }
 }
 
+/// Ask the hardware to start fetching `bytes` into L1.
+///
+/// Attention walks one 512-byte K row and one V row per position, and consecutive positions are
+/// `bytes_per_token` apart — 28 KB on a 28-layer model — so the rows of a single layer are a
+/// strided walk the prefetcher follows badly. A layer's arithmetic is only 0.24 ms of a 12 ms
+/// attention step, so what this is for is the walk, not the loop.
+///
+/// Safe to call: it reads no memory the caller did not hand it, and does nothing when the CPU has
+/// no prefetch instruction to offer.
+pub(crate) fn prefetch(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if available() {
+        // SAFETY: AVX2 implies SSE, so `_mm_prefetch` is available; it touches no memory the CPU
+        // could fault on, and the pointer is inside a slice the caller holds.
+        unsafe { prefetch_t0(bytes.as_ptr()) }
+    }
+}
+
+/// # Safety
+///
+/// The CPU must support SSE, which AVX2 implies.
+#[target_feature(enable = "avx2")]
+unsafe fn prefetch_t0(at: *const u8) {
+    // A prefetch hint never faults, whatever the address, so there is nothing to guard here.
+    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    _mm_prefetch(at as *const i8, _MM_HINT_T0);
+}
+
 /// [`dot_f32`] over a row the KV cache stores as `f16`, converting inside the loop.
 ///
 /// The conversion is exact and the reduction tree is [`dot_f32_avx2`]'s, so this gives the bits
@@ -2156,6 +2186,65 @@ mod tests {
             super::axpy_f32(&mut slow, 1.75, &decoded);
             assert_eq!(fast, slow, "axpy over {length} values");
         }
+    }
+
+    /// What each phase of a depth-1024 attention layer costs, at its own shape: 12 heads over
+    /// 1024 positions against an `f16` row of 128 values.
+    ///
+    /// Ignored by default. `cargo test -p vipera-backend-cpu --release --lib -- --ignored
+    /// --nocapture attention_phase_cost`.
+    #[test]
+    #[ignore]
+    fn attention_phase_cost() {
+        const HEADS: usize = 12;
+        const POSITIONS: usize = 1024;
+        const DIM: usize = 128;
+        let mut rng = Rng(0x5eed_0a77_0000_000b);
+        let q: Vec<f32> = (0..HEADS * DIM).map(|_| rng.unit() * 2.0 - 1.0).collect();
+        let key: Vec<u8> = (0..DIM)
+            .flat_map(|_| crate::quant::f32_to_f16(rng.unit() * 2.0 - 1.0).to_le_bytes())
+            .collect();
+        let value = key.clone();
+        let mut out = vec![0.0_f32; DIM];
+
+        let best = |rounds: u32, mut run: Box<dyn FnMut()>| -> f64 {
+            run();
+            let mut best = f64::INFINITY;
+            for _ in 0..rounds {
+                let start = std::time::Instant::now();
+                run();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best * 1000.0
+        };
+
+        let score = best(
+            5,
+            Box::new(|| {
+                let mut total = 0.0_f32;
+                for _ in 0..POSITIONS {
+                    for head in 0..HEADS {
+                        total += super::dot_f16_f32(&q[head * DIM..][..DIM], &key);
+                    }
+                }
+                std::hint::black_box(total);
+            }),
+        );
+        let weighted = best(
+            5,
+            Box::new(|| {
+                for _ in 0..POSITIONS {
+                    for _ in 0..HEADS {
+                        super::axpy_f16_f32(&mut out, 0.5, &value);
+                    }
+                }
+                std::hint::black_box(&out);
+            }),
+        );
+        println!(
+            "attention layer at 1024 x 12 x 128: score {score:.2} ms, weighted sum {weighted:.2} ms, both {:.2} ms",
+            score + weighted
+        );
     }
 
     /// `vpdpbusd` against `maddubs` + `madd` on the shapes that dominate a decode step.
