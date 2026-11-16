@@ -1,0 +1,8 @@
+{
+  "note": "Recorded from llama-server 0.8.0-dev (build 1, commit 39febd2ad) on the model below, POST /completion with temperature 0, top_k 1, cache_prompt false, return_tokens true. Re-record it when the reference build or the model changes.",
+  "model": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "prompt": "The capital of France is",
+  "max_new": 12,
+  "text": " Paris. The capital of Italy is Rome. The capital of",
+  "tokens": [12095, 13, 576, 6722, 315, 15344, 374, 21718, 13, 576, 6722, 315]
+}

@@ -1,9 +1,16 @@
 //! Diff a greedy continuation against llama.cpp on the same model file.
 //!
 //! This is the check that says the dequantization, rotary embedding, attention, and KV layout all
-//! agree with the reference implementation, not merely with themselves. It is skipped — with the
-//! reason printed — when the model or `llama-server` is not available on the machine, because neither
-//! belongs in the repository. Run it with `--nocapture` to see whether it ran:
+//! agree with the reference implementation, not merely with themselves.
+//!
+//! The reference comes from one of two places. `tests/fixtures/llama_cpp_continuation.json` holds a
+//! continuation recorded from llama.cpp on the model this repository develops against, so the check
+//! runs on any machine that has the model — no llama.cpp install needed. When `LLAMA_SERVER` points
+//! at a `llama-server` binary, the test asks it live instead and the fixture is not consulted; that
+//! is how the fixture gets re-recorded after a reference build or a model change.
+//!
+//! Skipped — with the reason printed — when there is no model, or when there is no server and the
+//! fixture was recorded on a different model. Run it with `--nocapture` to see which arm ran:
 //!
 //! ```text
 //! VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
@@ -27,26 +34,35 @@ fn greedy_continuation_matches_llama_cpp() {
         );
         return;
     };
-    let Some(server) = server_binary() else {
-        eprintln!("skipped: no llama-server; set LLAMA_SERVER to the llama.cpp server binary");
-        return;
-    };
     let vipera = vipera_binary();
 
-    let port = free_port();
-    let mut server = Server::start(&server, &model, port).expect("start llama-server");
-    wait_until_healthy(port, &mut server).expect("llama-server never became healthy");
-
-    let request = format!(
-        r#"{{"prompt":{},"n_predict":{MAX_NEW},"temperature":0,"top_k":1,"cache_prompt":false,"return_tokens":true}}"#,
-        escape(PROMPT)
-    );
-    let reference_body = http(port, "/completion", &request).expect("llama.cpp completion");
-    let reference = json_numbers(&reference_body, "tokens")
-        .expect("llama.cpp did not return a tokens array; check its version");
+    // Live reference when a server binary is available, the recorded one otherwise.
+    let reference = match server_binary() {
+        Some(binary) => {
+            let port = free_port();
+            let mut server = Server::start(&binary, &model, port).expect("start llama-server");
+            let reference = ask_llama_server(port, &mut server).expect("llama.cpp completion");
+            eprintln!("compared against a live llama-server on port {port}");
+            reference
+        }
+        None => match fixture_tokens(&model) {
+            Some(tokens) => {
+                eprintln!(
+                    "no llama-server; compared against tests/fixtures/llama_cpp_continuation.json"
+                );
+                tokens
+            }
+            None => {
+                eprintln!(
+                    "skipped: no llama-server and the fixture was recorded on another model; set LLAMA_SERVER"
+                );
+                return;
+            }
+        },
+    };
     assert!(
         !reference.is_empty(),
-        "llama.cpp generated nothing: {reference_body}"
+        "llama.cpp generated nothing for {PROMPT:?}"
     );
 
     let output = Command::new(&vipera)
@@ -82,6 +98,58 @@ fn greedy_continuation_matches_llama_cpp() {
             "token {index} differs for prompt {PROMPT:?}\n  vipera: {ours:?}\n  llama.cpp: {reference:?}"
         );
     }
+}
+
+/// Ask the server for the reference continuation, waiting for it to finish loading.
+///
+/// Not every build answers `/health` only once the model is ready: the llama.cpp inside Ollama
+/// reports healthy while the weights are still mmapping, and a completion sent then comes back
+/// without a `tokens` array. So this retries the completion itself until the array appears, which
+/// covers both behaviours and needs no version check.
+fn ask_llama_server(port: u16, server: &mut Server) -> Result<Vec<u32>, String> {
+    wait_until_healthy(port, server)?;
+    let request = format!(
+        r#"{{"prompt":{},"n_predict":{MAX_NEW},"temperature":0,"top_k":1,"cache_prompt":false,"return_tokens":true}}"#,
+        escape(PROMPT)
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        match http(port, "/completion", &request) {
+            Ok(body) => match json_numbers(&body, "tokens") {
+                Some(tokens) if !tokens.is_empty() => return Ok(tokens),
+                _ => last = body,
+            },
+            Err(error) => last = error,
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "no tokens array from llama.cpp within the deadline: {last}"
+    ))
+}
+
+/// The recorded reference continuation, when it was recorded on this model file.
+fn fixture_tokens(model: &Path) -> Option<Vec<u32>> {
+    let name = model.file_name()?.to_str()?;
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/llama_cpp_continuation.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let recorded = field(&text, "model")?;
+    let prompt = field(&text, "prompt")?;
+    if recorded != name || prompt != PROMPT {
+        return None;
+    }
+    json_numbers(&text, "tokens")
+}
+
+/// The JSON string value of `"key": "value"` — all this test needs from the fixture.
+fn field(body: &str, key: &str) -> Option<String> {
+    let start = body.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = &body[start..];
+    let open = rest.find('"')? + 1;
+    let close = rest[open..].find('"')? + open;
+    Some(rest[open..close].to_owned())
 }
 
 fn model_path() -> Option<PathBuf> {
@@ -246,5 +314,34 @@ mod tests {
     #[test]
     fn escapes_a_prompt_for_json() {
         assert_eq!(escape("a\"b\\c\nd"), r#""a\"b\\c\nd""#);
+    }
+
+    #[test]
+    fn reads_a_string_field_out_of_the_fixture() {
+        let fixture = r#"{"model": "m.gguf", "prompt": "x", "max_new": 1}"#;
+        assert_eq!(super::field(fixture, "model").as_deref(), Some("m.gguf"));
+        assert_eq!(super::field(fixture, "prompt").as_deref(), Some("x"));
+        assert_eq!(super::field(fixture, "absent"), None);
+    }
+
+    #[test]
+    fn the_fixture_records_a_whole_continuation() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/llama_cpp_continuation.json");
+        let text = std::fs::read_to_string(path).expect("fixture is checked in");
+        let tokens = super::json_numbers(&text, "tokens").expect("tokens array");
+        assert!(
+            !tokens.is_empty(),
+            "a fixture with no tokens checks nothing"
+        );
+        assert_eq!(
+            tokens.len(),
+            12,
+            "the fixture is recorded for MAX_NEW tokens"
+        );
+        assert_eq!(
+            super::field(&text, "prompt").as_deref(),
+            Some(super::PROMPT)
+        );
     }
 }

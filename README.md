@@ -91,16 +91,20 @@ curl -s localhost:8080/v1/chat/completions \
 ```
 
 The server batches up to four conversations into one weight read; `--rate-limit` adds a per-key
-request budget, and there is no request logging.
+request budget. Every request writes one JSON line to stderr — `{"event":"request","peer":…,
+"method":…,"path":…,"status":…,"micros":…}` — the same event shape `vipera generate` prints, and
+`VIPERA_ACCESS_LOG=0` silences it.
 
 ## Limitations
 
 - **GPU**: there is no CUDA, Metal or Vulkan backend. `verify` reports host memory only.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
-- **Server**: no request logging and no TLS; put it behind a proxy for either. Rate limiting is
-  opt-in (`--rate-limit`), not a default.
-- **Parity checks**: the tokenizer and continuation tests skip unless `llama-server` is installed.
+- **Server**: no TLS; put it behind a proxy for that. Rate limiting is opt-in (`--rate-limit`), not
+  a default.
+- **Parity checks**: the continuation test compares against a usage recording of llama.cpp checked
+  into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
+  `LLAMA_SERVER` at a `llama-server` binary to compare against a live one instead.
 - **Speed**: the CPU path is usable for a single conversation, not a throughput claim. Q4_K
   activations are multiplied as `i8`, so outputs agree with the `f32` path on the checked prompts
   but are not bit-identical to it.

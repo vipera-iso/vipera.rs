@@ -710,7 +710,33 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
     if let Ok(mut metrics) = served.metrics.lock() {
         metrics.record(endpoint, status, started.elapsed().as_secs_f64());
     }
+    // One line per request, in the same JSON-event shape `vipera generate` writes, so a log
+    // collector reads both the same way. `VIPERA_ACCESS_LOG=0` silences it.
+    if access_log_enabled() {
+        eprintln!(
+            "{{\"event\":\"request\",\"peer\":{},\"method\":{},\"path\":{},\"status\":{status},\"micros\":{}}}",
+            quote(&peer),
+            quote(&request.method),
+            quote(&request.path),
+            started.elapsed().as_micros()
+        );
+    }
     Ok(())
+}
+
+/// Whether each request writes one line to stderr. On by default; `0`, `false`, `off` or `no`
+/// silences it for a host that would rather have nothing between it and its log files.
+fn access_log_enabled() -> bool {
+    access_log_enabled_for(std::env::var("VIPERA_ACCESS_LOG").ok().as_deref())
+}
+
+/// [`access_log_enabled`] against a given value, so the rule can be tested without the process
+/// environment.
+fn access_log_enabled_for(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
 }
 
 /// Headers that let a page call the server directly.
@@ -2433,6 +2459,17 @@ impl Histogram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_access_log_is_on_unless_it_is_turned_off() {
+        assert!(access_log_enabled_for(None), "unset means on");
+        for off in ["0", "false", "OFF", "no", " 0 "] {
+            assert!(!access_log_enabled_for(Some(off)), "{off:?} turns it off");
+        }
+        for on in ["1", "true", "yes", ""] {
+            assert!(access_log_enabled_for(Some(on)), "{on:?} leaves it on");
+        }
+    }
 
     fn request_with_bearer(value: Option<&str>) -> Request {
         Request {
