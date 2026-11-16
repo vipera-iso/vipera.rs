@@ -30,13 +30,21 @@ is expected to be green at every commit, so a local run alone does not prove the
 
 ## Rules the code is held to
 
-- No external crates. `std`, `core` and `alloc` only.
+- No external crates. `std`, `core` and `alloc` only. The single recorded exception is `rustls`
+  for TLS in `vipera serve` (`EXC-002` in `CONSTRAINTS.md`); anything else needs its own row there,
+  with an owner and an expiry, or it is a removal rather than an exception.
 - `unsafe` stays in `crates/vipera-backend-cpu/src/simd.rs`, the only file with
   `#![allow(unsafe_code)]`. Every `unsafe` block carries a `// SAFETY:` comment naming the invariant
   that makes it sound, and every `unsafe fn` has a `# Safety` section listing its preconditions.
 - No `unwrap()`, `expect()` or `panic!()` in library code. Tests may use them.
 - `#![warn(missing_docs)]` is on in every crate, so a public item without a doc block fails clippy.
 - A behavior change ships with a test that fails without it.
+- A performance change ships with a number, before and after, in `docs/benchmarks.md`. A change
+  that cannot show one is reverted; a change that measures neutral is reverted too, and the number
+  is recorded first. When the change only moves scheduling, a cache hint or an address, time both
+  arms in one process — two separate runs compare two different amounts of interference, which is
+  how the same switch once measured 20% and later 34%. `attention_combinations` and
+  `kv_row_order_at_1024` are the examples to copy, and the ledger describes the recipe.
 
 ## Checkpoints
 

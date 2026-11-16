@@ -66,13 +66,14 @@ welcome; adding to the count is not.
 |--------|-------|-----------|
 | Project coverage | unknown — `pytest` and `pytest-cov` are not installed in the system interpreter | must be measured before it is enforced |
 | Planner unit tests | 0 (tests cover gguf, hardware, a risk gate only) | must increase with every planner change |
-| Diff-scoped checks | unavailable — this workspace is not a git repository | becomes available if the project is initialized as one |
+| Diff-scoped checks | available — this is a git repository, and every change lands through a PR whose CI run is the confirmation | every performance claim also carries a before/after in `docs/benchmarks.md` |
 
 ## Exceptions
 
 | ID | Rule | Path | Reason | Owner | Expires |
 |----|------|------|--------|-------|---------|
 | EXC-001 | Stdlib-only (`research.md` R3), dependency approval (agent rule 2), `unsafe` confined to `simd.rs` | `crates/vipera-backend-cpu/src/ffi_ggml.rs`, `crates/vipera-backend-cpu/src/vipera_ggml_shim.cpp`, `crates/vipera-backend-cpu/build.rs`, `vendor/ggml/` | Bind the ggml Q4_K GEMM behind feature `ggml-q4k`, **default off**, to close the measured 4.6x prefill gap on `pp128` (45.0 tok/s vs llama.cpp 209.06, same machine, build 5676dfb). Scope of the toolchain exception is `cc` **plus a C++ compiler** (`CXX`): the kernels are C++17 with no C linkage, so a C-only toolchain fails at link, not at typecheck. Rollback: feature off, one revert. Full record: `docs/design/ADR-001-ggml-q4k-bind.md`. | vipera-iso | 2027-02-11 |
+| EXC-002 | Stdlib-only (`research.md` R3), dependency approval (agent rule 2) | `crates/vipera-server/Cargo.toml`, `crates/vipera-server/src/serve.rs`, `bins/vipera/Cargo.toml` (dev-dependency, client side of the TLS test) | Serve HTTPS. Writing TLS by hand is not something to ship, and the workspace had no alternative that was not one; `rustls` 0.23 with `ring`, no default features, is the whole of it. Everything else in the engine stays stdlib-only, and `vipera serve` without `--tls-cert`/`--tls-key` links nothing new at run time. Rollback: drop the two flags, one revert, and the plain-HTTP path is untouched. Full record: the `vipera-server` crate doc comment and the README. | vipera-iso | 2027-02-11 |
 
 An exception needs an owner and an expiry; without both it is a removal, not an exception.
 

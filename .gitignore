@@ -2,12 +2,15 @@
 # Everything else in this home directory belongs to other projects and is not part of it.
 /*
 !/.gitignore
+!/.editorconfig
 !/.github/
 !/Cargo.toml
 !/Cargo.lock
 !/rust-toolchain.toml
 !/README.md
 !/CONTRIBUTING.md
+# How to report a vulnerability, and what the project holds itself to when it is reported.
+!/SECURITY.md
 # The written quality bar and its exception table (EXC-001) must travel with the code: an ADR
 # that points at an exception nobody else can see is not a record.
 !/CONSTRAINTS.md

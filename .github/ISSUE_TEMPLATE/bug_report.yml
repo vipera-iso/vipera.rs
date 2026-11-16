@@ -1,0 +1,57 @@
+name: Bug report
+description: Something the engine, the CLI or the server should do, and does not
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The gate in `CONTRIBUTING.md` decides most reports, so paste the command and its real output
+        rather than a summary of it. A report that comes with the failing command is usually fixed
+        in one pass; one without it usually costs a round trip.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command, the model, and the output. Trim to the lines that matter.
+      placeholder: |
+        $ vipera generate model.gguf --prompt "..." --max-tokens 16
+        panic at ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: For a generation difference, the token ids matter more than the prose.
+    validations:
+      required: true
+
+  - type: textarea
+    id: gate
+    attributes:
+      label: What the gate says here
+      description: Output of the three commands, or the one that fails. Skip if the failure is not a check failure.
+      placeholder: |
+        $ cargo test --workspace --locked
+        ...
+    validations:
+      required: false
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: CPU model and thread count, OS, `rustc --version`, and the GGUF (arch, quant, size).
+      placeholder: i5-11300H, 4C/8T, VIPERA_THREADS=8, Arch Linux, rustc 1.9x, Qwen2.5-1.5B Q4_K_M
+    validations:
+      required: true
+
+  - type: textarea
+    id: measured
+    attributes:
+      label: Anything already measured
+      description: If you tried a fix or timed something, put the numbers here. The ledger wants them even if the outcome is negative.
+    validations:
+      required: false
