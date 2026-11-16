@@ -2188,6 +2188,158 @@ mod tests {
         }
     }
 
+    /// Would a transposed K layout pay? The score pass both ways, at the shape that matters.
+    ///
+    /// `per-position dots` is what attention does today: one 128-wide `f16` dot per head per
+    /// position, reduced horizontally. `block gemm` is what a `[dim][position]` layout allows: 64
+    /// positions scored at once with FMA, the reduction vertical, no horizontal sums. The transpose
+    /// itself is timed separately, because that is the cost a format change would move somewhere
+    /// else (into the KV writes) rather than remove.
+    ///
+    /// Ignored by default: `cargo test -p vipera-backend-cpu --release --lib -- --ignored
+    /// --nocapture transposed_k_scores`.
+    #[test]
+    #[ignore]
+    fn transposed_k_scores() {
+        const HEADS: usize = 12;
+        const KV_HEADS: usize = 2;
+        const DIM: usize = 128;
+        const POSITIONS: usize = 1024;
+        const BLOCK: usize = 64;
+        let group = HEADS / KV_HEADS;
+        let mut rng = Rng(0x5eed_0a77_0000_0011);
+        let q: Vec<f32> = (0..HEADS * DIM).map(|_| rng.unit() * 2.0 - 1.0).collect();
+        // One layer's K rows, position-major and contiguous: the shape the cache has now.
+        let rows: Vec<u8> = (0..POSITIONS * KV_HEADS * DIM)
+            .flat_map(|_| crate::quant::f32_to_f16(rng.unit() * 2.0 - 1.0).to_le_bytes())
+            .collect();
+        let row_bytes = KV_HEADS * DIM * 2;
+
+        fn time<R: FnMut()>(rounds: u32, mut run: R) -> f64 {
+            run();
+            let mut best = f64::INFINITY;
+            for _ in 0..rounds {
+                let start = std::time::Instant::now();
+                run();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best * 1000.0
+        }
+
+        let mut scores = vec![0.0_f32; HEADS * POSITIONS];
+        let dots = time(5, || {
+            for position in 0..POSITIONS {
+                for head in 0..HEADS {
+                    let packed = position * row_bytes + (head / group) * DIM * 2;
+                    scores[head * POSITIONS + position] =
+                        super::dot_f16_f32(&q[head * DIM..][..DIM], &rows[packed..][..DIM * 2]);
+                }
+            }
+            std::hint::black_box(&scores);
+        });
+
+        // `kt[dim][position within block]`, the layout a transposed K would give for free.
+        let mut kt = vec![0.0_f32; DIM * BLOCK];
+        let transpose = time(5, || {
+            for block_start in (0..POSITIONS).step_by(BLOCK) {
+                for dim in 0..DIM {
+                    for offset in 0..BLOCK {
+                        let position = block_start + offset;
+                        let at = position * row_bytes + dim * 2;
+                        kt[dim * BLOCK + offset] =
+                            crate::quant::f16_to_f32(u16::from_le_bytes([rows[at], rows[at + 1]]));
+                    }
+                }
+            }
+            std::hint::black_box(&kt);
+        });
+
+        let mut block_scores = vec![0.0_f32; HEADS * POSITIONS];
+        let gemm = time(5, || {
+            // For each block of positions: transpose once, score the group's heads from it.
+            for block_start in (0..POSITIONS).step_by(BLOCK) {
+                for kv_head in 0..KV_HEADS {
+                    for dim in 0..DIM {
+                        for offset in 0..BLOCK {
+                            let at =
+                                (block_start + offset) * row_bytes + kv_head * DIM * 2 + dim * 2;
+                            kt[dim * BLOCK + offset] =
+                                crate::quant::f16_to_f32(u16::from_le_bytes([
+                                    rows[at],
+                                    rows[at + 1],
+                                ]));
+                        }
+                    }
+                    if !available() {
+                        continue;
+                    }
+                    for member in 0..group {
+                        let head = kv_head * group + member;
+                        // SAFETY: AVX2 was checked above, and every load stays inside `kt`.
+                        unsafe {
+                            score_block_avx2(
+                                &q[head * DIM..][..DIM],
+                                &kt,
+                                &mut block_scores[head * POSITIONS + block_start..][..BLOCK],
+                            )
+                        };
+                    }
+                }
+            }
+            std::hint::black_box(&block_scores);
+        });
+
+        println!(
+            "score pass at {POSITIONS} x {HEADS} x {DIM}: per-position dots {dots:.2} ms, \
+             block gemm (with transpose) {gemm:.2} ms, transpose alone {transpose:.2} ms"
+        );
+        let worst = dots.abs().max(1.0);
+        let diff = scores
+            .iter()
+            .zip(&block_scores)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        println!(
+            "largest gap between the two, on the same data: {diff:.3} (score scale {worst:.0})"
+        );
+    }
+
+    /// `scores[i] = dot(q, kt[..][i])` for `scores.len()` positions, FMA over dimensions, the
+    /// reduction vertical instead of a horizontal sum per position.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2, `kt` must hold `q.len() * scores.len()` values in
+    /// `[dim][position]` order, and `scores.len()` must be a multiple of eight.
+    #[cfg(test)]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn score_block_avx2(q: &[f32], kt: &[f32], scores: &mut [f32]) {
+        // SAFETY: the caller guarantees AVX2+FMA, the layout of `kt`, and that `scores` divides
+        // into eight-lane chunks; every load below stays inside one.
+        unsafe {
+            let positions = scores.len();
+            let out = scores.as_mut_ptr();
+            let mut lane = 0;
+            while lane + 8 <= positions {
+                let mut acc = _mm256_setzero_ps();
+                for (dim, value) in q.iter().enumerate() {
+                    let k = _mm256_loadu_ps(kt.as_ptr().add(dim * positions + lane));
+                    acc = _mm256_fmadd_ps(_mm256_set1_ps(*value), k, acc);
+                }
+                _mm256_storeu_ps(out.add(lane), acc);
+                lane += 8;
+            }
+            while lane < positions {
+                let mut total = 0.0_f32;
+                for (dim, value) in q.iter().enumerate() {
+                    total += value * kt[dim * positions + lane];
+                }
+                *out.add(lane) = total;
+                lane += 1;
+            }
+        }
+    }
+
     /// What each phase of a depth-1024 attention layer costs, at its own shape: 12 heads over
     /// 1024 positions against an `f16` row of 128 values.
     ///

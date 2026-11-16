@@ -926,3 +926,33 @@ parked prompt, then the cache fills and the rest recompute. The threshold is ari
 budget has to hold the concurrent prompted sequences plus the parked copy, so ~8 x 500 tokens plus
 one prompt needs 8192 and has nothing to spare at 4096. Past that the gain is flat, so 8192 is the
 size to recommend for this burst shape.
+
+### A transposed K layout with a block GEMM score pass: 4.6x slower — 2026-11-16
+
+The remaining cost of a depth-1024 attention step is the strided walk over KV rows (each K row is
+512 bytes, consecutive positions are `bytes_per_token` = 28 KB apart), so the proposal was to store
+K as `[dim][position]` per block, which makes positions contiguous for a dimension and lets the
+score pass become Q x K^T with the reduction vertical instead of one horizontal sum per position.
+
+Before changing the cache format, the pair was prototyped in `simd::tests::transposed_k_scores`
+over the real shape (1024 positions x 12 heads x 128 dims, f16 rows), on a separate branch:
+
+| score pass | ms |
+|---|---|
+| per-position dots (today) | 0.14 |
+| block GEMM of 64 positions, transposed K given | 0.37 (0.67 with the transpose counted) |
+| transpose alone | 0.27-0.33 |
+
+Both produce the same scores on the same data (largest gap 0.000). The block GEMM is 2.6x slower
+even when the transpose is free, and 4.6x slower when it is not. The reason is loads: the GEMM
+reads one 32-byte vector of `kt` per FMA, and re-reads the whole block once per head, while the
+per-position dot reads a contiguous 128-value row that is already in L1 and reduces it with two
+accumulators.
+
+**Verdict: the format change is not carried.** It would cost a change to the KV format, the write
+path, `load_layer`, prefix-cache copies and every KV test, to make the already-cheap phase slower.
+The score pass is 0.14 ms of a 12 ms attention step, so even making it free would leave ~4 ms of
+the step untouched: whatever is left is the walk and the weighted sum, not the scoring.
+
+The prototype stays as an ignored bench, so the next person does not have to rebuild it to find
+the same answer.
