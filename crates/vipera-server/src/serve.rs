@@ -2612,40 +2612,6 @@ impl Histogram {
 mod tests {
     use super::*;
 
-    #[test]
-    fn base64_decodes_padding_and_line_breaks() {
-        assert_eq!(base64_decode("aGk=").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(base64_decode("aGk").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(base64_decode("a\nG\r\nk").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(base64_decode("AQID").as_deref(), Some(&[1u8, 2, 3][..]));
-        assert_eq!(base64_decode(""), Some(Vec::new()));
-        assert_eq!(base64_decode("aGk*"), None, "a stray byte is not skipped");
-    }
-
-    #[test]
-    fn pem_blocks_carry_their_tags_in_order() {
-        let pem = b"-----BEGIN CERTIFICATE-----\naGk=\n-----END CERTIFICATE-----\n\
-                    -----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
-        let blocks = pem_blocks(pem);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].0, "CERTIFICATE");
-        assert_eq!(blocks[0].1, b"hi");
-        assert_eq!(blocks[1].0, "PRIVATE KEY");
-        assert_eq!(blocks[1].1, [1u8, 2, 3]);
-        assert!(pem_blocks(b"no blocks here").is_empty());
-    }
-
-    #[test]
-    fn the_access_log_is_on_unless_it_is_turned_off() {
-        assert!(access_log_enabled_for(None), "unset means on");
-        for off in ["0", "false", "OFF", "no", " 0 "] {
-            assert!(!access_log_enabled_for(Some(off)), "{off:?} turns it off");
-        }
-        for on in ["1", "true", "yes", ""] {
-            assert!(access_log_enabled_for(Some(on)), "{on:?} leaves it on");
-        }
-    }
-
     fn request_with_bearer(value: Option<&str>) -> Request {
         Request {
             method: "POST".to_owned(),
@@ -2743,6 +2709,39 @@ mod tests {
         drop(second);
     }
 
+    #[test]
+    fn base64_decodes_padding_and_line_breaks() {
+        assert_eq!(base64_decode("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("aGk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("a\nG\r\nk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("AQID").as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(base64_decode(""), Some(Vec::new()));
+        assert_eq!(base64_decode("aGk*"), None, "a stray byte is not skipped");
+    }
+
+    #[test]
+    fn pem_blocks_carry_their_tags_in_order() {
+        let pem = b"-----BEGIN CERTIFICATE-----\naGk=\n-----END CERTIFICATE-----\n\
+                    -----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+        let blocks = pem_blocks(pem);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "CERTIFICATE");
+        assert_eq!(blocks[0].1, b"hi");
+        assert_eq!(blocks[1].0, "PRIVATE KEY");
+        assert_eq!(blocks[1].1, [1u8, 2, 3]);
+        assert!(pem_blocks(b"no blocks here").is_empty());
+    }
+
+    #[test]
+    fn the_access_log_is_on_unless_it_is_turned_off() {
+        assert!(access_log_enabled_for(None), "unset means on");
+        for off in ["0", "false", "OFF", "no", " 0 "] {
+            assert!(!access_log_enabled_for(Some(off)), "{off:?} turns it off");
+        }
+        for on in ["1", "true", "yes", ""] {
+            assert!(access_log_enabled_for(Some(on)), "{on:?} leaves it on");
+        }
+    }
     #[test]
     fn rejects_roles_the_contract_does_not_define() {
         let request = Json::parse(r#"{"messages":[{"role":"tool","content":"x"}]}"#).unwrap();
