@@ -1824,14 +1824,16 @@ fn attend_entries(
                     handles.push(scope.spawn(move || {
                         let mut local = AttnScratch::default();
                         attend_entry(
-                            &q[..query],
-                            &kv[0],
-                            layer,
-                            positions[0],
-                            shape,
-                            first..end,
+                            AttentionCall {
+                                q: &q[..query],
+                                kv: &kv[0],
+                                layer,
+                                positions: positions[0],
+                                shape,
+                                heads: first..end,
+                                out: slot,
+                            },
                             &mut local,
-                            slot,
                         )
                     }));
                 }
@@ -1847,14 +1849,16 @@ fn attend_entries(
     if wanted <= 1 {
         for entry in 0..entries {
             attend_entry(
-                &q[entry * query..][..query],
-                &kv[entry],
-                layer,
-                positions[entry],
-                shape,
-                0..shape.heads,
+                AttentionCall {
+                    q: &q[entry * query..][..query],
+                    kv: &kv[entry],
+                    layer,
+                    positions: positions[entry],
+                    shape,
+                    heads: 0..shape.heads,
+                    out: &mut out[entry * query..][..query],
+                },
                 scratch,
-                &mut out[entry * query..][..query],
             )?;
         }
         return Ok(());
@@ -1878,14 +1882,16 @@ fn attend_entries(
                 for (offset, row) in slot.chunks_mut(query).enumerate() {
                     let entry = first + offset;
                     attend_entry(
-                        &q[entry * query..][..query],
-                        &kv[entry],
-                        layer,
-                        positions[entry],
-                        shape,
-                        0..shape.heads,
+                        AttentionCall {
+                            q: &q[entry * query..][..query],
+                            kv: &kv[entry],
+                            layer,
+                            positions: positions[entry],
+                            shape,
+                            heads: 0..shape.heads,
+                            out: row,
+                        },
                         &mut local,
-                        row,
                     )?;
                 }
                 Ok(())
@@ -1901,48 +1907,121 @@ fn attend_entries(
 
 /// One entry's attention, over `heads` only, choosing the kernel by history length.
 #[allow(clippy::too_many_arguments)]
-fn attend_entry(
-    q: &[f32],
-    kv: &KvRead<'_>,
+/// One attention kernel, and everything the forward pass asks of it.
+///
+/// There are two, and [`algorithm_for`] picks between them by history length. They sit behind a
+/// trait so the choice is one function rather than a branch in the forward pass, and so another
+/// kernel — a block-parallel one, or a device one — is an implementation rather than an edit here.
+/// Both must compute the oracle's bits: the tests compare them to each other and to [`attention`].
+/// One attention call: the query rows, the history to read, and where the answer goes.
+struct AttentionCall<'q, 'k> {
+    /// The query heads, `shape.heads * head_dim` values.
+    q: &'q [f32],
+    /// The KV cache to read.
+    kv: &'q KvRead<'k>,
+    /// Layer of the cache this pass reads.
     layer: usize,
+    /// Positions of history, including the one `q` is.
     positions: usize,
+    /// Head geometry.
     shape: AttnShape,
+    /// Heads to compute, in absolute head numbers.
     heads: std::ops::Range<usize>,
-    scratch: &mut AttnScratch,
-    out: &mut [f32],
-) -> Result<(), ViperaError> {
-    if positions >= STREAMING_MIN_POSITIONS {
-        return attention_streaming_heads(
-            q,
-            kv,
-            layer,
-            positions,
-            shape,
-            heads,
+    /// Where `heads.len()` rows of `head_dim` values are written, in head order from `heads.start`.
+    out: &'q mut [f32],
+}
+
+trait AttentionAlgorithm {
+    /// Fill `call.out` from `call`.
+    fn attend(
+        &self,
+        call: AttentionCall<'_, '_>,
+        scratch: &mut AttnScratch,
+    ) -> Result<(), ViperaError>;
+
+    /// Which kernel this is, for the test that the selection follows [`STREAMING_MIN_POSITIONS`].
+    #[cfg(test)]
+    fn name(&self) -> &'static str;
+}
+
+/// Decode the layer once and score the whole window from the decoded buffers.
+///
+/// Cheapest below [`STREAMING_MIN_POSITIONS`], where the two `positions * width` buffers are still
+/// small enough that decoding each row once beats decoding it twice.
+struct BufferedAttention;
+
+/// Read each K/V row out of the cache where it lies, keeping one row of scratch.
+struct StreamingAttention;
+
+impl AttentionAlgorithm for BufferedAttention {
+    fn attend(
+        &self,
+        call: AttentionCall<'_, '_>,
+        scratch: &mut AttnScratch,
+    ) -> Result<(), ViperaError> {
+        call.kv.load_layer(
+            call.layer,
+            call.shape,
+            call.positions,
+            &mut scratch.k_all,
+            &mut scratch.v_all,
+        )?;
+        attention_heads(
+            call.q,
+            &scratch.k_all,
+            &scratch.v_all,
+            call.positions,
+            call.shape,
+            call.heads,
+            &mut scratch.scores,
+            call.out,
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "buffered"
+    }
+}
+
+impl AttentionAlgorithm for StreamingAttention {
+    fn attend(
+        &self,
+        call: AttentionCall<'_, '_>,
+        scratch: &mut AttnScratch,
+    ) -> Result<(), ViperaError> {
+        attention_streaming_heads(
+            call.q,
+            call.kv,
+            call.layer,
+            call.positions,
+            call.shape,
+            call.heads,
             &mut scratch.scores,
             &mut scratch.row,
             &mut scratch.head_state,
-            out,
-        );
+            call.out,
+        )
     }
-    kv.load_layer(
-        layer,
-        shape,
-        positions,
-        &mut scratch.k_all,
-        &mut scratch.v_all,
-    )?;
-    attention_heads(
-        q,
-        &scratch.k_all,
-        &scratch.v_all,
-        positions,
-        shape,
-        heads,
-        &mut scratch.scores,
-        out,
-    );
-    Ok(())
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "streaming"
+    }
+}
+
+/// The kernel for a history of `positions`: the only place the choice is made.
+fn algorithm_for(positions: usize) -> &'static dyn AttentionAlgorithm {
+    if positions >= STREAMING_MIN_POSITIONS {
+        &StreamingAttention
+    } else {
+        &BufferedAttention
+    }
+}
+
+fn attend_entry(call: AttentionCall<'_, '_>, scratch: &mut AttnScratch) -> Result<(), ViperaError> {
+    algorithm_for(call.positions).attend(call, scratch)
 }
 
 /// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
@@ -2442,6 +2521,75 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(bits(&out), bits(&expected));
+    }
+
+    /// The kernel choice is one function, so this pins it to the documented threshold — and the
+    /// two kernels it chooses between have to agree bit for bit at the position where they swap.
+    #[test]
+    fn the_attention_kernel_follows_the_position_threshold() {
+        assert_eq!(algorithm_for(1).name(), "buffered");
+        assert_eq!(
+            algorithm_for(STREAMING_MIN_POSITIONS - 1).name(),
+            "buffered"
+        );
+        assert_eq!(algorithm_for(STREAMING_MIN_POSITIONS).name(), "streaming");
+
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let positions = STREAMING_MIN_POSITIONS;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            positions,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let mut outputs = Vec::new();
+        for algorithm in [
+            &BufferedAttention as &dyn AttentionAlgorithm,
+            &StreamingAttention,
+        ] {
+            let mut scratch = AttnScratch::default();
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            algorithm
+                .attend(
+                    AttentionCall {
+                        q: &q,
+                        kv: &read,
+                        layer: 0,
+                        positions,
+                        shape,
+                        heads: 0..shape.heads,
+                        out: &mut out,
+                    },
+                    &mut scratch,
+                )
+                .expect("attention");
+            outputs.push(out.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "the kernels disagree at the boundary"
+        );
     }
 
     /// What one layer of one decode step pays for its K/V: decode the history, then attend.
