@@ -970,3 +970,37 @@ the step untouched: whatever is left is the walk and the weighted sum, not the s
 
 The prototype stays as an ignored bench, so the next person does not have to rebuild it to find
 the same answer.
+
+### Layer-major KV inside a block: 27% off the walk at depth 1024 — 2026-11-16
+
+The previous entry established that what is left of a depth-1024 attention step is the walk, not the
+arithmetic. The walk is strided because a token owns every layer: K rows are 512 bytes, and
+consecutive positions are `bytes_per_token` = 28 KB apart, so one layer of a 16-token block is 16
+rows scattered across 448 KB.
+
+Before touching the format, the same bytes were re-ordered *inside* a block — layer-major, every
+layer's rows for the whole block together — behind `VIPERA_KV_LAYER_MAJOR=1`. The block table, the
+block size and the row encoding are unchanged; only the addresses move, so the two arms read the
+same values in the same order and must compute the same bits.
+
+Measured by `kv_row_order_at_1024` (28 layers x 1024 positions, f16, `tokens_per_block` = 16, best
+of five per arm, both arms in one process, pinned to cores 2-7 with `VIPERA_THREADS=6`):
+
+| run | token-major | layer-major | gain |
+|---|---|---|---|
+| 1 | 15.22 ms | 11.10 ms | -27% |
+| 2 | 15.62 ms | 11.12 ms | -29% |
+| 3 | 15.21 ms | 12.50 ms | -18% |
+
+Per layer that is 0.543 ms to 0.396 ms. The bench asserts the two arms' outputs are equal bit for
+bit before it prints anything, so the gain is locality and nothing else.
+
+Exactness through the model, not just the bench: `vipera generate` with the switch off and on gave
+identical token ids on (a) a 920-token prompt at f16 and (b) a 1534-token prompt at `q8_0` (34-byte
+rows, six blocks), greedy, same seed.
+
+**Verdict: worth keeping, not yet worth making default.** A 1024-deep step spends ~8-12 ms in
+attention and KV, so 27% of that is 2-3 ms of a ~44 ms step (5-7%). The end-to-end decode bench
+cannot resolve 3 ms on this machine — its noise floor is +-10 ms even at 32 positions, where the two
+orders read exactly the same bytes — so the win is measured where it happens and nowhere else. The
+switch stays, off by default, until a quieter machine can confirm the step.

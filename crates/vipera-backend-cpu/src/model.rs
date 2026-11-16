@@ -1200,6 +1200,87 @@ impl ModelConfig {
     }
 }
 
+/// The order the bytes of one block are laid out in.
+///
+/// `TokenMajor` puts every layer of a token together, so reading one layer walks the block with a
+/// stride of a whole token (`bytes_per_token`, 28 KB for this model). `LayerMajor` puts each
+/// layer's rows for the whole block together, so the same walk moves one row at a time and only
+/// crosses into another block every `tokens_per_block` positions. The values a layer holds are
+/// identical either way; only the addresses differ.
+///
+/// Set `VIPERA_KV_LAYER_MAJOR=1` to turn it on. It is a switch, not a format: the block table,
+/// the block size and the row encoding all stay as they are, which is what makes the two arms
+/// comparable and the change revertible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOrder {
+    TokenMajor,
+    LayerMajor,
+}
+
+impl RowOrder {
+    fn from_env() -> Self {
+        match std::env::var("VIPERA_KV_LAYER_MAJOR") {
+            Ok(value)
+                if !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                ) =>
+            {
+                Self::LayerMajor
+            }
+            _ => Self::TokenMajor,
+        }
+    }
+
+    /// Where a token's K row starts, how far the next token's row is, and how far from K that
+    /// same token's V row is. The three numbers are the whole difference between the orders.
+    fn row_walk(
+        self,
+        block_start: usize,
+        in_block: usize,
+        per_block: usize,
+        bytes_per_token: usize,
+        layer_bytes: usize,
+        layer: usize,
+    ) -> RowWalk {
+        let k_and_stride = match self {
+            Self::TokenMajor => (
+                block_start + in_block * bytes_per_token + layer * 2 * layer_bytes,
+                bytes_per_token,
+            ),
+            Self::LayerMajor => (
+                block_start + layer * 2 * layer_bytes * per_block + in_block * layer_bytes,
+                layer_bytes,
+            ),
+        };
+        RowWalk {
+            k: k_and_stride.0,
+            stride: k_and_stride.1,
+            v: self.v_delta(per_block, layer_bytes),
+        }
+    }
+
+    /// How far a token's V row sits from its K row.
+    const fn v_delta(self, per_block: usize, layer_bytes: usize) -> usize {
+        match self {
+            Self::TokenMajor => layer_bytes,
+            Self::LayerMajor => layer_bytes * per_block,
+        }
+    }
+
+    /// The V row that pairs with the K row at `k_base`.
+    const fn value_row(self, k_base: usize, per_block: usize, layer_bytes: usize) -> usize {
+        k_base + self.v_delta(per_block, layer_bytes)
+    }
+}
+
+/// One block's walk over one layer, as [`RowOrder::row_walk`] describes it.
+struct RowWalk {
+    k: usize,
+    stride: usize,
+    v: usize,
+}
+
 /// The K/V buffer viewed as the runtime's blocks.
 struct KvView<'a> {
     storage: &'a mut [u8],
@@ -1210,15 +1291,17 @@ struct KvView<'a> {
 }
 
 impl KvView<'_> {
-    fn slot(&self, position: usize) -> Result<usize, ViperaError> {
+    /// The physical block `position` lives in, and how far into it `position` is.
+    fn token_in_block(&self, position: usize) -> Result<(usize, usize), ViperaError> {
         let block = *self
             .table
             .get(position / self.tokens_per_block)
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?;
-        Ok(
-            (block as usize * self.tokens_per_block + position % self.tokens_per_block)
-                * self.bytes_per_token,
-        )
+        let per_block = self.tokens_per_block;
+        Ok((
+            block as usize * per_block * self.bytes_per_token,
+            position % per_block,
+        ))
     }
 
     fn write(
@@ -1230,17 +1313,32 @@ impl KvView<'_> {
         v: &[f32],
     ) -> Result<(), ViperaError> {
         let layer_bytes = self.layout.bytes_per_row(shape.kv_heads * shape.head_dim);
-        let base = self.slot(position)? + layer * 2 * layer_bytes;
-        let end = base + 2 * layer_bytes;
-        if end > self.storage.len() {
-            return Err(ViperaError::internal(
-                "KV write would fall outside the cache buffer",
-            ));
+        let per_block = self.tokens_per_block.max(1);
+        let (block_start, in_block) = self.token_in_block(position)?;
+        let RowWalk {
+            k: base,
+            v: v_delta,
+            ..
+        } = RowOrder::from_env().row_walk(
+            block_start,
+            in_block,
+            per_block,
+            self.bytes_per_token,
+            layer_bytes,
+            layer,
+        );
+        let v_base = base + v_delta;
+        for end in [base + layer_bytes, v_base + layer_bytes] {
+            if end > self.storage.len() {
+                return Err(ViperaError::internal(
+                    "KV write would fall outside the cache buffer",
+                ));
+            }
         }
         self.layout
             .encode(&mut self.storage[base..base + layer_bytes], k)?;
         self.layout
-            .encode(&mut self.storage[base + layer_bytes..end], v)
+            .encode(&mut self.storage[v_base..v_base + layer_bytes], v)
     }
 
     /// The whole layer decoded to `f32`. Used for short histories (see [`STREAMING_MIN_POSITIONS`]),
@@ -1295,6 +1393,7 @@ impl<'a> KvRead<'a> {
 
     fn for_each_row(
         &self,
+        order: RowOrder,
         layer: usize,
         layer_bytes: usize,
         positions: usize,
@@ -1305,11 +1404,17 @@ impl<'a> KvRead<'a> {
             self.table,
             self.tokens_per_block,
             self.bytes_per_token,
+            order,
             layer,
             layer_bytes,
             positions,
             visit,
         )
+    }
+
+    /// The V row that pairs with the K row `for_each_row` handed the visitor.
+    fn value_row(&self, order: RowOrder, k_base: usize, layer_bytes: usize) -> usize {
+        order.value_row(k_base, self.tokens_per_block.max(1), layer_bytes)
     }
 
     fn load_layer(
@@ -1342,6 +1447,7 @@ fn for_each_row(
     table: &[u32],
     tokens_per_block: usize,
     bytes_per_token: usize,
+    order: RowOrder,
     layer: usize,
     layer_bytes: usize,
     positions: usize,
@@ -1354,17 +1460,24 @@ fn for_each_row(
             .get(position / per_block)
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?
             as usize;
+        let block_start = block * per_block * bytes_per_token;
         let in_block = (per_block - position % per_block).min(positions - position);
-        let mut base =
-            (block * per_block + position % per_block) * bytes_per_token + layer * 2 * layer_bytes;
+        let RowWalk { mut k, stride, v } = order.row_walk(
+            block_start,
+            position % per_block,
+            per_block,
+            bytes_per_token,
+            layer_bytes,
+            layer,
+        );
         for offset in 0..in_block {
-            if base + 2 * layer_bytes > storage.len() {
+            if k + v + layer_bytes > storage.len() {
                 return Err(ViperaError::internal(
                     "KV read would fall outside the cache buffer",
                 ));
             }
-            visit(position + offset, base)?;
-            base += bytes_per_token;
+            visit(position + offset, k)?;
+            k += stride;
         }
         position += in_block;
     }
@@ -1393,6 +1506,7 @@ fn load_layer(
     // per block instead of once per position: at 1024 positions that was a division and a
     // bounds-checked lookup for every row of every layer.
     let per_block = tokens_per_block.max(1);
+    let order = RowOrder::from_env();
     let mut position = 0;
     while position < positions {
         let slot = position / per_block;
@@ -1403,11 +1517,19 @@ fn load_layer(
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?
             as usize;
         let in_block = (per_block - position % per_block).min(positions - position);
-        let mut base =
-            (block * per_block + position % per_block) * bytes_per_token + layer * 2 * layer_bytes;
+        let walk = order.row_walk(
+            block * per_block * bytes_per_token,
+            position % per_block,
+            per_block,
+            bytes_per_token,
+            layer_bytes,
+            layer,
+        );
+        let mut base = walk.k;
+        let (stride, v) = (walk.stride, walk.v);
         for offset in 0..in_block {
-            let end = base + 2 * layer_bytes;
-            if end > storage.len() {
+            let v_base = base + v;
+            if v_base + layer_bytes > storage.len() {
                 return Err(ViperaError::internal(
                     "KV read would fall outside the cache buffer",
                 ));
@@ -1417,8 +1539,11 @@ fn load_layer(
                 &storage[base..base + layer_bytes],
                 &mut k_all[at..][..width],
             )?;
-            layout.decode(&storage[base + layer_bytes..end], &mut v_all[at..][..width])?;
-            base += bytes_per_token;
+            layout.decode(
+                &storage[v_base..v_base + layer_bytes],
+                &mut v_all[at..][..width],
+            )?;
+            base += stride;
         }
         position += in_block;
     }
@@ -1592,6 +1717,7 @@ fn attention_streaming(
     attention_streaming_heads(
         q,
         &KvRead::of(kv),
+        RowOrder::from_env(),
         layer,
         positions,
         shape,
@@ -1610,6 +1736,7 @@ fn attention_streaming(
 fn attention_streaming_heads(
     q: &[f32],
     kv: &KvRead<'_>,
+    order: RowOrder,
     layer: usize,
     positions: usize,
     shape: AttnShape,
@@ -1639,7 +1766,7 @@ fn attention_streaming_heads(
     head_state.resize(count, f32::NEG_INFINITY);
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
-    kv.for_each_row(layer, layer_bytes, positions, |position, base| {
+    kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
         if !in_place {
             kv.layout
                 .decode(&kv.storage[base..base + layer_bytes], row)?;
@@ -1683,8 +1810,8 @@ fn attention_streaming_heads(
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
     out[..count * head_dim].fill(0.0);
-    kv.for_each_row(layer, layer_bytes, positions, |position, base| {
-        let v_base = base + layer_bytes;
+    kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+        let v_base = kv.value_row(order, base, layer_bytes);
         if !in_place {
             kv.layout
                 .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;
@@ -1967,6 +2094,7 @@ impl AttentionAlgorithm for StreamingAttention {
         attention_streaming_heads(
             call.q,
             call.kv,
+            RowOrder::from_env(),
             call.layer,
             call.positions,
             call.shape,
@@ -2651,7 +2779,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_slots_follow_the_block_table_across_block_boundaries() {
+    fn kv_positions_map_through_the_block_table() {
         // One layer: K and V are 4 bytes each, so a position costs 8 bytes in this toy layout.
         let per_token = 8;
         let mut storage = vec![0u8; 2 * 4 * per_token];
@@ -2663,18 +2791,225 @@ mod tests {
             bytes_per_token: per_token,
             layout: KvLayout::F16,
         };
-        assert_eq!(kv.slot(0).expect("slot"), 4 * per_token);
-        assert_eq!(kv.slot(3).expect("slot"), 7 * per_token);
+        assert_eq!(kv.token_in_block(0).expect("block"), (4 * per_token, 0));
+        assert_eq!(kv.token_in_block(3).expect("block"), (4 * per_token, 3));
         assert_eq!(
-            kv.slot(4).expect("slot"),
-            0,
+            kv.token_in_block(4).expect("block"),
+            (0, 0),
             "block 0 holds the second half"
         );
-        assert_eq!(kv.slot(7).expect("slot"), 3 * per_token);
+        assert_eq!(kv.token_in_block(7).expect("block"), (0, 3));
         assert!(
-            kv.slot(8).is_err(),
-            "a position beyond the block table has no slot"
+            kv.token_in_block(8).is_err(),
+            "a position beyond the block table has no block"
         );
+    }
+
+    /// The strided walk at 1024 positions, both orders, one process: same values at the same
+    /// logical positions, only the addresses differ. Prints the cost and asserts the two arms
+    /// compute the same bits, which is what makes the comparison meaningful.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib kv_row_order_at_1024 -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a number, run with --ignored --nocapture"]
+    fn kv_row_order_at_1024() {
+        // The model this repository benchmarks: 28 layers, 12 heads over 2 KV heads of 128.
+        let layers = 28;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let row = KvLayout::F16.bytes_per_row(width);
+        let bytes_per_token = layers * 2 * row;
+        // `DEFAULT_TOKENS_PER_BLOCK`, so the walk is the one the binary runs.
+        let per_block = 16;
+        let positions = 1024usize;
+        let blocks = positions.div_ceil(per_block);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let mut values = vec![0.0_f32; width];
+        let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7) % 23) as f32 * 0.03 - 0.3)
+            .collect();
+
+        let mut layout_for = |order: RowOrder| {
+            let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+            for layer in 0..layers {
+                for position in 0..positions {
+                    let walk = order.row_walk(
+                        position / per_block * per_block * bytes_per_token,
+                        position % per_block,
+                        per_block,
+                        bytes_per_token,
+                        row,
+                        layer,
+                    );
+                    for (at, value) in values.iter_mut().enumerate() {
+                        *value = ((position * 31 + layer * 7 + at * 13) % 97) as f32 * 0.01 - 0.5;
+                    }
+                    KvLayout::F16
+                        .encode(&mut storage[walk.k..walk.k + row], &values)
+                        .expect("write K");
+                    let v_base = walk.k + walk.v;
+                    KvLayout::F16
+                        .encode(&mut storage[v_base..v_base + row], &values)
+                        .expect("write V");
+                }
+            }
+            storage
+        };
+
+        let mut arms = Vec::new();
+        for order in [RowOrder::TokenMajor, RowOrder::LayerMajor] {
+            let mut storage = layout_for(order);
+            let kv = KvView {
+                storage: &mut storage,
+                table: &table,
+                tokens_per_block: per_block,
+                bytes_per_token,
+                layout: KvLayout::F16,
+            };
+            let read = KvRead::of(&kv);
+            let run = |read: &KvRead<'_>, out: &mut [f32]| {
+                let mut scores = Vec::new();
+                let mut row_buffer = Vec::new();
+                let mut head_state = Vec::new();
+                for layer in 0..layers {
+                    attention_streaming_heads(
+                        &q,
+                        read,
+                        order,
+                        layer,
+                        positions,
+                        shape,
+                        0..shape.heads,
+                        &mut scores,
+                        &mut row_buffer,
+                        &mut head_state,
+                        out,
+                    )
+                    .expect("attention");
+                }
+            };
+            run(&read, &mut out);
+            let mut best = f64::INFINITY;
+            let mut rounds = 0;
+            while rounds < 5 {
+                let started = std::time::Instant::now();
+                run(&read, &mut out);
+                best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+                rounds += 1;
+            }
+            println!(
+                "{order:?}: {best:6.2} ms for {layers} layers x {positions} positions ({:.3} ms/layer)",
+                best / layers as f64
+            );
+            arms.push((order, best, out.clone()));
+        }
+        assert_eq!(
+            arms[0].2, arms[1].2,
+            "the two orders must compute the same output bits"
+        );
+    }
+
+    #[test]
+    fn the_row_orders_differ_only_in_addresses() {
+        // Two layers of one 4-value row, four tokens per block, three blocks in a permuted table:
+        // enough to cross a block boundary and to see the table's indirection.
+        let row = KvLayout::F16.bytes_per_row(4);
+        let per_block = 4;
+        let layers = 2;
+        let bytes_per_token = layers * 2 * row;
+        let table = [2u32, 0, 1];
+        let positions = 10;
+        let storage = vec![0u8; 3 * per_block * bytes_per_token];
+
+        let rows = |order: RowOrder, layer: usize| -> Vec<(usize, usize, usize)> {
+            let mut out = Vec::new();
+            for_each_row(
+                &storage,
+                &table,
+                per_block,
+                bytes_per_token,
+                order,
+                layer,
+                row,
+                positions,
+                |position, k| {
+                    out.push((position, k, order.value_row(k, per_block, row)));
+                    Ok(())
+                },
+            )
+            .expect("walk");
+            out
+        };
+
+        let token = rows(RowOrder::TokenMajor, 1);
+        let layer_major = rows(RowOrder::LayerMajor, 1);
+        assert_eq!(
+            token
+                .iter()
+                .map(|(position, ..)| *position)
+                .collect::<Vec<_>>(),
+            layer_major
+                .iter()
+                .map(|(position, ..)| *position)
+                .collect::<Vec<_>>(),
+            "both orders visit the positions in the same order"
+        );
+        assert_ne!(
+            token.iter().map(|(_, k, _)| *k).collect::<Vec<_>>(),
+            layer_major.iter().map(|(_, k, _)| *k).collect::<Vec<_>>(),
+            "the switch has to move the rows, or it measures nothing"
+        );
+        assert_eq!(
+            token[1].1 - token[0].1,
+            bytes_per_token,
+            "token-major stride"
+        );
+        assert_eq!(
+            layer_major[1].1 - layer_major[0].1,
+            row,
+            "layer-major strides one row, so a block's rows for one layer are contiguous"
+        );
+
+        // Every row of every layer, in either order, lands somewhere unique and inside its block:
+        // no two K/V rows share bytes, and layer-major fills each block exactly.
+        for order in [RowOrder::TokenMajor, RowOrder::LayerMajor] {
+            let mut seen = std::collections::BTreeSet::new();
+            for layer in 0..layers {
+                for (position, k, v) in rows(order, layer) {
+                    for (which, start) in [("K", k), ("V", v)] {
+                        assert!(
+                            seen.insert(start),
+                            "{order:?}: layer {layer}, {which} of position {position} overlaps another row"
+                        );
+                        assert!(
+                            start + row <= storage.len(),
+                            "{order:?}: row past the buffer"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                seen.len(),
+                layers * 2 * positions,
+                "{order:?}: every row has its own bytes"
+            );
+        }
+
+        // Layer-major packs each block without gaps: the rows of one block span its whole size.
+        let mut block_bytes = Vec::new();
+        for layer in 0..layers {
+            let start = rows(RowOrder::LayerMajor, layer)[0].1;
+            block_bytes.push(start);
+        }
+        assert_eq!(block_bytes[0] % (per_block * bytes_per_token), 0);
+        assert_eq!(block_bytes[1] - block_bytes[0], 2 * row * per_block);
     }
 
     #[test]
