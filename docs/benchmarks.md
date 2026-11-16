@@ -819,3 +819,31 @@ covers all but four tokens.
 Every workspace test passes (runtime engine tests 48 -> 64). Not a kernel change, so nothing here
 touches the prefill ceiling above: it removes prompt work rather than speeding it up, which is why
 it is the only change in this batch that moves a number by more than a few percent.
+
+### Prefix cache through the HTTP server, eight at once — 2026-11-16
+
+`vipera serve` (its `max_batch` is 4), one seed request to park a 480-token prompt, then eight
+concurrent requests that share it and differ only in their four-token question. Non-streaming, so
+`time_total` is the whole request; two rounds, cache off against on, with `--ctx 8192`:
+
+| round | cache off | cache on |
+|---|---|---|
+| 1 | 33.83 s wall (per request 33.78) | 1.15 s wall (per request 0.95-1.11) |
+| 2 | 34.81 s wall (per request 34.52-34.77) | 1.17 s wall (per request 0.88-1.12) |
+
+29x on the wall clock of the burst, and the text of all eight answers is identical between the two
+modes.
+
+The cache does not shrink KV demand, which is the operational catch: at `--ctx 2048` the same
+burst took 16.70 s against 7.34 s with the cache on (2.3x instead of 29x), because eight sequences
+of ~500 tokens no longer fit the 2048-token budget, so later requests find the donor evicted and
+fall back to computing. That is arithmetic, not a measured decomposition — but it is enough to say
+the knob belongs with a context large enough to hold the concurrent prompts plus one parked copy.
+
+### A copied prefix is the same on Q8_0 KV as on F16 — 2026-11-16
+
+`prefix_cache_gives_the_same_tokens_for_every_kv_type`: 480 shared tokens plus a four-token tail,
+twelve generated tokens, cache off against cache on, per KV type. F16 and Q8_0 both reuse 480 and
+return identical tokens. Q4_0 is not carried by this backend at all (`KvLayout::of` returns `None`,
+so planning refuses it before any of this matters), so it is reported as skipped rather than
+passing.

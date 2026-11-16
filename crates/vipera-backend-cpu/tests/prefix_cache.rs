@@ -27,14 +27,14 @@ fn model_path() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-fn engine(path: &PathBuf, cache: bool) -> Engine<CpuBackend> {
+fn engine(path: &PathBuf, cache: bool, kv_type: KvCacheType) -> Engine<CpuBackend> {
     let bytes = std::fs::read(path).expect("model bytes");
     let file = GgufFile::parse(&bytes).expect("gguf");
     let backend = CpuBackend::from_bytes(bytes, &file).expect("backend");
     let bytes_per_token = backend
         .config()
-        .kv_bytes_per_token_for(KvCacheType::F16)
-        .expect("f16 kv");
+        .kv_bytes_per_token_for(kv_type)
+        .expect("kv bytes per token");
     let context = 2048;
     let kv = KvCache::new(
         KvConfig::from_bytes(
@@ -102,7 +102,7 @@ fn prefix_cache_reuses_a_shared_prompt() {
 
     let mut produced = Vec::new();
     for cache in [false, true] {
-        let mut engine = engine(&path, cache);
+        let mut engine = engine(&path, cache, KvCacheType::F16);
         // Request one seeds the KV (parked when the cache is on); its time is not measured.
         request(&mut engine, &shared, &[500, 501, 502, 503], 1);
         // One generated token keeps the measurement to the prompt pass plus a single decode.
@@ -125,4 +125,45 @@ fn prefix_cache_reuses_a_shared_prompt() {
         "twelve tokens from a copied prefix are the ones a computed prefix gives: {:?}",
         produced[1]
     );
+}
+
+/// The cache is a byte copy of another request's KV, so it is only sound if a position's stored
+/// KV depends on the token and the position and not on the chunk it arrived in. F16 KV stores the
+/// row as computed; Q8_0 and Q4_0 quantize it, so this asks the same question of each type.
+fn supported(path: &PathBuf, kv_type: KvCacheType) -> bool {
+    let bytes = std::fs::read(path).expect("model bytes");
+    let file = GgufFile::parse(&bytes).expect("gguf");
+    let backend = CpuBackend::from_bytes(bytes, &file).expect("backend");
+    backend.config().kv_bytes_per_token_for(kv_type).is_some()
+}
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn prefix_cache_gives_the_same_tokens_for_every_kv_type() {
+    let Some(path) = model_path() else {
+        eprintln!("no model: set VIPERA_TEST_MODEL");
+        return;
+    };
+    let shared: Vec<u32> = (0..480u32).map(|i| 1000 + (i * 37) % 20_000).collect();
+    let tail = [11u32, 22, 33, 44];
+
+    for kv_type in [KvCacheType::F16, KvCacheType::Q8_0, KvCacheType::Q4_0] {
+        if !supported(&path, kv_type) {
+            println!("{kv_type:?} KV: this backend cannot store it, skipped");
+            continue;
+        }
+        let mut produced = Vec::new();
+        for cache in [false, true] {
+            let mut engine = engine(&path, cache, kv_type);
+            request(&mut engine, &shared, &[500, 501, 502, 503], 1);
+            produced.push(request(&mut engine, &shared, &tail, 12));
+        }
+        assert_eq!(
+            produced[0].tokens, produced[1].tokens,
+            "{kv_type:?}: a copied prefix changed the tokens"
+        );
+        println!(
+            "{kv_type:?} KV: reused {:>3}, tokens {:?}",
+            produced[1].reused, produced[1].tokens
+        );
+    }
 }
