@@ -29,6 +29,9 @@ vipera-runtime = { path = "crates/vipera-runtime" }
 vipera-backend-cpu = { path = "crates/vipera-backend-cpu" }
 vipera-server = { path = "crates/vipera-server" }
 vipera-core = { path = "crates/vipera-core" }
+# TLS for `vipera serve`. `ring` keeps the provider to one audited C-free-API backend and
+# `std`/`tls12` are what a server needs; nothing else in the workspace takes a third-party crate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

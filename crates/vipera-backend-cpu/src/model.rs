@@ -1200,6 +1200,87 @@ impl ModelConfig {
     }
 }
 
+/// The order the bytes of one block are laid out in.
+///
+/// `TokenMajor` puts every layer of a token together, so reading one layer walks the block with a
+/// stride of a whole token (`bytes_per_token`, 28 KB for this model). `LayerMajor` puts each
+/// layer's rows for the whole block together, so the same walk moves one row at a time and only
+/// crosses into another block every `tokens_per_block` positions. The values a layer holds are
+/// identical either way; only the addresses differ.
+///
+/// Layer-major is the default — it is 28-46% off the walk at depth 1024 and 34-59% at 4096, see
+/// `docs/benchmarks.md`. `VIPERA_KV_LAYER_MAJOR=0` (or `false`, `off`, `no`) walks token-major
+/// instead, for an A/B in one binary. It is a switch, not a format: the block table, the block
+/// size and the row encoding all stay as they are, which is what makes the two arms comparable
+/// and the change revertible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowOrder {
+    TokenMajor,
+    LayerMajor,
+}
+
+impl RowOrder {
+    fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(forced) = forced_order() {
+            return forced;
+        }
+        if flag("VIPERA_KV_LAYER_MAJOR") {
+            Self::LayerMajor
+        } else {
+            Self::TokenMajor
+        }
+    }
+
+    /// Where a token's K row starts, how far the next token's row is, and how far from K that
+    /// same token's V row is. The three numbers are the whole difference between the orders.
+    fn row_walk(
+        self,
+        block_start: usize,
+        in_block: usize,
+        per_block: usize,
+        bytes_per_token: usize,
+        layer_bytes: usize,
+        layer: usize,
+    ) -> RowWalk {
+        let k_and_stride = match self {
+            Self::TokenMajor => (
+                block_start + in_block * bytes_per_token + layer * 2 * layer_bytes,
+                bytes_per_token,
+            ),
+            Self::LayerMajor => (
+                block_start + layer * 2 * layer_bytes * per_block + in_block * layer_bytes,
+                layer_bytes,
+            ),
+        };
+        RowWalk {
+            k: k_and_stride.0,
+            stride: k_and_stride.1,
+            v: self.v_delta(per_block, layer_bytes),
+        }
+    }
+
+    /// How far a token's V row sits from its K row.
+    const fn v_delta(self, per_block: usize, layer_bytes: usize) -> usize {
+        match self {
+            Self::TokenMajor => layer_bytes,
+            Self::LayerMajor => layer_bytes * per_block,
+        }
+    }
+
+    /// The V row that pairs with the K row at `k_base`.
+    const fn value_row(self, k_base: usize, per_block: usize, layer_bytes: usize) -> usize {
+        k_base + self.v_delta(per_block, layer_bytes)
+    }
+}
+
+/// One block's walk over one layer, as [`RowOrder::row_walk`] describes it.
+struct RowWalk {
+    k: usize,
+    stride: usize,
+    v: usize,
+}
+
 /// The K/V buffer viewed as the runtime's blocks.
 struct KvView<'a> {
     storage: &'a mut [u8],
@@ -1210,15 +1291,17 @@ struct KvView<'a> {
 }
 
 impl KvView<'_> {
-    fn slot(&self, position: usize) -> Result<usize, ViperaError> {
+    /// The physical block `position` lives in, and how far into it `position` is.
+    fn token_in_block(&self, position: usize) -> Result<(usize, usize), ViperaError> {
         let block = *self
             .table
             .get(position / self.tokens_per_block)
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?;
-        Ok(
-            (block as usize * self.tokens_per_block + position % self.tokens_per_block)
-                * self.bytes_per_token,
-        )
+        let per_block = self.tokens_per_block;
+        Ok((
+            block as usize * per_block * self.bytes_per_token,
+            position % per_block,
+        ))
     }
 
     fn write(
@@ -1230,17 +1313,32 @@ impl KvView<'_> {
         v: &[f32],
     ) -> Result<(), ViperaError> {
         let layer_bytes = self.layout.bytes_per_row(shape.kv_heads * shape.head_dim);
-        let base = self.slot(position)? + layer * 2 * layer_bytes;
-        let end = base + 2 * layer_bytes;
-        if end > self.storage.len() {
-            return Err(ViperaError::internal(
-                "KV write would fall outside the cache buffer",
-            ));
+        let per_block = self.tokens_per_block.max(1);
+        let (block_start, in_block) = self.token_in_block(position)?;
+        let RowWalk {
+            k: base,
+            v: v_delta,
+            ..
+        } = RowOrder::from_env().row_walk(
+            block_start,
+            in_block,
+            per_block,
+            self.bytes_per_token,
+            layer_bytes,
+            layer,
+        );
+        let v_base = base + v_delta;
+        for end in [base + layer_bytes, v_base + layer_bytes] {
+            if end > self.storage.len() {
+                return Err(ViperaError::internal(
+                    "KV write would fall outside the cache buffer",
+                ));
+            }
         }
         self.layout
             .encode(&mut self.storage[base..base + layer_bytes], k)?;
         self.layout
-            .encode(&mut self.storage[base + layer_bytes..end], v)
+            .encode(&mut self.storage[v_base..v_base + layer_bytes], v)
     }
 
     /// The whole layer decoded to `f32`. Used for short histories (see [`STREAMING_MIN_POSITIONS`]),
@@ -1295,6 +1393,7 @@ impl<'a> KvRead<'a> {
 
     fn for_each_row(
         &self,
+        order: RowOrder,
         layer: usize,
         layer_bytes: usize,
         positions: usize,
@@ -1305,11 +1404,17 @@ impl<'a> KvRead<'a> {
             self.table,
             self.tokens_per_block,
             self.bytes_per_token,
+            order,
             layer,
             layer_bytes,
             positions,
             visit,
         )
+    }
+
+    /// The V row that pairs with the K row `for_each_row` handed the visitor.
+    fn value_row(&self, order: RowOrder, k_base: usize, layer_bytes: usize) -> usize {
+        order.value_row(k_base, self.tokens_per_block.max(1), layer_bytes)
     }
 
     fn load_layer(
@@ -1342,6 +1447,7 @@ fn for_each_row(
     table: &[u32],
     tokens_per_block: usize,
     bytes_per_token: usize,
+    order: RowOrder,
     layer: usize,
     layer_bytes: usize,
     positions: usize,
@@ -1354,17 +1460,24 @@ fn for_each_row(
             .get(position / per_block)
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?
             as usize;
+        let block_start = block * per_block * bytes_per_token;
         let in_block = (per_block - position % per_block).min(positions - position);
-        let mut base =
-            (block * per_block + position % per_block) * bytes_per_token + layer * 2 * layer_bytes;
+        let RowWalk { mut k, stride, v } = order.row_walk(
+            block_start,
+            position % per_block,
+            per_block,
+            bytes_per_token,
+            layer_bytes,
+            layer,
+        );
         for offset in 0..in_block {
-            if base + 2 * layer_bytes > storage.len() {
+            if k + v + layer_bytes > storage.len() {
                 return Err(ViperaError::internal(
                     "KV read would fall outside the cache buffer",
                 ));
             }
-            visit(position + offset, base)?;
-            base += bytes_per_token;
+            visit(position + offset, k)?;
+            k += stride;
         }
         position += in_block;
     }
@@ -1393,6 +1506,7 @@ fn load_layer(
     // per block instead of once per position: at 1024 positions that was a division and a
     // bounds-checked lookup for every row of every layer.
     let per_block = tokens_per_block.max(1);
+    let order = RowOrder::from_env();
     let mut position = 0;
     while position < positions {
         let slot = position / per_block;
@@ -1403,11 +1517,19 @@ fn load_layer(
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?
             as usize;
         let in_block = (per_block - position % per_block).min(positions - position);
-        let mut base =
-            (block * per_block + position % per_block) * bytes_per_token + layer * 2 * layer_bytes;
+        let walk = order.row_walk(
+            block * per_block * bytes_per_token,
+            position % per_block,
+            per_block,
+            bytes_per_token,
+            layer_bytes,
+            layer,
+        );
+        let mut base = walk.k;
+        let (stride, v) = (walk.stride, walk.v);
         for offset in 0..in_block {
-            let end = base + 2 * layer_bytes;
-            if end > storage.len() {
+            let v_base = base + v;
+            if v_base + layer_bytes > storage.len() {
                 return Err(ViperaError::internal(
                     "KV read would fall outside the cache buffer",
                 ));
@@ -1417,8 +1539,11 @@ fn load_layer(
                 &storage[base..base + layer_bytes],
                 &mut k_all[at..][..width],
             )?;
-            layout.decode(&storage[base + layer_bytes..end], &mut v_all[at..][..width])?;
-            base += bytes_per_token;
+            layout.decode(
+                &storage[v_base..v_base + layer_bytes],
+                &mut v_all[at..][..width],
+            )?;
+            base += stride;
         }
         position += in_block;
     }
@@ -1546,6 +1671,85 @@ const STREAMING_MIN_POSITIONS: usize = 256;
 /// thread, because starting the workers costs more than the split saves.
 const PARALLEL_ATTENTION_MIN: usize = 4096;
 
+/// Attention's switches, read once per call rather than per row.
+///
+/// A switch here cannot change a bit of the result — the head split only decides which thread
+/// computes which head — so one process can time both arms on the same bytes. `VIPERA_ATTN_HEAD_
+/// SPLIT=0` (or `false`, `off`, `no`) keeps a single entry's heads on the calling thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttentionSwitches {
+    /// A single entry's heads go to the pool instead of the calling thread.
+    split_heads: bool,
+    /// Which order the KV bytes are walked in.
+    order: RowOrder,
+}
+
+impl AttentionSwitches {
+    fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(forced) = forced_switches() {
+            return forced;
+        }
+        Self {
+            split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
+            order: RowOrder::from_env(),
+        }
+    }
+}
+
+/// `VIPERA_<NAME>=0|false|off|no` turns a switch off; unset or anything else leaves it on.
+fn flag(name: &str) -> bool {
+    std::env::var(name).map_or(true, |value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
+/// The switches a measurement wants, so one process can time all four combinations. Only the
+/// benchmark sets it, and it only reaches performance code: unset means "ask the environment".
+#[cfg(test)]
+fn forced_switches() -> Option<AttentionSwitches> {
+    use std::sync::atomic::Ordering;
+    let forced = BENCH_SWITCHES.load(Ordering::Relaxed);
+    (forced & 4 != 0).then_some(AttentionSwitches {
+        split_heads: forced & 1 != 0,
+        order: if forced & 2 != 0 {
+            RowOrder::LayerMajor
+        } else {
+            RowOrder::TokenMajor
+        },
+    })
+}
+
+#[cfg(test)]
+fn forced_order() -> Option<RowOrder> {
+    forced_switches().map(|switches| switches.order)
+}
+
+#[cfg(test)]
+fn force_switches(switches: AttentionSwitches) {
+    use std::sync::atomic::Ordering;
+    let bits = 4
+        | u8::from(switches.split_heads)
+        | (u8::from(switches.order == RowOrder::LayerMajor) << 1);
+    BENCH_SWITCHES.store(bits, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn clear_forced_switches() {
+    BENCH_SWITCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+static BENCH_SWITCHES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn in_place_kv_enabled() -> bool {
+    std::env::var("VIPERA_INPLACE_KV").map_or(true, |value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
 /// Causal grouped-query attention read straight from the KV blocks.
 ///
 /// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
@@ -1572,6 +1776,7 @@ fn attention_streaming(
     attention_streaming_heads(
         q,
         &KvRead::of(kv),
+        AttentionSwitches::from_env().order,
         layer,
         positions,
         shape,
@@ -1590,6 +1795,7 @@ fn attention_streaming(
 fn attention_streaming_heads(
     q: &[f32],
     kv: &KvRead<'_>,
+    order: RowOrder,
     layer: usize,
     positions: usize,
     shape: AttnShape,
@@ -1605,6 +1811,11 @@ fn attention_streaming_heads(
     let layer_bytes = kv.layout.bytes_per_row(width);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sequential = quant::exact_dot_requested();
+    // An f16 row is already the value the kernel reads, so the attention passes read it in place
+    // instead of decoding it into `row` first: same bits (the conversion is exact and the dot tree
+    // is the same one), no 2 MB of row buffer per layer per pass. `VIPERA_INPLACE_KV=0` keeps the
+    // decoded arm for an A/B in one binary.
+    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
     let count = heads.end - heads.start;
     scores.clear();
     scores.resize(count * positions, 0.0);
@@ -1614,11 +1825,14 @@ fn attention_streaming_heads(
     head_state.resize(count, f32::NEG_INFINITY);
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
-    kv.for_each_row(layer, layer_bytes, positions, |position, base| {
-        kv.layout
-            .decode(&kv.storage[base..base + layer_bytes], row)?;
+    kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+        if !in_place {
+            kv.layout
+                .decode(&kv.storage[base..base + layer_bytes], row)?;
+        }
         for kv_head in 0..shape.kv_heads {
             let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+            let packed = (base + kv_head * head_dim * 2)..;
             for member in 0..group {
                 let head = kv_head * group + member;
                 if head < heads.start || head >= heads.end {
@@ -1628,6 +1842,8 @@ fn attention_streaming_heads(
                 let query = &q[head * head_dim..(head + 1) * head_dim];
                 let dot = if sequential {
                     query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
+                } else if in_place {
+                    crate::simd::dot_f16_f32(query, &kv.storage[packed.start..][..head_dim * 2])
                 } else {
                     crate::simd::dot_f32(query, key)
                 };
@@ -1653,23 +1869,32 @@ fn attention_streaming_heads(
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
     out[..count * head_dim].fill(0.0);
-    kv.for_each_row(layer, layer_bytes, positions, |position, base| {
-        let v_base = base + layer_bytes;
-        kv.layout
-            .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;
+    kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+        let v_base = kv.value_row(order, base, layer_bytes);
+        if !in_place {
+            kv.layout
+                .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;
+        }
         for kv_head in 0..shape.kv_heads {
             let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+            let packed = (v_base + kv_head * head_dim * 2)..;
             for member in 0..group {
                 let head = kv_head * group + member;
                 if head < heads.start || head >= heads.end {
                     continue;
                 }
                 let local = head - heads.start;
-                crate::simd::axpy_f32(
-                    &mut out[local * head_dim..(local + 1) * head_dim],
-                    scores[local * positions + position] * head_state[local],
-                    value,
-                );
+                let weight = scores[local * positions + position] * head_state[local];
+                let target = &mut out[local * head_dim..(local + 1) * head_dim];
+                if in_place {
+                    crate::simd::axpy_f16_f32(
+                        target,
+                        weight,
+                        &kv.storage[packed.start..][..head_dim * 2],
+                    );
+                } else {
+                    crate::simd::axpy_f32(target, weight, value);
+                }
             }
         }
         Ok(())
@@ -1729,6 +1954,7 @@ fn attend_entries(
         assert_eq!(kv.len(), entries, "one KV view per entry");
         assert_eq!(out.len(), entries * query, "one output row per entry");
     }
+    let switches = AttentionSwitches::from_env();
     let last = positions.iter().copied().max().unwrap_or(0);
     let lanes = entries.saturating_mul(shape.heads).saturating_mul(last);
     // Only the entries are split. Splitting a single entry's heads was measured too: at ctx 1024 a
@@ -1740,17 +1966,59 @@ fn attend_entries(
         quant::max_threads().min(entries)
     };
 
+    // One entry with a long history has nothing to split by entry, but its heads are independent
+    // through the whole kernel, so they go to the pool instead. This was measured before with the
+    // row buffer in place and lost (each worker decoded every row again); with the rows read in
+    // place a worker repeats only the arithmetic, which is what the split is for.
+    if entries == 1 && lanes >= PARALLEL_ATTENTION_MIN && switches.split_heads {
+        let workers = quant::max_threads().min(shape.heads).max(1);
+        if workers > 1 {
+            let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                let mut cursor: &mut [f32] = out;
+                for part in 0..workers {
+                    let first = shape.heads * part / workers;
+                    let end = shape.heads * (part + 1) / workers;
+                    let (slot, rest) = cursor.split_at_mut((end - first) * shape.head_dim);
+                    cursor = rest;
+                    handles.push(scope.spawn(move || {
+                        let mut local = AttnScratch::default();
+                        attend_entry(
+                            AttentionCall {
+                                q: &q[..query],
+                                kv: &kv[0],
+                                layer,
+                                positions: positions[0],
+                                shape,
+                                heads: first..end,
+                                out: slot,
+                            },
+                            &mut local,
+                        )
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("an attention worker panicked"))
+                    .collect()
+            });
+            return results.into_iter().collect();
+        }
+    }
+
     if wanted <= 1 {
         for entry in 0..entries {
             attend_entry(
-                &q[entry * query..][..query],
-                &kv[entry],
-                layer,
-                positions[entry],
-                shape,
-                0..shape.heads,
+                AttentionCall {
+                    q: &q[entry * query..][..query],
+                    kv: &kv[entry],
+                    layer,
+                    positions: positions[entry],
+                    shape,
+                    heads: 0..shape.heads,
+                    out: &mut out[entry * query..][..query],
+                },
                 scratch,
-                &mut out[entry * query..][..query],
             )?;
         }
         return Ok(());
@@ -1774,14 +2042,16 @@ fn attend_entries(
                 for (offset, row) in slot.chunks_mut(query).enumerate() {
                     let entry = first + offset;
                     attend_entry(
-                        &q[entry * query..][..query],
-                        &kv[entry],
-                        layer,
-                        positions[entry],
-                        shape,
-                        0..shape.heads,
+                        AttentionCall {
+                            q: &q[entry * query..][..query],
+                            kv: &kv[entry],
+                            layer,
+                            positions: positions[entry],
+                            shape,
+                            heads: 0..shape.heads,
+                            out: row,
+                        },
                         &mut local,
-                        row,
                     )?;
                 }
                 Ok(())
@@ -1797,48 +2067,122 @@ fn attend_entries(
 
 /// One entry's attention, over `heads` only, choosing the kernel by history length.
 #[allow(clippy::too_many_arguments)]
-fn attend_entry(
-    q: &[f32],
-    kv: &KvRead<'_>,
+/// One attention kernel, and everything the forward pass asks of it.
+///
+/// There are two, and [`algorithm_for`] picks between them by history length. They sit behind a
+/// trait so the choice is one function rather than a branch in the forward pass, and so another
+/// kernel — a block-parallel one, or a device one — is an implementation rather than an edit here.
+/// Both must compute the oracle's bits: the tests compare them to each other and to [`attention`].
+/// One attention call: the query rows, the history to read, and where the answer goes.
+struct AttentionCall<'q, 'k> {
+    /// The query heads, `shape.heads * head_dim` values.
+    q: &'q [f32],
+    /// The KV cache to read.
+    kv: &'q KvRead<'k>,
+    /// Layer of the cache this pass reads.
     layer: usize,
+    /// Positions of history, including the one `q` is.
     positions: usize,
+    /// Head geometry.
     shape: AttnShape,
+    /// Heads to compute, in absolute head numbers.
     heads: std::ops::Range<usize>,
-    scratch: &mut AttnScratch,
-    out: &mut [f32],
-) -> Result<(), ViperaError> {
-    if positions >= STREAMING_MIN_POSITIONS {
-        return attention_streaming_heads(
-            q,
-            kv,
-            layer,
-            positions,
-            shape,
-            heads,
+    /// Where `heads.len()` rows of `head_dim` values are written, in head order from `heads.start`.
+    out: &'q mut [f32],
+}
+
+trait AttentionAlgorithm {
+    /// Fill `call.out` from `call`.
+    fn attend(
+        &self,
+        call: AttentionCall<'_, '_>,
+        scratch: &mut AttnScratch,
+    ) -> Result<(), ViperaError>;
+
+    /// Which kernel this is, for the test that the selection follows [`STREAMING_MIN_POSITIONS`].
+    #[cfg(test)]
+    fn name(&self) -> &'static str;
+}
+
+/// Decode the layer once and score the whole window from the decoded buffers.
+///
+/// Cheapest below [`STREAMING_MIN_POSITIONS`], where the two `positions * width` buffers are still
+/// small enough that decoding each row once beats decoding it twice.
+struct BufferedAttention;
+
+/// Read each K/V row out of the cache where it lies, keeping one row of scratch.
+struct StreamingAttention;
+
+impl AttentionAlgorithm for BufferedAttention {
+    fn attend(
+        &self,
+        call: AttentionCall<'_, '_>,
+        scratch: &mut AttnScratch,
+    ) -> Result<(), ViperaError> {
+        call.kv.load_layer(
+            call.layer,
+            call.shape,
+            call.positions,
+            &mut scratch.k_all,
+            &mut scratch.v_all,
+        )?;
+        attention_heads(
+            call.q,
+            &scratch.k_all,
+            &scratch.v_all,
+            call.positions,
+            call.shape,
+            call.heads,
+            &mut scratch.scores,
+            call.out,
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "buffered"
+    }
+}
+
+impl AttentionAlgorithm for StreamingAttention {
+    fn attend(
+        &self,
+        call: AttentionCall<'_, '_>,
+        scratch: &mut AttnScratch,
+    ) -> Result<(), ViperaError> {
+        attention_streaming_heads(
+            call.q,
+            call.kv,
+            AttentionSwitches::from_env().order,
+            call.layer,
+            call.positions,
+            call.shape,
+            call.heads,
             &mut scratch.scores,
             &mut scratch.row,
             &mut scratch.head_state,
-            out,
-        );
+            call.out,
+        )
     }
-    kv.load_layer(
-        layer,
-        shape,
-        positions,
-        &mut scratch.k_all,
-        &mut scratch.v_all,
-    )?;
-    attention_heads(
-        q,
-        &scratch.k_all,
-        &scratch.v_all,
-        positions,
-        shape,
-        heads,
-        &mut scratch.scores,
-        out,
-    );
-    Ok(())
+
+    #[cfg(test)]
+    fn name(&self) -> &'static str {
+        "streaming"
+    }
+}
+
+/// The kernel for a history of `positions`: the only place the choice is made.
+fn algorithm_for(positions: usize) -> &'static dyn AttentionAlgorithm {
+    if positions >= STREAMING_MIN_POSITIONS {
+        &StreamingAttention
+    } else {
+        &BufferedAttention
+    }
+}
+
+fn attend_entry(call: AttentionCall<'_, '_>, scratch: &mut AttnScratch) -> Result<(), ViperaError> {
+    algorithm_for(call.positions).attend(call, scratch)
 }
 
 /// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
@@ -2340,6 +2684,75 @@ mod tests {
         assert_eq!(bits(&out), bits(&expected));
     }
 
+    /// The kernel choice is one function, so this pins it to the documented threshold — and the
+    /// two kernels it chooses between have to agree bit for bit at the position where they swap.
+    #[test]
+    fn the_attention_kernel_follows_the_position_threshold() {
+        assert_eq!(algorithm_for(1).name(), "buffered");
+        assert_eq!(
+            algorithm_for(STREAMING_MIN_POSITIONS - 1).name(),
+            "buffered"
+        );
+        assert_eq!(algorithm_for(STREAMING_MIN_POSITIONS).name(), "streaming");
+
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let positions = STREAMING_MIN_POSITIONS;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            positions,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let mut outputs = Vec::new();
+        for algorithm in [
+            &BufferedAttention as &dyn AttentionAlgorithm,
+            &StreamingAttention,
+        ] {
+            let mut scratch = AttnScratch::default();
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            algorithm
+                .attend(
+                    AttentionCall {
+                        q: &q,
+                        kv: &read,
+                        layer: 0,
+                        positions,
+                        shape,
+                        heads: 0..shape.heads,
+                        out: &mut out,
+                    },
+                    &mut scratch,
+                )
+                .expect("attention");
+            outputs.push(out.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "the kernels disagree at the boundary"
+        );
+    }
+
     /// What one layer of one decode step pays for its K/V: decode the history, then attend.
     ///
     /// ```text
@@ -2426,7 +2839,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_slots_follow_the_block_table_across_block_boundaries() {
+    fn kv_positions_map_through_the_block_table() {
         // One layer: K and V are 4 bytes each, so a position costs 8 bytes in this toy layout.
         let per_token = 8;
         let mut storage = vec![0u8; 2 * 4 * per_token];
@@ -2438,18 +2851,428 @@ mod tests {
             bytes_per_token: per_token,
             layout: KvLayout::F16,
         };
-        assert_eq!(kv.slot(0).expect("slot"), 4 * per_token);
-        assert_eq!(kv.slot(3).expect("slot"), 7 * per_token);
+        assert_eq!(kv.token_in_block(0).expect("block"), (4 * per_token, 0));
+        assert_eq!(kv.token_in_block(3).expect("block"), (4 * per_token, 3));
         assert_eq!(
-            kv.slot(4).expect("slot"),
-            0,
+            kv.token_in_block(4).expect("block"),
+            (0, 0),
             "block 0 holds the second half"
         );
-        assert_eq!(kv.slot(7).expect("slot"), 3 * per_token);
+        assert_eq!(kv.token_in_block(7).expect("block"), (0, 3));
         assert!(
-            kv.slot(8).is_err(),
-            "a position beyond the block table has no slot"
+            kv.token_in_block(8).is_err(),
+            "a position beyond the block table has no block"
         );
+    }
+
+    /// The strided walk at 1024 positions, both orders, one process: same values at the same
+    /// logical positions, only the addresses differ. Prints the cost and asserts the two arms
+    /// compute the same bits, which is what makes the comparison meaningful.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib kv_row_order_at_1024 -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a number, run with --ignored --nocapture"]
+    fn kv_row_order_at_1024() {
+        // The model this repository benchmarks: 28 layers, 12 heads over 2 KV heads of 128.
+        let layers = 28;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let row = KvLayout::F16.bytes_per_row(width);
+        let bytes_per_token = layers * 2 * row;
+        // `DEFAULT_TOKENS_PER_BLOCK`, so the walk is the one the binary runs.
+        let per_block = 16;
+        let positions = 1024usize;
+        let blocks = positions.div_ceil(per_block);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let mut values = vec![0.0_f32; width];
+        let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7) % 23) as f32 * 0.03 - 0.3)
+            .collect();
+
+        let mut layout_for = |order: RowOrder| {
+            let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+            for layer in 0..layers {
+                for position in 0..positions {
+                    let walk = order.row_walk(
+                        position / per_block * per_block * bytes_per_token,
+                        position % per_block,
+                        per_block,
+                        bytes_per_token,
+                        row,
+                        layer,
+                    );
+                    for (at, value) in values.iter_mut().enumerate() {
+                        *value = ((position * 31 + layer * 7 + at * 13) % 97) as f32 * 0.01 - 0.5;
+                    }
+                    KvLayout::F16
+                        .encode(&mut storage[walk.k..walk.k + row], &values)
+                        .expect("write K");
+                    let v_base = walk.k + walk.v;
+                    KvLayout::F16
+                        .encode(&mut storage[v_base..v_base + row], &values)
+                        .expect("write V");
+                }
+            }
+            storage
+        };
+
+        let mut arms = Vec::new();
+        for order in [RowOrder::TokenMajor, RowOrder::LayerMajor] {
+            let mut storage = layout_for(order);
+            let kv = KvView {
+                storage: &mut storage,
+                table: &table,
+                tokens_per_block: per_block,
+                bytes_per_token,
+                layout: KvLayout::F16,
+            };
+            let read = KvRead::of(&kv);
+            let run = |read: &KvRead<'_>, out: &mut [f32]| {
+                let mut scores = Vec::new();
+                let mut row_buffer = Vec::new();
+                let mut head_state = Vec::new();
+                for layer in 0..layers {
+                    attention_streaming_heads(
+                        &q,
+                        read,
+                        order,
+                        layer,
+                        positions,
+                        shape,
+                        0..shape.heads,
+                        &mut scores,
+                        &mut row_buffer,
+                        &mut head_state,
+                        out,
+                    )
+                    .expect("attention");
+                }
+            };
+            run(&read, &mut out);
+            let mut best = f64::INFINITY;
+            let mut rounds = 0;
+            while rounds < 5 {
+                let started = std::time::Instant::now();
+                run(&read, &mut out);
+                best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+                rounds += 1;
+            }
+            println!(
+                "{order:?}: {best:6.2} ms for {layers} layers x {positions} positions ({:.3} ms/layer)",
+                best / layers as f64
+            );
+            arms.push((order, best, out.clone()));
+        }
+        assert_eq!(
+            arms[0].2, arms[1].2,
+            "the two orders must compute the same output bits"
+        );
+    }
+
+    /// The attention switches in every combination, at two depths, all in one process on the same
+    /// bytes. Prints the table and asserts every arm at a depth computes the same output, which is
+    /// what makes a timing difference a scheduling or locality difference and nothing else.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib attention_combinations -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a table, run with --ignored --nocapture"]
+    fn attention_combinations() {
+        let layers = 28;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let row = KvLayout::F16.bytes_per_row(width);
+        let bytes_per_token = layers * 2 * row;
+        let per_block = 16;
+        let query = shape.heads * shape.head_dim;
+        let q: Vec<f32> = (0..query)
+            .map(|at| ((at * 7) % 23) as f32 * 0.03 - 0.3)
+            .collect();
+        let mut out = vec![0.0_f32; query];
+        let orders = [RowOrder::TokenMajor, RowOrder::LayerMajor];
+
+        for positions in [1024usize, 4096, 8192] {
+            let blocks = positions.div_ceil(per_block);
+            let table: Vec<u32> = (0..blocks as u32).collect();
+            let lengths = [positions];
+            let mut arms: Vec<(AttentionSwitches, f64, Vec<f32>)> = Vec::new();
+            for order in orders {
+                let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+                let mut values = vec![0.0_f32; width];
+                for layer in 0..layers {
+                    for position in 0..positions {
+                        let walk = order.row_walk(
+                            position / per_block * per_block * bytes_per_token,
+                            position % per_block,
+                            per_block,
+                            bytes_per_token,
+                            row,
+                            layer,
+                        );
+                        for (at, value) in values.iter_mut().enumerate() {
+                            *value =
+                                ((position * 31 + layer * 7 + at * 13) % 97) as f32 * 0.01 - 0.5;
+                        }
+                        KvLayout::F16
+                            .encode(&mut storage[walk.k..walk.k + row], &values)
+                            .expect("write K");
+                        let v_base = walk.k + walk.v;
+                        KvLayout::F16
+                            .encode(&mut storage[v_base..v_base + row], &values)
+                            .expect("write V");
+                    }
+                }
+                let kv = KvView {
+                    storage: &mut storage,
+                    table: &table,
+                    tokens_per_block: per_block,
+                    bytes_per_token,
+                    layout: KvLayout::F16,
+                };
+                let read = KvRead::of(&kv);
+                let views = std::slice::from_ref(&read);
+
+                for split_heads in [false, true] {
+                    let switches = AttentionSwitches { split_heads, order };
+                    let mut scratch = AttnScratch::default();
+                    let pass = |scratch: &mut AttnScratch, out: &mut Vec<f32>| {
+                        out.fill(0.0);
+                        for layer in 0..layers {
+                            attend_entries(&q, views, &lengths, layer, shape, scratch, out)
+                                .expect("attention");
+                        }
+                    };
+                    // Four sweeps, direction alternating, so no arm keeps a warmer position in the
+                    // sequence than another.
+                    let mut best = f64::INFINITY;
+                    for sweep in 0..4 {
+                        force_switches(switches);
+                        if sweep < 2 {
+                            pass(&mut scratch, &mut out);
+                            continue;
+                        }
+                        let started = std::time::Instant::now();
+                        pass(&mut scratch, &mut out);
+                        best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    arms.push((switches, best, out.clone()));
+                }
+            }
+            clear_forced_switches();
+            let baseline = arms
+                .iter()
+                .find(|(switches, ..)| {
+                    switches.order == RowOrder::TokenMajor && !switches.split_heads
+                })
+                .map(|(.., out)| out.clone())
+                .expect("a baseline arm");
+            println!("depth {positions}:");
+            for (switches, best, output) in &arms {
+                let share = 100.0 * (1.0 - best / arms[0].1);
+                println!(
+                    "  {:>11} split {:<5}: {best:6.2} ms ({:.3} ms/layer, {:+.0}% vs token-major/split-off)",
+                    if switches.order == RowOrder::TokenMajor {
+                        "token-major"
+                    } else {
+                        "layer-major"
+                    },
+                    switches.split_heads,
+                    best / layers as f64,
+                    if switches.order == RowOrder::TokenMajor && !switches.split_heads {
+                        0.0
+                    } else {
+                        share
+                    }
+                );
+                assert_eq!(
+                    output, &baseline,
+                    "{:?} must compute what the baseline computes",
+                    switches
+                );
+            }
+        }
+    }
+
+    /// The write path at a prefill-sized batch: 128 tokens x 28 layers, both orders, one process.
+    /// The read side is what the layer-major change is for, so this is the cost it must not add.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib kv_write_batch_at_128 -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a number, run with --ignored --nocapture"]
+    fn kv_write_batch_at_128() {
+        let layers = 28;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let row = KvLayout::F16.bytes_per_row(width);
+        let bytes_per_token = layers * 2 * row;
+        let per_block = 16;
+        let batch = 128usize;
+        let blocks = batch.div_ceil(per_block);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let k: Vec<f32> = (0..width).map(|at| at as f32 * 0.01 - 1.0).collect();
+        let v: Vec<f32> = (0..width).map(|at| 1.0 - at as f32 * 0.01).collect();
+
+        let mut arms = Vec::new();
+        for order in [RowOrder::TokenMajor, RowOrder::LayerMajor] {
+            let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+            let mut best = f64::INFINITY;
+            let mut loaded = (Vec::new(), Vec::new());
+            for sweep in 0..4 {
+                force_switches(AttentionSwitches {
+                    split_heads: true,
+                    order,
+                });
+                let mut kv = KvView {
+                    storage: &mut storage,
+                    table: &table,
+                    tokens_per_block: per_block,
+                    bytes_per_token,
+                    layout: KvLayout::F16,
+                };
+                let started = std::time::Instant::now();
+                for _ in 0..10 {
+                    for position in 0..batch {
+                        for layer in 0..layers {
+                            kv.write(position, layer, shape, &k, &v).expect("write");
+                        }
+                    }
+                }
+                let elapsed = started.elapsed().as_secs_f64() * 100.0;
+                if sweep >= 2 {
+                    best = best.min(elapsed);
+                }
+                kv.load_layer(0, shape, batch, &mut loaded.0, &mut loaded.1)
+                    .expect("load");
+            }
+            println!(
+                "{order:?}: {best:6.2} ms for {batch} tokens x {layers} layers ({:.3} us/token-layer)",
+                best * 1000.0 / (batch * layers) as f64
+            );
+            arms.push((order, best, loaded));
+        }
+        clear_forced_switches();
+        assert_eq!(
+            arms[0].2.0, arms[1].2.0,
+            "the two orders must store the same K"
+        );
+        assert_eq!(
+            arms[0].2.1, arms[1].2.1,
+            "the two orders must store the same V"
+        );
+    }
+
+    #[test]
+    fn the_row_orders_differ_only_in_addresses() {
+        // Two layers of one 4-value row, four tokens per block, three blocks in a permuted table:
+        // enough to cross a block boundary and to see the table's indirection.
+        let row = KvLayout::F16.bytes_per_row(4);
+        let per_block = 4;
+        let layers = 2;
+        let bytes_per_token = layers * 2 * row;
+        let table = [2u32, 0, 1];
+        let positions = 10;
+        let storage = vec![0u8; 3 * per_block * bytes_per_token];
+
+        let rows = |order: RowOrder, layer: usize| -> Vec<(usize, usize, usize)> {
+            let mut out = Vec::new();
+            for_each_row(
+                &storage,
+                &table,
+                per_block,
+                bytes_per_token,
+                order,
+                layer,
+                row,
+                positions,
+                |position, k| {
+                    out.push((position, k, order.value_row(k, per_block, row)));
+                    Ok(())
+                },
+            )
+            .expect("walk");
+            out
+        };
+
+        let token = rows(RowOrder::TokenMajor, 1);
+        let layer_major = rows(RowOrder::LayerMajor, 1);
+        assert_eq!(
+            token
+                .iter()
+                .map(|(position, ..)| *position)
+                .collect::<Vec<_>>(),
+            layer_major
+                .iter()
+                .map(|(position, ..)| *position)
+                .collect::<Vec<_>>(),
+            "both orders visit the positions in the same order"
+        );
+        assert_ne!(
+            token.iter().map(|(_, k, _)| *k).collect::<Vec<_>>(),
+            layer_major.iter().map(|(_, k, _)| *k).collect::<Vec<_>>(),
+            "the switch has to move the rows, or it measures nothing"
+        );
+        assert_eq!(
+            token[1].1 - token[0].1,
+            bytes_per_token,
+            "token-major stride"
+        );
+        assert_eq!(
+            layer_major[1].1 - layer_major[0].1,
+            row,
+            "layer-major strides one row, so a block's rows for one layer are contiguous"
+        );
+
+        // Every row of every layer, in either order, lands somewhere unique and inside its block:
+        // no two K/V rows share bytes, and layer-major fills each block exactly.
+        for order in [RowOrder::TokenMajor, RowOrder::LayerMajor] {
+            let mut seen = std::collections::BTreeSet::new();
+            for layer in 0..layers {
+                for (position, k, v) in rows(order, layer) {
+                    for (which, start) in [("K", k), ("V", v)] {
+                        assert!(
+                            seen.insert(start),
+                            "{order:?}: layer {layer}, {which} of position {position} overlaps another row"
+                        );
+                        assert!(
+                            start + row <= storage.len(),
+                            "{order:?}: row past the buffer"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                seen.len(),
+                layers * 2 * positions,
+                "{order:?}: every row has its own bytes"
+            );
+        }
+
+        // Layer-major packs each block without gaps: the rows of one block span its whole size.
+        let mut block_bytes = Vec::new();
+        for layer in 0..layers {
+            let start = rows(RowOrder::LayerMajor, layer)[0].1;
+            block_bytes.push(start);
+        }
+        assert_eq!(block_bytes[0] % (per_block * bytes_per_token), 0);
+        assert_eq!(block_bytes[1] - block_bytes[0], 2 * row * per_block);
     }
 
     #[test]

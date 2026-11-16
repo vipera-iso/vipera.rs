@@ -3,13 +3,23 @@
 //! The cache owns a real zeroed buffer, so a runtime built on it consumes the memory it claims and
 //! `vipera verify` measures the same bytes the plan predicted. Blocks are handed out lowest-id first
 //! and returned on release; there is no compaction, which keeps block tables stable across turns.
+//!
+//! A finished sequence's blocks can be *parked* instead of released: kept, in least-recently-used
+//! order, so a later request that starts with the same tokens can copy them instead of computing
+//! them again. Parked blocks are free for every purpose except that copy: [`KvCache::reserve`]
+//! takes them back, oldest first, whenever the free list runs out, so a parked sequence never
+//! makes an allocation fail.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use vipera_errors::ViperaError;
 
 /// Tokens per block. 16 is the paged-attention default and keeps waste under one block per sequence.
 pub const DEFAULT_TOKENS_PER_BLOCK: u64 = 16;
+
+/// Most sequences kept parked at once. Beyond this the oldest is freed, so the number of
+/// candidates a new request is compared against stays small.
+pub const PARKED_LIMIT: usize = 32;
 
 /// Geometry of a KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +119,8 @@ pub struct KvCache {
     storage: Vec<u8>,
     free: Vec<u32>,
     tables: BTreeMap<u64, Vec<u32>>,
+    /// Sequences whose blocks are kept for reuse, oldest first.
+    parked: VecDeque<(u64, Vec<u32>)>,
 }
 
 impl KvCache {
@@ -140,6 +152,7 @@ impl KvCache {
             storage,
             free,
             tables: BTreeMap::new(),
+            parked: VecDeque::new(),
         })
     }
 
@@ -178,8 +191,34 @@ impl KvCache {
         self.used_blocks().saturating_mul(self.config.block_bytes())
     }
 
+    /// Blocks held by parked sequences. They count as in use here, and are free to any
+    /// [`KvCache::reserve`].
+    pub fn parked_blocks(&self) -> u64 {
+        self.parked
+            .iter()
+            .map(|(_, table)| table.len() as u64)
+            .sum()
+    }
+
+    /// Whether `sequence` is parked.
+    pub fn is_parked(&self, sequence: u64) -> bool {
+        self.parked.iter().any(|(id, _)| *id == sequence)
+    }
+
     /// Make sure `sequence` has blocks covering `tokens`, allocating the difference.
+    ///
+    /// When the free list runs out, parked sequences are given up, oldest first.
     pub fn reserve(&mut self, sequence: u64, tokens: u64) -> Result<(), ViperaError> {
+        self.reserve_keeping(sequence, tokens, None)
+    }
+
+    /// [`KvCache::reserve`] that will not give up the parked sequence `keep`.
+    fn reserve_keeping(
+        &mut self,
+        sequence: u64,
+        tokens: u64,
+        keep: Option<u64>,
+    ) -> Result<(), ViperaError> {
         let needed = self.config.blocks_for(tokens);
         if needed > self.config.blocks {
             return Err(ViperaError::infeasible(format!(
@@ -192,23 +231,116 @@ impl KvCache {
             .get(&sequence)
             .map_or(0, |table| table.len() as u64);
         let deficit = needed.saturating_sub(current);
-        if (self.free.len() as u64) < deficit {
+        let evictable: u64 = self
+            .parked
+            .iter()
+            .filter(|(id, _)| Some(*id) != keep)
+            .map(|(_, table)| table.len() as u64)
+            .sum();
+        let in_use = self.used_blocks().saturating_sub(self.parked_blocks());
+        if (self.free.len() as u64).saturating_add(evictable) < deficit {
             return Err(ViperaError::infeasible(format!(
-                "KV cache is full: {} blocks in use, {} needed for sequence {sequence}",
-                self.used_blocks(),
-                needed
+                "KV cache is full: {in_use} blocks in use, {needed} needed for sequence {sequence}"
             )));
         }
-        let table = self.tables.entry(sequence).or_default();
-        while (table.len() as u64) < needed {
+        self.tables.entry(sequence).or_default();
+        while self
+            .tables
+            .get(&sequence)
+            .map_or(0, |table| table.len() as u64)
+            < needed
+        {
+            if self.free.is_empty() {
+                self.evict_oldest_except(keep);
+            }
             let Some(block) = self.free.pop() else {
                 return Err(ViperaError::infeasible(format!(
-                    "KV cache is full: {} blocks in use, {} needed for sequence {sequence}",
-                    self.used_blocks(),
-                    needed
+                    "KV cache is full: {in_use} blocks in use, {needed} needed for sequence {sequence}"
                 )));
             };
-            table.push(block);
+            self.tables.entry(sequence).or_default().push(block);
+        }
+        Ok(())
+    }
+
+    /// Free the oldest parked sequence other than `keep`.
+    fn evict_oldest_except(&mut self, keep: Option<u64>) {
+        let Some(position) = self.parked.iter().position(|(id, _)| Some(*id) != keep) else {
+            return;
+        };
+        if let Some((_, table)) = self.parked.remove(position) {
+            self.free.extend(table);
+        }
+    }
+
+    /// Keep `sequence`'s blocks instead of releasing them, so a later request can copy its
+    /// leading positions. Returns `false` when it holds none.
+    ///
+    /// At most [`PARKED_LIMIT`] sequences stay parked; the oldest beyond that is freed.
+    pub fn park(&mut self, sequence: u64) -> bool {
+        let Some(table) = self.tables.remove(&sequence) else {
+            return false;
+        };
+        if table.is_empty() {
+            return false;
+        }
+        self.parked.push_back((sequence, table));
+        while self.parked.len() > PARKED_LIMIT {
+            self.evict_oldest_except(None);
+        }
+        true
+    }
+
+    /// Give `sequence`, which holds no blocks yet, a copy of the blocks of the parked sequence
+    /// `donor` that cover its first `tokens` positions.
+    ///
+    /// The copy takes whole blocks, so bytes past `tokens` in the last block come along; they are
+    /// positions the new sequence has not computed and overwrites before it reads them. The donor
+    /// is kept out of the eviction this copy may need, and becomes the most recently used. On an
+    /// error `sequence` holds nothing.
+    pub fn copy_from_parked(
+        &mut self,
+        donor: u64,
+        sequence: u64,
+        tokens: u64,
+    ) -> Result<(), ViperaError> {
+        let needed = self.config.blocks_for(tokens) as usize;
+        let Some(source) = self
+            .parked
+            .iter()
+            .find(|(id, _)| *id == donor)
+            .map(|(_, table)| table.clone())
+        else {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {donor} is not parked"
+            )));
+        };
+        if source.len() < needed {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {donor} holds {} blocks, fewer than the {needed} that {tokens} tokens need",
+                source.len()
+            )));
+        }
+        if self.tables.contains_key(&sequence) {
+            return Err(ViperaError::invalid_argument(format!(
+                "sequence {sequence} already holds blocks"
+            )));
+        }
+        if let Err(error) = self.reserve_keeping(sequence, tokens, Some(donor)) {
+            self.tables.remove(&sequence);
+            return Err(error);
+        }
+        let block_bytes = self.config.block_bytes() as usize;
+        let target = self.tables.get(&sequence).cloned().unwrap_or_default();
+        for (from, to) in source.iter().zip(&target) {
+            let from = *from as usize * block_bytes;
+            self.storage
+                .copy_within(from..from + block_bytes, *to as usize * block_bytes);
+        }
+        if let Some(position) = self.parked.iter().position(|(id, _)| *id == donor)
+            && let Some(entry) = self.parked.remove(position)
+        {
+            self.parked.push_back(entry);
         }
         Ok(())
     }
@@ -228,10 +360,19 @@ impl KvCache {
         }
     }
 
-    /// Release every block a sequence owns. Returns the number of blocks freed.
+    /// Release every block a sequence owns, parked or not. Returns the number of blocks freed.
     pub fn release(&mut self, sequence: u64) -> u64 {
-        let Some(table) = self.tables.remove(&sequence) else {
-            return 0;
+        let table = match self.tables.remove(&sequence) {
+            Some(table) => table,
+            None => {
+                let Some(position) = self.parked.iter().position(|(id, _)| *id == sequence) else {
+                    return 0;
+                };
+                self.parked
+                    .remove(position)
+                    .map(|(_, table)| table)
+                    .unwrap_or_default()
+            }
         };
         let freed = table.len() as u64;
         for block in table {
@@ -357,5 +498,126 @@ mod tests {
         assert!(KvConfig::new(0, 16, 1).is_err());
         assert!(KvConfig::new(2, 0, 1).is_err());
         assert!(KvConfig::new(2, 16, 0).is_err());
+    }
+
+    /// Write `marker` into every byte of each block of `sequence`.
+    fn fill(cache: &mut KvCache, sequence: u64, marker: u8) {
+        let block_bytes = cache.config().block_bytes() as usize;
+        let table = cache.table(sequence).expect("table").to_vec();
+        for block in table {
+            let start = block as usize * block_bytes;
+            cache.storage_mut()[start..start + block_bytes].fill(marker);
+        }
+    }
+
+    #[test]
+    fn a_parked_sequence_is_given_back_oldest_first_when_the_free_list_runs_out() {
+        let mut cache = cache(4);
+        cache.reserve(1, 8).unwrap();
+        cache.reserve(2, 8).unwrap();
+        assert!(cache.park(1));
+        assert!(cache.park(2));
+        assert_eq!(cache.free_blocks(), 0);
+        assert_eq!(cache.parked_blocks(), 4);
+
+        cache.reserve(3, 4).unwrap();
+        assert!(!cache.is_parked(1), "the oldest parked sequence goes first");
+        assert!(cache.is_parked(2));
+        assert_eq!(cache.table(3).map(<[u32]>::len), Some(1));
+        assert_eq!(cache.parked_blocks(), 2);
+    }
+
+    #[test]
+    fn parked_blocks_never_make_a_reservation_fail() {
+        let mut cache = cache(4);
+        cache.reserve(1, 16).unwrap();
+        assert!(cache.park(1));
+        cache.reserve(2, 16).unwrap();
+        assert_eq!(cache.parked_blocks(), 0);
+        assert_eq!(cache.table(2).map(<[u32]>::len), Some(4));
+        // A request larger than the whole cache is still refused, parked or not.
+        assert!(cache.reserve(3, 17).is_err());
+    }
+
+    #[test]
+    fn copying_from_a_parked_sequence_copies_its_bytes_and_keeps_the_donor_parked() {
+        let mut cache = cache(8);
+        cache.reserve(1, 8).unwrap();
+        fill(&mut cache, 1, 0xAB);
+        assert!(cache.park(1));
+
+        cache.copy_from_parked(1, 2, 6).unwrap();
+        let block_bytes = cache.config().block_bytes() as usize;
+        let table = cache.table(2).expect("table").to_vec();
+        assert_eq!(table.len(), 2, "6 tokens at 4 per block");
+        for block in table {
+            let start = block as usize * block_bytes;
+            assert!(
+                cache.storage_mut()[start..start + block_bytes]
+                    .iter()
+                    .all(|byte| *byte == 0xAB)
+            );
+        }
+        assert!(cache.is_parked(1), "the donor stays available");
+        // The copy is independent: writing the new sequence leaves the donor alone.
+        fill(&mut cache, 2, 0x11);
+        cache.copy_from_parked(1, 3, 4).unwrap();
+        let first = cache.table(3).expect("table")[0] as usize * block_bytes;
+        assert_eq!(cache.storage_mut()[first], 0xAB);
+    }
+
+    #[test]
+    fn a_copy_never_gives_up_its_own_donor_to_make_room() {
+        let mut cache = cache(4);
+        cache.reserve(1, 8).unwrap();
+        cache.reserve(2, 8).unwrap();
+        fill(&mut cache, 2, 0x5A);
+        assert!(cache.park(1));
+        assert!(cache.park(2));
+        // The cache is full of parked sequences; 2 is the donor, so 1 is the one to go.
+        cache.copy_from_parked(2, 3, 8).unwrap();
+        assert!(!cache.is_parked(1));
+        assert!(cache.is_parked(2));
+        let block_bytes = cache.config().block_bytes() as usize;
+        let first = cache.table(3).expect("table")[0] as usize * block_bytes;
+        assert_eq!(cache.storage_mut()[first], 0x5A);
+    }
+
+    #[test]
+    fn a_copy_that_cannot_fit_leaves_nothing_behind() {
+        let mut cache = cache(3);
+        cache.reserve(1, 12).unwrap();
+        assert!(cache.park(1));
+        // The only parked sequence is the donor and it is kept, so nothing is free for the copy.
+        let error = cache.copy_from_parked(1, 2, 12);
+        assert!(error.is_err());
+        assert_eq!(cache.table(2), None);
+        assert!(cache.is_parked(1));
+        assert!(cache.copy_from_parked(7, 2, 4).is_err(), "not parked");
+    }
+
+    #[test]
+    fn releasing_a_parked_sequence_frees_it() {
+        let mut cache = cache(4);
+        cache.reserve(1, 8).unwrap();
+        assert!(cache.park(1));
+        assert_eq!(cache.release(1), 2);
+        assert!(!cache.is_parked(1));
+        assert_eq!(cache.free_blocks(), 4);
+        assert_eq!(cache.release(1), 0);
+    }
+
+    #[test]
+    fn only_the_most_recent_sequences_stay_parked() {
+        let mut cache = cache(40);
+        for sequence in 0..PARKED_LIMIT as u64 + 3 {
+            cache.reserve(sequence, 4).unwrap();
+            assert!(cache.park(sequence));
+        }
+        assert!(!cache.is_parked(0));
+        assert!(!cache.is_parked(2));
+        assert!(cache.is_parked(3));
+        assert!(cache.is_parked(PARKED_LIMIT as u64 + 2));
+        assert_eq!(cache.parked_blocks(), PARKED_LIMIT as u64);
     }
 }

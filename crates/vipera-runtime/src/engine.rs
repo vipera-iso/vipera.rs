@@ -24,7 +24,7 @@ use crate::kv::KvCache;
 use crate::pipeline::{
     BatchContext, BatchEntry, ForwardContext, ForwardPass, RequestLog, Stage, StageTimings,
 };
-use crate::sequence::{FinishReason, Sequence};
+use crate::sequence::{FinishReason, Sequence, SequenceState};
 
 /// Runtime knobs that are not per-request.
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +186,22 @@ pub fn speculative_enabled(config: bool) -> bool {
         .unwrap_or(config)
 }
 
+/// Whether finished prompts are kept so a later request can reuse their KV.
+///
+/// Off unless the host turns it on, because it changes what a request computes: the first
+/// positions come from a copy of another request's KV, which is the same arithmetic only if the
+/// backend gives a position the same bits however the prompt around it was chunked.
+/// `VIPERA_PREFIX_CACHE` overrides the default (`0`/`false` off, anything else on) so an A/B run
+/// needs no rebuild.
+pub fn prefix_cache_enabled(default: bool) -> bool {
+    std::env::var("VIPERA_PREFIX_CACHE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(default)
+}
+
 /// Draft tokens proposed from the latest repeated n-gram in `context`.
 ///
 /// `n` is how many trailing tokens form the needle and the draft is up to four tokens long. The
@@ -303,6 +319,11 @@ pub struct Engine<F: ForwardPass> {
     /// True when the previous step served a prompt chunk while decode turns were waiting, so the
     /// next step owes them theirs. Only meaningful while a batch is mid-prefill.
     owe_decode: bool,
+    /// Whether a finished sequence's prompt is kept for a later request to copy. See
+    /// [`prefix_cache_enabled`].
+    prefix_cache: bool,
+    /// For each parked sequence, the prompt tokens whose KV it holds and a request may reuse.
+    retired: BTreeMap<u64, Vec<u32>>,
 }
 
 impl<F: ForwardPass> Engine<F> {
@@ -318,6 +339,22 @@ impl<F: ForwardPass> Engine<F> {
             next_sequence: 0,
             counters: Counters::default(),
             owe_decode: false,
+            prefix_cache: prefix_cache_enabled(false),
+            retired: BTreeMap::new(),
+        }
+    }
+
+    /// Turn the prefix cache on or off for later requests.
+    ///
+    /// With it on, a sequence that finishes normally is not freed when it is released: its blocks
+    /// are parked, and a request admitted afterwards copies the longest prompt prefix it shares
+    /// with one of them instead of computing it. Turning it off frees everything parked.
+    pub fn set_prefix_cache(&mut self, enabled: bool) {
+        self.prefix_cache = enabled;
+        if !enabled {
+            for donor in std::mem::take(&mut self.retired).into_keys() {
+                self.kv.release(donor);
+            }
         }
     }
 
@@ -380,7 +417,77 @@ impl<F: ForwardPass> Engine<F> {
         let mut sequence = Sequence::new(id, max_new_tokens);
         sequence.push_prompt(prompt);
         self.sequences.insert(id, sequence);
+        if self.prefix_cache {
+            self.adopt_prefix(id, prompt);
+        }
         Ok(id)
+    }
+
+    /// Give the new sequence `id` a copy of the KV of the longest prompt prefix it shares with a
+    /// parked one, and mark those positions as already computed.
+    ///
+    /// Best effort: a request that finds nothing, or cannot fit the copy, is admitted as it would
+    /// have been without the cache. At least one token is always left to compute, so the turn
+    /// samples from logits it produced itself.
+    fn adopt_prefix(&mut self, id: u64, prompt: &[u32]) {
+        self.retired.retain(|donor, _| self.kv.is_parked(*donor));
+        let mut best: Option<(u64, usize)> = None;
+        for (donor, tokens) in &self.retired {
+            let common = tokens
+                .iter()
+                .zip(prompt)
+                .take_while(|(left, right)| left == right)
+                .count();
+            // Donors come in id order, so on a tie the newest one wins.
+            if best.is_none_or(|(_, held)| common >= held) {
+                best = Some((*donor, common));
+            }
+        }
+        let Some((donor, common)) = best else {
+            return;
+        };
+        let reuse = common.min(prompt.len().saturating_sub(1));
+        // Less than a block is not worth a copy, and a block is the unit the cache keeps.
+        if (reuse as u64) < self.kv.config().tokens_per_block {
+            return;
+        }
+        if self.kv.copy_from_parked(donor, id, reuse as u64).is_err() {
+            self.kv.release(id);
+            return;
+        }
+        if let Some(sequence) = self.sequences.get_mut(&id) {
+            sequence.set_processed(reuse);
+            sequence.set_reused(reuse);
+        }
+    }
+
+    /// Keep a finished sequence's prompt KV for a later request instead of freeing it.
+    ///
+    /// Only a sequence that ended its turn normally qualifies, and only its prompt positions are
+    /// offered: those were computed by a prompt pass, as a new request would compute them, while
+    /// the tokens it generated were computed one decode step at a time.
+    fn park_for_reuse(&mut self, id: u64) -> bool {
+        if self.is_active(id) {
+            return false;
+        }
+        let Some(sequence) = self.sequences.get(&id) else {
+            return false;
+        };
+        if sequence.state() != SequenceState::Finished {
+            return false;
+        }
+        let reusable = sequence.processed().min(sequence.prompt_end());
+        if (reusable as u64) < self.kv.config().tokens_per_block {
+            return false;
+        }
+        let tokens = sequence.tokens()[..reusable].to_vec();
+        if !self.kv.park(id) {
+            return false;
+        }
+        self.sequences.remove(&id);
+        self.retired.insert(id, tokens);
+        self.retired.retain(|donor, _| self.kv.is_parked(*donor));
+        true
     }
 
     /// Ask sequence `id` to record a log-probability for every token it generates.
@@ -1098,12 +1205,21 @@ impl<F: ForwardPass> Engine<F> {
         Ok(self.kv.release(id))
     }
 
-    /// Drop a sequence and every block it owns.
+    /// Drop a sequence and every block it owns, unless the prefix cache keeps its prompt.
+    ///
+    /// A kept sequence frees no blocks now (`blocks` is 0): they are parked, and are given back
+    /// the moment any allocation needs them.
     pub fn release(&mut self, id: u64) -> Result<Released, ViperaError> {
         if !self.sequences.contains_key(&id) {
             return Err(ViperaError::invalid_argument(format!(
                 "sequence {id} does not exist"
             )));
+        }
+        if self.prefix_cache && self.park_for_reuse(id) {
+            return Ok(Released {
+                blocks: 0,
+                bytes: 0,
+            });
         }
         let blocks = self.kv.release(id);
         self.drop_turn(id);
@@ -1822,6 +1938,207 @@ mod tests {
             run([1, 0]),
             "scheduling order changed a sequence's tokens"
         );
+    }
+
+    /// A model whose answer depends on every position's stored K/V, so a prefix whose KV was
+    /// copied wrongly, or not at all, changes the tokens a request produces.
+    struct KvEcho {
+        vocab: usize,
+    }
+
+    fn slot_offset(table: &[u32], per_block: u64, bytes: u64, position: usize) -> usize {
+        let per_block = per_block as usize;
+        let block = table[position / per_block] as usize;
+        (block * per_block + position % per_block) * bytes as usize
+    }
+
+    impl ForwardPass for KvEcho {
+        fn logits(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+            let (table, per_block, bytes) = (
+                context.block_table,
+                context.tokens_per_block,
+                context.bytes_per_token,
+            );
+            for (offset, token) in context.new_tokens.iter().enumerate() {
+                let position = context.first_position as usize + offset;
+                let at = slot_offset(table, per_block, bytes, position);
+                // Never zero, so a slot that was not copied cannot pass for a stamp.
+                context.kv[at] = ((*token as usize * 31 + position * 7) % 251) as u8 + 1;
+            }
+            let last = context.first_position as usize + context.new_tokens.len() - 1;
+            let sum: usize = (0..=last)
+                .map(|position| {
+                    usize::from(context.kv[slot_offset(table, per_block, bytes, position)])
+                })
+                .sum();
+            let mut logits = vec![0.0f32; self.vocab];
+            logits[sum % self.vocab] = 10.0;
+            Ok(logits)
+        }
+    }
+
+    fn cached_engine(blocks: u64) -> Engine<KvEcho> {
+        let mut engine = engine_with_forward(greedy(), KvEcho { vocab: 97 }, blocks);
+        engine.set_prefix_cache(true);
+        engine
+    }
+
+    /// What a request produces on an engine with no cache and plenty of room: the reference.
+    fn cold(prompt: &[u32], max_new: u32) -> Generation {
+        let mut engine = engine_with_forward(greedy(), KvEcho { vocab: 97 }, 256);
+        engine.set_prefix_cache(false);
+        let id = engine.admit(prompt, max_new).unwrap();
+        engine.generate(id).unwrap()
+    }
+
+    /// Run one request to completion and release it, as the server does.
+    fn serve(engine: &mut Engine<KvEcho>, prompt: &[u32], max_new: u32) -> Generation {
+        let id = engine.admit(prompt, max_new).unwrap();
+        let generation = engine.generate(id).unwrap();
+        engine.release(id).unwrap();
+        generation
+    }
+
+    const SHARED: [u32; 10] = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+
+    #[test]
+    fn a_new_request_copies_the_prompt_of_a_released_one_and_computes_only_the_rest() {
+        let mut engine = cached_engine(64);
+        serve(&mut engine, &SHARED, 3);
+
+        let mut prompt = SHARED.to_vec();
+        prompt.extend_from_slice(&[20, 21, 22, 23]);
+        let warm = serve(&mut engine, &prompt, 6);
+        let reference = cold(&prompt, 6);
+
+        assert_eq!(warm.reused_tokens, 10);
+        assert_eq!(
+            warm.processed_tokens, 9,
+            "4 new prompt tokens and 5 decode steps"
+        );
+        assert_eq!(reference.processed_tokens, 19, "the same request, cold");
+        assert_eq!(
+            warm.tokens, reference.tokens,
+            "a copied prefix must give the tokens a computed one gives"
+        );
+    }
+
+    #[test]
+    fn only_the_prompt_the_donor_computed_is_reused_not_what_it_generated() {
+        let mut engine = cached_engine(64);
+        let first = serve(&mut engine, &SHARED, 3);
+
+        let mut prompt = SHARED.to_vec();
+        prompt.extend_from_slice(&first.tokens);
+        prompt.extend_from_slice(&[1, 2]);
+        let warm = serve(&mut engine, &prompt, 4);
+
+        assert_eq!(
+            warm.reused_tokens, 10,
+            "the generated tokens were not a prompt pass's work, so they are recomputed"
+        );
+        assert_eq!(warm.tokens, cold(&prompt, 4).tokens);
+    }
+
+    #[test]
+    fn the_donor_sharing_the_longest_prefix_is_the_one_copied() {
+        let mut engine = cached_engine(64);
+        serve(&mut engine, &[1, 2, 3, 4, 5, 6, 7, 8], 1);
+        serve(&mut engine, &[1, 2, 3, 4, 5, 6, 9, 9, 9, 9], 1);
+
+        let prompt = [1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9];
+        let warm = serve(&mut engine, &prompt, 3);
+        assert_eq!(
+            warm.reused_tokens, 10,
+            "the second donor shares ten, the first six"
+        );
+        assert_eq!(warm.tokens, cold(&prompt, 3).tokens);
+    }
+
+    #[test]
+    fn an_identical_prompt_still_computes_its_last_token() {
+        let mut engine = cached_engine(64);
+        serve(&mut engine, &SHARED, 3);
+        let warm = serve(&mut engine, &SHARED, 3);
+        assert_eq!(
+            warm.reused_tokens, 9,
+            "one token is left to give it its own logits"
+        );
+        assert_eq!(warm.tokens, cold(&SHARED, 3).tokens);
+    }
+
+    #[test]
+    fn a_shared_prefix_shorter_than_a_block_is_not_copied() {
+        let mut engine = cached_engine(64);
+        serve(&mut engine, &SHARED, 2);
+        // Three shared tokens, and a block holds four.
+        let warm = serve(&mut engine, &[5, 6, 7, 99, 98, 97, 96], 2);
+        assert_eq!(warm.reused_tokens, 0);
+    }
+
+    #[test]
+    fn with_the_cache_off_a_release_frees_everything_as_before() {
+        let mut engine = engine_with_forward(greedy(), KvEcho { vocab: 97 }, 64);
+        engine.set_prefix_cache(false);
+        let id = engine.admit(&SHARED, 3).unwrap();
+        engine.generate(id).unwrap();
+        let released = engine.release(id).unwrap();
+        assert!(released.blocks > 0);
+        assert_eq!(engine.kv().used_blocks(), 0);
+        let again = serve_off(&mut engine, &SHARED, 3);
+        assert_eq!(again.reused_tokens, 0);
+    }
+
+    fn serve_off(engine: &mut Engine<KvEcho>, prompt: &[u32], max_new: u32) -> Generation {
+        let id = engine.admit(prompt, max_new).unwrap();
+        let generation = engine.generate(id).unwrap();
+        engine.release(id).unwrap();
+        generation
+    }
+
+    #[test]
+    fn a_cancelled_sequence_is_never_kept() {
+        let mut engine = cached_engine(64);
+        let id = engine.admit(&SHARED, 3).unwrap();
+        engine.generate(id).unwrap();
+        engine.cancel(id).unwrap();
+        engine.release(id).unwrap();
+        assert_eq!(engine.kv().parked_blocks(), 0);
+        assert_eq!(engine.kv().used_blocks(), 0);
+    }
+
+    #[test]
+    fn kept_prompts_never_cause_a_request_to_be_refused() {
+        // Eight blocks of four tokens: two kept prompts fill the cache, and a request that needs
+        // all of it must still be admitted and give the same tokens as on an empty cache.
+        let mut engine = cached_engine(8);
+        serve(&mut engine, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 2);
+        serve(
+            &mut engine,
+            &[41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52],
+            2,
+        );
+        assert_eq!(engine.kv().free_blocks(), 0);
+        assert!(engine.kv().parked_blocks() > 0);
+
+        let big: Vec<u32> = (60..88).collect();
+        let warm = serve(&mut engine, &big, 2);
+        assert_eq!(warm.reused_tokens, 0);
+        assert_eq!(warm.tokens, cold(&big, 2).tokens);
+        // Sequences 0 and 1 were the kept prompts; the big request, 2, is kept in their place.
+        assert!(!engine.kv().is_parked(0));
+        assert!(!engine.kv().is_parked(1));
+        assert!(engine.kv().is_parked(2));
+    }
+
+    #[test]
+    fn turning_the_cache_off_frees_what_it_kept() {
+        let mut engine = cached_engine(64);
+        serve(&mut engine, &SHARED, 3);
+        assert!(engine.kv().parked_blocks() > 0);
+        engine.set_prefix_cache(false);
+        assert_eq!(engine.kv().parked_blocks(), 0);
+        assert_eq!(engine.kv().used_blocks(), 0);
     }
 }
 

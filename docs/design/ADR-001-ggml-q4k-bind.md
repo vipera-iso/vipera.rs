@@ -1,8 +1,17 @@
 # ADR-001: Bind ggml Q4_K GEMM sau feature flag
 
-Status: **Accepted cho phần policy** (EXC-001 đã ghi), **implementation chưa bắt đầu** — mục 10 còn
-3 điều kiện chặn.
+Status: **Bị số liệu bác bỏ cho Q4_K (2026-11-15) — implementation đóng.** Phần policy (EXC-001) còn
+hiệu lực đến expiry, chỉ dùng cho câu hỏi Q6_K.
 Ngày: 2026-11-13 · Owner: vipera-iso · Expiry của EXC-001: 2027-02-11 · Supersedes: none
+
+> **Kết luận Phase 0 (2026-11-15).** Giả định trung tâm của ADR này — prefill gap là *chất lượng
+> kernel*, nên bind `ggml_gemm_q4_K_8x8_q8_K` — đã được đo ở mức kernel và **sai**. Cùng shape,
+> cùng B=128, cùng 1 thread, cặp xen kẽ: Rust tiled **153.7 GFLOPS** (8960x1536) / **174.4**
+> (1536x8960) so với ggml repacked **125.1** / **128.8**. Kernel Rust nhanh hơn 23-35%, nên bind
+> làm prefill chậm đi. Không bind Q4_K, không thêm toolchain C++. Số đo đầy đủ ở
+> `docs/benchmarks.md`, "The ggml repacked GEMM is slower than the tiled Rust kernel".
+> Hệ quả: gap 18% prefill còn lại không nằm ở microkernel (xem mục 1, kết luận 2 — phần
+> streaming/residency và threading mới là chỗ phải đo tiếp).
 
 Tài liệu này thay cho bản nháp artifact ngày 2026-11-13: bản nháp đó không build được và bind sai
 symbol. Mục 10 ghi rõ 5 chỗ đã sửa và vì sao.

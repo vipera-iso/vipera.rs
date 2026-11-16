@@ -571,3 +571,568 @@ the prototype), numbers kept here so it is not rebuilt a third time.
 What would move decode instead: fewer calls or less traffic, not a narrower instruction stream. The
 `BatchScratch` logits buffer (`MAX_BATCH * vocab`, 78 MB at `MAX_BATCH = 128`) is the kind of thing to
 fix before another kernel is written.
+
+## Against a clean upstream llama.cpp, e574a17 — 2026-11-15
+
+The section above compares against `vipera.cpp/build-clang`, and that binary understates the gap:
+its prefill path is 30-35% below a clean upstream build of the same date (`pp128` 147.2 against 225.3,
+`pp512` 156.6 against 224.3), so a comparison against it credits the engine with prefill it does not
+have. Built here instead:
+
+```bash
+# upstream, newest at the time of measuring, CPU only, no local patches
+git clone --depth 400 https://github.com/ggml-org/llama.cpp llama-latest
+cd llama-latest && cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ -DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DGGML_CUDA=OFF \
+  -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+cmake --build build -j8 --target llama-bench
+
+llama-latest/build/bin/llama-bench -m ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  -p 128,512 -n 64 -t 8 -r 3 -ngl 0
+```
+
+Median of three paired rounds, 8 threads, same model, `e574a17` (build 466):
+
+| workload | vipera | llama.cpp e574a17 | ratio |
+|---|---|---|---|
+| pp128 | 186 (182–193) | 217 (216–222) | 0.86 |
+| pp512 | 171 (169–174) | 217 (216–223) | 0.79 |
+| pp512, same `ubatch` 128 | 171 | 208 | 0.82 |
+| decode, depth 0 | 34.3 tok/s (29.1 ms) | 37.5 (26.6 ms) | 0.91 |
+| decode, depth 256 | 32.8 (30.5 ms) | 35.6 (28.1 ms) | 0.92 |
+| decode, depth 1024 | 24.9 (40.1 ms) | 33.4 (29.9 ms) | 0.75 |
+
+What the three columns separate:
+
+- **The prefill gap is kernel work, not batch width.** Sweeping upstream's `-ub` on `pp512` gives
+  207.6 (128), 209.5 (256), 215.6 (512): widening the batch buys 4%, and at the engine's own width
+  of 128 it still loses 18%. Upstream repacks Q4_K at load into an interleaved blocked layout
+  (`ggml/src/ggml-cpu/repack.cpp`, `tiled/tiled-kernel.cpp`) and its inner loop reads packed nibbles
+  contiguously; the engine unpacks a 256-column slab per 32-row window from the GGUF layout in
+  `simd::q4k_matvec_tiled_range`. The tiling itself is load-bearing here — `VIPERA_TILED=0` drops
+  `pp512` from 168 to 49.7 tok/s — so the remaining 18% is the unpack and the strided row reads, not
+  a missing tile.
+- **Decode loses little until context arrives, then loses a quarter.** Upstream's own depth curve
+  (`-d`) is 37.58 → 35.63 → 33.42 → 30.07 tok/s at depth 0/256/1024/2048, i.e. attention costs
+  1.95 ms at 256 and 4.16 ms at 1024. The engine's curve over the same depths is 34.3 → 32.8 → 24.9,
+  i.e. 1.4 ms at 256 and 10.8 ms at 1024 — 2.6x upstream's attention cost. `model::attention_heads`
+  walks one `(head, position)` at a time: a `dot_f32`, a scalar `exp`, and an `axpy_f32` per
+  position, with `PARALLEL_ATTENTION_MIN = 4096` score lanes leaving everything below ~342 positions
+  on one thread. Upstream uses a flash-attention-style kernel over F16 KV.
+- **The old upstream column was low.** `9183a55` at 199.67/200.39/35.26 and the fork's 149.88/153.09
+  are both under a clean build of their own date: upstream `45b6604` (2026-11-06), the fork's base
+  date, measures 225.3/224.3/37.8 here. So the honest summary to date is **−14% `pp128`, −21%
+  `pp512`, −9% decode, −25% at 1k context**, not "parity except a 10% decode gap".
+
+Spread on this box is 8-15% between windows (a `powersave` governor on 4 cores/8 threads, plus other
+load), so single lines are not comparable across sections; the paired tables are.
+
+### On-demand pool chunks: no change — 2026-11-15
+
+A patch replaced the fixed row split with chunks claimed from an atomic counter, on the theory that
+a decode product waits on a worker that has not left its idle state yet. Measured at the locus it
+targets, `pool_dispatch_cost`, best of 200 dispatches:
+
+| rows | fixed, 0 µs gap | on demand x4, 0 µs gap | fixed, 100 µs gap | on demand x4, 100 µs gap |
+|---|---|---|---|---|
+| 256 | 9.7 µs | 11.2 µs | 12.0 µs | 12.0 µs |
+| 1536 | 27.1 | 27.9 | 28.3 | 29.1 |
+| 8960 | 132.1 | 131.6 | 125.4 | 126.6 |
+
+End to end, two alternating pairs: decode 28.9/28.9 ms off against 29.1/29.2 ms on. The tail the
+patch removes is not there at 256 rows — the product is bound by the rows it has, not by the last
+worker to wake — and the counter costs slightly more than it saves. **Reverted**; it also needed a
+`#[allow(clippy::too_many_arguments)]`, which `CONSTRAINTS.md` does not allow.
+
+### Four positions per attention value pass: bit-exact, no faster — 2026-11-15
+
+The value pass calls `axpy_f32` once per `(head, position)`, and each call reads and writes the
+`head_dim` output buffer — 512 B in and 512 B out, 344k times per token at depth 1024 (12 heads x
+1024 positions x 28 layers). Grouping four positions into one pass looks like a 2.4x cut in that
+traffic: one load and one store per four positions instead of four each.
+
+Implemented as `simd::axpy4_f32`, adding the four products to the running vector one at a time in
+position order (grouping the four sums first rounds 1 ULP differently and broke the two
+bit-identical attention tests). A/B at depth 1024, three alternating pairs behind `VIPERA_ATTN4`:
+
+| | pair 1 | pair 2 | pair 3 | median |
+|---|---|---|---|---|
+| 1024 ms/step, four axpy per position | 43.4 | 43.9 | 42.8 | 43.4 |
+| 1024 ms/step, four positions per pass | 44.0 | 44.1 | 42.6 | 44.0 |
+
+Neutral. The output buffer is 512 B and stays in L1, so moving it was never the cost: the pass is
+multiply-add throughput plus the V row loads, and the same number of those is paid either way.
+**Reverted.** The attention gap to upstream at this depth stays at ~2.6x (`4.16 ms` against
+`10.8 ms`), and closing it needs the flash-attention shape — online softmax over a block of
+positions with the scaling folded in — not a wider accumulation of the same work.
+
+### The ggml repacked GEMM is slower than the tiled Rust kernel — 2026-11-15
+
+ADR-001 rested on one premise: the prefill gap is *kernel quality*, and the way to buy ggml's
+repacked `block_q4_Kx8` GEMM is a C++ bind. That premise had never been measured at the kernel
+level — the ADR compares whole-engine tok/s. So: same shapes (8960x1536 and 1536x8960), same
+batch (128 activations), same thread count (1), alternating pairs in one window, synthetic Q4_K
+weights in both. ggml is the `vipera-ggml` prototype, compiled for `avx512vnni` from
+`llama-latest`, calling `ggml_gemm_q4_K_8x8_q8_K` on repacked weights and `ggml_quantize_mat_q8_K_4x8`
+activations; the Rust side is `simd::q4k_matvec_tiled_range` behind the new
+`q4k_tiled_batch128_throughput` bench.
+
+| Kernel, 1 thread, B=128 | 8960x1536 | 1536x8960 |
+|---|---|---|
+| Rust tiled, `q4k_matvec_tiled_range` | **154.1 / 152.5 / 153.7 GFLOPS** (median 153.7) | **173.3 / 174.4 / 175.6** (median 174.4) |
+| ggml repacked, `ggml_gemm_q4_K_8x8_q8_K` | 125.1 / 125.5 / 124.8 (median 125.1) | 128.8 / 128.5 / 128.9 (median 128.8) |
+
+The Rust kernel is **23% faster** on the gate shape and **35%** faster on the 35-block projection
+shape. Binding ggml's GEMM would make prefill slower, not faster, before a single line of seam
+code is written: the 2-4 dev-month cost stays unpaid and so does the second toolchain. **ADR-001
+implementation is closed**; the policy exception (EXC-001) stays until its expiry for the Q6_K
+question only.
+
+Two things this also says:
+
+- The 18% prefill gap to llama.cpp (171 against 209 tok/s pp512) is **not** the Q4_K GEMM kernel.
+  llama.cpp's kernel is the slower one per thread, so its win comes from elsewhere in the pass —
+  the streaming/residency behaviour of the real 0.98 GB weight sweep, or its threading, not the
+  microkernel. That is the next hypothesis to test, and this harness is where to test it.
+- Both figures are L3-resident (7.7 MB matrix), so they price the microkernel, not the stream. The
+  gap between 154 GFLOPS here and the ~42 GFLOPS/thread prefill actually sustains end to end is
+  the real headroom, and it lives outside the inner loop.
+
+### Where the "27% of kernel rate" went: SMT, not the tile and not the stream — 2026-11-15
+
+Follow-up on the last paragraph above. Three candidates, three measurements, all single thread
+unless stated, on the 6-block gate shape (8960x1536).
+
+**(a) The activation tile.** `q4k_matvec_tiled_range` builds `act`/`dxs`/`sumt` per thread:
+`blocks * halves * 64 * 16 * 4` bytes = **192 KB at B=128** (not the 786 KB first reported to the
+user — that multiplied by 16 twice), 1.5 MB across eight threads. Sweep (`q4k_tiled_batch_sweep`):
+
+| B | act tile | ms | GFLOPS |
+|---|---|---|---|
+| 16 | 24 KB | 6.3 / 6.5 | 70.1 / 68.0 |
+| 32 | 48 KB | 6.2 / 6.3 | 143.1 / 140.7 |
+| 64 | 96 KB | 13.5 / 13.1 | 130.9 / 134.9 |
+| 128 | 192 KB | 27.8 / 26.7 | 126.8 / 132.0 |
+
+No residency cliff: 32 is the best point (143) and 128 costs ~8% against it, which is the reuse
+trade-off, not a spill. The tile is not the limiter.
+
+**(b) The stream.** `q4k_tiled_streaming_throughput` runs the kernel over 127 copies of the shape —
+0.98 GB, the weight bytes one prefill chunk reads — B=128, one thread:
+**3000 / 3044 ms, 147.0–149.2 GFLOPS, 0.32–0.33 GB/s.** The rate *rises* against the L3-resident
+figure (127–132 in the same window). Streaming from RAM is free here: 256 FLOP per weight byte
+means the kernel never gets near the 43 GB/s ceiling.
+
+**(c) The pool.** End to end, pp512 chunked, alternating 4 and 8 threads:
+
+| | run 1 | run 2 |
+|---|---|---|
+| 4 threads | 105.8 tok/s | 95.3 tok/s |
+| 8 threads | 99.9 tok/s | 95.8 tok/s |
+
+Four threads equal eight: on this 4C/8T part the second hyperthread of a core buys nothing in
+prefill. That is the whole explanation for the 27%: one thread alone gets a full core (126–154
+GFLOPS), and a prefill thread shares its core's execution units, so per-thread rate halves. Eight
+threads x ~66 GFLOPS is the four-core ceiling, not headroom.
+
+**Consequence.** Prefill on this CPU is within a few percent of the core-limited ceiling, so the
+18% gap to llama.cpp cannot be closed by making this kernel wider: at 209 tok/s and ~3.05 GFLOP
+per token upstream would need ~159 GFLOPS/core, which is already at our single-thread kernel rate.
+Any further prefill work has to reduce work or threads, not tighten the loop. Tile split, cache
+blocking and more threads are all closed by the above.
+
+### Prompt chunk size 128 against 64 and 32: within noise — 2026-11-15
+
+With the tile sweep showing 143 GFLOPS at B=32 against 127-132 at B=128, the prompt chunk was made
+a named constant and swept end to end (pp512, chunked, 4 threads):
+
+| chunk | samples (tok/s) |
+|---|---|
+| 128 | 134.5, 146.3 |
+| 64 | 138.8, 138.6 |
+| 32 | 129.1 |
+
+The kernel's B=32 advantage does not survive the pass: four times as many chunks means four times
+the weight sweeps, and that costs more than the tile saves. 64 against 128 flips order between
+runs, so both stay inside this machine's noise. **Constant reverted**, chunking stays at
+`MAX_BATCH`.
+
+### Pool on-demand chunking: neutral at the kernel and neutral end to end — 2026-11-15
+
+Hypothesis: `fill_batch` hands each thread a fixed slice per product, so a product finishes only
+when the slowest-woken worker finishes its slice; llama.cpp instead takes chunks from an atomic
+counter on demand. The patch under test (`0001-pool-on-demand-chunks.patch`, from the external
+contributor) adds `Split::Dynamic { per_participant }`, defaults off, `VIPERA_POOL_CHUNKS=N`
+enables N chunks per participant for B<8 only, so the tiled prefill path is untouched. Every
+product stayed bit-identical to the sequential kernel in their suite (288 tests, 2 more than
+baseline).
+
+Dispatch cost, 8 participants, same binary (`quant::tests::pool_dispatch_cost`):
+
+| rows | between products | fixed | on demand x4 |
+|---|---|---|---|
+| 256 | 0 us | 9.4 us | 11.2 us |
+| 256 | 100 us | 13.2 us | 13.1 us |
+| 1536 | 0 us | 29.2 us | 29.3 us |
+| 1536 | 100 us | 31.4 us | 31.5 us |
+| 8960 | 0 us | 136.2 us | 134.5 us |
+| 8960 | 100 us | 144.9 us | 134.8 us |
+
+Decode end to end, pp32 decode, 8 threads, interleaved in one binary:
+
+| run | fixed | on demand x4 |
+|---|---|---|
+| 1 (cold weights) | 45.0 ms/step | 33.6 ms/step |
+| 2 | 33.8 ms/step | 33.7 ms/step |
+
+The two columns are the same to within 0.3%, and the kernel-level comparison is flat at every
+shape. The wake-up tail this was meant to remove is not visible on this part, which matches the
+earlier finding that the sleep-window cost attributed to wake-ups was really a core C-state. **The
+patch is not carried**: revert, as the contributor asked for a neutral result.
+
+Worth recording for whoever picks this up: a 256-row product is 9.4 us at eight threads, so the
+twelve small products of a decode step (wk/wv 256 rows, wq/wo 1536 rows, x28 layers) are ~0.3 ms
+of a 33.8 ms step. Even a perfect tail fix there is worth under 1%, which is why the end-to-end
+number cannot move: the 25% of Q4_K time in those products is real work, not dispatch overhead.
+
+### Prefix cache: 2791 ms of prompt work becomes 61 ms, with the same tokens — 2026-11-16
+
+The contributor's `0001-prefix-cache-park-and-copy.patch` keeps a finished request's prompt KV
+parked (LRU, at most 32 prompts, given back to any allocation that needs the blocks) and copies
+the longest shared prompt prefix into a later request instead of computing it. Off by default
+(`VIPERA_PREFIX_CACHE=1` or `Engine::set_prefix_cache(true)`), because it changes what a request
+computes.
+
+Measured on Qwen2.5-1.5B Q4_K_M with `tests/prefix_cache.rs`: a 480-token shared prompt plus four
+tokens that differ, one generated token, same engine handling both requests.
+
+| | ms | processed | reused |
+|---|---|---|---|
+| cache off | 2790.7 | 484 | 0 |
+| cache on | 61.0 | 4 | 480 |
+
+46x on that request, and the twelve-token continuation of the warm request is identical to the
+cold one (`[11, 220, 16, 15, ...]`), so the copied KV is the KV the prompt pass would have written
+there — including the case where the donor's prefix was computed in 128-token chunks and the copy
+covers all but four tokens.
+
+Every workspace test passes (runtime engine tests 48 -> 64). Not a kernel change, so nothing here
+touches the prefill ceiling above: it removes prompt work rather than speeding it up, which is why
+it is the only change in this batch that moves a number by more than a few percent.
+
+### Prefix cache through the HTTP server, eight at once — 2026-11-16
+
+`vipera serve` (its `max_batch` is 4), one seed request to park a 480-token prompt, then eight
+concurrent requests that share it and differ only in their four-token question. Non-streaming, so
+`time_total` is the whole request; two rounds, cache off against on, with `--ctx 8192`:
+
+| round | cache off | cache on |
+|---|---|---|
+| 1 | 33.83 s wall (per request 33.78) | 1.15 s wall (per request 0.95-1.11) |
+| 2 | 34.81 s wall (per request 34.52-34.77) | 1.17 s wall (per request 0.88-1.12) |
+
+29x on the wall clock of the burst, and the text of all eight answers is identical between the two
+modes.
+
+The cache does not shrink KV demand, which is the operational catch: at `--ctx 2048` the same
+burst took 16.70 s against 7.34 s with the cache on (2.3x instead of 29x), because eight sequences
+of ~500 tokens no longer fit the 2048-token budget, so later requests find the donor evicted and
+fall back to computing. That is arithmetic, not a measured decomposition — but it is enough to say
+the knob belongs with a context large enough to hold the concurrent prompts plus one parked copy.
+
+### A copied prefix is the same on Q8_0 KV as on F16 — 2026-11-16
+
+`prefix_cache_gives_the_same_tokens_for_every_kv_type`: 480 shared tokens plus a four-token tail,
+twelve generated tokens, cache off against cache on, per KV type. F16 and Q8_0 both reuse 480 and
+return identical tokens. Q4_0 is not carried by this backend at all (`KvLayout::of` returns `None`,
+so planning refuses it before any of this matters), so it is reported as skipped rather than
+passing.
+
+### Attention decode at depth 1024: read f16 in place, then split the heads — 2026-11-16
+
+Baseline in this window: 44.4 ms/step, attention+KV 12.8-14.1 ms (the quiet-machine figure is
+10.8, so only ratios below are worth reading).
+
+**In place, no row buffer.** `simd::dot_f16_f32` / `axpy_f16_f32` convert inside the loop with
+F16C and keep `dot_f32_avx2`'s two-accumulator reduction, so they are bit-identical to decoding
+the row and calling the f32 kernels (new test `f16_rows_give_the_same_bits_as_decoded_ones` checks
+`.to_bits()` over 1..256 values). Alone it is neutral: 13.4 against 13.2 ms, alternating, same
+binary. The row buffer was never the cost — 176 MFLOP per token of score and weighted sum is.
+
+**Heads across the pool.** That arithmetic picture is what makes the head split worth retrying:
+this split was measured and reverted earlier (45.3 -> 48.7 ms) because with a decoded row every
+worker decoded all 1024 rows again. Reading rows in place, a worker repeats only arithmetic, which
+is the thing there is too much of. One entry with `>= PARALLEL_ATTENTION_MIN` score lanes now
+sends its 12 heads to `min(threads, heads)` workers, each with its own scratch and output slice:
+
+| | attention+KV | step |
+|---|---|---|
+| split off | 15.0, 15.2, 15.0, 15.4, 14.5, 13.0, 11.5 (median 15.0) | median 46.9 |
+| split on | 11.0, 11.2, 11.3, 12.0, 13.0, 13.1, 15.0 (median 12.0) | median 44.6 |
+
+20% off attention and ~5% off the step in that window, with the same bits: a head's arithmetic and
+its order do not depend on which worker holds it, and every attention test still compares bit for
+bit against the decoded oracle. Measured again later on cores the agent was not using, it is 29%
+off attention and 4% off the step — see the section below, which supersedes these samples.
+
+**Not the 5 ms target.** Attention is arithmetic-bound at roughly 13-15 GFLOPS of one core here;
+the next step is a blocked, head-major score pass (Q x K^T as a small GEMM with the positions
+vectorized instead of one 128-wide dot per position), which needs FMA and therefore gives up bit
+equality with the buffered oracle. That is a tolerance policy for attention, not a kernel detail,
+so it is not taken here.
+
+Knobs for a same-binary A/B: `VIPERA_INPLACE_KV=0` and `VIPERA_ATTN_HEAD_SPLIT=0`.
+
+### Where a depth-1024 attention layer's time is not: the arithmetic — 2026-11-16
+
+`simd::tests::attention_phase_cost` times one layer's two phases at their own shape (1024
+positions x 12 heads x 128 values, f16 rows, L1-hot): **score 0.13 ms, weighted sum 0.11 ms,
+0.24 ms together**. Twenty-eight layers of that is 6.7 ms, against the 12-15 ms an attention step
+actually takes at ctx 1024 in the same window.
+
+So a blocked, position-vectorised score pass (Q x K^T as a small GEMM) cannot pay for itself here:
+it would shorten 0.13 ms of a layer and add a transpose of every K row, and the transpose has to be
+built from a row layout where consecutive positions are `bytes_per_token` apart (28 KB on this
+model). The same arithmetic says the head split was the right lever, and that the remaining cost is
+the strided walk, not the loop.
+
+### The head split and the prefetch, measured on cores the agent is not using — 2026-11-16
+
+The earlier samples for both were taken while this session's own harness held a core (100% of one
+logical CPU), so load average never fell below ~1.6 and the samples spanned 6.2-15.0 ms. Rather than
+wait for an idle machine that cannot exist while the agent runs, the benchmark was pinned to the
+three physical cores the agent is not on (`taskset -c 2-7`, six threads) and the two switches were
+alternated in one binary, three rounds each:
+
+| | attention+KV | median | step | median |
+|---|---|---|---|---|
+| head split off | 10.6, 11.6, 12.1 | 11.6 | 44.0, 45.6, 45.6 | 45.6 |
+| head split on | 7.7, 8.2, 9.1 | 8.2 | 42.2, 43.7, 43.7 | 43.7 |
+| prefetch off | 9.4, 9.5, 9.3 | 9.4 | 44.1, 43.6, 44.2 | 44.1 |
+| prefetch on | 8.6, 9.0, 10.5 | 9.0 | 43.5, 43.8, 45.2 | 43.8 |
+
+**Head split: confirmed, and better than the loaded window suggested** — 29% off attention (11.6
+to 8.2 ms) and 4% off the step. Kept.
+
+**Prefetch: 4% off attention, nothing at the step boundary** (44.1 against 43.8 is inside the
+spread), and one of the three rounds regressed. That does not clear the bar the other changes were
+held to, so it is **reverted**: `simd::prefetch` and the two calls in `model.rs` are gone, and the
+`VIPERA_ATTN_PREFETCH` switch with them. `simd::prefetch_ahead` stays where it was, in the matvec
+kernels, where it has a measurement behind it.
+
+Method note for the next measurement here: `taskset -c 2-7` plus `VIPERA_THREADS=6` is what makes
+this repeatable. Without it the same binaries spread by 2x.
+
+### Prefix cache: the KV headroom a burst needs — 2026-11-16
+
+Same burst as above (seed parks a 480-token prompt, eight concurrent requests share it), one round
+per context size:
+
+| `--ctx` | cache off | cache on | gain |
+|---|---|---|---|
+| 2048 | 16.70 s | 7.34 s | 2.3x |
+| 4096 | 37.05 s | 4.64 s | 7.9x |
+| 8192 | 33.83 s | 1.15 s | 29x |
+| 16384 | 37.17 s | 1.25 s | 28x |
+
+At 4096 the eight requests split into two groups (1.39 s and 4.5 s): the first four copy the
+parked prompt, then the cache fills and the rest recompute. The threshold is arithmetic — the
+budget has to hold the concurrent prompted sequences plus the parked copy, so ~8 x 500 tokens plus
+one prompt needs 8192 and has nothing to spare at 4096. Past that the gain is flat, so 8192 is the
+size to recommend for this burst shape.
+
+### A transposed K layout with a block GEMM score pass: 4.6x slower — 2026-11-16
+
+The remaining cost of a depth-1024 attention step is the strided walk over KV rows (each K row is
+512 bytes, consecutive positions are `bytes_per_token` = 28 KB apart), so the proposal was to store
+K as `[dim][position]` per block, which makes positions contiguous for a dimension and lets the
+score pass become Q x K^T with the reduction vertical instead of one horizontal sum per position.
+
+Before changing the cache format, the pair was prototyped in `simd::tests::transposed_k_scores`
+over the real shape (1024 positions x 12 heads x 128 dims, f16 rows), on a separate branch:
+
+| score pass | ms |
+|---|---|
+| per-position dots (today) | 0.14 |
+| block GEMM of 64 positions, transposed K given | 0.37 (0.67 with the transpose counted) |
+| transpose alone | 0.27-0.33 |
+
+Both produce the same scores on the same data (largest gap 0.000). The block GEMM is 2.6x slower
+even when the transpose is free, and 4.6x slower when it is not. The reason is loads: the GEMM
+reads one 32-byte vector of `kt` per FMA, and re-reads the whole block once per head, while the
+per-position dot reads a contiguous 128-value row that is already in L1 and reduces it with two
+accumulators.
+
+**Verdict: the format change is not carried.** It would cost a change to the KV format, the write
+path, `load_layer`, prefix-cache copies and every KV test, to make the already-cheap phase slower.
+The score pass is 0.14 ms of a 12 ms attention step, so even making it free would leave ~4 ms of
+the step untouched: whatever is left is the walk and the weighted sum, not the scoring.
+
+The prototype stays as an ignored bench, so the next person does not have to rebuild it to find
+the same answer.
+
+### Layer-major KV inside a block: 27% off the walk at depth 1024 — 2026-11-16
+
+The previous entry established that what is left of a depth-1024 attention step is the walk, not the
+arithmetic. The walk is strided because a token owns every layer: K rows are 512 bytes, and
+consecutive positions are `bytes_per_token` = 28 KB apart, so one layer of a 16-token block is 16
+rows scattered across 448 KB.
+
+Before touching the format, the same bytes were re-ordered *inside* a block — layer-major, every
+layer's rows for the whole block together — behind `VIPERA_KV_LAYER_MAJOR=1`. The block table, the
+block size and the row encoding are unchanged; only the addresses move, so the two arms read the
+same values in the same order and must compute the same bits.
+
+Measured by `kv_row_order_at_1024` (28 layers x 1024 positions, f16, `tokens_per_block` = 16, best
+of five per arm, both arms in one process, pinned to cores 2-7 with `VIPERA_THREADS=6`):
+
+| run | token-major | layer-major | gain |
+|---|---|---|---|
+| 1 | 15.22 ms | 11.10 ms | -27% |
+| 2 | 15.62 ms | 11.12 ms | -29% |
+| 3 | 15.21 ms | 12.50 ms | -18% |
+
+Per layer that is 0.543 ms to 0.396 ms. The bench asserts the two arms' outputs are equal bit for
+bit before it prints anything, so the gain is locality and nothing else.
+
+Exactness through the model, not just the bench: `vipera generate` with the switch off and on gave
+identical token ids on (a) a 920-token prompt at f16 and (b) a 1534-token prompt at `q8_0` (34-byte
+rows, six blocks), greedy, same seed.
+
+**Verdict: worth keeping, not yet worth making default.** A 1024-deep step spends ~8-12 ms in
+attention and KV, so 27% of that is 2-3 ms of a ~44 ms step (5-7%). The end-to-end decode bench
+cannot resolve 3 ms on this machine — its noise floor is +-10 ms even at 32 positions, where the two
+orders read exactly the same bytes — so the win is measured where it happens and nowhere else. The
+switch stays, off by default, until a quieter machine can confirm the step.
+
+### Settled in one process: head split 36%, prefetch nothing — 2026-11-16
+
+Every earlier sample of these two switches compared two processes, and this machine is never idle:
+`freebuff` holds a full logical CPU for the length of a session, and the load average has not gone
+below 3.5. Comparing two runs therefore compared two different amounts of interference, which is
+why the same switch came out as 20% once and 29% later.
+
+The fix is not a quieter machine but a tighter experiment: `attention_combinations` builds the
+KV once, then times both arms **in the same process on the same bytes**, four sweeps per arm with
+the sweep direction alternating so no arm holds a systematically warmer position, best sample per
+arm. It asserts all arms produce identical output before printing, so the flags can only be moving
+time. Pinned to cores 2-7 with `VIPERA_THREADS=6`.
+
+| run | split off | split on | gain |
+|---|---|---|---|
+| 1 | 14.93 ms | 9.76 ms | -35% |
+| 2 | 14.48 ms | 9.52 ms | -34% |
+| 3 | 14.91 ms | 9.58 ms | -36% |
+
+28 layers x 1024 positions, f16, `tokens_per_block` = 16. Per layer 0.533 ms to 0.342 ms. The
+arithmetic does not depend on which worker holds a head, and the output comparison in the bench says
+so.
+
+**Head split: 34-36%, not 20%.** Two independent methods now agree (this one and the cross-process
+`taskset` run that gave 29%), so the number to quote is roughly a third of the attention walk at
+depth 1024, worth ~3 ms of a ~44 ms step.
+
+**Prefetch: nothing worth keeping.** Restored behind the switch and measured in the same harness:
+
+| | prefetch off | prefetch on |
+|---|---|---|
+| split off | 14.44 ms | 13.81 ms (-4%) |
+| split on | 9.47 ms | 9.59 ms (+1%) |
+
+It helps the single-threaded walk by 4% and is a wash once the heads are split — which is the
+configuration that ships. So it is not the 10% it was once credited with: that number came from
+comparing runs, not from the switch. It is removed again, and the bench that measured it stays as
+an ignored test so the next attempt starts from the same table.
+
+Method note for the next switch: compare arms inside one process wherever the switch only changes
+scheduling or adds a hint. Cross-process A/B on this machine cannot resolve anything smaller than
+~10 ms.
+
+### How to measure a switch on this machine
+
+Every failure in this ledger's history of the two attention switches had the same shape: two runs
+compared, one arm landing in a quieter moment than the other, and a switch credited with whatever
+the machine happened to be doing. The machine is never quiet here (`freebuff` holds a core for the
+length of a session, load average 3.5-5.8), so the recipe is:
+
+1. **Build the input once**, in the test, and use the same bytes for every arm. No model load, no
+   prefill: the thing being changed is the loop, not the loader.
+2. **Time every arm in one process**, in sweeps, with the sweep direction alternating, and keep the
+   best sample per arm. Two sweeps warm, two measured is enough.
+3. **Assert the arms compute the same output before printing**, and make it fail the test if they
+   do not. A switch that changes a bit is not a performance switch, and a bench that cannot tell is
+   measuring the wrong thing.
+4. **Pin** (`taskset -c 2-7 VIPERA_THREADS=6`) so the pool gets whole physical cores.
+5. Quote the **ratio**, not the milliseconds: the same 2x2 table moves by ~20% run to run in
+   absolute terms and by 1-2 points in ratio.
+
+`attention_combinations` is that recipe for both attention switches at once, and
+`kv_row_order_at_1024` is the same idea for one.
+
+### The two attention switches combined, at 1024 and 4096 — 2026-11-16
+
+`attention_combinations` crosses the KV row order with the head split, both arms in one process,
+28 layers, f16, `tokens_per_block` = 16. Two runs, best per arm:
+
+| depth | arm | run 1 | run 2 | vs baseline |
+|---|---|---|---|---|
+| 1024 | token-major, split off | 15.31 ms | 14.20 ms | — |
+| 1024 | token-major, split on | 9.80 ms | 9.19 ms | -35% |
+| 1024 | layer-major, split off | 10.56 ms | 10.23 ms | -28% |
+| 1024 | layer-major, split on | 7.70 ms | 7.81 ms | -46% |
+| 4096 | token-major, split off | 68.66 ms | 68.53 ms | — |
+| 4096 | token-major, split on | 48.91 ms | 49.10 ms | -29% |
+| 4096 | layer-major, split off | 45.13 ms | 44.03 ms | -34% |
+| 4096 | layer-major, split on | 28.16 ms | 26.68 ms | -59% |
+
+**The head split holds at 4096** (-28%, against -35% at 1024): splitting twelve heads over six
+workers buys the same quarter-to-third of the walk at four times the depth, so it is a property of
+the work distribution and not of the buffer fitting in L3.
+
+**The two gains roughly add, and at 4096 they add better than the parts predict.** At 1024 the
+combined arm is -46%, where independent gains of 35% and 30% would give -54%: slightly under, which
+is what two changes competing for the same memory bandwidth looks like. At 4096 it is -59% against
+-54% predicted: the layer-major walk turns 4096 scattered rows into 256 contiguous 8 KB runs, and
+once the rows arrive in runs the six workers stop fighting over the same lines, so the split gets
+cheaper at the same time.
+
+For a 1024-deep step that is ~7-8 ms off the ~44 ms step; for 4096 it is ~40 ms off a step that was
+spending most of its time in the walk. Two switches, neither changing a bit.
+
+### Layer-major becomes the default — 2026-11-16
+
+Two things stood between the prototype and making it the default: it had to not cost anything on
+the write path, and the combined gain had to hold deep enough to matter.
+
+**Write path, prefill batch 128** (`kv_write_batch_at_128`, 128 tokens x 28 layers x 10 passes per
+sample, best of two samples, both orders in one process):
+
+| run | token-major | layer-major |
+|---|---|---|
+| 1 | 2.71 ms | 2.70 ms |
+| 2 | 2.71 ms | 2.65 ms |
+| 3 | 2.66 ms | 2.78 ms |
+
+Equal within noise: 0.75 us per token-layer either way. A 128-token chunk writes its KV in 2.7 ms
+against a prefill of roughly a second, so the write path is 0.3% either way and the row order does
+not move it.
+
+**Combined gain at three depths** (`attention_combinations`, two runs, best per arm):
+
+| depth | token/split-off | token/split-on | layer/split-off | layer/split-on |
+|---|---|---|---|---|
+| 1024 | 14.19 / 14.48 ms | -30% | -27% | **-45%** |
+| 4096 | 69.95 / 75.00 ms | -29% | -38% | **-58%** |
+| 8192 | 148.60 / 151.23 ms | -37% | -36% | **-60%** |
+
+The two switches stay additive as depth grows (independent 37% and 36% predict -60%), so there is
+no saturation point to work around: the walk is still the cost at 8192 and both changes still cut
+it.
+
+**Exactness with the switch unset**, i.e. the new default: `vipera generate` reproduces the same
+token ids recorded for layer-major earlier — 920-token prompt at f16, 1534-token prompt at `q8_0`,
+greedy, same seeds.
+
+So `VIPERA_KV_LAYER_MAJOR` now defaults on, and `=0` keeps the token-major walk for an A/B. The
+format is unchanged: same blocks, same block size, same row encoding, same block table, same prefix
+cache copies (whole-block `copy_within`, order-agnostic).

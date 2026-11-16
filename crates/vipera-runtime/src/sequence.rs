@@ -86,6 +86,9 @@ pub struct Sequence {
     pending_reused: usize,
     wants_logprobs: bool,
     top_logprobs: usize,
+    /// Leading tokens that were prompt rather than generated: the part of the context a forward
+    /// pass over a prompt computed, as opposed to one decode step at a time.
+    prompt_end: usize,
 }
 
 impl Sequence {
@@ -103,6 +106,7 @@ impl Sequence {
             pending_reused: 0,
             wants_logprobs: false,
             top_logprobs: 0,
+            prompt_end: 0,
         }
     }
 
@@ -151,6 +155,11 @@ impl Sequence {
         self.tokens.is_empty()
     }
 
+    /// How many leading tokens were prompt: everything before the first generated token.
+    pub const fn prompt_end(&self) -> usize {
+        self.prompt_end
+    }
+
     /// Tokens already sent through the forward pass.
     pub const fn processed(&self) -> usize {
         self.processed
@@ -194,6 +203,7 @@ impl Sequence {
     /// Append prompt tokens to the retained context.
     pub fn push_prompt(&mut self, tokens: &[u32]) {
         self.tokens.extend_from_slice(tokens);
+        self.prompt_end = self.tokens.len();
         self.finish = None;
         if self.state != SequenceState::Admitted {
             self.state = SequenceState::Admitted;
@@ -213,6 +223,7 @@ impl Sequence {
     pub fn truncate(&mut self, position: usize) {
         self.tokens.truncate(position);
         self.processed = self.processed.min(position);
+        self.prompt_end = self.prompt_end.min(position);
         self.snapshots
             .retain(|snapshot| snapshot.token_position <= position);
         self.finish = None;

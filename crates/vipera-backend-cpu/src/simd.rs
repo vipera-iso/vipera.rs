@@ -528,6 +528,141 @@ unsafe fn axpy_f32_avx2(target: &mut [f32], weight: f32, source: &[f32]) {
     }
 }
 
+/// [`dot_f32`] over a row the KV cache stores as `f16`, converting inside the loop.
+///
+/// The conversion is exact and the reduction tree is [`dot_f32_avx2`]'s, so this gives the bits
+/// that decoding the row and calling [`dot_f32`] gives — the attention tests compare against that
+/// oracle bit for bit. What it avoids is materializing the row: at 1024 positions a decode step
+/// writes and re-reads 2 MB of `f32` row buffer per layer for no arithmetic at all.
+///
+/// Safe to call: it detects the features itself, and the length is the shorter of the two.
+pub(crate) fn dot_f16_f32(a: &[f32], row: &[u8]) -> f32 {
+    let length = a.len().min(row.len() / 2);
+    if length == 0 {
+        return 0.0;
+    }
+    if available() && std::is_x86_feature_detected!("f16c") && length >= 8 {
+        // SAFETY: AVX2 and F16C were just detected, and the kernel stays inside `length`.
+        return unsafe { dot_f16_f32_avx2(a, row, length) };
+    }
+    let mut total = 0.0_f32;
+    for (value, chunk) in a.iter().zip(row.as_chunks::<2>().0).take(length) {
+        total += value * f16_to_f32(u16::from_le_bytes(*chunk));
+    }
+    total
+}
+
+/// [`dot_f16_f32`] with [`dot_f32_avx2`]'s reduction tree and the conversion folded in.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and F16C, and `length` must not exceed `a`'s length or `row`'s half.
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn dot_f16_f32_avx2(a: &[f32], row: &[u8], length: usize) -> f32 {
+    // SAFETY: the caller guarantees the features and `length`; every load reads eight halves or
+    // eight floats at an offset that leaves that many before `length`.
+    unsafe {
+        let (left, bytes) = (a.as_ptr(), row.as_ptr());
+        let mut first = _mm256_setzero_ps();
+        let mut second = _mm256_setzero_ps();
+        let mut at = 0;
+        while at + 16 <= length {
+            first = _mm256_add_ps(
+                first,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(at)),
+                    _mm256_cvtph_ps(_mm_loadu_si128(
+                        bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+                    )),
+                ),
+            );
+            second = _mm256_add_ps(
+                second,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(at + 8)),
+                    _mm256_cvtph_ps(_mm_loadu_si128(
+                        bytes.add((at + 8) * 2) as *const std::arch::x86_64::__m128i
+                    )),
+                ),
+            );
+            at += 16;
+        }
+        while at + 8 <= length {
+            first = _mm256_add_ps(
+                first,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(at)),
+                    _mm256_cvtph_ps(_mm_loadu_si128(
+                        bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+                    )),
+                ),
+            );
+            at += 8;
+        }
+        let mut total = hsum(_mm256_add_ps(first, second));
+        while at < length {
+            let low = std::ptr::read_unaligned(bytes.add(at * 2) as *const u16);
+            total += *left.add(at) * f16_to_f32(low);
+            at += 1;
+        }
+        total
+    }
+}
+
+/// [`axpy_f32`] over a row the KV cache stores as `f16`.
+///
+/// Same arithmetic as decoding then [`axpy_f32`], eight lanes at a time, without the row buffer.
+///
+/// Safe to call: it detects the features itself, and the length is the shorter of the two.
+pub(crate) fn axpy_f16_f32(target: &mut [f32], weight: f32, row: &[u8]) {
+    let length = target.len().min(row.len() / 2);
+    if length == 0 {
+        return;
+    }
+    if available() && std::is_x86_feature_detected!("f16c") && length >= 8 {
+        // SAFETY: AVX2 and F16C were just detected, and the kernel stays inside `length`.
+        unsafe { axpy_f16_f32_avx2(&mut target[..length], weight, row) };
+        return;
+    }
+    for (target, chunk) in target.iter_mut().zip(row.as_chunks::<2>().0).take(length) {
+        *target += weight * f16_to_f32(u16::from_le_bytes(*chunk));
+    }
+}
+
+/// [`axpy_f16_f32`] in eight lanes.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and F16C, and `target`'s length must not exceed `row`'s half.
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn axpy_f16_f32_avx2(target: &mut [f32], weight: f32, row: &[u8]) {
+    // SAFETY: the caller guarantees the features and that every load is inside `row`; the loop
+    // stops at the last whole block and the tail is one value at a time.
+    unsafe {
+        let length = target.len();
+        let scale = _mm256_set1_ps(weight);
+        let out = target.as_mut_ptr();
+        let input = row.as_ptr();
+        let mut at = 0;
+        while at + 8 <= length {
+            let scaled = _mm256_mul_ps(
+                scale,
+                _mm256_cvtph_ps(_mm_loadu_si128(
+                    input.add(at * 2) as *const std::arch::x86_64::__m128i
+                )),
+            );
+            let current = _mm256_loadu_ps(out.add(at));
+            _mm256_storeu_ps(out.add(at), _mm256_add_ps(current, scaled));
+            at += 8;
+        }
+        while at < length {
+            let low = std::ptr::read_unaligned(input.add(at * 2) as *const u16);
+            *out.add(at) += weight * f16_to_f32(low);
+            at += 1;
+        }
+    }
+}
+
 /// The AVX2 dot for a Q4_K row, or `None` when this CPU has no AVX2 or the format is another one.
 ///
 /// Safe to call: it checks the feature itself, and the lengths were validated by the caller's
@@ -1992,6 +2127,248 @@ pub(crate) unsafe fn q4k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32
 
 #[cfg(test)]
 mod tests {
+    /// Reading an `f16` row in place must give the bits that decoding it into `f32` and calling
+    /// the `f32` kernels gives. The attention path relies on this: it compares against the decoded
+    /// oracle bit for bit, so an inexact conversion or a different reduction tree would show up as
+    /// a broken attention test rather than as a slow one.
+    #[test]
+    fn f16_rows_give_the_same_bits_as_decoded_ones() {
+        let mut rng = Rng(0x5eed_0d16_0000_0007);
+        for length in [1usize, 7, 8, 15, 16, 128, 129, 256] {
+            let values: Vec<f32> = (0..length).map(|_| rng.unit() * 8.0 - 4.0).collect();
+            let row: Vec<u8> = values
+                .iter()
+                .flat_map(|value| crate::quant::f32_to_f16(*value).to_le_bytes())
+                .collect();
+            let other: Vec<f32> = (0..length).map(|_| rng.unit() * 2.0 - 1.0).collect();
+            let mut decoded = vec![0.0_f32; length];
+            super::half_to_float(&row, &mut decoded);
+
+            assert_eq!(
+                super::dot_f16_f32(&other, &row).to_bits(),
+                super::dot_f32(&other, &decoded).to_bits(),
+                "dot over {length} values"
+            );
+
+            let mut fast = vec![0.25_f32; length];
+            let mut slow = fast.clone();
+            super::axpy_f16_f32(&mut fast, 1.75, &row);
+            super::axpy_f32(&mut slow, 1.75, &decoded);
+            assert_eq!(fast, slow, "axpy over {length} values");
+        }
+    }
+
+    /// Would a transposed K layout pay? The score pass both ways, at the shape that matters.
+    ///
+    /// `per-position dots` is what attention does today: one 128-wide `f16` dot per head per
+    /// position, reduced horizontally. `block gemm` is what a `[dim][position]` layout allows: 64
+    /// positions scored at once with FMA, the reduction vertical, no horizontal sums. The transpose
+    /// itself is timed separately, because that is the cost a format change would move somewhere
+    /// else (into the KV writes) rather than remove.
+    ///
+    /// Ignored by default: `cargo test -p vipera-backend-cpu --release --lib -- --ignored
+    /// --nocapture transposed_k_scores`.
+    #[test]
+    #[ignore]
+    fn transposed_k_scores() {
+        const HEADS: usize = 12;
+        const KV_HEADS: usize = 2;
+        const DIM: usize = 128;
+        const POSITIONS: usize = 1024;
+        const BLOCK: usize = 64;
+        let group = HEADS / KV_HEADS;
+        let mut rng = Rng(0x5eed_0a77_0000_0011);
+        let q: Vec<f32> = (0..HEADS * DIM).map(|_| rng.unit() * 2.0 - 1.0).collect();
+        // One layer's K rows, position-major and contiguous: the shape the cache has now.
+        let rows: Vec<u8> = (0..POSITIONS * KV_HEADS * DIM)
+            .flat_map(|_| crate::quant::f32_to_f16(rng.unit() * 2.0 - 1.0).to_le_bytes())
+            .collect();
+        let row_bytes = KV_HEADS * DIM * 2;
+
+        fn time<R: FnMut()>(rounds: u32, mut run: R) -> f64 {
+            run();
+            let mut best = f64::INFINITY;
+            for _ in 0..rounds {
+                let start = std::time::Instant::now();
+                run();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best * 1000.0
+        }
+
+        let mut scores = vec![0.0_f32; HEADS * POSITIONS];
+        let dots = time(5, || {
+            for position in 0..POSITIONS {
+                for head in 0..HEADS {
+                    let packed = position * row_bytes + (head / group) * DIM * 2;
+                    scores[head * POSITIONS + position] =
+                        super::dot_f16_f32(&q[head * DIM..][..DIM], &rows[packed..][..DIM * 2]);
+                }
+            }
+            std::hint::black_box(&scores);
+        });
+
+        // `kt[dim][position within block]`, the layout a transposed K would give for free.
+        let mut kt = vec![0.0_f32; DIM * BLOCK];
+        let transpose = time(5, || {
+            for block_start in (0..POSITIONS).step_by(BLOCK) {
+                for dim in 0..DIM {
+                    for offset in 0..BLOCK {
+                        let position = block_start + offset;
+                        let at = position * row_bytes + dim * 2;
+                        kt[dim * BLOCK + offset] =
+                            crate::quant::f16_to_f32(u16::from_le_bytes([rows[at], rows[at + 1]]));
+                    }
+                }
+            }
+            std::hint::black_box(&kt);
+        });
+
+        let mut block_scores = vec![0.0_f32; HEADS * POSITIONS];
+        let gemm = time(5, || {
+            // For each block of positions: transpose once, score the group's heads from it.
+            for block_start in (0..POSITIONS).step_by(BLOCK) {
+                for kv_head in 0..KV_HEADS {
+                    for dim in 0..DIM {
+                        for offset in 0..BLOCK {
+                            let at =
+                                (block_start + offset) * row_bytes + kv_head * DIM * 2 + dim * 2;
+                            kt[dim * BLOCK + offset] =
+                                crate::quant::f16_to_f32(u16::from_le_bytes([
+                                    rows[at],
+                                    rows[at + 1],
+                                ]));
+                        }
+                    }
+                    if !available() {
+                        continue;
+                    }
+                    for member in 0..group {
+                        let head = kv_head * group + member;
+                        // SAFETY: AVX2 was checked above, and every load stays inside `kt`.
+                        unsafe {
+                            score_block_avx2(
+                                &q[head * DIM..][..DIM],
+                                &kt,
+                                &mut block_scores[head * POSITIONS + block_start..][..BLOCK],
+                            )
+                        };
+                    }
+                }
+            }
+            std::hint::black_box(&block_scores);
+        });
+
+        println!(
+            "score pass at {POSITIONS} x {HEADS} x {DIM}: per-position dots {dots:.2} ms, \
+             block gemm (with transpose) {gemm:.2} ms, transpose alone {transpose:.2} ms"
+        );
+        let worst = dots.abs().max(1.0);
+        let diff = scores
+            .iter()
+            .zip(&block_scores)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        println!(
+            "largest gap between the two, on the same data: {diff:.3} (score scale {worst:.0})"
+        );
+    }
+
+    /// `scores[i] = dot(q, kt[..][i])` for `scores.len()` positions, FMA over dimensions, the
+    /// reduction vertical instead of a horizontal sum per position.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2, `kt` must hold `q.len() * scores.len()` values in
+    /// `[dim][position]` order, and `scores.len()` must be a multiple of eight.
+    #[cfg(test)]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn score_block_avx2(q: &[f32], kt: &[f32], scores: &mut [f32]) {
+        // SAFETY: the caller guarantees AVX2+FMA, the layout of `kt`, and that `scores` divides
+        // into eight-lane chunks; every load below stays inside one.
+        unsafe {
+            let positions = scores.len();
+            let out = scores.as_mut_ptr();
+            let mut lane = 0;
+            while lane + 8 <= positions {
+                let mut acc = _mm256_setzero_ps();
+                for (dim, value) in q.iter().enumerate() {
+                    let k = _mm256_loadu_ps(kt.as_ptr().add(dim * positions + lane));
+                    acc = _mm256_fmadd_ps(_mm256_set1_ps(*value), k, acc);
+                }
+                _mm256_storeu_ps(out.add(lane), acc);
+                lane += 8;
+            }
+            while lane < positions {
+                let mut total = 0.0_f32;
+                for (dim, value) in q.iter().enumerate() {
+                    total += value * kt[dim * positions + lane];
+                }
+                *out.add(lane) = total;
+                lane += 1;
+            }
+        }
+    }
+
+    /// What each phase of a depth-1024 attention layer costs, at its own shape: 12 heads over
+    /// 1024 positions against an `f16` row of 128 values.
+    ///
+    /// Ignored by default. `cargo test -p vipera-backend-cpu --release --lib -- --ignored
+    /// --nocapture attention_phase_cost`.
+    #[test]
+    #[ignore]
+    fn attention_phase_cost() {
+        const HEADS: usize = 12;
+        const POSITIONS: usize = 1024;
+        const DIM: usize = 128;
+        let mut rng = Rng(0x5eed_0a77_0000_000b);
+        let q: Vec<f32> = (0..HEADS * DIM).map(|_| rng.unit() * 2.0 - 1.0).collect();
+        let key: Vec<u8> = (0..DIM)
+            .flat_map(|_| crate::quant::f32_to_f16(rng.unit() * 2.0 - 1.0).to_le_bytes())
+            .collect();
+        let value = key.clone();
+        let mut out = vec![0.0_f32; DIM];
+
+        let best = |rounds: u32, mut run: Box<dyn FnMut()>| -> f64 {
+            run();
+            let mut best = f64::INFINITY;
+            for _ in 0..rounds {
+                let start = std::time::Instant::now();
+                run();
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best * 1000.0
+        };
+
+        let score = best(
+            5,
+            Box::new(|| {
+                let mut total = 0.0_f32;
+                for _ in 0..POSITIONS {
+                    for head in 0..HEADS {
+                        total += super::dot_f16_f32(&q[head * DIM..][..DIM], &key);
+                    }
+                }
+                std::hint::black_box(total);
+            }),
+        );
+        let weighted = best(
+            5,
+            Box::new(|| {
+                for _ in 0..POSITIONS {
+                    for _ in 0..HEADS {
+                        super::axpy_f16_f32(&mut out, 0.5, &value);
+                    }
+                }
+                std::hint::black_box(&out);
+            }),
+        );
+        println!(
+            "attention layer at 1024 x 12 x 128: score {score:.2} ms, weighted sum {weighted:.2} ms, both {:.2} ms",
+            score + weighted
+        );
+    }
+
     /// `vpdpbusd` against `maddubs` + `madd` on the shapes that dominate a decode step.
     ///
     /// Checks bit-exactness row by row, then times both at one and four threads.
@@ -2878,6 +3255,170 @@ mod tests {
                 bytes / (ms / 1e3)
             );
         }
+    }
+
+    /// Median seconds of one `B`-wide tiled call over `count` rows starting at
+    /// `first_row`, five samples.
+    fn time_tiled<const B: usize>(
+        matrix: &[u8],
+        stride: usize,
+        blocks: usize,
+        first_row: usize,
+        count: usize,
+    ) -> f64 {
+        let cols = blocks * 256;
+        let mut rng = Rng(0x5eed_0d07_0000_0003);
+        let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+            .map(|_| {
+                let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+                (QuantizedX::new(&x), crate::quant::x_sums(&x))
+            })
+            .collect();
+        let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+        let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+        let mut out = vec![0.0f32; B * count];
+        let mut samples = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let ok = try_q4k_matvec_tiled_range::<B>(
+                matrix, stride, first_row, count, &xs, &sums, &mut out,
+            );
+            assert!(ok, "tiled kernel must accept this shape");
+            std::hint::black_box(&out);
+            samples.push(start.elapsed().as_secs_f64());
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
+        samples[samples.len() / 2]
+    }
+
+    /// The tiled kernel at prefill batch, single thread, on the two shapes
+    /// ADR-001 measures for the ggml repacked GEMM: the number that decides
+    /// whether binding that kernel is worth a second toolchain.
+    ///
+    /// Single-threaded on purpose: ggml's figure in `vipera-ggml` is
+    /// single-threaded too, and the pool would hide the kernel difference.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_batch128_throughput() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        for &(rows, blocks) in &[(8960usize, 6usize), (1536, 35)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let mut rng = Rng(0x5eed_0d07_0000_0002);
+            let row = q4k_row(&mut rng, blocks);
+            let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+            let seconds = time_tiled::<B>(&matrix, stride, blocks, 0, rows);
+            let gflops = 2.0 * (rows * cols * B) as f64 / seconds / 1e9;
+            println!(
+                "tiled q4_K {:>6}x{:<5} x {B} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS",
+                rows,
+                cols,
+                seconds * 1e3,
+                gflops
+            );
+        }
+    }
+
+    /// Does the batch-wide activation tile cost throughput? Its size is
+    /// `blocks * halves * 64 * 16 * 4` bytes — 192 KB at B=128 on the 6-block
+    /// shape, 1.5 MB across eight threads — so if residency is the limiter the
+    /// rate should rise as the batch (and the tile) shrinks.
+    ///
+    /// Reuse falls with the batch too, so a flat curve is the interesting
+    /// answer: it would mean the tile is not what caps the kernel.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_batch_sweep() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        let (rows, blocks) = (8960usize, 6usize);
+        let cols = blocks * 256;
+        let stride = blocks * 144;
+        let mut rng = Rng(0x5eed_0d07_0000_0004);
+        let row = q4k_row(&mut rng, blocks);
+        let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+        for b in [16usize, 32, 64, 128] {
+            let seconds = match b {
+                16 => time_tiled::<16>(&matrix, stride, blocks, 0, rows),
+                32 => time_tiled::<32>(&matrix, stride, blocks, 0, rows),
+                64 => time_tiled::<64>(&matrix, stride, blocks, 0, rows),
+                _ => time_tiled::<128>(&matrix, stride, blocks, 0, rows),
+            };
+            // `act` + `dxs` + `sumt`, the per-thread tile buffers.
+            let tile_kb = blocks * b.div_ceil(16) * 4096 / 1024;
+            let gflops = 2.0 * (rows * cols * b) as f64 / seconds / 1e9;
+            println!(
+                "sweep B={b:>3} act tile {tile_kb:>4} KB/thread: {:>7.1} ms  {:>6.1} GFLOPS",
+                seconds * 1e3,
+                gflops
+            );
+        }
+    }
+
+    /// The same kernel on a weight sweep bigger than L3: 127 copies of the
+    /// 6-block gate shape, 0.98 GB, the size one prefill chunk reads from RAM.
+    /// The L3-resident figure above prices the microkernel; this one prices the
+    /// stream, and the ratio between them is the headroom prefill leaves on the
+    /// table when the weights are not cached.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_streaming_throughput() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        const COPIES: usize = 127;
+        let (rows, blocks) = (8960usize, 6usize);
+        let cols = blocks * 256;
+        let stride = blocks * 144;
+        let mut rng = Rng(0x5eed_0d07_0000_0005);
+        let row = q4k_row(&mut rng, blocks);
+        let matrix: Vec<u8> = (0..rows * COPIES).flat_map(|_| row.clone()).collect();
+        let cols_b = blocks * 256;
+        let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+            .map(|_| {
+                let x: Vec<f32> = (0..cols_b).map(|_| rng.unit()).collect();
+                (QuantizedX::new(&x), crate::quant::x_sums(&x))
+            })
+            .collect();
+        let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+        let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+        let mut out = vec![0.0f32; B * rows];
+        let mut samples = Vec::new();
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            for copy in 0..COPIES {
+                let ok = try_q4k_matvec_tiled_range::<B>(
+                    &matrix,
+                    stride,
+                    copy * rows,
+                    rows,
+                    &xs,
+                    &sums,
+                    &mut out,
+                );
+                assert!(ok, "tiled kernel must accept this shape");
+                std::hint::black_box(&out);
+            }
+            samples.push(start.elapsed().as_secs_f64());
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("ordered"));
+        let seconds = samples[samples.len() / 2];
+        let bytes = (rows * COPIES * stride) as f64;
+        let gflops = 2.0 * (rows * COPIES * cols * B) as f64 / seconds / 1e9;
+        println!(
+            "stream 0.98 GB q4_K 8960x1536 x{B} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS  {:>5.2} GB/s",
+            seconds * 1e3,
+            gflops,
+            bytes / seconds / 1e9
+        );
     }
 
     #[test]

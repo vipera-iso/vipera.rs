@@ -21,7 +21,7 @@
 //! once; past that the server answers `503` instead of spawning another thread.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Read, Write};
+use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -77,6 +77,8 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let mut ctx: Option<u64> = None;
     let mut kv_type = KvCacheType::F16;
     let mut rate_limit: Option<u32> = None;
+    let mut tls_cert: Option<&str> = None;
+    let mut tls_key: Option<&str> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -103,6 +105,14 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
             }
             "--kv-type" => {
                 kv_type = KvCacheType::parse(next_value(args, index, "--kv-type")?)?;
+                index += 1;
+            }
+            "--tls-cert" => {
+                tls_cert = Some(next_value(args, index, "--tls-cert")?);
+                index += 1;
+            }
+            "--tls-key" => {
+                tls_key = Some(next_value(args, index, "--tls-key")?);
                 index += 1;
             }
             "--rate-limit" => {
@@ -135,6 +145,28 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let path = path.ok_or_else(|| ViperaError::usage("serve needs a model path"))?;
     let model_id = model_id.unwrap_or_else(|| default_model_id(path));
 
+    let tls = match (tls_cert, tls_key) {
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(ViperaError::usage("--tls-cert needs --tls-key"));
+        }
+        (None, Some(_)) => {
+            return Err(ViperaError::usage("--tls-key needs --tls-cert"));
+        }
+        (Some(cert), Some(key)) => {
+            let cert_pem = std::fs::read(cert).map_err(|error| {
+                ViperaError::invalid_argument(format!("cannot read {cert}: {error}"))
+            })?;
+            let key_pem = std::fs::read(key).map_err(|error| {
+                ViperaError::invalid_argument(format!("cannot read {key}: {error}"))
+            })?;
+            let config = tls_config(&cert_pem, &key_pem).map_err(|error| {
+                ViperaError::invalid_argument(format!("TLS is not usable: {error}"))
+            })?;
+            Some(config)
+        }
+    };
+
     let served = Arc::new(Served::load(
         path,
         model_id,
@@ -142,6 +174,7 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
         ctx,
         kv_type,
         rate_limit,
+        tls,
     )?);
     let listener = TcpListener::bind((host.as_str(), port)).map_err(|error| {
         ViperaError::invalid_argument(format!("cannot bind {host}:{port}: {error}"))
@@ -161,9 +194,14 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
         use std::io::Write as _;
         let mut out = std::io::stdout().lock();
         // Ignore a closed pipe here: the server should keep serving.
+        let scheme = if served.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        };
         let _ = writeln!(
             out,
-            "vipera: serving {} as \"{}\" on http://{address}",
+            "vipera: serving {} as \"{}\" on {scheme}://{address}",
             path, served.model
         );
         let _ = out.flush();
@@ -183,6 +221,8 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
                     );
                     continue;
                 };
+                // Small replies and streamed tokens: Nagle would hold them back.
+                let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                 let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
                 let served = Arc::clone(&served);
@@ -425,6 +465,98 @@ struct Served {
     api_key: Option<String>,
     rate_limit: Option<Arc<RateLimiter>>,
     metrics: Mutex<Metrics>,
+    /// `None` serves plain HTTP. `Some` completes a TLS handshake before reading the request, with
+    /// the certificate and key `--tls-cert` / `--tls-key` named.
+    tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+/// Whatever a connection speaks: a plain `TcpStream`, or the same socket under rustls.
+///
+/// The request path only ever reads and writes bytes, so it is written against this rather than
+/// against `TcpStream`; the address and the socket timeouts stay at the accept loop, where the
+/// socket still is.
+trait Transport: std::io::Read + std::io::Write {}
+
+impl Transport for TcpStream {}
+
+impl Transport for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {}
+
+/// A server configuration from PEM certificate and key bytes.
+///
+/// The certificate chain comes first in the file, leaf first; the key may be PKCS#8, SEC1 or
+/// PKCS#1, because every tool writes one of the three and the tag says which.
+pub fn tls_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
+    let chain: Vec<rustls::pki_types::CertificateDer<'static>> = pem_blocks(cert_pem)
+        .into_iter()
+        .filter(|(tag, _)| tag.ends_with("CERTIFICATE"))
+        .map(|(_, der)| rustls::pki_types::CertificateDer::from(der))
+        .collect();
+    if chain.is_empty() {
+        return Err("no CERTIFICATE block in the certificate file".to_owned());
+    }
+    let (tag, der) = pem_blocks(key_pem)
+        .into_iter()
+        .find(|(tag, _)| tag.ends_with("PRIVATE KEY"))
+        .ok_or_else(|| "no PRIVATE KEY block in the key file".to_owned())?;
+    let key = rustls::pki_types::PrivateKeyDer::try_from(der)
+        .map_err(|error| format!("{tag} is not a key rustls accepts: {error}"))?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(|error| format!("certificate and key do not go together: {error}"))?;
+    Ok(Arc::new(config))
+}
+
+/// The DER bytes of every PEM block, with its tag (`CERTIFICATE`, `PRIVATE KEY`, …).
+///
+/// Hand-rolled on purpose: the workspace takes one third-party crate for TLS and no base64 crate
+/// for twenty lines of decoding, and the tests below cover the padding and the line breaks.
+fn pem_blocks(pem: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let text = String::from_utf8_lossy(pem);
+    let mut blocks = Vec::new();
+    let mut tag = None;
+    let mut body = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
+            tag = Some(rest.trim_end_matches("-----").to_owned());
+            body.clear();
+        } else if line.starts_with("-----END ") {
+            if let Some(tag) = tag.take()
+                && let Some(der) = base64_decode(&body)
+            {
+                blocks.push((tag, der));
+            }
+        } else if tag.is_some() {
+            body.push_str(line);
+        }
+    }
+    blocks
+}
+
+/// Standard base64 with optional padding, ignoring anything outside the alphabet.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = ALPHABET.iter().position(|known| *known == byte)? as u32;
+        acc = (acc << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 impl Served {
@@ -435,6 +567,7 @@ impl Served {
         ctx: Option<u64>,
         kv_type: KvCacheType,
         rate_limit: Option<u32>,
+        tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Result<Served, ViperaError> {
         let path = resolve_model_path(path)?;
         // This build has no device backend, so plan the placement this process will actually run:
@@ -523,6 +656,7 @@ impl Served {
             api_key,
             rate_limit: rate_limit.map(|limit| Arc::new(RateLimiter::new(limit))),
             metrics: Mutex::new(Metrics::default()),
+            tls,
         })
     }
 }
@@ -701,16 +835,62 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
         .peer_addr()
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    let Some(request) = read_request(&mut stream)? else {
+    if let Some(config) = &served.tls {
+        let connection = rustls::ServerConnection::new(Arc::clone(config))
+            .map_err(|error| std::io::Error::other(format!("TLS: {error}")))?;
+        let mut tls = rustls::StreamOwned::new(connection, stream);
+        let result = serve_connection(served, &mut tls, &peer);
+        // `Connection: close` is the contract here, and over TLS that means close_notify before
+        // the socket goes: a client that reads to the end treats a bare EOF as a truncated
+        // response, not as the end of one. curl tolerates it; rustls' own client does not.
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        return result;
+    }
+    serve_connection(served, &mut stream, &peer)
+}
+
+fn serve_connection(
+    served: &Served,
+    stream: &mut dyn Transport,
+    peer: &str,
+) -> std::io::Result<()> {
+    let Some(request) = read_request(stream)? else {
         return Ok(());
     };
     let started = Instant::now();
-    let status = route(served, &mut stream, &request, started, &peer)?;
+    let status = route(served, stream, &request, started, peer)?;
     let endpoint = endpoint_name(&request.path);
     if let Ok(mut metrics) = served.metrics.lock() {
         metrics.record(endpoint, status, started.elapsed().as_secs_f64());
     }
+    // One line per request, in the same JSON-event shape `vipera generate` writes, so a log
+    // collector reads both the same way. `VIPERA_ACCESS_LOG=0` silences it.
+    if access_log_enabled() {
+        eprintln!(
+            "{{\"event\":\"request\",\"peer\":{},\"method\":{},\"path\":{},\"status\":{status},\"micros\":{}}}",
+            quote(peer),
+            quote(&request.method),
+            quote(&request.path),
+            started.elapsed().as_micros()
+        );
+    }
     Ok(())
+}
+
+/// Whether each request writes one line to stderr. On by default; `0`, `false`, `off` or `no`
+/// silences it for a host that would rather have nothing between it and its log files.
+fn access_log_enabled() -> bool {
+    access_log_enabled_for(std::env::var("VIPERA_ACCESS_LOG").ok().as_deref())
+}
+
+/// [`access_log_enabled`] against a given value, so the rule can be tested without the process
+/// environment.
+fn access_log_enabled_for(value: Option<&str>) -> bool {
+    value.is_none_or(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
 }
 
 /// Headers that let a page call the server directly.
@@ -723,7 +903,7 @@ const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
 
 fn route(
     served: &Served,
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     request: &Request,
     started: Instant,
     peer: &str,
@@ -817,7 +997,7 @@ fn endpoint_name(path: &str) -> &'static str {
 
 fn chat(
     served: &Served,
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     request: &Request,
     started: Instant,
 ) -> std::io::Result<u16> {
@@ -968,7 +1148,6 @@ fn chat(
 
     if streaming {
         let (sequence, receiver) = turns.remove(0);
-        stream.set_nodelay(true).ok();
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{CORS_HEADERS}\
@@ -1228,7 +1407,7 @@ fn chat(
 /// behaviour as chat.
 fn completions(
     served: &Served,
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     request: &Request,
     started: Instant,
 ) -> std::io::Result<u16> {
@@ -1388,7 +1567,6 @@ fn completions(
 
     if streaming {
         let (sequence, receiver) = turns.remove(0);
-        stream.set_nodelay(true).ok();
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
@@ -2104,13 +2282,13 @@ fn completion_chunk(
     )
 }
 
-fn sse(stream: &mut TcpStream, data: &str) -> std::io::Result<()> {
+fn sse(stream: &mut dyn Transport, data: &str) -> std::io::Result<()> {
     stream.write_all(format!("data: {data}\n\n").as_bytes())?;
     stream.flush()
 }
 
 fn respond(
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -2127,7 +2305,7 @@ fn respond(
 }
 
 /// Answer a CORS preflight: no credentials, no body, and a day-long cache.
-fn respond_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+fn respond_preflight(stream: &mut dyn Transport) -> std::io::Result<()> {
     let head = format!(
         "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\n\
          Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -2137,7 +2315,7 @@ fn respond_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn respond_error(
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     status: u16,
     code: &str,
     message: &str,
@@ -2172,7 +2350,7 @@ fn respond_error(
 }
 
 fn respond_error_retry(
-    stream: &mut TcpStream,
+    stream: &mut dyn Transport,
     status: u16,
     code: &str,
     message: &str,
@@ -2222,7 +2400,7 @@ impl Request {
 }
 
 /// Read one request. `Ok(None)` means the peer closed before sending a request line.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+fn read_request(stream: &mut dyn Transport) -> std::io::Result<Option<Request>> {
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 8192];
     let head_end = loop {
@@ -2531,6 +2709,39 @@ mod tests {
         drop(second);
     }
 
+    #[test]
+    fn base64_decodes_padding_and_line_breaks() {
+        assert_eq!(base64_decode("aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("aGk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("a\nG\r\nk").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode("AQID").as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(base64_decode(""), Some(Vec::new()));
+        assert_eq!(base64_decode("aGk*"), None, "a stray byte is not skipped");
+    }
+
+    #[test]
+    fn pem_blocks_carry_their_tags_in_order() {
+        let pem = b"-----BEGIN CERTIFICATE-----\naGk=\n-----END CERTIFICATE-----\n\
+                    -----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+        let blocks = pem_blocks(pem);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "CERTIFICATE");
+        assert_eq!(blocks[0].1, b"hi");
+        assert_eq!(blocks[1].0, "PRIVATE KEY");
+        assert_eq!(blocks[1].1, [1u8, 2, 3]);
+        assert!(pem_blocks(b"no blocks here").is_empty());
+    }
+
+    #[test]
+    fn the_access_log_is_on_unless_it_is_turned_off() {
+        assert!(access_log_enabled_for(None), "unset means on");
+        for off in ["0", "false", "OFF", "no", " 0 "] {
+            assert!(!access_log_enabled_for(Some(off)), "{off:?} turns it off");
+        }
+        for on in ["1", "true", "yes", ""] {
+            assert!(access_log_enabled_for(Some(on)), "{on:?} leaves it on");
+        }
+    }
     #[test]
     fn rejects_roles_the_contract_does_not_define() {
         let request = Json::parse(r#"{"messages":[{"role":"tool","content":"x"}]}"#).unwrap();
