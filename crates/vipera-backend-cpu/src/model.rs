@@ -1673,16 +1673,62 @@ const PARALLEL_ATTENTION_MIN: usize = 4096;
 
 /// Whether attention reads an `f16` KV row in place or decodes it into a `f32` row first.
 ///
-/// On by default: the two compute the same bits, so the only difference is the row buffer. `0`,
-/// `false`, `off` or `no` turns it off so both arms can be timed in one binary.
-/// Whether a single entry's heads are split across the pool. `0`/`false`/`off`/`no` keeps them on
-/// the calling thread, for an A/B in one binary.
-fn head_split_enabled() -> bool {
-    std::env::var("VIPERA_ATTN_HEAD_SPLIT").map_or(true, |value| {
+/// Attention's switches, read once per call rather than per row.
+///
+/// A switch here cannot change a bit of the result — the head split only decides which thread
+/// computes which head — so one process can time both arms on the same bytes. `VIPERA_ATTN_HEAD_
+/// SPLIT=0` (or `false`, `off`, `no`) keeps a single entry's heads on the calling thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttentionSwitches {
+    /// A single entry's heads go to the pool instead of the calling thread.
+    split_heads: bool,
+}
+
+impl AttentionSwitches {
+    fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(forced) = forced_switches() {
+            return forced;
+        }
+        Self {
+            split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
+        }
+    }
+}
+
+/// `VIPERA_<NAME>=0|false|off|no` turns a switch off; unset or anything else leaves it on.
+fn flag(name: &str) -> bool {
+    std::env::var(name).map_or(true, |value| {
         let value = value.trim().to_ascii_lowercase();
         !matches!(value.as_str(), "0" | "false" | "off" | "no")
     })
 }
+
+/// The switches a measurement wants, so one process can time all four combinations. Only the
+/// benchmark sets it, and it only reaches performance code: unset means "ask the environment".
+#[cfg(test)]
+fn forced_switches() -> Option<AttentionSwitches> {
+    use std::sync::atomic::Ordering;
+    let forced = BENCH_SWITCHES.load(Ordering::Relaxed);
+    (forced & 2 != 0).then_some(AttentionSwitches {
+        split_heads: forced & 1 != 0,
+    })
+}
+
+#[cfg(test)]
+fn force_switches(switches: AttentionSwitches) {
+    use std::sync::atomic::Ordering;
+    let bits = 2 | u8::from(switches.split_heads);
+    BENCH_SWITCHES.store(bits, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn clear_forced_switches() {
+    BENCH_SWITCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+static BENCH_SWITCHES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn in_place_kv_enabled() -> bool {
     std::env::var("VIPERA_INPLACE_KV").map_or(true, |value| {
@@ -1895,6 +1941,7 @@ fn attend_entries(
         assert_eq!(kv.len(), entries, "one KV view per entry");
         assert_eq!(out.len(), entries * query, "one output row per entry");
     }
+    let switches = AttentionSwitches::from_env();
     let last = positions.iter().copied().max().unwrap_or(0);
     let lanes = entries.saturating_mul(shape.heads).saturating_mul(last);
     // Only the entries are split. Splitting a single entry's heads was measured too: at ctx 1024 a
@@ -1910,7 +1957,7 @@ fn attend_entries(
     // through the whole kernel, so they go to the pool instead. This was measured before with the
     // row buffer in place and lost (each worker decoded every row again); with the rows read in
     // place a worker repeats only the arithmetic, which is what the split is for.
-    if entries == 1 && lanes >= PARALLEL_ATTENTION_MIN && head_split_enabled() {
+    if entries == 1 && lanes >= PARALLEL_ATTENTION_MIN && switches.split_heads {
         let workers = quant::max_threads().min(shape.heads).max(1);
         if workers > 1 {
             let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
@@ -2914,6 +2961,126 @@ mod tests {
             arms[0].2, arms[1].2,
             "the two orders must compute the same output bits"
         );
+    }
+
+    /// The two attention switches at depth 1024, all four combinations in one process, on the same
+    /// bytes. Prints the table and asserts every arm computes the same output, which is what makes
+    /// a timing difference a scheduling difference and nothing else.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib attention_switches_at_1024 -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a table, run with --ignored --nocapture"]
+    fn attention_switches_at_1024() {
+        let layers = 28;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let row = KvLayout::F16.bytes_per_row(width);
+        let bytes_per_token = layers * 2 * row;
+        let per_block = 16;
+        let positions = 1024usize;
+        let blocks = positions.div_ceil(per_block);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+        let mut values = vec![0.0_f32; width];
+        let order = RowOrder::TokenMajor;
+        for layer in 0..layers {
+            for position in 0..positions {
+                let walk = order.row_walk(
+                    position / per_block * per_block * bytes_per_token,
+                    position % per_block,
+                    per_block,
+                    bytes_per_token,
+                    row,
+                    layer,
+                );
+                for (at, value) in values.iter_mut().enumerate() {
+                    *value = ((position * 31 + layer * 7 + at * 13) % 97) as f32 * 0.01 - 0.5;
+                }
+                KvLayout::F16
+                    .encode(&mut storage[walk.k..walk.k + row], &values)
+                    .expect("write K");
+                let v_base = walk.k + walk.v;
+                KvLayout::F16
+                    .encode(&mut storage[v_base..v_base + row], &values)
+                    .expect("write V");
+            }
+        }
+
+        let query = shape.heads * shape.head_dim;
+        let q: Vec<f32> = (0..query)
+            .map(|at| ((at * 7) % 23) as f32 * 0.03 - 0.3)
+            .collect();
+        let mut out = vec![0.0_f32; query];
+        let kv = KvView {
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block: per_block,
+            bytes_per_token,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let views = std::slice::from_ref(&read);
+        let lengths = [positions];
+
+        let combos: Vec<AttentionSwitches> = [false, true]
+            .into_iter()
+            .map(|split_heads| AttentionSwitches { split_heads })
+            .collect();
+        let mut best = vec![f64::INFINITY; combos.len()];
+        let mut outputs: Vec<Option<Vec<f32>>> = vec![None; combos.len()];
+        // Four sweeps, alternating direction, so no arm gets a systematically warmer position in
+        // the sequence than another.
+        for sweep in 0..4 {
+            let mut order: Vec<usize> = (0..combos.len()).collect();
+            if sweep % 2 == 1 {
+                order.reverse();
+            }
+            for &index in &order {
+                let switches = combos[index];
+                force_switches(switches);
+                let mut scratch = AttnScratch::default();
+                for _ in 0..2 {
+                    out.fill(0.0);
+                    for layer in 0..layers {
+                        attend_entries(&q, views, &lengths, layer, shape, &mut scratch, &mut out)
+                            .expect("attention");
+                    }
+                }
+                let started = std::time::Instant::now();
+                out.fill(0.0);
+                for layer in 0..layers {
+                    attend_entries(&q, views, &lengths, layer, shape, &mut scratch, &mut out)
+                        .expect("attention");
+                }
+                best[index] = best[index].min(started.elapsed().as_secs_f64() * 1000.0);
+                outputs[index] = Some(out.clone());
+            }
+        }
+        clear_forced_switches();
+        for (index, switches) in combos.iter().enumerate() {
+            println!(
+                "split {:<5}: {:6.2} ms for {layers} layers x {positions} ({:.3} ms/layer)",
+                switches.split_heads,
+                best[index],
+                best[index] / layers as f64
+            );
+        }
+        let baseline = outputs[0].clone().expect("an output");
+        for (index, output) in outputs.iter().enumerate() {
+            assert_eq!(
+                output.as_ref().expect("an output"),
+                &baseline,
+                "{:?} must compute what {:?} computes",
+                combos[index],
+                combos[0]
+            );
+        }
     }
 
     #[test]

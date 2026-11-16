@@ -1004,3 +1004,46 @@ attention and KV, so 27% of that is 2-3 ms of a ~44 ms step (5-7%). The end-to-e
 cannot resolve 3 ms on this machine — its noise floor is +-10 ms even at 32 positions, where the two
 orders read exactly the same bytes — so the win is measured where it happens and nowhere else. The
 switch stays, off by default, until a quieter machine can confirm the step.
+
+### Settled in one process: head split 36%, prefetch nothing — 2026-11-16
+
+Every earlier sample of these two switches compared two processes, and this machine is never idle:
+`freebuff` holds a full logical CPU for the length of a session, and the load average has not gone
+below 3.5. Comparing two runs therefore compared two different amounts of interference, which is
+why the same switch came out as 20% once and 29% later.
+
+The fix is not a quieter machine but a tighter experiment: `attention_switches_at_1024` builds the
+KV once, then times both arms **in the same process on the same bytes**, four sweeps per arm with
+the sweep direction alternating so no arm holds a systematically warmer position, best sample per
+arm. It asserts all arms produce identical output before printing, so the flags can only be moving
+time. Pinned to cores 2-7 with `VIPERA_THREADS=6`.
+
+| run | split off | split on | gain |
+|---|---|---|---|
+| 1 | 14.93 ms | 9.76 ms | -35% |
+| 2 | 14.48 ms | 9.52 ms | -34% |
+| 3 | 14.91 ms | 9.58 ms | -36% |
+
+28 layers x 1024 positions, f16, `tokens_per_block` = 16. Per layer 0.533 ms to 0.342 ms. The
+arithmetic does not depend on which worker holds a head, and the output comparison in the bench says
+so.
+
+**Head split: 34-36%, not 20%.** Two independent methods now agree (this one and the cross-process
+`taskset` run that gave 29%), so the number to quote is roughly a third of the attention walk at
+depth 1024, worth ~3 ms of a ~44 ms step.
+
+**Prefetch: nothing worth keeping.** Restored behind the switch and measured in the same harness:
+
+| | prefetch off | prefetch on |
+|---|---|---|
+| split off | 14.44 ms | 13.81 ms (-4%) |
+| split on | 9.47 ms | 9.59 ms (+1%) |
+
+It helps the single-threaded walk by 4% and is a wash once the heads are split — which is the
+configuration that ships. So it is not the 10% it was once credited with: that number came from
+comparing runs, not from the switch. It is removed again, and the bench that measured it stays as
+an ignored test so the next attempt starts from the same table.
+
+Method note for the next switch: compare arms inside one process wherever the switch only changes
+scheduling or adds a hint. Cross-process A/B on this machine cannot resolve anything smaller than
+~10 ms.
