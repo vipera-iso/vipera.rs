@@ -847,3 +847,37 @@ twelve generated tokens, cache off against cache on, per KV type. F16 and Q8_0 b
 return identical tokens. Q4_0 is not carried by this backend at all (`KvLayout::of` returns `None`,
 so planning refuses it before any of this matters), so it is reported as skipped rather than
 passing.
+
+### Attention decode at depth 1024: read f16 in place, then split the heads — 2026-11-16
+
+Baseline in this window: 44.4 ms/step, attention+KV 12.8-14.1 ms (the quiet-machine figure is
+10.8, so only ratios below are worth reading).
+
+**In place, no row buffer.** `simd::dot_f16_f32` / `axpy_f16_f32` convert inside the loop with
+F16C and keep `dot_f32_avx2`'s two-accumulator reduction, so they are bit-identical to decoding
+the row and calling the f32 kernels (new test `f16_rows_give_the_same_bits_as_decoded_ones` checks
+`.to_bits()` over 1..256 values). Alone it is neutral: 13.4 against 13.2 ms, alternating, same
+binary. The row buffer was never the cost — 176 MFLOP per token of score and weighted sum is.
+
+**Heads across the pool.** That arithmetic picture is what makes the head split worth retrying:
+this split was measured and reverted earlier (45.3 -> 48.7 ms) because with a decoded row every
+worker decoded all 1024 rows again. Reading rows in place, a worker repeats only arithmetic, which
+is the thing there is too much of. One entry with `>= PARALLEL_ATTENTION_MIN` score lanes now
+sends its 12 heads to `min(threads, heads)` workers, each with its own scratch and output slice:
+
+| | attention+KV | step |
+|---|---|---|
+| split off | 15.0, 15.2, 15.0, 15.4, 14.5, 13.0, 11.5 (median 15.0) | median 46.9 |
+| split on | 11.0, 11.2, 11.3, 12.0, 13.0, 13.1, 15.0 (median 12.0) | median 44.6 |
+
+20% off attention and ~5% off the step, with the same bits: a head's arithmetic and its order do
+not depend on which worker holds it, and every attention test still compares bit for bit against
+the decoded oracle.
+
+**Not the 5 ms target.** Attention is arithmetic-bound at roughly 13-15 GFLOPS of one core here;
+the next step is a blocked, head-major score pass (Q x K^T as a small GEMM with the positions
+vectorized instead of one 128-wide dot per position), which needs FMA and therefore gives up bit
+equality with the buffered oracle. That is a tolerance policy for attention, not a kernel detail,
+so it is not taken here.
+
+Knobs for a same-binary A/B: `VIPERA_INPLACE_KV=0` and `VIPERA_ATTN_HEAD_SPLIT=0`.

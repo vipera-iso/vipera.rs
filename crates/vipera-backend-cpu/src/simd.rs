@@ -528,6 +528,141 @@ unsafe fn axpy_f32_avx2(target: &mut [f32], weight: f32, source: &[f32]) {
     }
 }
 
+/// [`dot_f32`] over a row the KV cache stores as `f16`, converting inside the loop.
+///
+/// The conversion is exact and the reduction tree is [`dot_f32_avx2`]'s, so this gives the bits
+/// that decoding the row and calling [`dot_f32`] gives — the attention tests compare against that
+/// oracle bit for bit. What it avoids is materializing the row: at 1024 positions a decode step
+/// writes and re-reads 2 MB of `f32` row buffer per layer for no arithmetic at all.
+///
+/// Safe to call: it detects the features itself, and the length is the shorter of the two.
+pub(crate) fn dot_f16_f32(a: &[f32], row: &[u8]) -> f32 {
+    let length = a.len().min(row.len() / 2);
+    if length == 0 {
+        return 0.0;
+    }
+    if available() && std::is_x86_feature_detected!("f16c") && length >= 8 {
+        // SAFETY: AVX2 and F16C were just detected, and the kernel stays inside `length`.
+        return unsafe { dot_f16_f32_avx2(a, row, length) };
+    }
+    let mut total = 0.0_f32;
+    for (value, chunk) in a.iter().zip(row.as_chunks::<2>().0).take(length) {
+        total += value * f16_to_f32(u16::from_le_bytes(*chunk));
+    }
+    total
+}
+
+/// [`dot_f16_f32`] with [`dot_f32_avx2`]'s reduction tree and the conversion folded in.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and F16C, and `length` must not exceed `a`'s length or `row`'s half.
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn dot_f16_f32_avx2(a: &[f32], row: &[u8], length: usize) -> f32 {
+    // SAFETY: the caller guarantees the features and `length`; every load reads eight halves or
+    // eight floats at an offset that leaves that many before `length`.
+    unsafe {
+        let (left, bytes) = (a.as_ptr(), row.as_ptr());
+        let mut first = _mm256_setzero_ps();
+        let mut second = _mm256_setzero_ps();
+        let mut at = 0;
+        while at + 16 <= length {
+            first = _mm256_add_ps(
+                first,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(at)),
+                    _mm256_cvtph_ps(_mm_loadu_si128(
+                        bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+                    )),
+                ),
+            );
+            second = _mm256_add_ps(
+                second,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(at + 8)),
+                    _mm256_cvtph_ps(_mm_loadu_si128(
+                        bytes.add((at + 8) * 2) as *const std::arch::x86_64::__m128i
+                    )),
+                ),
+            );
+            at += 16;
+        }
+        while at + 8 <= length {
+            first = _mm256_add_ps(
+                first,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(at)),
+                    _mm256_cvtph_ps(_mm_loadu_si128(
+                        bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+                    )),
+                ),
+            );
+            at += 8;
+        }
+        let mut total = hsum(_mm256_add_ps(first, second));
+        while at < length {
+            let low = std::ptr::read_unaligned(bytes.add(at * 2) as *const u16);
+            total += *left.add(at) * f16_to_f32(low);
+            at += 1;
+        }
+        total
+    }
+}
+
+/// [`axpy_f32`] over a row the KV cache stores as `f16`.
+///
+/// Same arithmetic as decoding then [`axpy_f32`], eight lanes at a time, without the row buffer.
+///
+/// Safe to call: it detects the features itself, and the length is the shorter of the two.
+pub(crate) fn axpy_f16_f32(target: &mut [f32], weight: f32, row: &[u8]) {
+    let length = target.len().min(row.len() / 2);
+    if length == 0 {
+        return;
+    }
+    if available() && std::is_x86_feature_detected!("f16c") && length >= 8 {
+        // SAFETY: AVX2 and F16C were just detected, and the kernel stays inside `length`.
+        unsafe { axpy_f16_f32_avx2(&mut target[..length], weight, row) };
+        return;
+    }
+    for (target, chunk) in target.iter_mut().zip(row.as_chunks::<2>().0).take(length) {
+        *target += weight * f16_to_f32(u16::from_le_bytes(*chunk));
+    }
+}
+
+/// [`axpy_f16_f32`] in eight lanes.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and F16C, and `target`'s length must not exceed `row`'s half.
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn axpy_f16_f32_avx2(target: &mut [f32], weight: f32, row: &[u8]) {
+    // SAFETY: the caller guarantees the features and that every load is inside `row`; the loop
+    // stops at the last whole block and the tail is one value at a time.
+    unsafe {
+        let length = target.len();
+        let scale = _mm256_set1_ps(weight);
+        let out = target.as_mut_ptr();
+        let input = row.as_ptr();
+        let mut at = 0;
+        while at + 8 <= length {
+            let scaled = _mm256_mul_ps(
+                scale,
+                _mm256_cvtph_ps(_mm_loadu_si128(
+                    input.add(at * 2) as *const std::arch::x86_64::__m128i
+                )),
+            );
+            let current = _mm256_loadu_ps(out.add(at));
+            _mm256_storeu_ps(out.add(at), _mm256_add_ps(current, scaled));
+            at += 8;
+        }
+        while at < length {
+            let low = std::ptr::read_unaligned(input.add(at * 2) as *const u16);
+            *out.add(at) += weight * f16_to_f32(low);
+            at += 1;
+        }
+    }
+}
+
 /// The AVX2 dot for a Q4_K row, or `None` when this CPU has no AVX2 or the format is another one.
 ///
 /// Safe to call: it checks the feature itself, and the lengths were validated by the caller's
@@ -1992,6 +2127,37 @@ pub(crate) unsafe fn q4k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32
 
 #[cfg(test)]
 mod tests {
+    /// Reading an `f16` row in place must give the bits that decoding it into `f32` and calling
+    /// the `f32` kernels gives. The attention path relies on this: it compares against the decoded
+    /// oracle bit for bit, so an inexact conversion or a different reduction tree would show up as
+    /// a broken attention test rather than as a slow one.
+    #[test]
+    fn f16_rows_give_the_same_bits_as_decoded_ones() {
+        let mut rng = Rng(0x5eed_0d16_0000_0007);
+        for length in [1usize, 7, 8, 15, 16, 128, 129, 256] {
+            let values: Vec<f32> = (0..length).map(|_| rng.unit() * 8.0 - 4.0).collect();
+            let row: Vec<u8> = values
+                .iter()
+                .flat_map(|value| crate::quant::f32_to_f16(*value).to_le_bytes())
+                .collect();
+            let other: Vec<f32> = (0..length).map(|_| rng.unit() * 2.0 - 1.0).collect();
+            let mut decoded = vec![0.0_f32; length];
+            super::half_to_float(&row, &mut decoded);
+
+            assert_eq!(
+                super::dot_f16_f32(&other, &row).to_bits(),
+                super::dot_f32(&other, &decoded).to_bits(),
+                "dot over {length} values"
+            );
+
+            let mut fast = vec![0.25_f32; length];
+            let mut slow = fast.clone();
+            super::axpy_f16_f32(&mut fast, 1.75, &row);
+            super::axpy_f32(&mut slow, 1.75, &decoded);
+            assert_eq!(fast, slow, "axpy over {length} values");
+        }
+    }
+
     /// `vpdpbusd` against `maddubs` + `madd` on the shapes that dominate a decode step.
     ///
     /// Checks bit-exactness row by row, then times both at one and four threads.

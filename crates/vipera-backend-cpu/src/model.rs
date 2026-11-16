@@ -1546,6 +1546,26 @@ const STREAMING_MIN_POSITIONS: usize = 256;
 /// thread, because starting the workers costs more than the split saves.
 const PARALLEL_ATTENTION_MIN: usize = 4096;
 
+/// Whether attention reads an `f16` KV row in place or decodes it into a `f32` row first.
+///
+/// On by default: the two compute the same bits, so the only difference is the row buffer. `0`,
+/// `false`, `off` or `no` turns it off so both arms can be timed in one binary.
+/// Whether a single entry's heads are split across the pool. `0`/`false`/`off`/`no` keeps them on
+/// the calling thread, for an A/B in one binary.
+fn head_split_enabled() -> bool {
+    std::env::var("VIPERA_ATTN_HEAD_SPLIT").map_or(true, |value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
+fn in_place_kv_enabled() -> bool {
+    std::env::var("VIPERA_INPLACE_KV").map_or(true, |value| {
+        let value = value.trim().to_ascii_lowercase();
+        !matches!(value.as_str(), "0" | "false" | "off" | "no")
+    })
+}
+
 /// Causal grouped-query attention read straight from the KV blocks.
 ///
 /// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
@@ -1605,6 +1625,11 @@ fn attention_streaming_heads(
     let layer_bytes = kv.layout.bytes_per_row(width);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sequential = quant::exact_dot_requested();
+    // An f16 row is already the value the kernel reads, so the attention passes read it in place
+    // instead of decoding it into `row` first: same bits (the conversion is exact and the dot tree
+    // is the same one), no 2 MB of row buffer per layer per pass. `VIPERA_INPLACE_KV=0` keeps the
+    // decoded arm for an A/B in one binary.
+    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
     let count = heads.end - heads.start;
     scores.clear();
     scores.resize(count * positions, 0.0);
@@ -1615,10 +1640,13 @@ fn attention_streaming_heads(
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
     kv.for_each_row(layer, layer_bytes, positions, |position, base| {
-        kv.layout
-            .decode(&kv.storage[base..base + layer_bytes], row)?;
+        if !in_place {
+            kv.layout
+                .decode(&kv.storage[base..base + layer_bytes], row)?;
+        }
         for kv_head in 0..shape.kv_heads {
             let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+            let packed = (base + kv_head * head_dim * 2)..;
             for member in 0..group {
                 let head = kv_head * group + member;
                 if head < heads.start || head >= heads.end {
@@ -1628,6 +1656,8 @@ fn attention_streaming_heads(
                 let query = &q[head * head_dim..(head + 1) * head_dim];
                 let dot = if sequential {
                     query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
+                } else if in_place {
+                    crate::simd::dot_f16_f32(query, &kv.storage[packed.start..][..head_dim * 2])
                 } else {
                     crate::simd::dot_f32(query, key)
                 };
@@ -1655,21 +1685,30 @@ fn attention_streaming_heads(
     out[..count * head_dim].fill(0.0);
     kv.for_each_row(layer, layer_bytes, positions, |position, base| {
         let v_base = base + layer_bytes;
-        kv.layout
-            .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;
+        if !in_place {
+            kv.layout
+                .decode(&kv.storage[v_base..v_base + layer_bytes], row)?;
+        }
         for kv_head in 0..shape.kv_heads {
             let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+            let packed = (v_base + kv_head * head_dim * 2)..;
             for member in 0..group {
                 let head = kv_head * group + member;
                 if head < heads.start || head >= heads.end {
                     continue;
                 }
                 let local = head - heads.start;
-                crate::simd::axpy_f32(
-                    &mut out[local * head_dim..(local + 1) * head_dim],
-                    scores[local * positions + position] * head_state[local],
-                    value,
-                );
+                let weight = scores[local * positions + position] * head_state[local];
+                let target = &mut out[local * head_dim..(local + 1) * head_dim];
+                if in_place {
+                    crate::simd::axpy_f16_f32(
+                        target,
+                        weight,
+                        &kv.storage[packed.start..][..head_dim * 2],
+                    );
+                } else {
+                    crate::simd::axpy_f32(target, weight, value);
+                }
             }
         }
         Ok(())
@@ -1739,6 +1778,44 @@ fn attend_entries(
     } else {
         quant::max_threads().min(entries)
     };
+
+    // One entry with a long history has nothing to split by entry, but its heads are independent
+    // through the whole kernel, so they go to the pool instead. This was measured before with the
+    // row buffer in place and lost (each worker decoded every row again); with the rows read in
+    // place a worker repeats only the arithmetic, which is what the split is for.
+    if entries == 1 && lanes >= PARALLEL_ATTENTION_MIN && head_split_enabled() {
+        let workers = quant::max_threads().min(shape.heads).max(1);
+        if workers > 1 {
+            let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(workers);
+                let mut cursor: &mut [f32] = out;
+                for part in 0..workers {
+                    let first = shape.heads * part / workers;
+                    let end = shape.heads * (part + 1) / workers;
+                    let (slot, rest) = cursor.split_at_mut((end - first) * shape.head_dim);
+                    cursor = rest;
+                    handles.push(scope.spawn(move || {
+                        let mut local = AttnScratch::default();
+                        attend_entry(
+                            &q[..query],
+                            &kv[0],
+                            layer,
+                            positions[0],
+                            shape,
+                            first..end,
+                            &mut local,
+                            slot,
+                        )
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("an attention worker panicked"))
+                    .collect()
+            });
+            return results.into_iter().collect();
+        }
+    }
 
     if wanted <= 1 {
         for entry in 0..entries {
