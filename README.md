@@ -90,8 +90,9 @@ curl -s localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-The server batches up to four conversations into one weight read; `--rate-limit` adds a per-key
-request budget. Every request writes one JSON line to stderr — `{"event":"request","peer":…,
+`--tls-cert chain.pem --tls-key key.pem` serves HTTPS instead of HTTP (the certificate is not reloaded
+on change; restart to pick up a new one). The server batches up to four conversations into one weight
+read; `--rate-limit` adds a per-key request budget. Every request writes one JSON line to stderr — `{"event":"request","peer":…,
 "method":…,"path":…,"status":…,"micros":…}` — the same event shape `vipera generate` prints, and
 `VIPERA_ACCESS_LOG=0` silences it.
 
@@ -100,8 +101,9 @@ request budget. Every request writes one JSON line to stderr — `{"event":"requ
 - **GPU**: there is no CUDA, Metal or Vulkan backend. `verify` reports host memory only.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
-- **Server**: no TLS; put it behind a proxy for that. Rate limiting is opt-in (`--rate-limit`), not
-  a default.
+- **Server**: rate limiting is opt-in (`--rate-limit`), not a default. TLS needs a certificate:
+  `--tls-cert` and `--tls-key` (PEM; the chain file leaf first) serve HTTPS, and there is no ACME or
+  cert reload — restart to pick up a renewed certificate.
 - **Parity checks**: the continuation test compares against a usage recording of llama.cpp checked
   into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
   `LLAMA_SERVER` at a `llama-server` binary to compare against a live one instead.
