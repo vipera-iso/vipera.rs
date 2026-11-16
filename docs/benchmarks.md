@@ -1012,7 +1012,7 @@ Every earlier sample of these two switches compared two processes, and this mach
 below 3.5. Comparing two runs therefore compared two different amounts of interference, which is
 why the same switch came out as 20% once and 29% later.
 
-The fix is not a quieter machine but a tighter experiment: `attention_switches_at_1024` builds the
+The fix is not a quieter machine but a tighter experiment: `attention_combinations` builds the
 KV once, then times both arms **in the same process on the same bytes**, four sweeps per arm with
 the sweep direction alternating so no arm holds a systematically warmer position, best sample per
 arm. It asserts all arms produce identical output before printing, so the flags can only be moving
@@ -1047,3 +1047,54 @@ an ignored test so the next attempt starts from the same table.
 Method note for the next switch: compare arms inside one process wherever the switch only changes
 scheduling or adds a hint. Cross-process A/B on this machine cannot resolve anything smaller than
 ~10 ms.
+
+### How to measure a switch on this machine
+
+Every failure in this ledger's history of the two attention switches had the same shape: two runs
+compared, one arm landing in a quieter moment than the other, and a switch credited with whatever
+the machine happened to be doing. The machine is never quiet here (`freebuff` holds a core for the
+length of a session, load average 3.5-5.8), so the recipe is:
+
+1. **Build the input once**, in the test, and use the same bytes for every arm. No model load, no
+   prefill: the thing being changed is the loop, not the loader.
+2. **Time every arm in one process**, in sweeps, with the sweep direction alternating, and keep the
+   best sample per arm. Two sweeps warm, two measured is enough.
+3. **Assert the arms compute the same output before printing**, and make it fail the test if they
+   do not. A switch that changes a bit is not a performance switch, and a bench that cannot tell is
+   measuring the wrong thing.
+4. **Pin** (`taskset -c 2-7 VIPERA_THREADS=6`) so the pool gets whole physical cores.
+5. Quote the **ratio**, not the milliseconds: the same 2x2 table moves by ~20% run to run in
+   absolute terms and by 1-2 points in ratio.
+
+`attention_combinations` is that recipe for both attention switches at once, and
+`kv_row_order_at_1024` is the same idea for one.
+
+### The two attention switches combined, at 1024 and 4096 — 2026-11-16
+
+`attention_combinations` crosses the KV row order with the head split, both arms in one process,
+28 layers, f16, `tokens_per_block` = 16. Two runs, best per arm:
+
+| depth | arm | run 1 | run 2 | vs baseline |
+|---|---|---|---|---|
+| 1024 | token-major, split off | 15.31 ms | 14.20 ms | — |
+| 1024 | token-major, split on | 9.80 ms | 9.19 ms | -35% |
+| 1024 | layer-major, split off | 10.56 ms | 10.23 ms | -28% |
+| 1024 | layer-major, split on | 7.70 ms | 7.81 ms | -46% |
+| 4096 | token-major, split off | 68.66 ms | 68.53 ms | — |
+| 4096 | token-major, split on | 48.91 ms | 49.10 ms | -29% |
+| 4096 | layer-major, split off | 45.13 ms | 44.03 ms | -34% |
+| 4096 | layer-major, split on | 28.16 ms | 26.68 ms | -59% |
+
+**The head split holds at 4096** (-28%, against -35% at 1024): splitting twelve heads over six
+workers buys the same quarter-to-third of the walk at four times the depth, so it is a property of
+the work distribution and not of the buffer fitting in L3.
+
+**The two gains roughly add, and at 4096 they add better than the parts predict.** At 1024 the
+combined arm is -46%, where independent gains of 35% and 30% would give -54%: slightly under, which
+is what two changes competing for the same memory bandwidth looks like. At 4096 it is -59% against
+-54% predicted: the layer-major walk turns 4096 scattered rows into 256 contiguous 8 KB runs, and
+once the rows arrive in runs the six workers stop fighting over the same lines, so the split gets
+cheaper at the same time.
+
+For a 1024-deep step that is ~7-8 ms off the ~44 ms step; for 4096 it is ~40 ms off a step that was
+spending most of its time in the walk. Two switches, neither changing a bit.

@@ -1219,6 +1219,10 @@ enum RowOrder {
 
 impl RowOrder {
     fn from_env() -> Self {
+        #[cfg(test)]
+        if let Some(forced) = forced_order() {
+            return forced;
+        }
         match std::env::var("VIPERA_KV_LAYER_MAJOR") {
             Ok(value)
                 if !matches!(
@@ -1671,8 +1675,6 @@ const STREAMING_MIN_POSITIONS: usize = 256;
 /// thread, because starting the workers costs more than the split saves.
 const PARALLEL_ATTENTION_MIN: usize = 4096;
 
-/// Whether attention reads an `f16` KV row in place or decodes it into a `f32` row first.
-///
 /// Attention's switches, read once per call rather than per row.
 ///
 /// A switch here cannot change a bit of the result — the head split only decides which thread
@@ -1682,6 +1684,8 @@ const PARALLEL_ATTENTION_MIN: usize = 4096;
 struct AttentionSwitches {
     /// A single entry's heads go to the pool instead of the calling thread.
     split_heads: bool,
+    /// Which order the KV bytes are walked in.
+    order: RowOrder,
 }
 
 impl AttentionSwitches {
@@ -1692,6 +1696,7 @@ impl AttentionSwitches {
         }
         Self {
             split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
+            order: RowOrder::from_env(),
         }
     }
 }
@@ -1710,15 +1715,27 @@ fn flag(name: &str) -> bool {
 fn forced_switches() -> Option<AttentionSwitches> {
     use std::sync::atomic::Ordering;
     let forced = BENCH_SWITCHES.load(Ordering::Relaxed);
-    (forced & 2 != 0).then_some(AttentionSwitches {
+    (forced & 4 != 0).then_some(AttentionSwitches {
         split_heads: forced & 1 != 0,
+        order: if forced & 2 != 0 {
+            RowOrder::LayerMajor
+        } else {
+            RowOrder::TokenMajor
+        },
     })
+}
+
+#[cfg(test)]
+fn forced_order() -> Option<RowOrder> {
+    forced_switches().map(|switches| switches.order)
 }
 
 #[cfg(test)]
 fn force_switches(switches: AttentionSwitches) {
     use std::sync::atomic::Ordering;
-    let bits = 2 | u8::from(switches.split_heads);
+    let bits = 4
+        | u8::from(switches.split_heads)
+        | (u8::from(switches.order == RowOrder::LayerMajor) << 1);
     BENCH_SWITCHES.store(bits, Ordering::Relaxed);
 }
 
@@ -1763,7 +1780,7 @@ fn attention_streaming(
     attention_streaming_heads(
         q,
         &KvRead::of(kv),
-        RowOrder::from_env(),
+        AttentionSwitches::from_env().order,
         layer,
         positions,
         shape,
@@ -2141,7 +2158,7 @@ impl AttentionAlgorithm for StreamingAttention {
         attention_streaming_heads(
             call.q,
             call.kv,
-            RowOrder::from_env(),
+            AttentionSwitches::from_env().order,
             call.layer,
             call.positions,
             call.shape,
@@ -2963,16 +2980,16 @@ mod tests {
         );
     }
 
-    /// The two attention switches at depth 1024, all four combinations in one process, on the same
-    /// bytes. Prints the table and asserts every arm computes the same output, which is what makes
-    /// a timing difference a scheduling difference and nothing else.
+    /// The attention switches in every combination, at two depths, all in one process on the same
+    /// bytes. Prints the table and asserts every arm at a depth computes the same output, which is
+    /// what makes a timing difference a scheduling or locality difference and nothing else.
     ///
     /// ```text
-    /// cargo test --release -p vipera-backend-cpu --lib attention_switches_at_1024 -- --ignored --nocapture
+    /// cargo test --release -p vipera-backend-cpu --lib attention_combinations -- --ignored --nocapture
     /// ```
     #[test]
     #[ignore = "measurement: prints a table, run with --ignored --nocapture"]
-    fn attention_switches_at_1024() {
+    fn attention_combinations() {
         let layers = 28;
         let shape = AttnShape {
             heads: 12,
@@ -2983,103 +3000,112 @@ mod tests {
         let row = KvLayout::F16.bytes_per_row(width);
         let bytes_per_token = layers * 2 * row;
         let per_block = 16;
-        let positions = 1024usize;
-        let blocks = positions.div_ceil(per_block);
-        let table: Vec<u32> = (0..blocks as u32).collect();
-        let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
-        let mut values = vec![0.0_f32; width];
-        let order = RowOrder::TokenMajor;
-        for layer in 0..layers {
-            for position in 0..positions {
-                let walk = order.row_walk(
-                    position / per_block * per_block * bytes_per_token,
-                    position % per_block,
-                    per_block,
-                    bytes_per_token,
-                    row,
-                    layer,
-                );
-                for (at, value) in values.iter_mut().enumerate() {
-                    *value = ((position * 31 + layer * 7 + at * 13) % 97) as f32 * 0.01 - 0.5;
-                }
-                KvLayout::F16
-                    .encode(&mut storage[walk.k..walk.k + row], &values)
-                    .expect("write K");
-                let v_base = walk.k + walk.v;
-                KvLayout::F16
-                    .encode(&mut storage[v_base..v_base + row], &values)
-                    .expect("write V");
-            }
-        }
-
         let query = shape.heads * shape.head_dim;
         let q: Vec<f32> = (0..query)
             .map(|at| ((at * 7) % 23) as f32 * 0.03 - 0.3)
             .collect();
         let mut out = vec![0.0_f32; query];
-        let kv = KvView {
-            storage: &mut storage,
-            table: &table,
-            tokens_per_block: per_block,
-            bytes_per_token,
-            layout: KvLayout::F16,
-        };
-        let read = KvRead::of(&kv);
-        let views = std::slice::from_ref(&read);
-        let lengths = [positions];
+        let orders = [RowOrder::TokenMajor, RowOrder::LayerMajor];
 
-        let combos: Vec<AttentionSwitches> = [false, true]
-            .into_iter()
-            .map(|split_heads| AttentionSwitches { split_heads })
-            .collect();
-        let mut best = vec![f64::INFINITY; combos.len()];
-        let mut outputs: Vec<Option<Vec<f32>>> = vec![None; combos.len()];
-        // Four sweeps, alternating direction, so no arm gets a systematically warmer position in
-        // the sequence than another.
-        for sweep in 0..4 {
-            let mut order: Vec<usize> = (0..combos.len()).collect();
-            if sweep % 2 == 1 {
-                order.reverse();
-            }
-            for &index in &order {
-                let switches = combos[index];
-                force_switches(switches);
-                let mut scratch = AttnScratch::default();
-                for _ in 0..2 {
-                    out.fill(0.0);
-                    for layer in 0..layers {
-                        attend_entries(&q, views, &lengths, layer, shape, &mut scratch, &mut out)
-                            .expect("attention");
+        for positions in [1024usize, 4096] {
+            let blocks = positions.div_ceil(per_block);
+            let table: Vec<u32> = (0..blocks as u32).collect();
+            let lengths = [positions];
+            let mut arms: Vec<(AttentionSwitches, f64, Vec<f32>)> = Vec::new();
+            for order in orders {
+                let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+                let mut values = vec![0.0_f32; width];
+                for layer in 0..layers {
+                    for position in 0..positions {
+                        let walk = order.row_walk(
+                            position / per_block * per_block * bytes_per_token,
+                            position % per_block,
+                            per_block,
+                            bytes_per_token,
+                            row,
+                            layer,
+                        );
+                        for (at, value) in values.iter_mut().enumerate() {
+                            *value =
+                                ((position * 31 + layer * 7 + at * 13) % 97) as f32 * 0.01 - 0.5;
+                        }
+                        KvLayout::F16
+                            .encode(&mut storage[walk.k..walk.k + row], &values)
+                            .expect("write K");
+                        let v_base = walk.k + walk.v;
+                        KvLayout::F16
+                            .encode(&mut storage[v_base..v_base + row], &values)
+                            .expect("write V");
                     }
                 }
-                let started = std::time::Instant::now();
-                out.fill(0.0);
-                for layer in 0..layers {
-                    attend_entries(&q, views, &lengths, layer, shape, &mut scratch, &mut out)
-                        .expect("attention");
+                let kv = KvView {
+                    storage: &mut storage,
+                    table: &table,
+                    tokens_per_block: per_block,
+                    bytes_per_token,
+                    layout: KvLayout::F16,
+                };
+                let read = KvRead::of(&kv);
+                let views = std::slice::from_ref(&read);
+
+                for split_heads in [false, true] {
+                    let switches = AttentionSwitches { split_heads, order };
+                    let mut scratch = AttnScratch::default();
+                    let pass = |scratch: &mut AttnScratch, out: &mut Vec<f32>| {
+                        out.fill(0.0);
+                        for layer in 0..layers {
+                            attend_entries(&q, views, &lengths, layer, shape, scratch, out)
+                                .expect("attention");
+                        }
+                    };
+                    // Four sweeps, direction alternating, so no arm keeps a warmer position in the
+                    // sequence than another.
+                    let mut best = f64::INFINITY;
+                    for sweep in 0..4 {
+                        force_switches(switches);
+                        if sweep < 2 {
+                            pass(&mut scratch, &mut out);
+                            continue;
+                        }
+                        let started = std::time::Instant::now();
+                        pass(&mut scratch, &mut out);
+                        best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    arms.push((switches, best, out.clone()));
                 }
-                best[index] = best[index].min(started.elapsed().as_secs_f64() * 1000.0);
-                outputs[index] = Some(out.clone());
             }
-        }
-        clear_forced_switches();
-        for (index, switches) in combos.iter().enumerate() {
-            println!(
-                "split {:<5}: {:6.2} ms for {layers} layers x {positions} ({:.3} ms/layer)",
-                switches.split_heads,
-                best[index],
-                best[index] / layers as f64
-            );
-        }
-        let baseline = outputs[0].clone().expect("an output");
-        for (index, output) in outputs.iter().enumerate() {
-            assert_eq!(
-                output.as_ref().expect("an output"),
-                &baseline,
-                "{:?} must compute what {:?} computes",
-                combos[index],
-                combos[0]
-            );
+            clear_forced_switches();
+            let baseline = arms
+                .iter()
+                .find(|(switches, ..)| {
+                    switches.order == RowOrder::TokenMajor && !switches.split_heads
+                })
+                .map(|(.., out)| out.clone())
+                .expect("a baseline arm");
+            println!("depth {positions}:");
+            for (switches, best, output) in &arms {
+                let share = 100.0 * (1.0 - best / arms[0].1);
+                println!(
+                    "  {:>11} split {:<5}: {best:6.2} ms ({:.3} ms/layer, {:+.0}% vs token-major/split-off)",
+                    if switches.order == RowOrder::TokenMajor {
+                        "token-major"
+                    } else {
+                        "layer-major"
+                    },
+                    switches.split_heads,
+                    best / layers as f64,
+                    if switches.order == RowOrder::TokenMajor && !switches.split_heads {
+                        0.0
+                    } else {
+                        share
+                    }
+                );
+                assert_eq!(
+                    output, &baseline,
+                    "{:?} must compute what the baseline computes",
+                    switches
+                );
+            }
         }
     }
 
