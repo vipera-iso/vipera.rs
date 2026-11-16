@@ -1098,3 +1098,41 @@ cheaper at the same time.
 
 For a 1024-deep step that is ~7-8 ms off the ~44 ms step; for 4096 it is ~40 ms off a step that was
 spending most of its time in the walk. Two switches, neither changing a bit.
+
+### Layer-major becomes the default — 2026-11-16
+
+Two things stood between the prototype and making it the default: it had to not cost anything on
+the write path, and the combined gain had to hold deep enough to matter.
+
+**Write path, prefill batch 128** (`kv_write_batch_at_128`, 128 tokens x 28 layers x 10 passes per
+sample, best of two samples, both orders in one process):
+
+| run | token-major | layer-major |
+|---|---|---|
+| 1 | 2.71 ms | 2.70 ms |
+| 2 | 2.71 ms | 2.65 ms |
+| 3 | 2.66 ms | 2.78 ms |
+
+Equal within noise: 0.75 us per token-layer either way. A 128-token chunk writes its KV in 2.7 ms
+against a prefill of roughly a second, so the write path is 0.3% either way and the row order does
+not move it.
+
+**Combined gain at three depths** (`attention_combinations`, two runs, best per arm):
+
+| depth | token/split-off | token/split-on | layer/split-off | layer/split-on |
+|---|---|---|---|---|
+| 1024 | 14.19 / 14.48 ms | -30% | -27% | **-45%** |
+| 4096 | 69.95 / 75.00 ms | -29% | -38% | **-58%** |
+| 8192 | 148.60 / 151.23 ms | -37% | -36% | **-60%** |
+
+The two switches stay additive as depth grows (independent 37% and 36% predict -60%), so there is
+no saturation point to work around: the walk is still the cost at 8192 and both changes still cut
+it.
+
+**Exactness with the switch unset**, i.e. the new default: `vipera generate` reproduces the same
+token ids recorded for layer-major earlier — 920-token prompt at f16, 1534-token prompt at `q8_0`,
+greedy, same seeds.
+
+So `VIPERA_KV_LAYER_MAJOR` now defaults on, and `=0` keeps the token-major walk for an A/B. The
+format is unchanged: same blocks, same block size, same row encoding, same block table, same prefix
+cache copies (whole-block `copy_within`, order-agnostic).

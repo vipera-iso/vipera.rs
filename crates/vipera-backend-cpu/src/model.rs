@@ -1208,9 +1208,11 @@ impl ModelConfig {
 /// crosses into another block every `tokens_per_block` positions. The values a layer holds are
 /// identical either way; only the addresses differ.
 ///
-/// Set `VIPERA_KV_LAYER_MAJOR=1` to turn it on. It is a switch, not a format: the block table,
-/// the block size and the row encoding all stay as they are, which is what makes the two arms
-/// comparable and the change revertible.
+/// Layer-major is the default — it is 28-46% off the walk at depth 1024 and 34-59% at 4096, see
+/// `docs/benchmarks.md`. `VIPERA_KV_LAYER_MAJOR=0` (or `false`, `off`, `no`) walks token-major
+/// instead, for an A/B in one binary. It is a switch, not a format: the block table, the block
+/// size and the row encoding all stay as they are, which is what makes the two arms comparable
+/// and the change revertible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowOrder {
     TokenMajor,
@@ -1223,16 +1225,10 @@ impl RowOrder {
         if let Some(forced) = forced_order() {
             return forced;
         }
-        match std::env::var("VIPERA_KV_LAYER_MAJOR") {
-            Ok(value)
-                if !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no"
-                ) =>
-            {
-                Self::LayerMajor
-            }
-            _ => Self::TokenMajor,
+        if flag("VIPERA_KV_LAYER_MAJOR") {
+            Self::LayerMajor
+        } else {
+            Self::TokenMajor
         }
     }
 
@@ -3007,7 +3003,7 @@ mod tests {
         let mut out = vec![0.0_f32; query];
         let orders = [RowOrder::TokenMajor, RowOrder::LayerMajor];
 
-        for positions in [1024usize, 4096] {
+        for positions in [1024usize, 4096, 8192] {
             let blocks = positions.div_ceil(per_block);
             let table: Vec<u32> = (0..blocks as u32).collect();
             let lengths = [positions];
@@ -3107,6 +3103,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The write path at a prefill-sized batch: 128 tokens x 28 layers, both orders, one process.
+    /// The read side is what the layer-major change is for, so this is the cost it must not add.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib kv_write_batch_at_128 -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a number, run with --ignored --nocapture"]
+    fn kv_write_batch_at_128() {
+        let layers = 28;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let row = KvLayout::F16.bytes_per_row(width);
+        let bytes_per_token = layers * 2 * row;
+        let per_block = 16;
+        let batch = 128usize;
+        let blocks = batch.div_ceil(per_block);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let k: Vec<f32> = (0..width).map(|at| at as f32 * 0.01 - 1.0).collect();
+        let v: Vec<f32> = (0..width).map(|at| 1.0 - at as f32 * 0.01).collect();
+
+        let mut arms = Vec::new();
+        for order in [RowOrder::TokenMajor, RowOrder::LayerMajor] {
+            let mut storage = vec![0u8; blocks * per_block * bytes_per_token];
+            let mut best = f64::INFINITY;
+            let mut loaded = (Vec::new(), Vec::new());
+            for sweep in 0..4 {
+                force_switches(AttentionSwitches {
+                    split_heads: true,
+                    order,
+                });
+                let mut kv = KvView {
+                    storage: &mut storage,
+                    table: &table,
+                    tokens_per_block: per_block,
+                    bytes_per_token,
+                    layout: KvLayout::F16,
+                };
+                let started = std::time::Instant::now();
+                for _ in 0..10 {
+                    for position in 0..batch {
+                        for layer in 0..layers {
+                            kv.write(position, layer, shape, &k, &v).expect("write");
+                        }
+                    }
+                }
+                let elapsed = started.elapsed().as_secs_f64() * 100.0;
+                if sweep >= 2 {
+                    best = best.min(elapsed);
+                }
+                kv.load_layer(0, shape, batch, &mut loaded.0, &mut loaded.1)
+                    .expect("load");
+            }
+            println!(
+                "{order:?}: {best:6.2} ms for {batch} tokens x {layers} layers ({:.3} us/token-layer)",
+                best * 1000.0 / (batch * layers) as f64
+            );
+            arms.push((order, best, loaded));
+        }
+        clear_forced_switches();
+        assert_eq!(
+            arms[0].2.0, arms[1].2.0,
+            "the two orders must store the same K"
+        );
+        assert_eq!(
+            arms[0].2.1, arms[1].2.1,
+            "the two orders must store the same V"
+        );
     }
 
     #[test]
