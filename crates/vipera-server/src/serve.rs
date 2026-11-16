@@ -21,6 +21,7 @@
 //! once; past that the server answers `503` instead of spawning another thread.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -838,7 +839,13 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
         let connection = rustls::ServerConnection::new(Arc::clone(config))
             .map_err(|error| std::io::Error::other(format!("TLS: {error}")))?;
         let mut tls = rustls::StreamOwned::new(connection, stream);
-        return serve_connection(served, &mut tls, &peer);
+        let result = serve_connection(served, &mut tls, &peer);
+        // `Connection: close` is the contract here, and over TLS that means close_notify before
+        // the socket goes: a client that reads to the end treats a bare EOF as a truncated
+        // response, not as the end of one. curl tolerates it; rustls' own client does not.
+        tls.conn.send_close_notify();
+        let _ = tls.flush();
+        return result;
     }
     serve_connection(served, &mut stream, &peer)
 }

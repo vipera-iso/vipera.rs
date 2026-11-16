@@ -15,5 +15,9 @@ vipera-tokenizer.workspace = true
 vipera-traits.workspace = true
 vipera-server.workspace = true
 
+[dev-dependencies]
+# The TLS test is a client as well as a server-spawner, so it needs the stack the server uses.
+rustls.workspace = true
+
 [lints]
 workspace = true
