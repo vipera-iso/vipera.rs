@@ -1136,3 +1136,33 @@ greedy, same seeds.
 So `VIPERA_KV_LAYER_MAJOR` now defaults on, and `=0` keeps the token-major walk for an A/B. The
 format is unchanged: same blocks, same block size, same row encoding, same block table, same prefix
 cache copies (whole-block `copy_within`, order-agnostic).
+
+### A Zig kernel for the Q4_K prefill matmul: 1.5%, inside noise — 2026-11-12
+
+Prefill is the only compute-bound loop left in the backend, so the experiment replaced the Rust
+tiled Q4_K matmul with a Zig kernel, compiled by `build.rs` when a Zig compiler is on `PATH`,
+entered only after an AVX2/FMA check at run time, with the Rust tiled path as the fallback.
+
+Qwen2.5-1.5B Q4_K_M, 457-token prompt, greedy, four runs alternating:
+
+| arm | prefill |
+|---|---|
+| Rust tiled | 6692 / 6759 ms |
+| Zig kernel | 6564 / 6689 ms |
+
+~1.5%, which is inside run-to-run noise. Token ids identical. The same source at `x86-64-v4`
+(512-bit) measured 14% slower, consistent with this machine's earlier finding that wider vectors
+lose to downclocking.
+
+The arithmetic says why there was nothing to win: 1.42 TFLOP over ~5.6 s is ~250 GFLOPS against
+this i5's AVX2 peak of ~282, so the kernel was already at ~89% of the ceiling and the headroom it
+was chasing was ~1%. What is left is not the kernel but the 197 `matvec` calls a step makes — the
+dispatch and C-state sections above.
+
+**Not carried, and not pushed as a PR.** Three reasons: it is neutral by its own measurement and
+this repository reverts neutral work; it cannot be built or tested on this machine (no `zig`), and
+`ci.yml` does not install Zig either, so the kernel would be compiled by nobody and tested
+nowhere; and dead code behind a `cfg` no build sets is exactly the kind of thing that rots.
+
+The numbers are recorded from commit `673da58` on the dropped branch `feat/zig-prefill`, so the
+next person does not spend a day rebuilding it to learn the same thing.
