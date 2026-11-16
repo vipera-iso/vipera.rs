@@ -1,0 +1,3 @@
+# Free-form issues stay enabled: a question about a measurement is not a bug or a proposal, and
+# forcing it into a form loses the context that makes it answerable.
+blank_issues_enabled: true

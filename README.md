@@ -1,7 +1,10 @@
 # vipera.rs
 
-A CPU-first inference engine for GGUF models, written in Rust with no external crates: it parses the
-file, plans memory, tokenizes, samples, generates, and serves an OpenAI-compatible chat endpoint.
+A CPU-first inference engine for GGUF models, written in Rust with no external crates in the engine
+itself: it parses the file, plans memory, tokenizes, samples, generates, and serves an
+OpenAI-compatible chat endpoint. The one dependency in the workspace is `rustls`, for TLS
+termination in `vipera serve`, and it is recorded as `EXC-002` in [`CONSTRAINTS.md`](CONSTRAINTS.md)
+rather than quietly breaking the rule.
 
 The engine is the Cargo workspace in this repository. The specification, plan and contracts live
 under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
@@ -52,7 +55,22 @@ crates/
 bins/vipera/                  the `vipera` command (argument parsing only)
 scripts/                      parity checks against llama.cpp
 specs/001-vipera-rs-engine/   spec, plan, tasks, CLI and HTTP contracts
+docs/design/                  ADRs and the performance specification
+docs/benchmarks.md            the measurement ledger, losing experiments included
+docs/benchmarks/              the surveys the plan was written from
 ```
+
+## Documentation
+
+| Where | What |
+|---|---|
+| [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/) | specification, plan, CLI and HTTP contracts, session checkpoints |
+| [`docs/design/`](docs/design/) | ADR-001 (the ggml Q4_K bind), ADR-002 (weight mapping), continuous batching, the performance spec |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | every experiment with a number: what won, what measured neutral, what would have to be true for a proposal to work |
+| [`docs/benchmarks/`](docs/benchmarks/) | the CPU-algorithm survey and the llama.cpp gap report, and how to add a measurement |
+| [`CONSTRAINTS.md`](CONSTRAINTS.md) | the quality bar the gate enforces, with each exception recorded rather than assumed |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | the gate, commit conventions, and how a performance claim is made |
+| [`SECURITY.md`](SECURITY.md) | what to report privately, and what is out of scope |
 
 ## Build and test
 
@@ -60,7 +78,7 @@ Requires stable Rust (edition 2024). No system libraries, no network, no GPU.
 
 ```bash
 cargo build --release
-cargo test --workspace        # 285 tests; model-dependent ones skip when no model is present
+cargo test --workspace        # 315 tests; model-dependent ones skip when no model is present
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

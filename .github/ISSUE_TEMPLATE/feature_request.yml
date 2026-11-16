@@ -1,0 +1,42 @@
+name: Feature or performance proposal
+description: A behaviour to add, or a change to make something faster
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository reverts an optimisation that cannot show a number, so a proposal is judged by
+        whether it comes with one. `docs/benchmarks.md` is the place it would land, and reading it
+        first saves work: most of the obvious ideas are already there with a measurement attached.
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What to change
+      description: The behaviour or the code path, stated so it could be implemented.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it is worth doing
+      description: The problem it solves, or the measurement that motivated it. A ceiling calculation counts; "this is the standard approach" does not.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence it would help
+      description: Numbers from this repository, numbers from elsewhere with a source, or the arithmetic that predicts a gain. Say what would have to be measured to settle it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What else was considered
+      description: Including "nothing, this is the smallest change that works" when that is the answer.
+    validations:
+      required: false
