@@ -2043,124 +2043,120 @@ fn attention_kv_chunked_heads(
             o: vec![0.0_f32; count * head_dim],
         })
         .collect();
+
+    let compute_chunk = |part: &mut Partial, start: usize, end: usize| -> Result<(), ViperaError> {
+        if start >= end {
+            return Ok(());
+        }
+        let mut scores = vec![0.0_f32; count * (end - start)];
+        let mut row = vec![0.0_f32; width];
+
+        // Pass 1 over the chunk: dot products and per-head maxima.
+        kv.for_each_row_range(order, layer, layer_bytes, start, end, |position, base| {
+            let p = position - start;
+            if !in_place {
+                kv.layout
+                    .decode(&kv.storage[base..base + layer_bytes], &mut row)?;
+            }
+            for kv_head in 0..kv_heads {
+                let packed_k = base + kv_head * head_dim * 2;
+                let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                for member in 0..group {
+                    let head = kv_head * group + member;
+                    if head < heads.start || head >= heads.end {
+                        continue;
+                    }
+                    let local = head - heads.start;
+                    let query = &q[head * head_dim..(head + 1) * head_dim];
+                    let dot = if sequential {
+                        query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
+                    } else if in_place {
+                        crate::simd::dot_f16_f32(query, &kv.storage[packed_k..][..head_dim * 2])
+                    } else {
+                        crate::simd::dot_f32(query, key)
+                    };
+                    let score = dot * scale;
+                    scores[local * (end - start) + p] = score;
+                    if score > part.m[local] {
+                        part.m[local] = score;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        // Per-head chunk normalizer: exp(score - m_c) and sum.
+        for local in 0..count {
+            let best = part.m[local];
+            let mut total = 0.0_f32;
+            let window = &mut scores[local * (end - start)..(local + 1) * (end - start)];
+            for score in window.iter_mut() {
+                *score = (*score - best).exp();
+                total += *score;
+            }
+            part.d[local] = total;
+        }
+
+        // Pass 2 over the chunk: weighted V sum, unnormalized except for m_c.
+        kv.for_each_row_range(order, layer, layer_bytes, start, end, |position, base| {
+            let p = position - start;
+            let v_base = kv.value_row(order, base, layer_bytes);
+            if !in_place {
+                kv.layout
+                    .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
+            }
+            for kv_head in 0..kv_heads {
+                let packed_v = v_base + kv_head * head_dim * 2;
+                let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                for member in 0..group {
+                    let head = kv_head * group + member;
+                    if head < heads.start || head >= heads.end {
+                        continue;
+                    }
+                    let local = head - heads.start;
+                    let weight = scores[local * (end - start) + p];
+                    let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                    if in_place {
+                        crate::simd::axpy_f16_f32(
+                            target,
+                            weight,
+                            &kv.storage[packed_v..][..head_dim * 2],
+                        );
+                    } else {
+                        crate::simd::axpy_f32(target, weight, value);
+                    }
+                }
+            }
+            Ok(())
+        })
+    };
+
+    // The caller takes the last chunk; spawn one worker fewer like the head split.
+    let spawned = workers - 1;
+    let caller_range = {
+        let start = positions * spawned / workers;
+        start..(positions * (spawned + 1) / workers)
+    };
+    let (spawn_parts, tail) = partials.split_at_mut(spawned);
+    let caller_part = &mut tail[0];
     let chunk_error: std::sync::Mutex<Option<ViperaError>> = std::sync::Mutex::new(None);
 
     thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for (worker, part) in partials.iter_mut().enumerate() {
+        let mut handles = Vec::with_capacity(spawned);
+        for (worker, part) in spawn_parts.iter_mut().enumerate() {
             let start = positions * worker / workers;
             let end = positions * (worker + 1) / workers;
             let err = &chunk_error;
+            let f = &compute_chunk;
             handles.push(scope.spawn(move || {
-                if start >= end {
-                    return;
-                }
-                let mut scores = vec![0.0_f32; count * (end - start)];
-                let mut row = vec![0.0_f32; width];
-
-                // Pass 1 over the chunk: dot products and per-head maxima.
-                let r = kv.for_each_row_range(
-                    order,
-                    layer,
-                    layer_bytes,
-                    start,
-                    end,
-                    |position, base| {
-                        let p = position - start;
-                        if !in_place {
-                            kv.layout
-                                .decode(&kv.storage[base..base + layer_bytes], &mut row)?;
-                        }
-                        for kv_head in 0..kv_heads {
-                            let packed_k = base + kv_head * head_dim * 2;
-                            let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                            for member in 0..group {
-                                let head = kv_head * group + member;
-                                if head < heads.start || head >= heads.end {
-                                    continue;
-                                }
-                                let local = head - heads.start;
-                                let query = &q[head * head_dim..(head + 1) * head_dim];
-                                let dot = if sequential {
-                                    query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
-                                } else if in_place {
-                                    crate::simd::dot_f16_f32(
-                                        query,
-                                        &kv.storage[packed_k..][..head_dim * 2],
-                                    )
-                                } else {
-                                    crate::simd::dot_f32(query, key)
-                                };
-                                let score = dot * scale;
-                                scores[local * (end - start) + p] = score;
-                                if score > part.m[local] {
-                                    part.m[local] = score;
-                                }
-                            }
-                        }
-                        Ok(())
-                    },
-                );
-                if let Err(e) = r {
-                    *err.lock().expect("chunk error") = Some(e);
-                    return;
-                }
-
-                // Per-head chunk normalizer: exp(score - m_c) and sum.
-                for local in 0..count {
-                    let best = part.m[local];
-                    let mut total = 0.0_f32;
-                    let window = &mut scores[local * (end - start)..(local + 1) * (end - start)];
-                    for score in window.iter_mut() {
-                        *score = (*score - best).exp();
-                        total += *score;
-                    }
-                    part.d[local] = total;
-                }
-
-                // Pass 2 over the chunk: weighted V sum, unnormalized except for m_c.
-                let r = kv.for_each_row_range(
-                    order,
-                    layer,
-                    layer_bytes,
-                    start,
-                    end,
-                    |position, base| {
-                        let p = position - start;
-                        let v_base = kv.value_row(order, base, layer_bytes);
-                        if !in_place {
-                            kv.layout
-                                .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
-                        }
-                        for kv_head in 0..kv_heads {
-                            let packed_v = v_base + kv_head * head_dim * 2;
-                            let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                            for member in 0..group {
-                                let head = kv_head * group + member;
-                                if head < heads.start || head >= heads.end {
-                                    continue;
-                                }
-                                let local = head - heads.start;
-                                let weight = scores[local * (end - start) + p];
-                                let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
-                                if in_place {
-                                    crate::simd::axpy_f16_f32(
-                                        target,
-                                        weight,
-                                        &kv.storage[packed_v..][..head_dim * 2],
-                                    );
-                                } else {
-                                    crate::simd::axpy_f32(target, weight, value);
-                                }
-                            }
-                        }
-                        Ok(())
-                    },
-                );
-                if let Err(e) = r {
+                if let Err(e) = f(part, start, end) {
                     *err.lock().expect("chunk error") = Some(e);
                 }
             }));
+        }
+
+        if let Err(e) = compute_chunk(caller_part, caller_range.start, caller_range.end) {
+            *chunk_error.lock().expect("chunk error") = Some(e);
         }
         for handle in handles {
             handle.join().expect("an attention chunk worker panicked");

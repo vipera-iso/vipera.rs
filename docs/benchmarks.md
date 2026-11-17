@@ -1302,14 +1302,16 @@ shape) while mathematically equivalent. It is therefore opt-in, `VIPERA_ATTN_KV_
 in exact-dot mode; the default path and the bit-exact streaming/buffered contracts are unchanged.
 
 Integrated component measurement, one layer (f16 KV, layer-major, 4 workers, i5-11300H 4C/8T, busy),
-20 rounds, median, vs the serial single-entry path:
+median of 30 rounds, vs the serial single-entry path (caller computes the last chunk, spawning
+`workers - 1` like the head split):
 
 | positions | serial | KV-chunk ×4 | speedup | max-abs diff |
 |---:|---:|---:|---:|---:|
-| 1024 | 0.35 ms | 0.19 ms | ~1.8× | 9.7e-8 |
-| 4096 | 1.46 ms | 0.55 ms | ~2.7× | 8.9e-8 |
-| 8192 | 3.17 ms | 1.05 ms | ~3.0× | 6.8e-8 |
+| 1024 | 0.36 ms | 0.25 ms | ~1.5× | 9.7e-8 |
+| 4096 | 1.40 ms | 0.48 ms | ~2.9× | 8.9e-8 |
+| 8192 | 2.95 ms | 0.93 ms | ~3.2× | 6.8e-8 |
 
-The implementation spawns and joins workers per call (same cost model as the head split, ~sub-ms per
-28-layer token) and uses a ranged row-walk so workers read only their chunk. End-to-end decode impact
-depends on depth and the rest of the step; the head split remains the default bit-exact parallel path.
+The implementation spawns and joins `workers - 1` threads per call (same cost model as the head
+split, ~sub-ms per 28-layer token) and uses a ranged row-walk so workers read only their chunk.
+End-to-end decode impact depends on depth and the rest of the step; the head split remains the
+default bit-exact parallel path.
