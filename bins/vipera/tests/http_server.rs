@@ -213,6 +213,92 @@ fn serve_answers_chat_completions_and_streams() {
     server.stop();
 }
 
+/// The README promises a 600-a-minute per-key budget without any flag, `--rate-limit 0` turning it
+/// off, and `--rate-limit N` replacing it. Each scenario needs its own process because the budget is
+/// fixed at startup.
+#[test]
+fn serve_budgets_requests_by_default_and_lets_the_flag_change_it() {
+    let Some(model) = model_path() else {
+        eprintln!(
+            "skipped: no model; set VIPERA_TEST_MODEL or place qwen2.5-1.5b-instruct-q4_k_m.gguf in ~/.vipera/models"
+        );
+        return;
+    };
+
+    // Default: everything is allowed up to 600, then 429 with a Retry-After. The bucket refills a
+    // few tokens while the burst runs, so the first refusal may land a few requests late.
+    let port = free_port();
+    let mut server = Server::start(&model, port).expect("start vipera serve");
+    wait_until_listening(port, &mut server).expect("server never accepted a connection");
+    let mut first_limited = None;
+    let mut limited = 0;
+    for request in 1..=620 {
+        let response = http(port, "GET", "/ready", "").expect("ready");
+        if response.starts_with("HTTP/1.1 200") {
+            assert!(
+                first_limited.is_none(),
+                "request {request} was allowed after {first_limited:?}"
+            );
+            continue;
+        }
+        assert!(
+            response.starts_with("HTTP/1.1 429"),
+            "request {request}: {response}"
+        );
+        limited += 1;
+        if first_limited.is_none() {
+            first_limited = Some(request);
+            assert!(response.contains("Retry-After: 1"), "{response}");
+            assert!(response.contains(r#""code":"rate_limited""#), "{response}");
+        }
+    }
+    server.stop();
+    let first = first_limited.expect("the default budget must refuse something in 620 requests");
+    assert!(
+        (601..=610).contains(&first),
+        "the first refusal was request {first}, not ~601"
+    );
+    assert!(limited >= 10, "only {limited} requests were refused");
+
+    // `--rate-limit 0`: the documented off switch really turns it off.
+    let port = free_port();
+    let mut server = Server::start_with(&model, port, &["--rate-limit", "0"])
+        .expect("start vipera serve --rate-limit 0");
+    wait_until_listening(port, &mut server).expect("server never accepted a connection");
+    for request in 1..=620 {
+        let response = http(port, "GET", "/ready", "").expect("ready");
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "request {request} without a budget: {response}"
+        );
+    }
+    server.stop();
+
+    // `--rate-limit N`: the flag replaces the default instead of adding to it.
+    let port = free_port();
+    let mut server = Server::start_with(&model, port, &["--rate-limit", "2"])
+        .expect("start vipera serve --rate-limit 2");
+    wait_until_listening(port, &mut server).expect("server never accepted a connection");
+    let mut first_limited = None;
+    for request in 1..=10 {
+        let response = http(port, "GET", "/ready", "").expect("ready");
+        if response.starts_with("HTTP/1.1 429") {
+            first_limited = Some(request);
+            break;
+        }
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "request {request}: {response}"
+        );
+    }
+    server.stop();
+    assert_eq!(
+        first_limited,
+        Some(3),
+        "a budget of 2 must refuse the third request"
+    );
+}
+
 fn model_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("VIPERA_TEST_MODEL") {
         let path = PathBuf::from(path);
@@ -243,6 +329,10 @@ struct Server {
 
 impl Server {
     fn start(model: &Path, port: u16) -> std::io::Result<Self> {
+        Self::start_with(model, port, &[])
+    }
+
+    fn start_with(model: &Path, port: u16, extra: &[&str]) -> std::io::Result<Self> {
         let child = Command::new(vipera_binary())
             .args([
                 "serve",
@@ -256,6 +346,7 @@ impl Server {
                 "--api-key",
                 API_KEY,
             ])
+            .args(extra)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;

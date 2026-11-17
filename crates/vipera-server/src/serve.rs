@@ -14,11 +14,11 @@
 //! What Phase 1 does not do, stated here rather than implied: request bodies must be `Content-Length`
 //! framed (chunked bodies are refused with `invalid_request`), `stop` sequences are parsed and ignored,
 //! and a client that disconnects mid-stream still lets the current turn finish before the
-//! connection is dropped. Rate limiting is opt-in via `--rate-limit` (requests per minute, `429` +
-//! `Retry-After` when exceeded); without the flag there is no limit. A limit is per authenticated
-//! key when `--api-key` is set, and per peer otherwise: without a key every `authorization` value
-//! is caller-chosen, so it cannot name a client. At most [`MAX_CONNECTIONS`] connections are served at
-//! once; past that the server answers `503` instead of spawning another thread.
+//! connection is dropped. Requests carry a per-key (or, without a key, per peer) budget of 600 a
+//! minute by default (`429` + `Retry-After` when exceeded); `--rate-limit N` changes the budget and
+//! `--rate-limit 0` turns it off. Without a key every `authorization` value is caller-chosen, so it
+//! cannot name a client. At most [`MAX_CONNECTIONS`] connections are served at once; past that the
+//! server answers `503` instead of spawning another thread.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write as _;
@@ -121,9 +121,8 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
                 index += 1;
             }
             "--rate-limit" => {
-                let limit = next_number(args, index, "--rate-limit")?;
                 // Zero is the documented way to say "no budget"; the default is `DEFAULT_RATE_LIMIT`.
-                rate_limit = (limit > 0).then_some(limit);
+                rate_limit = budget_from_flag(next_number(args, index, "--rate-limit")?);
                 index += 1;
             }
             flag if flag.starts_with('-') => {
@@ -251,6 +250,11 @@ fn default_model_id(path: &str) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("local")
         .to_owned()
+}
+
+/// The budget a `--rate-limit` value asks for: zero turns the budget off, anything else sets it.
+fn budget_from_flag(limit: u32) -> Option<u32> {
+    (limit > 0).then_some(limit)
 }
 
 fn next_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, ViperaError> {
@@ -2889,6 +2893,22 @@ mod tests {
         assert!(!source.refresh(), "the new stamp is remembered");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_default_budget_is_six_hundred_requests_a_minute() {
+        assert_eq!(DEFAULT_RATE_LIMIT, 600);
+    }
+
+    #[test]
+    fn a_zero_flag_turns_the_budget_off_and_a_positive_one_sets_it() {
+        assert_eq!(
+            budget_from_flag(0),
+            None,
+            "zero is the documented off switch"
+        );
+        assert_eq!(budget_from_flag(5), Some(5));
+        assert_eq!(budget_from_flag(600), Some(600));
     }
 
     #[test]

@@ -33,8 +33,8 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
   (`stream_options.include_usage`), token logprobs with top alternatives (chat streaming and
   non-streaming) and up to four `n` choices on the non-streaming path, `response_format: json_object` validation on non-streaming
   replies,
-  `GET /v1/models`, `/health`, `/ready`, `/metrics`, bearer auth, error envelopes, opt-in per-key
-  rate limiting.
+  `GET /v1/models`, `/health`, `/ready`, `/metrics`, bearer auth, error envelopes, and a per-key (or
+  per-peer) request budget (600/min by default).
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
   scalar reference.
 
@@ -78,7 +78,7 @@ Requires stable Rust (edition 2024). No system libraries, no network, no GPU.
 
 ```bash
 cargo build --release
-cargo test --workspace        # 315 tests; model-dependent ones skip when no model is present
+cargo test --workspace        # model-dependent ones skip when no model is present
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
@@ -125,10 +125,13 @@ conversations into one weight read; requests carry a per-key budget of 600 a min
   There is no ACME client — issue or renew the certificate out of band and write the files in place.
 - **Parity checks**: the continuation test compares against a usage recording of llama.cpp checked
   into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
-  `LLAMA_SERVER` at a `llama-server` binary to compare against a live one instead.
+  `LLAMA_SERVER` at a `llama-server` binary (or have `llama-server` on `PATH`) to compare against a
+  live one instead.
 - **Speed**: the CPU path is usable for a single conversation, not a throughput claim. Q4_K
-  activations are multiplied as `i8`, so outputs agree with the `f32` path on the checked prompts
-  but are not bit-identical to it.
+  activations are multiplied as `i8` by default, so outputs agree with the `f32` path on the checked
+  prompts but are not bit-identical to it; set `VIPERA_Q4K_F32=1` to run Q4_K with `f32` activations.
+  That path's greedy continuation on the checked prompt is pinned by
+  `bins/vipera/tests/fixtures/q4k_f32_continuation.json`, so it is reproduced bit for bit (slower).
 
 ## License
 

@@ -1,0 +1,7 @@
+{
+  "note": "Recorded from `vipera generate --temperature 0` with VIPERA_Q4K_F32=1 on the model below (i5-11300H, release build, 2026-11-17). It pins the Q4_K f32-activation continuation the README describes; the default i8-activation path diverges from it at token 2 on this prompt, so the test fails if the switch stops being honoured. Re-record it when the Q4_K arithmetic changes.",
+  "model": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "prompt": "The quick brown fox jumps over the lazy dog.",
+  "max_new": 24,
+  "tokens": [1416, 279, 11652, 374, 5326, 304, 9931, 1973, 11, 1128, 1035, 387, 279, 501, 11652, 30, 2014, 9931, 279, 1973, 315, 279, 4244, 304]
+}

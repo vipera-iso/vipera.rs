@@ -170,28 +170,46 @@ pub(crate) struct QuantizedX {
 /// Whether this format's dot reads an `i8` activation.
 ///
 /// `VIPERA_EXACT_DOT=1` takes Q6_K back off that path, which restores the `f32` kernel and with it
-/// the tokens the engine produced before the q8 kernel existed. Q4_K has had no `f32` kernel since
-/// its own quantization landed, so the switch does not apply to it.
+/// the tokens the engine produced before the q8 kernel existed; it does not apply to Q4_K.
+/// `VIPERA_Q4K_F32=1` opts Q4_K into `f32` activations instead (bit-identical to the `f32` path on
+/// the checked prompts, slower).
 fn quantizes(ty: GgmlType) -> bool {
+    quantizes_for(ty, q4k_f32_activations_requested(), exact_dot_requested())
+}
+
+/// [`quantizes`] with the switches passed in, so the mapping is testable without touching the
+/// process environment (each switch is cached in a `OnceLock`).
+fn quantizes_for(ty: GgmlType, q4k_f32: bool, exact: bool) -> bool {
     match ty {
-        GgmlType::Q4K => true,
-        GgmlType::Q6K => !exact_dot_requested(),
+        GgmlType::Q4K => !q4k_f32,
+        GgmlType::Q6K => !exact,
         _ => false,
     }
+}
+
+/// Whether an environment value asks for a switch: unset, empty, and `0` mean no; anything else
+/// means yes.
+fn env_truthy(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `VIPERA_Q4K_F32` asked for `f32` activations on Q4_K rows, so the dot runs on the
+/// dequantized `f32` path instead of `i8` activations (bit-identical to the `f32` path, slower).
+pub(crate) fn q4k_f32_activations_requested() -> bool {
+    static F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F32.get_or_init(|| env_truthy(std::env::var("VIPERA_Q4K_F32").ok().as_deref()))
 }
 
 /// Whether `VIPERA_EXACT_DOT` asked for the pre-q8 Q6_K kernel, and for the sequential attention
 /// score dot, so the tokens before either change can still be reproduced.
 pub(crate) fn exact_dot_requested() -> bool {
     static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EXACT.get_or_init(|| {
-        std::env::var("VIPERA_EXACT_DOT")
-            .map(|value| {
-                let value = value.trim();
-                !value.is_empty() && value != "0"
-            })
-            .unwrap_or(false)
-    })
+    *EXACT.get_or_init(|| env_truthy(std::env::var("VIPERA_EXACT_DOT").ok().as_deref()))
 }
 
 impl QuantizedX {
@@ -981,6 +999,41 @@ mod tests {
             assert_eq!(f16_to_f32(bits), value, "{value} did not round trip");
         }
         assert_eq!(f16_to_f32(f32_to_f16(1.000_1)), 1.0);
+    }
+
+    #[test]
+    fn the_q4k_f32_switch_takes_q4k_off_the_i8_activation_path() {
+        assert!(
+            quantizes_for(GgmlType::Q4K, false, false),
+            "the default multiplies i8 activations"
+        );
+        assert!(
+            !quantizes_for(GgmlType::Q4K, true, false),
+            "VIPERA_Q4K_F32 restores the f32 dot for Q4_K"
+        );
+        assert!(
+            quantizes_for(GgmlType::Q6K, false, false),
+            "Q6_K keeps its q8 dot by default"
+        );
+        assert!(
+            !quantizes_for(GgmlType::Q6K, false, true),
+            "VIPERA_EXACT_DOT restores the f32 dot for Q6_K"
+        );
+        assert!(
+            !quantizes_for(GgmlType::F32, true, true),
+            "formats with no quantized dot never build one"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_nonzero_switch_value_turns_it_on() {
+        for on in ["1", "true", "on"] {
+            assert!(env_truthy(Some(on)), "{on:?} turns a switch on");
+        }
+        for off in ["", "0", " 0 "] {
+            assert!(!env_truthy(Some(off)), "{off:?} leaves a switch off");
+        }
+        assert!(!env_truthy(None), "unset leaves a switch off");
     }
 
     #[test]
