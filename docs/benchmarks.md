@@ -1275,3 +1275,18 @@ workers against eight: 27.17 vs 25.83 and 27.46 vs 25.68 ms at 4096 (eight ahead
 advantage across runs, so at longer contexts the case for four workers is the oversubscription one —
 half the spawns and no sibling threads fighting for the same cores on a machine that is never idle —
 not a measured gain.
+
+### Attention split bookkeeping off the heap — 2026-11-17
+
+The single-entry (decode) and small multi-entry head/entry splits built `Vec`s for slots, handles and
+results once per layer/call. Both now keep that bookkeeping in fixed stack arrays when the split fits
+(≤ 16 workers/parts), so the hot decode path allocates no per-layer split vectors. `clear_forced_
+switches` also now resets the forced worker cap, which a bench could otherwise leak across
+measurements in one process.
+
+Measured on the same busy 4-core/8-thread machine, layer-major split, 4 workers,
+`attention_combinations`: before 7.33 / 26.12 / 54.72 ms at 1024 / 4096 / 8192 (one run); after
+7.51-8.00 / 27.03-28.15 / 57.25-61.96 ms across three runs. The spread is larger than the change and
+dominated by machine load, so no speedup is claimed — this is a structural cleanup of per-layer
+churn, not a measured win. Correctness is unchanged (the same tests and the attention harness still
+match bit for bit).

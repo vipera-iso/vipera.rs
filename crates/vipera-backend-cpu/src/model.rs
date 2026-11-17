@@ -1749,7 +1749,9 @@ fn force_switches(switches: AttentionSwitches) {
 
 #[cfg(test)]
 fn clear_forced_switches() {
-    BENCH_SWITCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    BENCH_SWITCHES.store(0, Ordering::Relaxed);
+    BENCH_WORKERS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1761,12 +1763,14 @@ static BENCH_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 
 /// How many workers share one entry's heads: one per head, up to the thread count and the cap, and
 /// never fewer than one.
+#[inline]
 fn attention_workers(threads: usize, heads: usize, cap: Option<usize>) -> usize {
     threads.min(heads).min(cap.unwrap_or(usize::MAX)).max(1)
 }
 
 /// The heads worker `part` of `workers` computes: contiguous runs that cover `0..heads` exactly
 /// once and differ in length by at most one.
+#[inline]
 fn head_range(heads: usize, workers: usize, part: usize) -> std::ops::Range<usize> {
     heads * part / workers..heads * (part + 1) / workers
 }
@@ -2025,9 +2029,62 @@ fn attend_entries(
         let workers = attention_workers(threads, shape.heads, switches.workers);
         if workers > 1 {
             // The caller takes the last part itself, so the split still puts one thread on each
-            // core but creates and joins one thread fewer per layer.
+            // core but creates and joins one thread fewer per layer. The head/slice bookkeeping stays
+            // on the stack: decode runs this once per layer and the old Vecs showed up in profiles as
+            // avoidable churn.
             let spawned = workers - 1;
             let caller_heads = head_range(shape.heads, workers, spawned);
+            if spawned <= 16 {
+                let mut rest: &mut [f32] = out;
+                let result = thread::scope(|scope| {
+                    let mut handles: [Option<
+                        std::thread::ScopedJoinHandle<'_, Result<(), ViperaError>>,
+                    >; 16] = [const { None }; 16];
+                    for (part, slot_handle) in handles.iter_mut().enumerate().take(spawned) {
+                        let heads = head_range(shape.heads, workers, part);
+                        let len = (heads.end - heads.start) * shape.head_dim;
+                        let (slot, tail) = rest.split_at_mut(len);
+                        rest = tail;
+                        *slot_handle = Some(scope.spawn(move || {
+                            let mut local = AttnScratch::default();
+                            attend_entry(
+                                AttentionCall {
+                                    q: &q[..query],
+                                    kv: &kv[0],
+                                    layer,
+                                    positions: positions[0],
+                                    shape,
+                                    heads: heads.start..heads.end,
+                                    out: slot,
+                                },
+                                &mut local,
+                            )
+                        }));
+                    }
+                    let caller = attend_entry(
+                        AttentionCall {
+                            q: &q[..query],
+                            kv: &kv[0],
+                            layer,
+                            positions: positions[0],
+                            shape,
+                            heads: caller_heads,
+                            out: rest,
+                        },
+                        scratch,
+                    );
+                    for slot_handle in handles.iter_mut().take(spawned) {
+                        slot_handle
+                            .take()
+                            .expect("a spawned attention worker")
+                            .join()
+                            .expect("an attention worker panicked")?;
+                    }
+                    caller
+                });
+                return result;
+            }
+
             let mut slots: Vec<&mut [f32]> = Vec::with_capacity(workers);
             let mut cursor: &mut [f32] = out;
             for part in 0..workers {
@@ -2100,6 +2157,47 @@ fn attend_entries(
     }
 
     // One worker per contiguous run of entries: the output rows are already in that order.
+    if wanted <= 16 {
+        let mut rest: &mut [f32] = out;
+        return thread::scope(|scope| {
+            let mut handles: [Option<std::thread::ScopedJoinHandle<'_, Result<(), ViperaError>>>;
+                16] = [const { None }; 16];
+            for (part, slot_handle) in handles.iter_mut().enumerate().take(wanted) {
+                let first = entries * part / wanted;
+                let end = entries * (part + 1) / wanted;
+                let (slot, tail) = rest.split_at_mut((end - first) * query);
+                rest = tail;
+                *slot_handle = Some(scope.spawn(move || -> Result<(), ViperaError> {
+                    let mut local = AttnScratch::default();
+                    for (offset, row) in slot.chunks_mut(query).enumerate() {
+                        let entry = first + offset;
+                        attend_entry(
+                            AttentionCall {
+                                q: &q[entry * query..][..query],
+                                kv: &kv[entry],
+                                layer,
+                                positions: positions[entry],
+                                shape,
+                                heads: 0..shape.heads,
+                                out: row,
+                            },
+                            &mut local,
+                        )?;
+                    }
+                    Ok(())
+                }));
+            }
+            for slot_handle in handles.iter_mut().take(wanted) {
+                slot_handle
+                    .take()
+                    .expect("a spawned attention worker")
+                    .join()
+                    .expect("an attention worker panicked")?;
+            }
+            Ok(())
+        });
+    }
+
     let mut jobs = Vec::with_capacity(wanted);
     let mut cursor: &mut [f32] = out;
     for part in 0..wanted {
