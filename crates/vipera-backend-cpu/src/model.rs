@@ -1682,6 +1682,11 @@ struct AttentionSwitches {
     split_heads: bool,
     /// Which order the KV bytes are walked in.
     order: RowOrder,
+    /// At most this many workers share a single entry's heads; `None` is one per head up to the
+    /// physical core count (see [`physical_cores`]). Each worker is a thread created and joined
+    /// for the one layer, so more workers divide the arithmetic finer and pay for one more thread;
+    /// past the physical core count the siblings contend instead. `VIPERA_ATTN_WORKERS=N`.
+    workers: Option<usize>,
 }
 
 impl AttentionSwitches {
@@ -1693,6 +1698,10 @@ impl AttentionSwitches {
         Self {
             split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
             order: RowOrder::from_env(),
+            workers: std::env::var("VIPERA_ATTN_WORKERS")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|workers| *workers > 0),
         }
     }
 }
@@ -1711,6 +1720,7 @@ fn flag(name: &str) -> bool {
 fn forced_switches() -> Option<AttentionSwitches> {
     use std::sync::atomic::Ordering;
     let forced = BENCH_SWITCHES.load(Ordering::Relaxed);
+    let workers = BENCH_WORKERS.load(Ordering::Relaxed);
     (forced & 4 != 0).then_some(AttentionSwitches {
         split_heads: forced & 1 != 0,
         order: if forced & 2 != 0 {
@@ -1718,6 +1728,7 @@ fn forced_switches() -> Option<AttentionSwitches> {
         } else {
             RowOrder::TokenMajor
         },
+        workers: (workers != 0).then_some(workers),
     })
 }
 
@@ -1733,6 +1744,7 @@ fn force_switches(switches: AttentionSwitches) {
         | u8::from(switches.split_heads)
         | (u8::from(switches.order == RowOrder::LayerMajor) << 1);
     BENCH_SWITCHES.store(bits, Ordering::Relaxed);
+    BENCH_WORKERS.store(switches.workers.unwrap_or(0), Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1742,6 +1754,44 @@ fn clear_forced_switches() {
 
 #[cfg(test)]
 static BENCH_SWITCHES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The worker cap a measurement forces, `0` for none.
+#[cfg(test)]
+static BENCH_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many workers share one entry's heads: one per head, up to the thread count and the cap, and
+/// never fewer than one.
+fn attention_workers(threads: usize, heads: usize, cap: Option<usize>) -> usize {
+    threads.min(heads).min(cap.unwrap_or(usize::MAX)).max(1)
+}
+
+/// The heads worker `part` of `workers` computes: contiguous runs that cover `0..heads` exactly
+/// once and differ in length by at most one.
+fn head_range(heads: usize, workers: usize, part: usize) -> std::ops::Range<usize> {
+    heads * part / workers..heads * (part + 1) / workers
+}
+
+/// Physical cores, read once.
+///
+/// The matvec pool is memory-bound and runs on every logical processor the OS reports, but this
+/// per-layer head split is compute-bound and builds its workers per layer: on an SMT machine the
+/// sibling threads contend for the same core and the extra spawns cost more than the finer split
+/// saves. Measured on the 4-core/8-thread i5-11300H: 4 workers beat 8 in every sweep at depth 1024
+/// and 4096 (-2% to -20%) and were mixed at 8192. Falls back to the configured thread count when topology
+/// is unavailable.
+fn physical_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        if let Some(cores) = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|text| vipera_core::hardware::parse_physical_cores(&text))
+        {
+            return usize::try_from(cores).unwrap_or(1).max(1);
+        }
+        crate::quant::max_threads()
+    })
+}
 
 fn in_place_kv_enabled() -> bool {
     std::env::var("VIPERA_INPLACE_KV").map_or(true, |value| {
@@ -1971,16 +2021,27 @@ fn attend_entries(
     // row buffer in place and lost (each worker decoded every row again); with the rows read in
     // place a worker repeats only the arithmetic, which is what the split is for.
     if entries == 1 && lanes >= PARALLEL_ATTENTION_MIN && switches.split_heads {
-        let workers = quant::max_threads().min(shape.heads).max(1);
+        let threads = quant::max_threads().min(physical_cores());
+        let workers = attention_workers(threads, shape.heads, switches.workers);
         if workers > 1 {
+            // The caller takes the last part itself, so the split still puts one thread on each
+            // core but creates and joins one thread fewer per layer.
+            let spawned = workers - 1;
+            let caller_heads = head_range(shape.heads, workers, spawned);
+            let mut slots: Vec<&mut [f32]> = Vec::with_capacity(workers);
+            let mut cursor: &mut [f32] = out;
+            for part in 0..workers {
+                let heads = head_range(shape.heads, workers, part);
+                let (slot, rest) = cursor.split_at_mut((heads.end - heads.start) * shape.head_dim);
+                slots.push(slot);
+                cursor = rest;
+            }
+            let caller_slot = slots.pop().expect("one slot per worker");
             let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(workers);
-                let mut cursor: &mut [f32] = out;
-                for part in 0..workers {
-                    let first = shape.heads * part / workers;
-                    let end = shape.heads * (part + 1) / workers;
-                    let (slot, rest) = cursor.split_at_mut((end - first) * shape.head_dim);
-                    cursor = rest;
+                let mut handles = Vec::with_capacity(spawned);
+                for (part, slot) in slots.into_iter().enumerate() {
+                    let heads = head_range(shape.heads, workers, part);
+                    let (first, end) = (heads.start, heads.end);
                     handles.push(scope.spawn(move || {
                         let mut local = AttnScratch::default();
                         attend_entry(
@@ -1997,10 +2058,24 @@ fn attend_entries(
                         )
                     }));
                 }
-                handles
+                let caller = attend_entry(
+                    AttentionCall {
+                        q: &q[..query],
+                        kv: &kv[0],
+                        layer,
+                        positions: positions[0],
+                        shape,
+                        heads: caller_heads,
+                        out: caller_slot,
+                    },
+                    scratch,
+                );
+                let mut results: Vec<Result<(), ViperaError>> = handles
                     .into_iter()
                     .map(|handle| handle.join().expect("an attention worker panicked"))
-                    .collect()
+                    .collect();
+                results.push(caller);
+                results
             });
             return results.into_iter().collect();
         }
@@ -2976,6 +3051,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_head_split_never_has_more_workers_than_heads_threads_or_the_cap() {
+        assert_eq!(attention_workers(8, 12, None), 8);
+        assert_eq!(
+            attention_workers(16, 12, None),
+            12,
+            "one worker per head at most"
+        );
+        assert_eq!(attention_workers(8, 12, Some(3)), 3);
+        assert_eq!(
+            attention_workers(2, 12, Some(6)),
+            2,
+            "the cap cannot add threads"
+        );
+        assert_eq!(attention_workers(1, 12, None), 1);
+        assert_eq!(
+            attention_workers(8, 12, Some(1)),
+            1,
+            "a cap of one is the calling thread's share"
+        );
+    }
+
+    #[test]
+    fn the_head_ranges_cover_every_head_once_whatever_the_worker_count() {
+        for heads in [1_usize, 2, 7, 12, 28, 64] {
+            for workers in 1..=heads {
+                let mut next = 0;
+                let (mut shortest, mut longest) = (usize::MAX, 0);
+                for part in 0..workers {
+                    let range = head_range(heads, workers, part);
+                    assert_eq!(
+                        range.start, next,
+                        "{heads} heads, {workers} workers, part {part}"
+                    );
+                    next = range.end;
+                    shortest = shortest.min(range.len());
+                    longest = longest.max(range.len());
+                }
+                assert_eq!(next, heads, "{heads} heads over {workers} workers");
+                assert!(
+                    longest - shortest <= 1,
+                    "{heads} heads over {workers} workers"
+                );
+                assert!(shortest >= 1, "no worker is left without a head");
+            }
+        }
+    }
+
+    /// What creating and joining the threads of one `thread::scope` costs, per scope and per thread,
+    /// for the worker counts the head split uses. Attention pays this once per layer, 28 times a
+    /// token, on top of the arithmetic it divides.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib scoped_spawn_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a table, run with --ignored --nocapture"]
+    fn scoped_spawn_cost() {
+        for workers in [1_usize, 2, 3, 4, 6, 8] {
+            let mut best = f64::INFINITY;
+            for _ in 0..7 {
+                let rounds = 300;
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    thread::scope(|scope| {
+                        let handles: Vec<_> = (0..workers)
+                            .map(|_| scope.spawn(|| std::hint::black_box(1_u64)))
+                            .collect();
+                        for handle in handles {
+                            std::hint::black_box(handle.join().expect("worker"));
+                        }
+                    });
+                }
+                best = best.min(started.elapsed().as_secs_f64() / f64::from(rounds));
+            }
+            println!(
+                "{workers} threads per scope: {:6.1} us per scope, {:5.1} us per thread, x28 layers = {:5.2} ms a token",
+                best * 1e6,
+                best * 1e6 / workers as f64,
+                best * 28.0 * 1e3
+            );
+        }
+    }
+
     /// The attention switches in every combination, at two depths, all in one process on the same
     /// bytes. Prints the table and asserts every arm at a depth computes the same output, which is
     /// what makes a timing difference a scheduling or locality difference and nothing else.
@@ -3044,8 +3203,20 @@ mod tests {
                 let read = KvRead::of(&kv);
                 let views = std::slice::from_ref(&read);
 
-                for split_heads in [false, true] {
-                    let switches = AttentionSwitches { split_heads, order };
+                for (split_heads, workers) in [
+                    (false, None),
+                    (true, None),
+                    (true, Some(2)),
+                    (true, Some(3)),
+                    (true, Some(4)),
+                    (true, Some(6)),
+                    (true, Some(8)),
+                ] {
+                    let switches = AttentionSwitches {
+                        split_heads,
+                        order,
+                        workers,
+                    };
                     let mut scratch = AttnScratch::default();
                     let pass = |scratch: &mut AttnScratch, out: &mut Vec<f32>| {
                         out.fill(0.0);
@@ -3082,13 +3253,16 @@ mod tests {
             for (switches, best, output) in &arms {
                 let share = 100.0 * (1.0 - best / arms[0].1);
                 println!(
-                    "  {:>11} split {:<5}: {best:6.2} ms ({:.3} ms/layer, {:+.0}% vs token-major/split-off)",
+                    "  {:>11} split {:<5} workers {:<4}: {best:6.2} ms ({:.3} ms/layer, {:+.0}% vs token-major/split-off)",
                     if switches.order == RowOrder::TokenMajor {
                         "token-major"
                     } else {
                         "layer-major"
                     },
                     switches.split_heads,
+                    switches
+                        .workers
+                        .map_or_else(|| "all".to_string(), |workers| workers.to_string()),
                     best / layers as f64,
                     if switches.order == RowOrder::TokenMajor && !switches.split_heads {
                         0.0
@@ -3137,6 +3311,7 @@ mod tests {
             let mut loaded = (Vec::new(), Vec::new());
             for sweep in 0..4 {
                 force_switches(AttentionSwitches {
+                    workers: None,
                     split_heads: true,
                     order,
                 });
@@ -3370,5 +3545,130 @@ mod tests {
         let mut out = [0.0; 4];
         attention(&q, &k_all, &v_all, 1, shape, &mut scores, &mut out);
         assert_eq!(out, [2.0, 3.0, 2.0, 3.0]);
+    }
+
+    /// Both attention arms on the same decode steps, in one process: the cap is worth ~1 ms of a
+    /// ~42 ms step at ctx 1024, which two processes cannot resolve on this machine.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib decode_arm_switch -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a number, run with --ignored --nocapture"]
+    fn decode_arm_switch() {
+        let Some(path) = std::env::var_os("VIPERA_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME")?)
+                    .join(".vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf");
+                path.exists().then_some(path)
+            })
+        else {
+            eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+            return;
+        };
+        let mut backend = CpuBackend::load(&path).expect("load model");
+        let config = backend.config();
+        let bytes_per_token = config
+            .kv_bytes_per_token_for(KvCacheType::F16)
+            .expect("the width is a multiple of 32");
+        const BLOCK: u64 = 16;
+        const STEPS: usize = 100;
+        let ctx: usize = 1024;
+        // Two decode steps a round, one per arm, so the sequence grows by `2 * STEPS`.
+        let blocks = (ctx + 2 * STEPS + 64).div_ceil(BLOCK as usize);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let mut kv = vec![0u8; blocks * bytes_per_token as usize * BLOCK as usize];
+        let prompt: Vec<u32> = (0..ctx).map(|at| 1000 + (at % 400) as u32).collect();
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut next = {
+            let logits = backend
+                .logits(&mut ForwardContext {
+                    tokens: &tokens,
+                    new_tokens: &prompt,
+                    first_position: 0,
+                    block_table: &table,
+                    kv: &mut kv,
+                    tokens_per_block: BLOCK,
+                    bytes_per_token,
+                })
+                .expect("prefill");
+            argmax(&logits)
+        };
+        tokens.extend_from_slice(&prompt);
+
+        let order = RowOrder::from_env();
+        let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut deltas: Vec<f64> = Vec::new();
+        for round in 0..STEPS {
+            // Alternate the direction so neither arm always runs on the warmer cache.
+            let arms = if round % 2 == 0 { [4, 8] } else { [8, 4] };
+            let mut pair = [0.0_f64; 2];
+            for workers in arms {
+                force_switches(AttentionSwitches {
+                    split_heads: true,
+                    order,
+                    workers: Some(workers),
+                });
+                let at = usize::from(workers == 8);
+                let started = std::time::Instant::now();
+                let logits = backend
+                    .logits(&mut ForwardContext {
+                        tokens: &tokens,
+                        new_tokens: &[next],
+                        first_position: tokens.len() as u32,
+                        block_table: &table,
+                        kv: &mut kv,
+                        tokens_per_block: BLOCK,
+                        bytes_per_token,
+                    })
+                    .expect("decode");
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                samples[at].push(elapsed);
+                pair[at] = elapsed;
+                tokens.push(next);
+                next = argmax(&logits);
+            }
+            deltas.push(pair[1] - pair[0]);
+        }
+        clear_forced_switches();
+
+        let mut medians = [0.0; 2];
+        for (at, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            medians[at] = values[values.len() / 2];
+            println!(
+                "{} workers: median {:.2} ms, best {:.2} ms, over {} steps",
+                if at == 0 { 4 } else { 8 },
+                medians[at],
+                values[0],
+                values.len()
+            );
+        }
+        let slower = deltas.iter().filter(|delta| **delta > 0.0).count();
+        let paired = median(&mut deltas);
+        println!(
+            "8 vs 4 at ctx {ctx}: {:+.2} ms/step ({:+.1}%), paired median {paired:+.2} ms, \
+             eight slower in {slower}/{} rounds",
+            medians[1] - medians[0],
+            100.0 * (medians[1] - medians[0]) / medians[0],
+            STEPS
+        );
+
+        fn median(values: &mut [f64]) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        }
+
+        fn argmax(values: &[f32]) -> u32 {
+            let mut best = (0, f32::NEG_INFINITY);
+            for (at, value) in values.iter().enumerate() {
+                if *value > best.1 {
+                    best = (at, *value);
+                }
+            }
+            best.0 as u32
+        }
     }
 }

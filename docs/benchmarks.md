@@ -1166,3 +1166,112 @@ nowhere; and dead code behind a `cfg` no build sets is exactly the kind of thing
 
 The numbers are recorded from commit `673da58` on the dropped branch `feat/zig-prefill`, so the
 next person does not spend a day rebuilding it to learn the same thing.
+### Per-layer attention head split: workers capped at physical cores — 2026-11-17
+
+The split spawns and joins its workers once per layer, 28 times a token. A patch proposed capping
+that count, so the spawn was measured first (`scoped_spawn_cost`, 300 scopes per sample, best of
+seven, empty worker bodies):
+
+| workers | us/scope | x28 layers |
+|---|---|---|
+| 1 | 16.5 | 0.46 ms |
+| 2 | 25.1 | 0.70 ms |
+| 3 | 31.2 | 0.87 ms |
+| 4 | 37.7 | 1.06 ms |
+| 6 | 52.9 | 1.48 ms |
+| 8 | 68.2 | 1.91 ms |
+
+So 8 workers pay 1.91 ms a token in spawn alone at ctx 1024, against a ~32 ms decode step. That is
+real, but smaller than the arithmetic the split takes off. The arms below are `attention_combinations`
+on the 4-core/8-thread i5-11300H: layer-major, f16, 28 layers, `tokens_per_block` 16, every arm in
+one process on the same bytes, unpinned at the default 8 logical threads, best per arm. Both columns
+are the same five sweeps, with both arms present in each.
+
+| depth | 8 workers | 4 workers (physical cores) | change |
+|---|---|---|---|
+| 1024 | 7.74-9.16 ms | 7.55-7.73 ms | -2% to -16%, 4 wins all five |
+| 4096 | 27.10-32.81 ms | 25.49-27.80 ms | -3% to -20%, 4 wins all five |
+| 8192 | 52.68-58.68 ms | 52.40-56.28 ms | -9% to +6%, mixed (3 of 5) |
+
+Reading:
+
+- **The mechanism is SMT contention, not spawn.** The spawn delta between 4 and 8 workers is 0.85 ms
+  a token; the difference at 4096 is 1.5-6.7 ms. Four workers put one thread on each physical core;
+  eight put siblings on the same cores, and this walk is compute-bound, which is the opposite of the
+  memory-bound matvecs where 8 threads measured better than 4.
+- **3 workers are within noise of 4**, sometimes a point or two ahead because the session's own
+  tooling holds a core. The rule is physical cores, not a constant fitted to this laptop.
+- **`VIPERA_THREADS=6` is capped to 4 too, and measured equal or better than 6** in the same harness
+  (1024: 6.78-6.95 vs 7.01-7.10 ms; 4096: 25.88-28.20 vs 27.13-28.29; 8192 mixed). An explicit
+  `VIPERA_ATTN_WORKERS=N` still raises the cap for a measurement.
+
+The output is unchanged by construction and the harness asserts it: the arms differ only in which
+worker computes which head.
+
+**End to end the cap does not resolve.** `decode_attention_scaling` at ctx 1024, three alternating
+runs per arm across two processes (default 4 workers vs `VIPERA_ATTN_WORKERS=8`, same binary):
+41.7 / 41.4 / 42.2 ms per step against 41.5 / 42.1 / 43.1 ms, medians 41.7 and 42.1, spread ±1 ms.
+`decode_arm_switch` then timed both arms on the same hundred decode steps in one process, five
+times: arm medians 43.55 vs 43.75, 43.69 vs 43.27, 43.59 vs 44.19, 44.19 vs 44.17 and 43.83 vs 44.14
+ms; paired per-round medians +0.40, -0.24, +0.12, +0.11 and -0.30 ms, eight workers slower in 54, 46,
+51, 51 and 49 of 100 rounds; best steps 39.9-40.9 ms an arm. At ctx 1024 the cap is therefore neutral end to end to within ±0.4 ms on a 43 ms
+step — the 0.2-1 ms the attention walk gains is below what this machine resolves, so the cap's case
+rests on the walk and on the spawn accounting above, not on a decode number. The in-process harness
+is the ignored `decode_arm_switch` lib bench; it forces both arms on the same steps and needs
+`VIPERA_TEST_MODEL`.
+
+**Reusing one worker team across the 28 layers is not expressible safely here.** Such a team would
+outlive a layer, so it would have to hold the KV buffer for the whole pass, while `kv.write` needs
+it `&mut` between layers; `pool.rs` gets away with the same shape only because the weights it
+borrows are immutable for the pass. Copying the KV rows a worker needs per layer costs far more
+than the 1.91 ms of spawns, and `unsafe` is forbidden outside `simd.rs`.
+
+**So the calling thread takes one head range.** The split used to spawn `workers` threads and leave
+the caller waiting; it now spawns `workers - 1` and computes the last part itself, so the same cores
+are busy with one fewer thread created and joined per layer (6.5 us a layer at four workers, 0.18 ms
+a token, from the spawn table). `attention_combinations`, layer-major, f16, 28 layers, one arm per
+build, three runs of each binary alternating on the same machine:
+
+| depth | before | after | change |
+|---|---|---|---|
+| 1024 | 7.69 ms | 6.97 ms | -9%, ahead in 3/3 pairs |
+| 4096 | 25.42 ms | 24.81 ms | -2.4%, ahead in 3/3 pairs |
+| 8192 | 53.84 ms | 51.23 ms | -4.8%, ahead in 2/3 pairs |
+
+Medians of three runs. A single sweep spreads ±5%, so only the direction is worth quoting: every
+depth moved the same way, by about the size of the spawn the change removes. The output is still
+bit-identical, and the harness asserts it: the split decides which thread computes a head, never
+what a head computes.
+
+**This is the only thread creation left in a decode token.** The six matvecs a layer runs and the
+output projection share one `Pool` scoped to the whole pass, created once and reused across the 28
+layers; `quant::matvec`'s own scoped spawn is not on this path. What remains is the attention split:
+28 scopes a token, 31-38 us each from the spawn table above, so 0.87-1.06 ms of a 43 ms step.
+
+A base-plus-offset KV layout does not remove it. Tried: the compiler refuses the shape whatever the
+addressing looks like, because the obstacle is a lifetime and not an offset — a read view of the
+storage held by a pass-long worker is borrowed for the whole scope, and the next layer's `kv.write`
+needs the same storage `&mut`:
+
+```text
+error[E0502]: cannot borrow `storage` as mutable because it is also borrowed as immutable
+   |     let read = KvRead { storage: &storage };
+   |                                      -------- immutable borrow occurs here
+   |     scope.spawn(move || { let _ = read.storage.len(); });
+   |     storage[0] = 1;
+   |     ^^^^^^^ mutable borrow occurs here
+```
+
+The safe shapes are a lock shared with the team (`RwLock` around the storage, one lock pair a layer,
+and the buffer would have to stop arriving as the runtime's `&mut [u8]`) or running the layer loop
+inside the team so it owns the storage. Both can buy at most the 0.87 ms of spawn, because the split
+itself is worth much more and stays either way: layer-major, split off against four workers, three
+runs, 10.3 -> 7.2 ms at 1024, 43.6 -> 27.3 at 4096 and 86.0 -> 51.1 at 8192. Two percent of a step is
+not worth moving KV ownership out of the runtime, so the spawn stays per layer.
+
+**At long history the cap is not a measured win.** The same sweep at 4096 and 8192, two runs, four
+workers against eight: 27.17 vs 25.83 and 27.46 vs 25.68 ms at 4096 (eight ahead by 5-6%), 52.13 vs
+51.07 and 50.11 vs 52.13 ms at 8192 (the sign flips between runs). Only 1024 reproduces the cap's
+advantage across runs, so at longer contexts the case for four workers is the oversubscription one —
+half the spawns and no sibling threads fighting for the same cores on a machine that is never idle —
+not a measured gain.
