@@ -1399,7 +1399,19 @@ impl<'a> KvRead<'a> {
         positions: usize,
         visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
     ) -> Result<(), ViperaError> {
-        for_each_row(
+        self.for_each_row_range(order, layer, layer_bytes, 0, positions, visit)
+    }
+
+    fn for_each_row_range(
+        &self,
+        order: RowOrder,
+        layer: usize,
+        layer_bytes: usize,
+        start: usize,
+        end: usize,
+        visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
+    ) -> Result<(), ViperaError> {
+        for_each_row_range(
             self.storage,
             self.table,
             self.tokens_per_block,
@@ -1407,7 +1419,8 @@ impl<'a> KvRead<'a> {
             order,
             layer,
             layer_bytes,
-            positions,
+            start,
+            end,
             visit,
         )
     }
@@ -1440,9 +1453,9 @@ impl<'a> KvRead<'a> {
     }
 }
 
-/// [`KvRead::for_each_row`], over a buffer both views can reach.
+/// [`for_each_row`] restricted to positions `[start, end)`.
 #[allow(clippy::too_many_arguments)]
-fn for_each_row(
+fn for_each_row_range(
     storage: &[u8],
     table: &[u32],
     tokens_per_block: usize,
@@ -1450,18 +1463,19 @@ fn for_each_row(
     order: RowOrder,
     layer: usize,
     layer_bytes: usize,
-    positions: usize,
+    start: usize,
+    end: usize,
     mut visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
 ) -> Result<(), ViperaError> {
     let per_block = tokens_per_block.max(1);
-    let mut position = 0;
-    while position < positions {
+    let mut position = start.min(end);
+    while position < end {
         let block = *table
             .get(position / per_block)
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?
             as usize;
         let block_start = block * per_block * bytes_per_token;
-        let in_block = (per_block - position % per_block).min(positions - position);
+        let in_block = (per_block - position % per_block).min(end - position);
         let RowWalk { mut k, stride, v } = order.row_walk(
             block_start,
             position % per_block,
@@ -1680,6 +1694,10 @@ const PARALLEL_ATTENTION_MIN: usize = 4096;
 struct AttentionSwitches {
     /// A single entry's heads go to the pool instead of the calling thread.
     split_heads: bool,
+    /// Split a single entry's KV history across workers and merge the partials (approximate,
+    /// not bit-identical to the serial kernel). On by default; `VIPERA_ATTN_KV_SPLIT=0` restores
+    /// the bit-exact serial/head-split path.
+    kv_split: bool,
     /// Which order the KV bytes are walked in.
     order: RowOrder,
     /// At most this many workers share a single entry's heads; `None` is one per head up to the
@@ -1697,6 +1715,7 @@ impl AttentionSwitches {
         }
         Self {
             split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
+            kv_split: flag("VIPERA_ATTN_KV_SPLIT"),
             order: RowOrder::from_env(),
             workers: std::env::var("VIPERA_ATTN_WORKERS")
                 .ok()
@@ -1723,6 +1742,7 @@ fn forced_switches() -> Option<AttentionSwitches> {
     let workers = BENCH_WORKERS.load(Ordering::Relaxed);
     (forced & 4 != 0).then_some(AttentionSwitches {
         split_heads: forced & 1 != 0,
+        kv_split: forced & 8 != 0,
         order: if forced & 2 != 0 {
             RowOrder::LayerMajor
         } else {
@@ -1742,14 +1762,17 @@ fn force_switches(switches: AttentionSwitches) {
     use std::sync::atomic::Ordering;
     let bits = 4
         | u8::from(switches.split_heads)
-        | (u8::from(switches.order == RowOrder::LayerMajor) << 1);
+        | (u8::from(switches.order == RowOrder::LayerMajor) << 1)
+        | (u8::from(switches.kv_split) << 3);
     BENCH_SWITCHES.store(bits, Ordering::Relaxed);
     BENCH_WORKERS.store(switches.workers.unwrap_or(0), Ordering::Relaxed);
 }
 
 #[cfg(test)]
 fn clear_forced_switches() {
-    BENCH_SWITCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    BENCH_SWITCHES.store(0, Ordering::Relaxed);
+    BENCH_WORKERS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1761,12 +1784,14 @@ static BENCH_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 
 /// How many workers share one entry's heads: one per head, up to the thread count and the cap, and
 /// never fewer than one.
+#[inline]
 fn attention_workers(threads: usize, heads: usize, cap: Option<usize>) -> usize {
     threads.min(heads).min(cap.unwrap_or(usize::MAX)).max(1)
 }
 
 /// The heads worker `part` of `workers` computes: contiguous runs that cover `0..heads` exactly
 /// once and differ in length by at most one.
+#[inline]
 fn head_range(heads: usize, workers: usize, part: usize) -> std::ops::Range<usize> {
     heads * part / workers..heads * (part + 1) / workers
 }
@@ -1951,6 +1976,225 @@ fn attention_streaming_heads(
     })
 }
 
+/// Decode attention split by KV position chunks: each worker computes a partial `(max, sum_exp,
+/// weighted_v)` over a disjoint range of positions for every requested head, then the caller merges
+/// the partials in increasing chunk order. The merge is associative in exact math but groups
+/// floating-point sums differently from the serial two-pass kernel, so the result can differ by
+/// rounding (measured ~1e-7 max-abs on the 12×128 decode shape) and is not bit-identical to
+/// [`attention_streaming_heads`].
+#[allow(clippy::too_many_arguments)]
+fn attention_kv_chunked_heads(
+    q: &[f32],
+    kv: &KvRead<'_>,
+    order: RowOrder,
+    layer: usize,
+    positions: usize,
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
+    out: &mut [f32],
+    workers: usize,
+) -> Result<(), ViperaError> {
+    let count = heads.end - heads.start;
+    if count == 0 || positions == 0 {
+        out[..count * shape.head_dim].fill(0.0);
+        return Ok(());
+    }
+    let workers = workers.min(positions).max(1);
+    if workers <= 1 {
+        let mut scratch = AttnScratch::default();
+        return attention_streaming_heads(
+            q,
+            kv,
+            order,
+            layer,
+            positions,
+            shape,
+            heads,
+            &mut scratch.scores,
+            &mut scratch.row,
+            &mut scratch.head_state,
+            out,
+        );
+    }
+
+    let head_dim = shape.head_dim;
+    let heads_total = shape.heads;
+    let kv_heads = shape.kv_heads;
+    let group = heads_total / kv_heads;
+    let width = kv_heads * head_dim;
+    let layer_bytes = kv.layout.bytes_per_row(width);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sequential = quant::exact_dot_requested();
+    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+
+    #[derive(Clone)]
+    struct Partial {
+        m: Vec<f32>,
+        d: Vec<f32>,
+        o: Vec<f32>,
+    }
+
+    let mut partials: Vec<Partial> = (0..workers)
+        .map(|_| Partial {
+            m: vec![f32::NEG_INFINITY; count],
+            d: vec![0.0_f32; count],
+            o: vec![0.0_f32; count * head_dim],
+        })
+        .collect();
+
+    // One traversal per chunk: the K row yields every head's score, then the V row is folded into a
+    // running (max, sum, weighted-v) with an online-softmax update. Reading K and V once instead of
+    // in two passes also removes the per-worker `heads x positions` score buffer.
+    let compute_chunk = |part: &mut Partial, start: usize, end: usize| -> Result<(), ViperaError> {
+        if start >= end {
+            return Ok(());
+        }
+        let mut scores = vec![0.0_f32; count];
+        let mut row = vec![0.0_f32; width];
+
+        kv.for_each_row_range(order, layer, layer_bytes, start, end, |_position, base| {
+            if !in_place {
+                kv.layout
+                    .decode(&kv.storage[base..base + layer_bytes], &mut row)?;
+            }
+            for kv_head in 0..kv_heads {
+                let packed_k = base + kv_head * head_dim * 2;
+                let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                for member in 0..group {
+                    let head = kv_head * group + member;
+                    if head < heads.start || head >= heads.end {
+                        continue;
+                    }
+                    let local = head - heads.start;
+                    let query = &q[head * head_dim..(head + 1) * head_dim];
+                    let dot = if sequential {
+                        query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
+                    } else if in_place {
+                        crate::simd::dot_f16_f32(query, &kv.storage[packed_k..][..head_dim * 2])
+                    } else {
+                        crate::simd::dot_f32(query, key)
+                    };
+                    scores[local] = dot * scale;
+                }
+            }
+
+            let v_base = kv.value_row(order, base, layer_bytes);
+            if !in_place {
+                kv.layout
+                    .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
+            }
+            for kv_head in 0..kv_heads {
+                let packed_v = v_base + kv_head * head_dim * 2;
+                let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                for member in 0..group {
+                    let head = kv_head * group + member;
+                    if head < heads.start || head >= heads.end {
+                        continue;
+                    }
+                    let local = head - heads.start;
+                    let score = scores[local];
+                    let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                    let weight = if score > part.m[local] {
+                        // A new maximum rescales the running sum and the accumulator by
+                        // `exp(old_max - score)`; the new row then enters with weight one.
+                        let alpha = (part.m[local] - score).exp();
+                        part.m[local] = score;
+                        part.d[local] = part.d[local] * alpha + 1.0;
+                        for value in target.iter_mut() {
+                            *value *= alpha;
+                        }
+                        1.0_f32
+                    } else {
+                        let beta = (score - part.m[local]).exp();
+                        part.d[local] += beta;
+                        beta
+                    };
+                    if in_place {
+                        crate::simd::axpy_f16_f32(
+                            target,
+                            weight,
+                            &kv.storage[packed_v..][..head_dim * 2],
+                        );
+                    } else {
+                        crate::simd::axpy_f32(target, weight, value);
+                    }
+                }
+            }
+            Ok(())
+        })
+    };
+
+    // The caller takes the last chunk; spawn one worker fewer like the head split.
+    let spawned = workers - 1;
+    let caller_range = {
+        let start = positions * spawned / workers;
+        start..(positions * (spawned + 1) / workers)
+    };
+    let (spawn_parts, tail) = partials.split_at_mut(spawned);
+    let caller_part = &mut tail[0];
+    let chunk_error: std::sync::Mutex<Option<ViperaError>> = std::sync::Mutex::new(None);
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(spawned);
+        for (worker, part) in spawn_parts.iter_mut().enumerate() {
+            let start = positions * worker / workers;
+            let end = positions * (worker + 1) / workers;
+            let err = &chunk_error;
+            let f = &compute_chunk;
+            handles.push(scope.spawn(move || {
+                if let Err(e) = f(part, start, end) {
+                    *err.lock().expect("chunk error") = Some(e);
+                }
+            }));
+        }
+
+        if let Err(e) = compute_chunk(caller_part, caller_range.start, caller_range.end) {
+            *chunk_error.lock().expect("chunk error") = Some(e);
+        }
+        for handle in handles {
+            handle.join().expect("an attention chunk worker panicked");
+        }
+    });
+
+    if let Some(err) = chunk_error.into_inner().expect("chunk error") {
+        return Err(err);
+    }
+
+    // Merge partials in increasing chunk order.
+    out[..count * head_dim].fill(0.0);
+    let mut global_m = vec![f32::NEG_INFINITY; count];
+    let mut global_d = vec![0.0_f32; count];
+    for part in &partials {
+        for local in 0..count {
+            let m_new = global_m[local].max(part.m[local]);
+            let scale_a = if global_m[local] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (global_m[local] - m_new).exp()
+            };
+            let scale_b = if part.m[local] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (part.m[local] - m_new).exp()
+            };
+            global_d[local] = global_d[local] * scale_a + part.d[local] * scale_b;
+            let dst = &mut out[local * head_dim..(local + 1) * head_dim];
+            let src = &part.o[local * head_dim..(local + 1) * head_dim];
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d = *d * scale_a + *s * scale_b;
+            }
+            global_m[local] = m_new;
+        }
+    }
+    for local in 0..count {
+        let inv = 1.0 / global_d[local];
+        for value in &mut out[local * head_dim..(local + 1) * head_dim] {
+            *value *= inv;
+        }
+    }
+    Ok(())
+}
+
 /// Attention for one layer, choosing the kernel by history length.
 ///
 /// Both arms compute the same values, bit for bit: they see the same K/V rows in the same order.
@@ -2016,6 +2260,33 @@ fn attend_entries(
         quant::max_threads().min(entries)
     };
 
+    // One entry with a long history has nothing to split by entry. Splitting the KV history into
+    // chunks and merging partial (max, sum, weighted-v) results parallelizes the memory-bound
+    // scan well at depth, at the cost of floating-point merge grouping (~1e-7 max-abs vs serial),
+    // so it is opt-in (`VIPERA_ATTN_KV_SPLIT=1`) and skipped in exact-dot mode.
+    if entries == 1
+        && lanes >= PARALLEL_ATTENTION_MIN
+        && switches.kv_split
+        && !quant::exact_dot_requested()
+    {
+        let threads = quant::max_threads().min(physical_cores());
+        let workers =
+            attention_workers(threads, threads.max(1), switches.workers).min(positions[0].max(1));
+        if workers > 1 {
+            return attention_kv_chunked_heads(
+                &q[..query],
+                &kv[0],
+                switches.order,
+                layer,
+                positions[0],
+                shape,
+                0..shape.heads,
+                &mut out[..query],
+                workers,
+            );
+        }
+    }
+
     // One entry with a long history has nothing to split by entry, but its heads are independent
     // through the whole kernel, so they go to the pool instead. This was measured before with the
     // row buffer in place and lost (each worker decoded every row again); with the rows read in
@@ -2025,9 +2296,62 @@ fn attend_entries(
         let workers = attention_workers(threads, shape.heads, switches.workers);
         if workers > 1 {
             // The caller takes the last part itself, so the split still puts one thread on each
-            // core but creates and joins one thread fewer per layer.
+            // core but creates and joins one thread fewer per layer. The head/slice bookkeeping stays
+            // on the stack: decode runs this once per layer and the old Vecs showed up in profiles as
+            // avoidable churn.
             let spawned = workers - 1;
             let caller_heads = head_range(shape.heads, workers, spawned);
+            if spawned <= 16 {
+                let mut rest: &mut [f32] = out;
+                let result = thread::scope(|scope| {
+                    let mut handles: [Option<
+                        std::thread::ScopedJoinHandle<'_, Result<(), ViperaError>>,
+                    >; 16] = [const { None }; 16];
+                    for (part, slot_handle) in handles.iter_mut().enumerate().take(spawned) {
+                        let heads = head_range(shape.heads, workers, part);
+                        let len = (heads.end - heads.start) * shape.head_dim;
+                        let (slot, tail) = rest.split_at_mut(len);
+                        rest = tail;
+                        *slot_handle = Some(scope.spawn(move || {
+                            let mut local = AttnScratch::default();
+                            attend_entry(
+                                AttentionCall {
+                                    q: &q[..query],
+                                    kv: &kv[0],
+                                    layer,
+                                    positions: positions[0],
+                                    shape,
+                                    heads: heads.start..heads.end,
+                                    out: slot,
+                                },
+                                &mut local,
+                            )
+                        }));
+                    }
+                    let caller = attend_entry(
+                        AttentionCall {
+                            q: &q[..query],
+                            kv: &kv[0],
+                            layer,
+                            positions: positions[0],
+                            shape,
+                            heads: caller_heads,
+                            out: rest,
+                        },
+                        scratch,
+                    );
+                    for slot_handle in handles.iter_mut().take(spawned) {
+                        slot_handle
+                            .take()
+                            .expect("a spawned attention worker")
+                            .join()
+                            .expect("an attention worker panicked")?;
+                    }
+                    caller
+                });
+                return result;
+            }
+
             let mut slots: Vec<&mut [f32]> = Vec::with_capacity(workers);
             let mut cursor: &mut [f32] = out;
             for part in 0..workers {
@@ -2100,6 +2424,47 @@ fn attend_entries(
     }
 
     // One worker per contiguous run of entries: the output rows are already in that order.
+    if wanted <= 16 {
+        let mut rest: &mut [f32] = out;
+        return thread::scope(|scope| {
+            let mut handles: [Option<std::thread::ScopedJoinHandle<'_, Result<(), ViperaError>>>;
+                16] = [const { None }; 16];
+            for (part, slot_handle) in handles.iter_mut().enumerate().take(wanted) {
+                let first = entries * part / wanted;
+                let end = entries * (part + 1) / wanted;
+                let (slot, tail) = rest.split_at_mut((end - first) * query);
+                rest = tail;
+                *slot_handle = Some(scope.spawn(move || -> Result<(), ViperaError> {
+                    let mut local = AttnScratch::default();
+                    for (offset, row) in slot.chunks_mut(query).enumerate() {
+                        let entry = first + offset;
+                        attend_entry(
+                            AttentionCall {
+                                q: &q[entry * query..][..query],
+                                kv: &kv[entry],
+                                layer,
+                                positions: positions[entry],
+                                shape,
+                                heads: 0..shape.heads,
+                                out: row,
+                            },
+                            &mut local,
+                        )?;
+                    }
+                    Ok(())
+                }));
+            }
+            for slot_handle in handles.iter_mut().take(wanted) {
+                slot_handle
+                    .take()
+                    .expect("a spawned attention worker")
+                    .join()
+                    .expect("an attention worker panicked")?;
+            }
+            Ok(())
+        });
+    }
+
     let mut jobs = Vec::with_capacity(wanted);
     let mut cursor: &mut [f32] = out;
     for part in 0..wanted {
@@ -3214,6 +3579,7 @@ mod tests {
                 ] {
                     let switches = AttentionSwitches {
                         split_heads,
+                        kv_split: false,
                         order,
                         workers,
                     };
@@ -3313,6 +3679,7 @@ mod tests {
                 force_switches(AttentionSwitches {
                     workers: None,
                     split_heads: true,
+                    kv_split: false,
                     order,
                 });
                 let mut kv = KvView {
@@ -3368,7 +3735,7 @@ mod tests {
 
         let rows = |order: RowOrder, layer: usize| -> Vec<(usize, usize, usize)> {
             let mut out = Vec::new();
-            for_each_row(
+            for_each_row_range(
                 &storage,
                 &table,
                 per_block,
@@ -3376,6 +3743,7 @@ mod tests {
                 order,
                 layer,
                 row,
+                0,
                 positions,
                 |position, k| {
                     out.push((position, k, order.value_row(k, per_block, row)));
@@ -3608,6 +3976,7 @@ mod tests {
             for workers in arms {
                 force_switches(AttentionSwitches {
                     split_heads: true,
+                    kv_split: false,
                     order,
                     workers: Some(workers),
                 });
@@ -3670,5 +4039,213 @@ mod tests {
             }
             best.0 as u32
         }
+    }
+
+    /// The KV-chunk arm regroups the softmax sums, so it is held to a tight tolerance against the
+    /// serial kernel instead of bit equality; one worker must take the serial kernel unchanged.
+    #[test]
+    fn kv_chunk_split_matches_the_serial_kernel_within_rounding() {
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let tokens_per_block = 16;
+        let positions = 1024_usize;
+        let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            positions,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.05)
+            .collect();
+
+        let mut expected = vec![0.0_f32; shape.heads * shape.head_dim];
+        let mut scratch = AttnScratch::default();
+        attend_entry(
+            AttentionCall {
+                q: &q,
+                kv: &read,
+                layer: 0,
+                positions,
+                shape,
+                heads: 0..shape.heads,
+                out: &mut expected,
+            },
+            &mut scratch,
+        )
+        .expect("serial attention");
+
+        let mut chunked = vec![0.0_f32; shape.heads * shape.head_dim];
+        attention_kv_chunked_heads(
+            &q,
+            &read,
+            RowOrder::LayerMajor,
+            0,
+            positions,
+            shape,
+            0..shape.heads,
+            &mut chunked,
+            4,
+        )
+        .expect("chunked attention");
+
+        let magnitude = expected.iter().fold(0.0_f32, |max, v| max.max(v.abs()));
+        for (serial, split) in expected.iter().zip(chunked.iter()) {
+            assert!(
+                (serial - split).abs() <= 1e-5 * magnitude.max(1.0),
+                "chunked {split} is not within rounding of serial {serial}"
+            );
+        }
+
+        let mut one = vec![0.0_f32; shape.heads * shape.head_dim];
+        attention_kv_chunked_heads(
+            &q,
+            &read,
+            RowOrder::LayerMajor,
+            0,
+            positions,
+            shape,
+            0..shape.heads,
+            &mut one,
+            1,
+        )
+        .expect("one-worker attention");
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&one),
+            bits(&expected),
+            "one worker must fall back to the serial kernel"
+        );
+    }
+
+    /// Pairs the head split against the KV chunk on the same decode step, alternating the arm order
+    /// every round so neither arm always runs on the warmer cache. Needs a model:
+    /// `cargo test --release -p vipera-backend-cpu --lib decode_kv_split_switch -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: needs a model"]
+    fn decode_kv_split_switch() {
+        let Some(path) = std::env::var_os("VIPERA_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME")?)
+                    .join(".vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf");
+                path.exists().then_some(path)
+            })
+        else {
+            eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+            return;
+        };
+        let mut backend = CpuBackend::load(&path).expect("load model");
+        let config = backend.config();
+        let bytes_per_token = config
+            .kv_bytes_per_token_for(KvCacheType::F16)
+            .expect("the width is a multiple of 32");
+        const BLOCK: u64 = 16;
+        const STEPS: usize = 60;
+        let order = RowOrder::from_env();
+
+        for ctx in [1024usize, 4096] {
+            let blocks = (ctx + 2 * STEPS + 64).div_ceil(BLOCK as usize);
+            let table: Vec<u32> = (0..blocks as u32).collect();
+            let mut kv = vec![0u8; blocks * bytes_per_token as usize * BLOCK as usize];
+            let prompt: Vec<u32> = (0..ctx).map(|at| 1000 + (at % 400) as u32).collect();
+            let mut tokens: Vec<u32> = Vec::new();
+            let mut next = {
+                let logits = backend
+                    .logits(&mut ForwardContext {
+                        tokens: &tokens,
+                        new_tokens: &prompt,
+                        first_position: 0,
+                        block_table: &table,
+                        kv: &mut kv,
+                        tokens_per_block: BLOCK,
+                        bytes_per_token,
+                    })
+                    .expect("prefill");
+                argmax_t(&logits)
+            };
+            tokens.extend_from_slice(&prompt);
+
+            let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            let mut deltas: Vec<f64> = Vec::new();
+            for round in 0..STEPS {
+                let arms = if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                let mut pair = [0.0_f64; 2];
+                for kv_split in arms {
+                    force_switches(AttentionSwitches {
+                        split_heads: true,
+                        kv_split,
+                        order,
+                        workers: Some(4),
+                    });
+                    let at = usize::from(kv_split);
+                    let started = std::time::Instant::now();
+                    let logits = backend
+                        .logits(&mut ForwardContext {
+                            tokens: &tokens,
+                            new_tokens: &[next],
+                            first_position: tokens.len() as u32,
+                            block_table: &table,
+                            kv: &mut kv,
+                            tokens_per_block: BLOCK,
+                            bytes_per_token,
+                        })
+                        .expect("decode");
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    samples[at].push(elapsed);
+                    pair[at] = elapsed;
+                    tokens.push(next);
+                    next = argmax_t(&logits);
+                }
+                deltas.push(pair[1] - pair[0]);
+            }
+            clear_forced_switches();
+
+            let mut medians = [0.0; 2];
+            for (at, values) in samples.iter_mut().enumerate() {
+                values.sort_by(f64::total_cmp);
+                medians[at] = values[values.len() / 2];
+            }
+            let slower = deltas.iter().filter(|delta| **delta > 0.0).count();
+            deltas.sort_by(f64::total_cmp);
+            let paired = deltas[deltas.len() / 2];
+            println!(
+                "ctx {ctx}: head-split {:.2} ms/step, kv-split {:.2} ms/step ({:+.1}%), paired median {paired:+.2} ms, kv-split slower in {slower}/{STEPS} rounds",
+                medians[0],
+                medians[1],
+                100.0 * (medians[1] - medians[0]) / medians[0],
+            );
+        }
+    }
+
+    fn argmax_t(values: &[f32]) -> u32 {
+        let mut best = (0, f32::NEG_INFINITY);
+        for (at, value) in values.iter().enumerate() {
+            if *value > best.1 {
+                best = (at, *value);
+            }
+        }
+        best.0 as u32
     }
 }

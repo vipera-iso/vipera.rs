@@ -1275,3 +1275,65 @@ workers against eight: 27.17 vs 25.83 and 27.46 vs 25.68 ms at 4096 (eight ahead
 advantage across runs, so at longer contexts the case for four workers is the oversubscription one —
 half the spawns and no sibling threads fighting for the same cores on a machine that is never idle —
 not a measured gain.
+
+### Attention split bookkeeping off the heap — 2026-11-17
+
+The single-entry (decode) and small multi-entry head/entry splits built `Vec`s for slots, handles and
+results once per layer/call. Both now keep that bookkeeping in fixed stack arrays when the split fits
+(≤ 16 workers/parts), so the hot decode path allocates no per-layer split vectors. `clear_forced_
+switches` also now resets the forced worker cap, which a bench could otherwise leak across
+measurements in one process.
+
+Measured on the same busy 4-core/8-thread machine, layer-major split, 4 workers,
+`attention_combinations`: before 7.33 / 26.12 / 54.72 ms at 1024 / 4096 / 8192 (one run); after
+7.51-8.00 / 27.03-28.15 / 57.25-61.96 ms across three runs. The spread is larger than the change and
+dominated by machine load, so no speedup is claimed — this is a structural cleanup of per-layer
+churn, not a measured win. Correctness is unchanged (the same tests and the attention harness still
+match bit for bit).
+
+### KV-chunk parallel decode — 2026-11-17
+
+Single-entry (decode) attention can also be parallelized by splitting the KV history into contiguous
+position chunks. Each worker walks its chunk once: the K row yields every head's score, then the V row
+is folded into a running `(max, sum_exp, weighted_v)` with an online-softmax update (one `exp` per head
+per position, and a rescale of the accumulator only when a score raises the running maximum). The
+caller merges the partials in increasing chunk order and takes the last chunk itself, so `workers - 1`
+threads are spawned — the same cost model as the head split (~sub-ms per 28-layer token). The ranged
+row-walk means each worker reads only its own chunk.
+
+Unlike the head split, the merge groups floating-point sums differently from the serial kernel, so the
+result is not bit-identical (~1e-7 max-abs on the 12q/2kv/hd128 decode shape) while mathematically
+equivalent. That is the same trade the tiled prefill path makes, so the KV chunk is on by default and
+`VIPERA_ATTN_KV_SPLIT=0` restores the bit-exact serial/head-split path; exact-dot mode always skips it
+and the bit-exact streaming/buffered contracts are unchanged.
+
+Integrated component measurement, one layer (f16 KV, layer-major, 4 workers, i5-11300H 4C/8T, busy),
+median of 30 rounds, three runs, vs the serial single-entry path:
+
+| positions | serial | KV-chunk ×4 | speedup | max-abs diff |
+|---:|---:|---:|---:|---:|
+| 1024 | 0.36 ms | 0.18 ms | ~2.0× | 8.9e-8 |
+| 4096 | 1.41 ms | 0.55 ms | ~2.6× | 8.4e-8 |
+| 8192 | 2.96 ms | 1.02 ms | ~2.9× | 7.6e-8 |
+
+An earlier two-pass variant — a max pass over K, then a weighted-V pass over a per-worker
+`heads × chunk_positions` score buffer — measured 0.25 / 0.48 / 0.93 ms on the same shape (one run
+each): clearly slower at 1024, faster at 4096/8192. The fused walk ships anyway because it removes the
+score buffer (`heads × chunk_positions × 4` bytes per worker, ~98 KB at 8192 with four workers) and
+because it is the variant every end-to-end number below was taken with.
+
+End-to-end decode on Qwen2.5-1.5B Q4_K_M (greedy, `decode_kv_split_switch`, 60 paired rounds with the
+arm order alternating every round, 4 workers, `first_position` growing from ctx):
+
+| ctx | head split | KV-chunk | delta | paired median | KV-chunk slower in |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 43.99 ms/step | 41.33 ms/step | −6.0% | −2.74 ms | 13/60 rounds |
+| 4096 | 64.88 ms/step | 54.26 ms/step | −16.4% | −11.59 ms | 0/60 rounds |
+
+It wins end-to-end at both depths, which is why it is on by default. The split stays inside one
+`pool`-free scope per call; a team that lives across layers is still blocked on the KV storage
+ownership, as recorded above.
+
+The numerics are pinned by `kv_chunk_split_matches_the_serial_kernel_within_rounding`: the chunked
+arm must stay within 1e-5 of the serial kernel on the decode shape, and a single worker must fall
+back to the serial kernel bit-for-bit.
