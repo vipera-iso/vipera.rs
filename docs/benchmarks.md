@@ -1366,3 +1366,14 @@ buffer for the next layer's KV append (E0502), and `unsafe` is forbidden outside
 it means a read-only KV view separate from the write handle, with the buffer owned by the pass and
 handed to workers through an `RwLock` (readers during a layer, the writer between layers) or copied
 per layer — a storage redesign that the ~2% ceiling does not pay for today.
+
+Keeping a team hot across layers (the "single spawn scope budget" this work asked for) was measured
+and does not pay. A spin-wait handoff to three workers already in `thread::scope` is 0.2 µs, which
+would drop the 28-scope cost from ~1.06 ms to ~0.01 ms, but those three cores then compete with the
+matvec pool between attention calls: on the `8960 × 1536` Q4_K shape (`thread_budget` 8, 4C/8T,
+release, 20 calls) a parked baseline ran 0.16 ms/call while the same call with three cores spinning
+ran 0.26 ms/call, +61%. Parking the team between layers instead of spinning removes the contention but
+costs roughly what a scope does (~36 µs per dispatch in `pool_dispatch_cost`), so it cannot beat the
+37.9 µs scope it would replace. The ownership blocker is unchanged, and the contention/cost numbers
+close the remaining gap: there is no safe, non-regressing way to keep attention workers alive across
+the 28 layers on this machine.
