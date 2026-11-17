@@ -1211,10 +1211,10 @@ worker computes which head.
 **End to end the cap does not resolve.** `decode_attention_scaling` at ctx 1024, three alternating
 runs per arm across two processes (default 4 workers vs `VIPERA_ATTN_WORKERS=8`, same binary):
 41.7 / 41.4 / 42.2 ms per step against 41.5 / 42.1 / 43.1 ms, medians 41.7 and 42.1, spread ±1 ms.
-`decode_arm_switch` then timed both arms on the same hundred decode steps in one process, three
-times: arm medians 43.55 vs 43.75, 43.69 vs 43.27 and 43.59 vs 44.19 ms; paired per-round medians
-+0.40, -0.24 and +0.12 ms, eight workers slower in 54, 46 and 51 of 100 rounds; best steps 40.7-40.9
-ms either way. At ctx 1024 the cap is therefore neutral end to end to within ±0.4 ms on a 43 ms
+`decode_arm_switch` then timed both arms on the same hundred decode steps in one process, five
+times: arm medians 43.55 vs 43.75, 43.69 vs 43.27, 43.59 vs 44.19, 44.19 vs 44.17 and 43.83 vs 44.14
+ms; paired per-round medians +0.40, -0.24, +0.12, +0.11 and -0.30 ms, eight workers slower in 54, 46,
+51, 51 and 49 of 100 rounds; best steps 39.9-40.9 ms an arm. At ctx 1024 the cap is therefore neutral end to end to within ±0.4 ms on a 43 ms
 step — the 0.2-1 ms the attention walk gains is below what this machine resolves, so the cap's case
 rests on the walk and on the spawn accounting above, not on a decode number. The in-process harness
 is the ignored `decode_arm_switch` lib bench; it forces both arms on the same steps and needs
@@ -1246,9 +1246,32 @@ what a head computes.
 **This is the only thread creation left in a decode token.** The six matvecs a layer runs and the
 output projection share one `Pool` scoped to the whole pass, created once and reused across the 28
 layers; `quant::matvec`'s own scoped spawn is not on this path. What remains is the attention split:
-28 scopes a token, 31-38 us each from the spawn table above, so about 0.9-1.05 ms of a 43 ms step.
-Removing it needs one team that outlives a layer, which needs a `KvRead` to be sent to it; a `KvRead`
-borrows the KV storage for as long as that team lives, and `kv.write` needs the same storage `&mut`
-between layers. That is the borrow the ledger above rules out, so the spawn stays per layer until the
-KV layout changes (a shared base with per-layer offsets would do it) — not a change to make inside a
-cap.
+28 scopes a token, 31-38 us each from the spawn table above, so 0.87-1.06 ms of a 43 ms step.
+
+A base-plus-offset KV layout does not remove it. Tried: the compiler refuses the shape whatever the
+addressing looks like, because the obstacle is a lifetime and not an offset — a read view of the
+storage held by a pass-long worker is borrowed for the whole scope, and the next layer's `kv.write`
+needs the same storage `&mut`:
+
+```text
+error[E0502]: cannot borrow `storage` as mutable because it is also borrowed as immutable
+   |     let read = KvRead { storage: &storage };
+   |                                      -------- immutable borrow occurs here
+   |     scope.spawn(move || { let _ = read.storage.len(); });
+   |     storage[0] = 1;
+   |     ^^^^^^^ mutable borrow occurs here
+```
+
+The safe shapes are a lock shared with the team (`RwLock` around the storage, one lock pair a layer,
+and the buffer would have to stop arriving as the runtime's `&mut [u8]`) or running the layer loop
+inside the team so it owns the storage. Both can buy at most the 0.87 ms of spawn, because the split
+itself is worth much more and stays either way: layer-major, split off against four workers, three
+runs, 10.3 -> 7.2 ms at 1024, 43.6 -> 27.3 at 4096 and 86.0 -> 51.1 at 8192. Two percent of a step is
+not worth moving KV ownership out of the runtime, so the spawn stays per layer.
+
+**At long history the cap is not a measured win.** The same sweep at 4096 and 8192, two runs, four
+workers against eight: 27.17 vs 25.83 and 27.46 vs 25.68 ms at 4096 (eight ahead by 5-6%), 52.13 vs
+51.07 and 50.11 vs 52.13 ms at 8192 (the sign flips between runs). Only 1024 reproduces the cap's
+advantage across runs, so at longer contexts the case for four workers is the oversubscription one —
+half the spawns and no sibling threads fighting for the same cores on a machine that is never idle —
+not a measured gain.
