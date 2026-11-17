@@ -1337,3 +1337,32 @@ ownership, as recorded above.
 The numerics are pinned by `kv_chunk_split_matches_the_serial_kernel_within_rounding`: the chunked
 arm must stay within 1e-5 of the serial kernel on the decode shape, and a single worker must fall
 back to the serial kernel bit-for-bit.
+
+### Row-walk prefetch in the KV chunk — tried and reverted — 2026-11-17
+
+The chunk walk reads two interleaved streams per position: the K row, then the V row
+`layer_bytes * tokens_per_block` away. The block table restarts both streams at every block
+boundary, so the walk was given explicit `prefetch_ahead` hints for the rows three positions ahead
+(two cache lines each, K and V). Measured as an in-process A/B — a `PREFETCH_ROWS` toggle read by the
+walk, arm order alternating, 40 paired rounds per depth, KV-chunk arm, 4 workers:
+
+| positions | no prefetch | prefetch | delta | prefetch faster in |
+|---:|---:|---:|---:|---:|
+| 4096 | 0.59–0.62 ms | 0.60–0.68 ms | +2.4 … +9.5% | 16–17 / 40 rounds |
+| 8192 | 1.28 ms | 1.34–1.38 ms | +4.9 … +7.1% | 17–19 / 40 rounds |
+
+The hints cost more than they hide: at these depths a worker's stream is a few hundred kilobytes, the
+hardware prefetcher already runs ahead of the dot product, and the extra address arithmetic sits on
+the critical path. Reverted — no prefetch code shipped.
+
+### A worker team across the 28 layers — still blocked — 2026-11-17
+
+The KV chunk spawns `workers - 1` threads per attention call, once per layer and token. Spawn and join
+was measured at 31–38 µs per four-thread scope, so all 28 layers cost ~0.9–1.1 ms per token: 2.4% of
+the 41.33 ms/step at ctx 1024 and 1.5% of 54.26 ms/step at 4096 (numbers above). A team that lives for
+the whole pass would remove that, and it stays blocked on ownership, not on effort: `thread::scope`
+cannot hand a worker a `&[u8]` that lives for the pass while the layer loop needs `&mut` on the same
+buffer for the next layer's KV append (E0502), and `unsafe` is forbidden outside `simd.rs`. Unblocking
+it means a read-only KV view separate from the write handle, with the buffer owned by the pass and
+handed to workers through an `RwLock` (readers during a layer, the writer between layers) or copied
+per layer — a storage redesign that the ~2% ceiling does not pay for today.

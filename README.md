@@ -108,9 +108,10 @@ curl -s localhost:8080/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-`--tls-cert chain.pem --tls-key key.pem` serves HTTPS instead of HTTP (the certificate is not reloaded
-on change; restart to pick up a new one). The server batches up to four conversations into one weight
-read; `--rate-limit` adds a per-key request budget. Every request writes one JSON line to stderr — `{"event":"request","peer":…,
+`--tls-cert chain.pem --tls-key key.pem` serves HTTPS instead of HTTP (the pair is re-read when the
+files change, so a renewed certificate is picked up without a restart). The server batches up to four
+conversations into one weight read; requests carry a per-key budget of 600 a minute unless
+`--rate-limit N` says otherwise, and `--rate-limit 0` turns the budget off. Every request writes one JSON line to stderr — `{"event":"request","peer":…,
 "method":…,"path":…,"status":…,"micros":…}` — the same event shape `vipera generate` prints, and
 `VIPERA_ACCESS_LOG=0` silences it.
 
@@ -119,9 +120,9 @@ read; `--rate-limit` adds a per-key request budget. Every request writes one JSO
 - **GPU**: there is no CUDA, Metal or Vulkan backend. `verify` reports host memory only.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
-- **Server**: rate limiting is opt-in (`--rate-limit`), not a default. TLS needs a certificate:
-  `--tls-cert` and `--tls-key` (PEM; the chain file leaf first) serve HTTPS, and there is no ACME or
-  cert reload — restart to pick up a renewed certificate.
+- **Server**: TLS needs a certificate: `--tls-cert` and `--tls-key` (PEM; the chain file leaf first)
+  serve HTTPS, and the pair is re-read when the files change, so a renewal does not need a restart.
+  There is no ACME client — issue or renew the certificate out of band and write the files in place.
 - **Parity checks**: the continuation test compares against a usage recording of llama.cpp checked
   into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
   `LLAMA_SERVER` at a `llama-server` binary to compare against a live one instead.
