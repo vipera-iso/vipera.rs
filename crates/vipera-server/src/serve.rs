@@ -64,6 +64,11 @@ const MAX_STOP_SEQUENCES: usize = 4;
 /// The engine batches at most four turns, so that is the ceiling for `n`.
 const MAX_CHOICES: usize = 4;
 
+/// Requests per minute per key (or, without a key, per peer address) unless `--rate-limit` says
+/// otherwise. One conversation streams well under this; the budget is there so a runaway client
+/// cannot pin the machine, and `--rate-limit 0` turns it off for a trusted box.
+const DEFAULT_RATE_LIMIT: u32 = 600;
+
 /// Run `vipera serve`: parse `args`, load the model, and serve until a signal arrives.
 ///
 /// `args` are the flags after the subcommand. Returns the process exit code, which is `0` after a
@@ -76,7 +81,7 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let mut model_id: Option<String> = None;
     let mut ctx: Option<u64> = None;
     let mut kv_type = KvCacheType::F16;
-    let mut rate_limit: Option<u32> = None;
+    let mut rate_limit: Option<u32> = Some(DEFAULT_RATE_LIMIT);
     let mut tls_cert: Option<&str> = None;
     let mut tls_key: Option<&str> = None;
 
@@ -117,12 +122,8 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
             }
             "--rate-limit" => {
                 let limit = next_number(args, index, "--rate-limit")?;
-                if limit == 0 {
-                    return Err(ViperaError::usage(
-                        "--rate-limit must be at least 1 (omit the flag for no limit)",
-                    ));
-                }
-                rate_limit = Some(limit);
+                // Zero is the documented way to say "no budget"; the default is `DEFAULT_RATE_LIMIT`.
+                rate_limit = (limit > 0).then_some(limit);
                 index += 1;
             }
             flag if flag.starts_with('-') => {
@@ -154,16 +155,10 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
             return Err(ViperaError::usage("--tls-key needs --tls-cert"));
         }
         (Some(cert), Some(key)) => {
-            let cert_pem = std::fs::read(cert).map_err(|error| {
-                ViperaError::invalid_argument(format!("cannot read {cert}: {error}"))
-            })?;
-            let key_pem = std::fs::read(key).map_err(|error| {
-                ViperaError::invalid_argument(format!("cannot read {key}: {error}"))
-            })?;
-            let config = tls_config(&cert_pem, &key_pem).map_err(|error| {
+            let source = TlsSource::new(cert, key).map_err(|error| {
                 ViperaError::invalid_argument(format!("TLS is not usable: {error}"))
             })?;
-            Some(config)
+            Some(Arc::new(source))
         }
     };
 
@@ -221,6 +216,13 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
                     );
                     continue;
                 };
+                // A renewed certificate is a file write, not a restart: pick it up here, where
+                // the socket is still ours and no request is in flight.
+                if let Some(tls) = &served.tls
+                    && tls.refresh()
+                {
+                    eprintln!("vipera: reloaded the TLS certificate");
+                }
                 // Small replies and streamed tokens: Nagle would hold them back.
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -466,8 +468,8 @@ struct Served {
     rate_limit: Option<Arc<RateLimiter>>,
     metrics: Mutex<Metrics>,
     /// `None` serves plain HTTP. `Some` completes a TLS handshake before reading the request, with
-    /// the certificate and key `--tls-cert` / `--tls-key` named.
-    tls: Option<Arc<rustls::ServerConfig>>,
+    /// the certificate and key `--tls-cert` / `--tls-key` named, re-read when they change.
+    tls: Option<Arc<TlsSource>>,
 }
 
 /// Whatever a connection speaks: a plain `TcpStream`, or the same socket under rustls.
@@ -480,6 +482,95 @@ trait Transport: std::io::Read + std::io::Write {}
 impl Transport for TcpStream {}
 
 impl Transport for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {}
+
+/// A TLS configuration that follows the files it was built from.
+///
+/// Renewing a certificate is a file write here, not a restart: the accept loop compares the pair's
+/// length and modification time before each connection and rebuilds the configuration when they
+/// move. A file that does not parse keeps the previous configuration, so a half-written renewal
+/// cannot take a working server down, and the bad stamp is remembered so it is reported once.
+struct TlsSource {
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    current: std::sync::Mutex<TlsCurrent>,
+}
+
+struct TlsCurrent {
+    config: Arc<rustls::ServerConfig>,
+    stamp: StampPair,
+}
+
+/// The pair of stamps a configuration was built from, `None` when a file is missing.
+type StampPair = (Option<FileStamp>, Option<FileStamp>);
+
+/// Just enough of a file's metadata to notice a rotation, without reading it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+impl TlsSource {
+    fn new(cert: &str, key: &str) -> Result<Self, String> {
+        let cert = std::path::PathBuf::from(cert);
+        let key = std::path::PathBuf::from(key);
+        let (config, stamp) = Self::build(&cert, &key)?;
+        Ok(Self {
+            cert,
+            key,
+            current: std::sync::Mutex::new(TlsCurrent { config, stamp }),
+        })
+    }
+
+    fn build(
+        cert: &std::path::Path,
+        key: &std::path::Path,
+    ) -> Result<(Arc<rustls::ServerConfig>, StampPair), String> {
+        let stamp = (FileStamp::of(cert), FileStamp::of(key));
+        let cert_pem = std::fs::read(cert)
+            .map_err(|error| format!("cannot read {}: {error}", cert.display()))?;
+        let key_pem = std::fs::read(key)
+            .map_err(|error| format!("cannot read {}: {error}", key.display()))?;
+        Ok((tls_config(&cert_pem, &key_pem)?, stamp))
+    }
+
+    /// The configuration to hand the next handshake.
+    fn config(&self) -> Arc<rustls::ServerConfig> {
+        Arc::clone(&self.current.lock().expect("TLS configuration").config)
+    }
+
+    /// Rebuilds the configuration when either file moved. Returns whether it was replaced.
+    fn refresh(&self) -> bool {
+        let stamp = (FileStamp::of(&self.cert), FileStamp::of(&self.key));
+        if self.current.lock().expect("TLS configuration").stamp == stamp {
+            return false;
+        }
+        match Self::build(&self.cert, &self.key) {
+            Ok((config, stamp)) => {
+                let mut current = self.current.lock().expect("TLS configuration");
+                current.config = config;
+                current.stamp = stamp;
+                true
+            }
+            Err(error) => {
+                let mut current = self.current.lock().expect("TLS configuration");
+                current.stamp = stamp;
+                eprintln!("vipera: keeping the previous certificate: {error}");
+                false
+            }
+        }
+    }
+}
 
 /// A server configuration from PEM certificate and key bytes.
 ///
@@ -567,7 +658,7 @@ impl Served {
         ctx: Option<u64>,
         kv_type: KvCacheType,
         rate_limit: Option<u32>,
-        tls: Option<Arc<rustls::ServerConfig>>,
+        tls: Option<Arc<TlsSource>>,
     ) -> Result<Served, ViperaError> {
         let path = resolve_model_path(path)?;
         // This build has no device backend, so plan the placement this process will actually run:
@@ -835,8 +926,8 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
         .peer_addr()
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    if let Some(config) = &served.tls {
-        let connection = rustls::ServerConnection::new(Arc::clone(config))
+    if let Some(source) = &served.tls {
+        let connection = rustls::ServerConnection::new(source.config())
             .map_err(|error| std::io::Error::other(format!("TLS: {error}")))?;
         let mut tls = rustls::StreamOwned::new(connection, stream);
         let result = serve_connection(served, &mut tls, &peer);
@@ -2757,6 +2848,47 @@ mod tests {
         .unwrap();
         let messages = messages_of(&request).expect("valid");
         assert_eq!(messages.len(), 1);
+    }
+
+    /// The certificate pair is read once at startup; a renewal is a file write after that.
+    #[test]
+    fn a_rotated_certificate_is_reloaded_without_a_restart() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::env::temp_dir().join(format!("vipera-tls-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cert = dir.join("chain.crt");
+        let key = dir.join("server.key");
+        std::fs::copy(fixtures.join("chain.crt"), &cert).expect("chain");
+        std::fs::copy(fixtures.join("server.key"), &key).expect("key");
+        let source = TlsSource::new(
+            cert.to_str().expect("utf-8 path"),
+            key.to_str().expect("utf-8 path"),
+        )
+        .expect("the fixture pair loads");
+
+        assert!(!source.refresh(), "nothing moved since startup");
+        let serving = source.config();
+
+        // A half-written renewal keeps the certificate that works: a broken file must not take
+        // the server down, and the bad stamp is remembered instead of retried every connection.
+        std::fs::write(&cert, b"not a certificate").expect("write");
+        assert!(!source.refresh());
+        assert!(Arc::ptr_eq(&serving, &source.config()));
+        assert!(!source.refresh(), "the bad stamp is remembered");
+
+        std::fs::write(
+            &cert,
+            std::fs::read(fixtures.join("server.crt")).expect("leaf"),
+        )
+        .expect("write");
+        assert!(
+            source.refresh(),
+            "a usable renewal replaces the configuration"
+        );
+        assert!(!Arc::ptr_eq(&serving, &source.config()));
+        assert!(!source.refresh(), "the new stamp is remembered");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
