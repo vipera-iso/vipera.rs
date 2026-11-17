@@ -2024,14 +2024,24 @@ fn attend_entries(
         let threads = quant::max_threads().min(physical_cores());
         let workers = attention_workers(threads, shape.heads, switches.workers);
         if workers > 1 {
+            // The caller takes the last part itself, so the split still puts one thread on each
+            // core but creates and joins one thread fewer per layer.
+            let spawned = workers - 1;
+            let caller_heads = head_range(shape.heads, workers, spawned);
+            let mut slots: Vec<&mut [f32]> = Vec::with_capacity(workers);
+            let mut cursor: &mut [f32] = out;
+            for part in 0..workers {
+                let heads = head_range(shape.heads, workers, part);
+                let (slot, rest) = cursor.split_at_mut((heads.end - heads.start) * shape.head_dim);
+                slots.push(slot);
+                cursor = rest;
+            }
+            let caller_slot = slots.pop().expect("one slot per worker");
             let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(workers);
-                let mut cursor: &mut [f32] = out;
-                for part in 0..workers {
+                let mut handles = Vec::with_capacity(spawned);
+                for (part, slot) in slots.into_iter().enumerate() {
                     let heads = head_range(shape.heads, workers, part);
                     let (first, end) = (heads.start, heads.end);
-                    let (slot, rest) = cursor.split_at_mut((end - first) * shape.head_dim);
-                    cursor = rest;
                     handles.push(scope.spawn(move || {
                         let mut local = AttnScratch::default();
                         attend_entry(
@@ -2048,10 +2058,24 @@ fn attend_entries(
                         )
                     }));
                 }
-                handles
+                let caller = attend_entry(
+                    AttentionCall {
+                        q: &q[..query],
+                        kv: &kv[0],
+                        layer,
+                        positions: positions[0],
+                        shape,
+                        heads: caller_heads,
+                        out: caller_slot,
+                    },
+                    scratch,
+                );
+                let mut results: Vec<Result<(), ViperaError>> = handles
                     .into_iter()
                     .map(|handle| handle.join().expect("an attention worker panicked"))
-                    .collect()
+                    .collect();
+                results.push(caller);
+                results
             });
             return results.into_iter().collect();
         }
@@ -3521,5 +3545,114 @@ mod tests {
         let mut out = [0.0; 4];
         attention(&q, &k_all, &v_all, 1, shape, &mut scores, &mut out);
         assert_eq!(out, [2.0, 3.0, 2.0, 3.0]);
+    }
+
+    /// Both attention arms on the same decode steps, in one process: the cap is worth ~1 ms of a
+    /// ~42 ms step at ctx 1024, which two processes cannot resolve on this machine.
+    ///
+    /// ```text
+    /// cargo test --release -p vipera-backend-cpu --lib decode_arm_switch -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement: prints a number, run with --ignored --nocapture"]
+    fn decode_arm_switch() {
+        let Some(path) = std::env::var_os("VIPERA_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME")?)
+                    .join(".vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf");
+                path.exists().then_some(path)
+            })
+        else {
+            eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+            return;
+        };
+        let mut backend = CpuBackend::load(&path).expect("load model");
+        let config = backend.config();
+        let bytes_per_token = config
+            .kv_bytes_per_token_for(KvCacheType::F16)
+            .expect("the width is a multiple of 32");
+        const BLOCK: u64 = 16;
+        let ctx: usize = 1024;
+        let blocks = (ctx + 64).div_ceil(BLOCK as usize);
+        let table: Vec<u32> = (0..blocks as u32).collect();
+        let mut kv = vec![0u8; blocks * bytes_per_token as usize * BLOCK as usize];
+        let prompt: Vec<u32> = (0..ctx).map(|at| 1000 + (at % 400) as u32).collect();
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut next = {
+            let logits = backend
+                .logits(&mut ForwardContext {
+                    tokens: &tokens,
+                    new_tokens: &prompt,
+                    first_position: 0,
+                    block_table: &table,
+                    kv: &mut kv,
+                    tokens_per_block: BLOCK,
+                    bytes_per_token,
+                })
+                .expect("prefill");
+            argmax(&logits)
+        };
+        tokens.extend_from_slice(&prompt);
+
+        let order = RowOrder::from_env();
+        let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        for round in 0..20 {
+            // Alternate the direction so neither arm always runs on the warmer cache.
+            let arms = if round % 2 == 0 { [4, 8] } else { [8, 4] };
+            for workers in arms {
+                force_switches(AttentionSwitches {
+                    split_heads: true,
+                    order,
+                    workers: Some(workers),
+                });
+                let at = usize::from(workers == 8);
+                let started = std::time::Instant::now();
+                let logits = backend
+                    .logits(&mut ForwardContext {
+                        tokens: &tokens,
+                        new_tokens: &[next],
+                        first_position: tokens.len() as u32,
+                        block_table: &table,
+                        kv: &mut kv,
+                        tokens_per_block: BLOCK,
+                        bytes_per_token,
+                    })
+                    .expect("decode");
+                samples[at].push(started.elapsed().as_secs_f64() * 1000.0);
+                tokens.push(next);
+                next = argmax(&logits);
+            }
+        }
+        clear_forced_switches();
+
+        let mut medians = [0.0; 2];
+        for (at, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            medians[at] = values[values.len() / 2];
+            println!(
+                "{} workers: median {:.2} ms, best {:.2} ms, over {} steps",
+                if at == 0 { 4 } else { 8 },
+                medians[at],
+                values[0],
+                values.len()
+            );
+        }
+        println!(
+            "8 vs 4 at ctx {ctx}: {:+.2} ms/step ({:+.1}%)",
+            medians[1] - medians[0],
+            100.0 * (medians[1] - medians[0]) / medians[0]
+        );
+
+        fn argmax(values: &[f32]) -> u32 {
+            let mut best = (0, f32::NEG_INFINITY);
+            for (at, value) in values.iter().enumerate() {
+                if *value > best.1 {
+                    best = (at, *value);
+                }
+            }
+            best.0 as u32
+        }
     }
 }

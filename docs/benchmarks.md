@@ -1209,15 +1209,34 @@ The output is unchanged by construction and the harness asserts it: the arms dif
 worker computes which head.
 
 **End to end the cap does not resolve.** `decode_attention_scaling` at ctx 1024, three alternating
-runs per arm (default 4 workers vs `VIPERA_ATTN_WORKERS=8`, same binary): 41.7 / 41.4 / 42.2 ms per
-step against 41.5 / 42.1 / 43.1 ms, medians 41.7 and 42.1, spread ±1 ms. The direction agrees with
-the component measurement, the difference is inside the noise, which is what the cross-process
-caveat above predicts for a ~1 ms effect on a ~42 ms step.
+runs per arm across two processes (default 4 workers vs `VIPERA_ATTN_WORKERS=8`, same binary):
+41.7 / 41.4 / 42.2 ms per step against 41.5 / 42.1 / 43.1 ms, medians 41.7 and 42.1, spread ±1 ms.
+`decode_arm_switch` then timed both arms on the same twenty decode steps in one process, three
+times: +1.15, +0.02 and -0.45 ms/step for eight workers, best steps within ±0.4 ms. The effect the
+component measurement predicts is under 1 ms of a 42 ms step, and this machine does not resolve it
+either way; the cap's case rests on the attention walk, not on a decode number. The in-process
+harness is the ignored `decode_arm_switch` lib bench; it forces both arms on the same steps and
+needs `VIPERA_TEST_MODEL`.
 
 **Reusing one worker team across the 28 layers is not expressible safely here.** Such a team would
 outlive a layer, so it would have to hold the KV buffer for the whole pass, while `kv.write` needs
 it `&mut` between layers; `pool.rs` gets away with the same shape only because the weights it
 borrows are immutable for the pass. Copying the KV rows a worker needs per layer costs far more
-than the 1.91 ms of spawns, and `unsafe` is forbidden outside `simd.rs`. The per-layer scope stays;
-the remaining safe lever is having the calling thread compute one head range and spawning
-`workers - 1`, which saves one spawn per layer at the cost of one worker's parallelism.
+than the 1.91 ms of spawns, and `unsafe` is forbidden outside `simd.rs`.
+
+**So the calling thread takes one head range.** The split used to spawn `workers` threads and leave
+the caller waiting; it now spawns `workers - 1` and computes the last part itself, so the same cores
+are busy with one fewer thread created and joined per layer (6.5 us a layer at four workers, 0.18 ms
+a token, from the spawn table). `attention_combinations`, layer-major, f16, 28 layers, one arm per
+build, three runs of each binary alternating on the same machine:
+
+| depth | before | after | change |
+|---|---|---|---|
+| 1024 | 7.69 ms | 6.97 ms | -9%, ahead in 3/3 pairs |
+| 4096 | 25.42 ms | 24.81 ms | -2.4%, ahead in 3/3 pairs |
+| 8192 | 53.84 ms | 51.23 ms | -4.8%, ahead in 2/3 pairs |
+
+Medians of three runs. A single sweep spreads ±5%, so only the direction is worth quoting: every
+depth moved the same way, by about the size of the spawn the change removes. The output is still
+bit-identical, and the harness asserts it: the split decides which thread computes a head, never
+what a head computes.
