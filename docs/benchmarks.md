@@ -1290,3 +1290,26 @@ Measured on the same busy 4-core/8-thread machine, layer-major split, 4 workers,
 dominated by machine load, so no speedup is claimed — this is a structural cleanup of per-layer
 churn, not a measured win. Correctness is unchanged (the same tests and the attention harness still
 match bit for bit).
+
+### KV-chunk parallel decode (opt-in) — 2026-11-17
+
+Single-entry (decode) attention can also be parallelized by splitting the KV history into contiguous
+position chunks: each worker computes a partial `(max, sum_exp, weighted_v)` over its chunk for all
+heads (two passes over that chunk, ranged row-walk) and the caller merges the partials in increasing
+chunk order. Unlike the head split, the merge groups floating-point sums differently from the serial
+kernel, so the result is not bit-identical (measured ~1e-7 max-abs on the 12q/2kv/hd128 decode
+shape) while mathematically equivalent. It is therefore opt-in, `VIPERA_ATTN_KV_SPLIT=1`, and skipped
+in exact-dot mode; the default path and the bit-exact streaming/buffered contracts are unchanged.
+
+Integrated component measurement, one layer (f16 KV, layer-major, 4 workers, i5-11300H 4C/8T, busy),
+20 rounds, median, vs the serial single-entry path:
+
+| positions | serial | KV-chunk ×4 | speedup | max-abs diff |
+|---:|---:|---:|---:|---:|
+| 1024 | 0.35 ms | 0.19 ms | ~1.8× | 9.7e-8 |
+| 4096 | 1.46 ms | 0.55 ms | ~2.7× | 8.9e-8 |
+| 8192 | 3.17 ms | 1.05 ms | ~3.0× | 6.8e-8 |
+
+The implementation spawns and joins workers per call (same cost model as the head split, ~sub-ms per
+28-layer token) and uses a ranged row-walk so workers read only their chunk. End-to-end decode impact
+depends on depth and the rest of the step; the head split remains the default bit-exact parallel path.

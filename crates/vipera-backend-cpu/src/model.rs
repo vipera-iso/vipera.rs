@@ -1399,7 +1399,19 @@ impl<'a> KvRead<'a> {
         positions: usize,
         visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
     ) -> Result<(), ViperaError> {
-        for_each_row(
+        self.for_each_row_range(order, layer, layer_bytes, 0, positions, visit)
+    }
+
+    fn for_each_row_range(
+        &self,
+        order: RowOrder,
+        layer: usize,
+        layer_bytes: usize,
+        start: usize,
+        end: usize,
+        visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
+    ) -> Result<(), ViperaError> {
+        for_each_row_range(
             self.storage,
             self.table,
             self.tokens_per_block,
@@ -1407,7 +1419,8 @@ impl<'a> KvRead<'a> {
             order,
             layer,
             layer_bytes,
-            positions,
+            start,
+            end,
             visit,
         )
     }
@@ -1440,9 +1453,9 @@ impl<'a> KvRead<'a> {
     }
 }
 
-/// [`KvRead::for_each_row`], over a buffer both views can reach.
+/// [`for_each_row`] restricted to positions `[start, end)`.
 #[allow(clippy::too_many_arguments)]
-fn for_each_row(
+fn for_each_row_range(
     storage: &[u8],
     table: &[u32],
     tokens_per_block: usize,
@@ -1450,18 +1463,19 @@ fn for_each_row(
     order: RowOrder,
     layer: usize,
     layer_bytes: usize,
-    positions: usize,
+    start: usize,
+    end: usize,
     mut visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
 ) -> Result<(), ViperaError> {
     let per_block = tokens_per_block.max(1);
-    let mut position = 0;
-    while position < positions {
+    let mut position = start.min(end);
+    while position < end {
         let block = *table
             .get(position / per_block)
             .ok_or_else(|| ViperaError::internal("position has no KV block"))?
             as usize;
         let block_start = block * per_block * bytes_per_token;
-        let in_block = (per_block - position % per_block).min(positions - position);
+        let in_block = (per_block - position % per_block).min(end - position);
         let RowWalk { mut k, stride, v } = order.row_walk(
             block_start,
             position % per_block,
@@ -1680,6 +1694,9 @@ const PARALLEL_ATTENTION_MIN: usize = 4096;
 struct AttentionSwitches {
     /// A single entry's heads go to the pool instead of the calling thread.
     split_heads: bool,
+    /// Split a single entry's KV history across workers and merge the partials (approximate,
+    /// not bit-identical to the serial kernel). `VIPERA_ATTN_KV_SPLIT=1` enables it.
+    kv_split: bool,
     /// Which order the KV bytes are walked in.
     order: RowOrder,
     /// At most this many workers share a single entry's heads; `None` is one per head up to the
@@ -1697,6 +1714,10 @@ impl AttentionSwitches {
         }
         Self {
             split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
+            kv_split: std::env::var("VIPERA_ATTN_KV_SPLIT").is_ok_and(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "on" | "yes")
+            }),
             order: RowOrder::from_env(),
             workers: std::env::var("VIPERA_ATTN_WORKERS")
                 .ok()
@@ -1723,6 +1744,7 @@ fn forced_switches() -> Option<AttentionSwitches> {
     let workers = BENCH_WORKERS.load(Ordering::Relaxed);
     (forced & 4 != 0).then_some(AttentionSwitches {
         split_heads: forced & 1 != 0,
+        kv_split: forced & 8 != 0,
         order: if forced & 2 != 0 {
             RowOrder::LayerMajor
         } else {
@@ -1742,7 +1764,8 @@ fn force_switches(switches: AttentionSwitches) {
     use std::sync::atomic::Ordering;
     let bits = 4
         | u8::from(switches.split_heads)
-        | (u8::from(switches.order == RowOrder::LayerMajor) << 1);
+        | (u8::from(switches.order == RowOrder::LayerMajor) << 1)
+        | (u8::from(switches.kv_split) << 3);
     BENCH_SWITCHES.store(bits, Ordering::Relaxed);
     BENCH_WORKERS.store(switches.workers.unwrap_or(0), Ordering::Relaxed);
 }
@@ -1955,6 +1978,234 @@ fn attention_streaming_heads(
     })
 }
 
+/// Decode attention split by KV position chunks: each worker computes a partial `(max, sum_exp,
+/// weighted_v)` over a disjoint range of positions for every requested head, then the caller merges
+/// the partials in increasing chunk order. The merge is associative in exact math but groups
+/// floating-point sums differently from the serial two-pass kernel, so the result can differ by
+/// rounding (measured ~1e-7 max-abs on the 12×128 decode shape) and is not bit-identical to
+/// [`attention_streaming_heads`].
+#[allow(clippy::too_many_arguments)]
+fn attention_kv_chunked_heads(
+    q: &[f32],
+    kv: &KvRead<'_>,
+    order: RowOrder,
+    layer: usize,
+    positions: usize,
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
+    out: &mut [f32],
+    workers: usize,
+) -> Result<(), ViperaError> {
+    let count = heads.end - heads.start;
+    if count == 0 || positions == 0 {
+        out[..count * shape.head_dim].fill(0.0);
+        return Ok(());
+    }
+    let workers = workers.min(positions).max(1);
+    if workers <= 1 {
+        let mut scratch = AttnScratch::default();
+        return attention_streaming_heads(
+            q,
+            kv,
+            order,
+            layer,
+            positions,
+            shape,
+            heads,
+            &mut scratch.scores,
+            &mut scratch.row,
+            &mut scratch.head_state,
+            out,
+        );
+    }
+
+    let head_dim = shape.head_dim;
+    let heads_total = shape.heads;
+    let kv_heads = shape.kv_heads;
+    let group = heads_total / kv_heads;
+    let width = kv_heads * head_dim;
+    let layer_bytes = kv.layout.bytes_per_row(width);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sequential = quant::exact_dot_requested();
+    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+
+    #[derive(Clone)]
+    struct Partial {
+        m: Vec<f32>,
+        d: Vec<f32>,
+        o: Vec<f32>,
+    }
+
+    let mut partials: Vec<Partial> = (0..workers)
+        .map(|_| Partial {
+            m: vec![f32::NEG_INFINITY; count],
+            d: vec![0.0_f32; count],
+            o: vec![0.0_f32; count * head_dim],
+        })
+        .collect();
+    let chunk_error: std::sync::Mutex<Option<ViperaError>> = std::sync::Mutex::new(None);
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for (worker, part) in partials.iter_mut().enumerate() {
+            let start = positions * worker / workers;
+            let end = positions * (worker + 1) / workers;
+            let err = &chunk_error;
+            handles.push(scope.spawn(move || {
+                if start >= end {
+                    return;
+                }
+                let mut scores = vec![0.0_f32; count * (end - start)];
+                let mut row = vec![0.0_f32; width];
+
+                // Pass 1 over the chunk: dot products and per-head maxima.
+                let r = kv.for_each_row_range(
+                    order,
+                    layer,
+                    layer_bytes,
+                    start,
+                    end,
+                    |position, base| {
+                        let p = position - start;
+                        if !in_place {
+                            kv.layout
+                                .decode(&kv.storage[base..base + layer_bytes], &mut row)?;
+                        }
+                        for kv_head in 0..kv_heads {
+                            let packed_k = base + kv_head * head_dim * 2;
+                            let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                            for member in 0..group {
+                                let head = kv_head * group + member;
+                                if head < heads.start || head >= heads.end {
+                                    continue;
+                                }
+                                let local = head - heads.start;
+                                let query = &q[head * head_dim..(head + 1) * head_dim];
+                                let dot = if sequential {
+                                    query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
+                                } else if in_place {
+                                    crate::simd::dot_f16_f32(
+                                        query,
+                                        &kv.storage[packed_k..][..head_dim * 2],
+                                    )
+                                } else {
+                                    crate::simd::dot_f32(query, key)
+                                };
+                                let score = dot * scale;
+                                scores[local * (end - start) + p] = score;
+                                if score > part.m[local] {
+                                    part.m[local] = score;
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                );
+                if let Err(e) = r {
+                    *err.lock().expect("chunk error") = Some(e);
+                    return;
+                }
+
+                // Per-head chunk normalizer: exp(score - m_c) and sum.
+                for local in 0..count {
+                    let best = part.m[local];
+                    let mut total = 0.0_f32;
+                    let window = &mut scores[local * (end - start)..(local + 1) * (end - start)];
+                    for score in window.iter_mut() {
+                        *score = (*score - best).exp();
+                        total += *score;
+                    }
+                    part.d[local] = total;
+                }
+
+                // Pass 2 over the chunk: weighted V sum, unnormalized except for m_c.
+                let r = kv.for_each_row_range(
+                    order,
+                    layer,
+                    layer_bytes,
+                    start,
+                    end,
+                    |position, base| {
+                        let p = position - start;
+                        let v_base = kv.value_row(order, base, layer_bytes);
+                        if !in_place {
+                            kv.layout
+                                .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
+                        }
+                        for kv_head in 0..kv_heads {
+                            let packed_v = v_base + kv_head * head_dim * 2;
+                            let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                            for member in 0..group {
+                                let head = kv_head * group + member;
+                                if head < heads.start || head >= heads.end {
+                                    continue;
+                                }
+                                let local = head - heads.start;
+                                let weight = scores[local * (end - start) + p];
+                                let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                                if in_place {
+                                    crate::simd::axpy_f16_f32(
+                                        target,
+                                        weight,
+                                        &kv.storage[packed_v..][..head_dim * 2],
+                                    );
+                                } else {
+                                    crate::simd::axpy_f32(target, weight, value);
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                );
+                if let Err(e) = r {
+                    *err.lock().expect("chunk error") = Some(e);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("an attention chunk worker panicked");
+        }
+    });
+
+    if let Some(err) = chunk_error.into_inner().expect("chunk error") {
+        return Err(err);
+    }
+
+    // Merge partials in increasing chunk order.
+    out[..count * head_dim].fill(0.0);
+    let mut global_m = vec![f32::NEG_INFINITY; count];
+    let mut global_d = vec![0.0_f32; count];
+    for part in &partials {
+        for local in 0..count {
+            let m_new = global_m[local].max(part.m[local]);
+            let scale_a = if global_m[local] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (global_m[local] - m_new).exp()
+            };
+            let scale_b = if part.m[local] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (part.m[local] - m_new).exp()
+            };
+            global_d[local] = global_d[local] * scale_a + part.d[local] * scale_b;
+            let dst = &mut out[local * head_dim..(local + 1) * head_dim];
+            let src = &part.o[local * head_dim..(local + 1) * head_dim];
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d = *d * scale_a + *s * scale_b;
+            }
+            global_m[local] = m_new;
+        }
+    }
+    for local in 0..count {
+        let inv = 1.0 / global_d[local];
+        for value in &mut out[local * head_dim..(local + 1) * head_dim] {
+            *value *= inv;
+        }
+    }
+    Ok(())
+}
+
 /// Attention for one layer, choosing the kernel by history length.
 ///
 /// Both arms compute the same values, bit for bit: they see the same K/V rows in the same order.
@@ -2019,6 +2270,33 @@ fn attend_entries(
     } else {
         quant::max_threads().min(entries)
     };
+
+    // One entry with a long history has nothing to split by entry. Splitting the KV history into
+    // chunks and merging partial (max, sum, weighted-v) results parallelizes the memory-bound
+    // scan well at depth, at the cost of floating-point merge grouping (~1e-7 max-abs vs serial),
+    // so it is opt-in (`VIPERA_ATTN_KV_SPLIT=1`) and skipped in exact-dot mode.
+    if entries == 1
+        && lanes >= PARALLEL_ATTENTION_MIN
+        && switches.kv_split
+        && !quant::exact_dot_requested()
+    {
+        let threads = quant::max_threads().min(physical_cores());
+        let workers =
+            attention_workers(threads, threads.max(1), switches.workers).min(positions[0].max(1));
+        if workers > 1 {
+            return attention_kv_chunked_heads(
+                &q[..query],
+                &kv[0],
+                switches.order,
+                layer,
+                positions[0],
+                shape,
+                0..shape.heads,
+                &mut out[..query],
+                workers,
+            );
+        }
+    }
 
     // One entry with a long history has nothing to split by entry, but its heads are independent
     // through the whole kernel, so they go to the pool instead. This was measured before with the
@@ -3312,6 +3590,7 @@ mod tests {
                 ] {
                     let switches = AttentionSwitches {
                         split_heads,
+                        kv_split: false,
                         order,
                         workers,
                     };
@@ -3411,6 +3690,7 @@ mod tests {
                 force_switches(AttentionSwitches {
                     workers: None,
                     split_heads: true,
+                    kv_split: false,
                     order,
                 });
                 let mut kv = KvView {
@@ -3466,7 +3746,7 @@ mod tests {
 
         let rows = |order: RowOrder, layer: usize| -> Vec<(usize, usize, usize)> {
             let mut out = Vec::new();
-            for_each_row(
+            for_each_row_range(
                 &storage,
                 &table,
                 per_block,
@@ -3474,6 +3754,7 @@ mod tests {
                 order,
                 layer,
                 row,
+                0,
                 positions,
                 |position, k| {
                     out.push((position, k, order.value_row(k, per_block, row)));
@@ -3706,6 +3987,7 @@ mod tests {
             for workers in arms {
                 force_switches(AttentionSwitches {
                     split_heads: true,
+                    kv_split: false,
                     order,
                     workers: Some(workers),
                 });
