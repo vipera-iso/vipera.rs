@@ -1166,3 +1166,58 @@ nowhere; and dead code behind a `cfg` no build sets is exactly the kind of thing
 
 The numbers are recorded from commit `673da58` on the dropped branch `feat/zig-prefill`, so the
 next person does not spend a day rebuilding it to learn the same thing.
+### Per-layer attention head split: workers capped at physical cores — 2026-11-17
+
+The split spawns and joins its workers once per layer, 28 times a token. A patch proposed capping
+that count, so the spawn was measured first (`scoped_spawn_cost`, 300 scopes per sample, best of
+seven, empty worker bodies):
+
+| workers | us/scope | x28 layers |
+|---|---|---|
+| 1 | 16.5 | 0.46 ms |
+| 2 | 25.1 | 0.70 ms |
+| 3 | 31.2 | 0.87 ms |
+| 4 | 37.7 | 1.06 ms |
+| 6 | 52.9 | 1.48 ms |
+| 8 | 68.2 | 1.91 ms |
+
+So 8 workers pay 1.91 ms a token in spawn alone at ctx 1024, against a ~32 ms decode step. That is
+real, but smaller than the arithmetic the split takes off. The arms below are `attention_combinations`
+on the 4-core/8-thread i5-11300H: layer-major, f16, 28 layers, `tokens_per_block` 16, every arm in
+one process on the same bytes, unpinned at the default 8 logical threads, best per arm. Both columns
+are the same five sweeps, with both arms present in each.
+
+| depth | 8 workers | 4 workers (physical cores) | change |
+|---|---|---|---|
+| 1024 | 7.74-9.16 ms | 7.55-7.73 ms | -2% to -16%, 4 wins all five |
+| 4096 | 27.10-32.81 ms | 25.49-27.80 ms | -3% to -20%, 4 wins all five |
+| 8192 | 52.68-58.68 ms | 52.40-56.28 ms | -9% to +6%, mixed (3 of 5) |
+
+Reading:
+
+- **The mechanism is SMT contention, not spawn.** The spawn delta between 4 and 8 workers is 0.85 ms
+  a token; the difference at 4096 is 1.5-6.7 ms. Four workers put one thread on each physical core;
+  eight put siblings on the same cores, and this walk is compute-bound, which is the opposite of the
+  memory-bound matvecs where 8 threads measured better than 4.
+- **3 workers are within noise of 4**, sometimes a point or two ahead because the session's own
+  tooling holds a core. The rule is physical cores, not a constant fitted to this laptop.
+- **`VIPERA_THREADS=6` is capped to 4 too, and measured equal or better than 6** in the same harness
+  (1024: 6.78-6.95 vs 7.01-7.10 ms; 4096: 25.88-28.20 vs 27.13-28.29; 8192 mixed). An explicit
+  `VIPERA_ATTN_WORKERS=N` still raises the cap for a measurement.
+
+The output is unchanged by construction and the harness asserts it: the arms differ only in which
+worker computes which head.
+
+**End to end the cap does not resolve.** `decode_attention_scaling` at ctx 1024, three alternating
+runs per arm (default 4 workers vs `VIPERA_ATTN_WORKERS=8`, same binary): 41.7 / 41.4 / 42.2 ms per
+step against 41.5 / 42.1 / 43.1 ms, medians 41.7 and 42.1, spread ±1 ms. The direction agrees with
+the component measurement, the difference is inside the noise, which is what the cross-process
+caveat above predicts for a ~1 ms effect on a ~42 ms step.
+
+**Reusing one worker team across the 28 layers is not expressible safely here.** Such a team would
+outlive a layer, so it would have to hold the KV buffer for the whole pass, while `kv.write` needs
+it `&mut` between layers; `pool.rs` gets away with the same shape only because the weights it
+borrows are immutable for the pass. Copying the KV rows a worker needs per layer costs far more
+than the 1.91 ms of spawns, and `unsafe` is forbidden outside `simd.rs`. The per-layer scope stays;
+the remaining safe lever is having the calling thread compute one head range and spawning
+`workers - 1`, which saves one spawn per layer at the cost of one worker's parallelism.
