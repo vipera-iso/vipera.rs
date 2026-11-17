@@ -1211,12 +1211,14 @@ worker computes which head.
 **End to end the cap does not resolve.** `decode_attention_scaling` at ctx 1024, three alternating
 runs per arm across two processes (default 4 workers vs `VIPERA_ATTN_WORKERS=8`, same binary):
 41.7 / 41.4 / 42.2 ms per step against 41.5 / 42.1 / 43.1 ms, medians 41.7 and 42.1, spread ±1 ms.
-`decode_arm_switch` then timed both arms on the same twenty decode steps in one process, three
-times: +1.15, +0.02 and -0.45 ms/step for eight workers, best steps within ±0.4 ms. The effect the
-component measurement predicts is under 1 ms of a 42 ms step, and this machine does not resolve it
-either way; the cap's case rests on the attention walk, not on a decode number. The in-process
-harness is the ignored `decode_arm_switch` lib bench; it forces both arms on the same steps and
-needs `VIPERA_TEST_MODEL`.
+`decode_arm_switch` then timed both arms on the same hundred decode steps in one process, three
+times: arm medians 43.55 vs 43.75, 43.69 vs 43.27 and 43.59 vs 44.19 ms; paired per-round medians
++0.40, -0.24 and +0.12 ms, eight workers slower in 54, 46 and 51 of 100 rounds; best steps 40.7-40.9
+ms either way. At ctx 1024 the cap is therefore neutral end to end to within ±0.4 ms on a 43 ms
+step — the 0.2-1 ms the attention walk gains is below what this machine resolves, so the cap's case
+rests on the walk and on the spawn accounting above, not on a decode number. The in-process harness
+is the ignored `decode_arm_switch` lib bench; it forces both arms on the same steps and needs
+`VIPERA_TEST_MODEL`.
 
 **Reusing one worker team across the 28 layers is not expressible safely here.** Such a team would
 outlive a layer, so it would have to hold the KV buffer for the whole pass, while `kv.write` needs
@@ -1240,3 +1242,13 @@ Medians of three runs. A single sweep spreads ±5%, so only the direction is wor
 depth moved the same way, by about the size of the spawn the change removes. The output is still
 bit-identical, and the harness asserts it: the split decides which thread computes a head, never
 what a head computes.
+
+**This is the only thread creation left in a decode token.** The six matvecs a layer runs and the
+output projection share one `Pool` scoped to the whole pass, created once and reused across the 28
+layers; `quant::matvec`'s own scoped spawn is not on this path. What remains is the attention split:
+28 scopes a token, 31-38 us each from the spawn table above, so about 0.9-1.05 ms of a 43 ms step.
+Removing it needs one team that outlives a layer, which needs a `KvRead` to be sent to it; a `KvRead`
+borrows the KV storage for as long as that team lives, and `kv.write` needs the same storage `&mut`
+between layers. That is the borrow the ledger above rules out, so the spawn stays per layer until the
+KV layout changes (a shared base with per-layer offsets would do it) — not a change to make inside a
+cap.

@@ -3574,8 +3574,10 @@ mod tests {
             .kv_bytes_per_token_for(KvCacheType::F16)
             .expect("the width is a multiple of 32");
         const BLOCK: u64 = 16;
+        const STEPS: usize = 100;
         let ctx: usize = 1024;
-        let blocks = (ctx + 64).div_ceil(BLOCK as usize);
+        // Two decode steps a round, one per arm, so the sequence grows by `2 * STEPS`.
+        let blocks = (ctx + 2 * STEPS + 64).div_ceil(BLOCK as usize);
         let table: Vec<u32> = (0..blocks as u32).collect();
         let mut kv = vec![0u8; blocks * bytes_per_token as usize * BLOCK as usize];
         let prompt: Vec<u32> = (0..ctx).map(|at| 1000 + (at % 400) as u32).collect();
@@ -3598,9 +3600,11 @@ mod tests {
 
         let order = RowOrder::from_env();
         let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
-        for round in 0..20 {
+        let mut deltas: Vec<f64> = Vec::new();
+        for round in 0..STEPS {
             // Alternate the direction so neither arm always runs on the warmer cache.
             let arms = if round % 2 == 0 { [4, 8] } else { [8, 4] };
+            let mut pair = [0.0_f64; 2];
             for workers in arms {
                 force_switches(AttentionSwitches {
                     split_heads: true,
@@ -3620,10 +3624,13 @@ mod tests {
                         bytes_per_token,
                     })
                     .expect("decode");
-                samples[at].push(started.elapsed().as_secs_f64() * 1000.0);
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                samples[at].push(elapsed);
+                pair[at] = elapsed;
                 tokens.push(next);
                 next = argmax(&logits);
             }
+            deltas.push(pair[1] - pair[0]);
         }
         clear_forced_switches();
 
@@ -3639,11 +3646,20 @@ mod tests {
                 values.len()
             );
         }
+        let slower = deltas.iter().filter(|delta| **delta > 0.0).count();
+        let paired = median(&mut deltas);
         println!(
-            "8 vs 4 at ctx {ctx}: {:+.2} ms/step ({:+.1}%)",
+            "8 vs 4 at ctx {ctx}: {:+.2} ms/step ({:+.1}%), paired median {paired:+.2} ms, \
+             eight slower in {slower}/{} rounds",
             medians[1] - medians[0],
-            100.0 * (medians[1] - medians[0]) / medians[0]
+            100.0 * (medians[1] - medians[0]) / medians[0],
+            STEPS
         );
+
+        fn median(values: &mut [f64]) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        }
 
         fn argmax(values: &[f32]) -> u32 {
             let mut best = (0, f32::NEG_INFINITY);
