@@ -1377,3 +1377,33 @@ costs roughly what a scope does (~36 µs per dispatch in `pool_dispatch_cost`), 
 37.9 µs scope it would replace. The ownership blocker is unchanged, and the contention/cost numbers
 close the remaining gap: there is no safe, non-regressing way to keep attention workers alive across
 the 28 layers on this machine.
+
+### Prefill at 1024 and 4096 prompt tokens — 2026-11-17
+
+Measured on the same rig (i5-11300H 4C/8T, release, `~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf`,
+f16 KV) with `VIPERA_PROFILE_STEP=1`. The engine prefills in 128-token chunks (`ceil(n/128)` passes);
+the profiler labels the first chunk of each run `chunk` and the rest `decode`, but every pass in this
+measurement is a prompt-chunk forward (attention grows with position). Best of 3 rounds at 1024, 2 at
+4096:
+
+| prefill | time | throughput | chunks |
+|---|---|---|---|
+| 1024 | 7276.5 ms | 140.7 tok/s | 8 × 128 |
+| 4096 | 50534.4 ms | 81.1 tok/s | 32 × 128 |
+
+Phase split per 128-token chunk (ms and share of that chunk):
+
+| chunk (position) | q4k | q6k | attention | norm | rest | total |
+|---|---|---|---|---|---|---|
+| first (0–127) | 482 ms (67%) | 128 ms (18%) | 42 ms (6%) | 14 ms (2%) | 52 ms (7%) | 718 ms |
+| mid 1k (~896–1023) | 507 ms (54%) | 136 ms (14%) | 230 ms (24%) | 15 ms (2%) | 54 ms (6%) | 941 ms |
+| late 4k (~3968–4095) | 527 ms (36%) | 138 ms (10%) | 710 ms (49%) | 16 ms (1%) | 56 ms (4%) | 1447 ms |
+
+**Bottleneck.** The matmul work per chunk is flat with prompt length (q4k+q6k ~610–665 ms, the weight
+read done once per 128 tokens) while attention grows with the history it scans: 42 ms (6%) at the start,
+~230 ms (24%) by the end of 1k, and ~710 ms (49%) by the end of 4k, overtaking q4k as the largest phase.
+Prefill throughput therefore falls with prompt length (141 → 81 tok/s from 1k to 4k) because total
+attention scales as O(n²) over the prompt. The next lever at 4k prefill is attention, not the matmuls:
+cutting matmul cost helps every chunk equally, but the late chunks that dominate a 4k prompt are now
+attention-bound (and the decode-time KV-chunk kernel is the one that would have to carry a batched
+prefill form).
