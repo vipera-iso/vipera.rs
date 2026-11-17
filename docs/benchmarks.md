@@ -1291,27 +1291,49 @@ dominated by machine load, so no speedup is claimed — this is a structural cle
 churn, not a measured win. Correctness is unchanged (the same tests and the attention harness still
 match bit for bit).
 
-### KV-chunk parallel decode (opt-in) — 2026-11-17
+### KV-chunk parallel decode — 2026-11-17
 
 Single-entry (decode) attention can also be parallelized by splitting the KV history into contiguous
-position chunks: each worker computes a partial `(max, sum_exp, weighted_v)` over its chunk for all
-heads (two passes over that chunk, ranged row-walk) and the caller merges the partials in increasing
-chunk order. Unlike the head split, the merge groups floating-point sums differently from the serial
-kernel, so the result is not bit-identical (measured ~1e-7 max-abs on the 12q/2kv/hd128 decode
-shape) while mathematically equivalent. It is therefore opt-in, `VIPERA_ATTN_KV_SPLIT=1`, and skipped
-in exact-dot mode; the default path and the bit-exact streaming/buffered contracts are unchanged.
+position chunks. Each worker walks its chunk once: the K row yields every head's score, then the V row
+is folded into a running `(max, sum_exp, weighted_v)` with an online-softmax update (one `exp` per head
+per position, and a rescale of the accumulator only when a score raises the running maximum). The
+caller merges the partials in increasing chunk order and takes the last chunk itself, so `workers - 1`
+threads are spawned — the same cost model as the head split (~sub-ms per 28-layer token). The ranged
+row-walk means each worker reads only its own chunk.
+
+Unlike the head split, the merge groups floating-point sums differently from the serial kernel, so the
+result is not bit-identical (~1e-7 max-abs on the 12q/2kv/hd128 decode shape) while mathematically
+equivalent. That is the same trade the tiled prefill path makes, so the KV chunk is on by default and
+`VIPERA_ATTN_KV_SPLIT=0` restores the bit-exact serial/head-split path; exact-dot mode always skips it
+and the bit-exact streaming/buffered contracts are unchanged.
 
 Integrated component measurement, one layer (f16 KV, layer-major, 4 workers, i5-11300H 4C/8T, busy),
-median of 30 rounds, vs the serial single-entry path (caller computes the last chunk, spawning
-`workers - 1` like the head split):
+median of 30 rounds, three runs, vs the serial single-entry path:
 
 | positions | serial | KV-chunk ×4 | speedup | max-abs diff |
 |---:|---:|---:|---:|---:|
-| 1024 | 0.36 ms | 0.25 ms | ~1.5× | 9.7e-8 |
-| 4096 | 1.40 ms | 0.48 ms | ~2.9× | 8.9e-8 |
-| 8192 | 2.95 ms | 0.93 ms | ~3.2× | 6.8e-8 |
+| 1024 | 0.36 ms | 0.18 ms | ~2.0× | 8.9e-8 |
+| 4096 | 1.41 ms | 0.55 ms | ~2.6× | 8.4e-8 |
+| 8192 | 2.96 ms | 1.02 ms | ~2.9× | 7.6e-8 |
 
-The implementation spawns and joins `workers - 1` threads per call (same cost model as the head
-split, ~sub-ms per 28-layer token) and uses a ranged row-walk so workers read only their chunk.
-End-to-end decode impact depends on depth and the rest of the step; the head split remains the
-default bit-exact parallel path.
+An earlier two-pass variant — a max pass over K, then a weighted-V pass over a per-worker
+`heads × chunk_positions` score buffer — measured 0.25 / 0.48 / 0.93 ms on the same shape (one run
+each): clearly slower at 1024, faster at 4096/8192. The fused walk ships anyway because it removes the
+score buffer (`heads × chunk_positions × 4` bytes per worker, ~98 KB at 8192 with four workers) and
+because it is the variant every end-to-end number below was taken with.
+
+End-to-end decode on Qwen2.5-1.5B Q4_K_M (greedy, `decode_kv_split_switch`, 60 paired rounds with the
+arm order alternating every round, 4 workers, `first_position` growing from ctx):
+
+| ctx | head split | KV-chunk | delta | paired median | KV-chunk slower in |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 43.99 ms/step | 41.33 ms/step | −6.0% | −2.74 ms | 13/60 rounds |
+| 4096 | 64.88 ms/step | 54.26 ms/step | −16.4% | −11.59 ms | 0/60 rounds |
+
+It wins end-to-end at both depths, which is why it is on by default. The split stays inside one
+`pool`-free scope per call; a team that lives across layers is still blocked on the KV storage
+ownership, as recorded above.
+
+The numerics are pinned by `kv_chunk_split_matches_the_serial_kernel_within_rounding`: the chunked
+arm must stay within 1e-5 of the serial kernel on the decode shape, and a single worker must fall
+back to the serial kernel bit-for-bit.

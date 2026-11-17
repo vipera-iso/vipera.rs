@@ -1695,7 +1695,8 @@ struct AttentionSwitches {
     /// A single entry's heads go to the pool instead of the calling thread.
     split_heads: bool,
     /// Split a single entry's KV history across workers and merge the partials (approximate,
-    /// not bit-identical to the serial kernel). `VIPERA_ATTN_KV_SPLIT=1` enables it.
+    /// not bit-identical to the serial kernel). On by default; `VIPERA_ATTN_KV_SPLIT=0` restores
+    /// the bit-exact serial/head-split path.
     kv_split: bool,
     /// Which order the KV bytes are walked in.
     order: RowOrder,
@@ -1714,10 +1715,7 @@ impl AttentionSwitches {
         }
         Self {
             split_heads: flag("VIPERA_ATTN_HEAD_SPLIT"),
-            kv_split: std::env::var("VIPERA_ATTN_KV_SPLIT").is_ok_and(|value| {
-                let value = value.trim().to_ascii_lowercase();
-                matches!(value.as_str(), "1" | "true" | "on" | "yes")
-            }),
+            kv_split: flag("VIPERA_ATTN_KV_SPLIT"),
             order: RowOrder::from_env(),
             workers: std::env::var("VIPERA_ATTN_WORKERS")
                 .ok()
@@ -2044,16 +2042,17 @@ fn attention_kv_chunked_heads(
         })
         .collect();
 
+    // One traversal per chunk: the K row yields every head's score, then the V row is folded into a
+    // running (max, sum, weighted-v) with an online-softmax update. Reading K and V once instead of
+    // in two passes also removes the per-worker `heads x positions` score buffer.
     let compute_chunk = |part: &mut Partial, start: usize, end: usize| -> Result<(), ViperaError> {
         if start >= end {
             return Ok(());
         }
-        let mut scores = vec![0.0_f32; count * (end - start)];
+        let mut scores = vec![0.0_f32; count];
         let mut row = vec![0.0_f32; width];
 
-        // Pass 1 over the chunk: dot products and per-head maxima.
-        kv.for_each_row_range(order, layer, layer_bytes, start, end, |position, base| {
-            let p = position - start;
+        kv.for_each_row_range(order, layer, layer_bytes, start, end, |_position, base| {
             if !in_place {
                 kv.layout
                     .decode(&kv.storage[base..base + layer_bytes], &mut row)?;
@@ -2075,31 +2074,10 @@ fn attention_kv_chunked_heads(
                     } else {
                         crate::simd::dot_f32(query, key)
                     };
-                    let score = dot * scale;
-                    scores[local * (end - start) + p] = score;
-                    if score > part.m[local] {
-                        part.m[local] = score;
-                    }
+                    scores[local] = dot * scale;
                 }
             }
-            Ok(())
-        })?;
 
-        // Per-head chunk normalizer: exp(score - m_c) and sum.
-        for local in 0..count {
-            let best = part.m[local];
-            let mut total = 0.0_f32;
-            let window = &mut scores[local * (end - start)..(local + 1) * (end - start)];
-            for score in window.iter_mut() {
-                *score = (*score - best).exp();
-                total += *score;
-            }
-            part.d[local] = total;
-        }
-
-        // Pass 2 over the chunk: weighted V sum, unnormalized except for m_c.
-        kv.for_each_row_range(order, layer, layer_bytes, start, end, |position, base| {
-            let p = position - start;
             let v_base = kv.value_row(order, base, layer_bytes);
             if !in_place {
                 kv.layout
@@ -2114,8 +2092,23 @@ fn attention_kv_chunked_heads(
                         continue;
                     }
                     let local = head - heads.start;
-                    let weight = scores[local * (end - start) + p];
+                    let score = scores[local];
                     let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                    let weight = if score > part.m[local] {
+                        // A new maximum rescales the running sum and the accumulator by
+                        // `exp(old_max - score)`; the new row then enters with weight one.
+                        let alpha = (part.m[local] - score).exp();
+                        part.m[local] = score;
+                        part.d[local] = part.d[local] * alpha + 1.0;
+                        for value in target.iter_mut() {
+                            *value *= alpha;
+                        }
+                        1.0_f32
+                    } else {
+                        let beta = (score - part.m[local]).exp();
+                        part.d[local] += beta;
+                        beta
+                    };
                     if in_place {
                         crate::simd::axpy_f16_f32(
                             target,
@@ -4046,5 +4039,213 @@ mod tests {
             }
             best.0 as u32
         }
+    }
+
+    /// The KV-chunk arm regroups the softmax sums, so it is held to a tight tolerance against the
+    /// serial kernel instead of bit equality; one worker must take the serial kernel unchanged.
+    #[test]
+    fn kv_chunk_split_matches_the_serial_kernel_within_rounding() {
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let tokens_per_block = 16;
+        let positions = 1024_usize;
+        let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            positions,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.05)
+            .collect();
+
+        let mut expected = vec![0.0_f32; shape.heads * shape.head_dim];
+        let mut scratch = AttnScratch::default();
+        attend_entry(
+            AttentionCall {
+                q: &q,
+                kv: &read,
+                layer: 0,
+                positions,
+                shape,
+                heads: 0..shape.heads,
+                out: &mut expected,
+            },
+            &mut scratch,
+        )
+        .expect("serial attention");
+
+        let mut chunked = vec![0.0_f32; shape.heads * shape.head_dim];
+        attention_kv_chunked_heads(
+            &q,
+            &read,
+            RowOrder::LayerMajor,
+            0,
+            positions,
+            shape,
+            0..shape.heads,
+            &mut chunked,
+            4,
+        )
+        .expect("chunked attention");
+
+        let magnitude = expected.iter().fold(0.0_f32, |max, v| max.max(v.abs()));
+        for (serial, split) in expected.iter().zip(chunked.iter()) {
+            assert!(
+                (serial - split).abs() <= 1e-5 * magnitude.max(1.0),
+                "chunked {split} is not within rounding of serial {serial}"
+            );
+        }
+
+        let mut one = vec![0.0_f32; shape.heads * shape.head_dim];
+        attention_kv_chunked_heads(
+            &q,
+            &read,
+            RowOrder::LayerMajor,
+            0,
+            positions,
+            shape,
+            0..shape.heads,
+            &mut one,
+            1,
+        )
+        .expect("one-worker attention");
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&one),
+            bits(&expected),
+            "one worker must fall back to the serial kernel"
+        );
+    }
+
+    /// Pairs the head split against the KV chunk on the same decode step, alternating the arm order
+    /// every round so neither arm always runs on the warmer cache. Needs a model:
+    /// `cargo test --release -p vipera-backend-cpu --lib decode_kv_split_switch -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: needs a model"]
+    fn decode_kv_split_switch() {
+        let Some(path) = std::env::var_os("VIPERA_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.exists())
+            .or_else(|| {
+                let path = std::path::PathBuf::from(std::env::var_os("HOME")?)
+                    .join(".vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf");
+                path.exists().then_some(path)
+            })
+        else {
+            eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+            return;
+        };
+        let mut backend = CpuBackend::load(&path).expect("load model");
+        let config = backend.config();
+        let bytes_per_token = config
+            .kv_bytes_per_token_for(KvCacheType::F16)
+            .expect("the width is a multiple of 32");
+        const BLOCK: u64 = 16;
+        const STEPS: usize = 60;
+        let order = RowOrder::from_env();
+
+        for ctx in [1024usize, 4096] {
+            let blocks = (ctx + 2 * STEPS + 64).div_ceil(BLOCK as usize);
+            let table: Vec<u32> = (0..blocks as u32).collect();
+            let mut kv = vec![0u8; blocks * bytes_per_token as usize * BLOCK as usize];
+            let prompt: Vec<u32> = (0..ctx).map(|at| 1000 + (at % 400) as u32).collect();
+            let mut tokens: Vec<u32> = Vec::new();
+            let mut next = {
+                let logits = backend
+                    .logits(&mut ForwardContext {
+                        tokens: &tokens,
+                        new_tokens: &prompt,
+                        first_position: 0,
+                        block_table: &table,
+                        kv: &mut kv,
+                        tokens_per_block: BLOCK,
+                        bytes_per_token,
+                    })
+                    .expect("prefill");
+                argmax_t(&logits)
+            };
+            tokens.extend_from_slice(&prompt);
+
+            let mut samples: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            let mut deltas: Vec<f64> = Vec::new();
+            for round in 0..STEPS {
+                let arms = if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                };
+                let mut pair = [0.0_f64; 2];
+                for kv_split in arms {
+                    force_switches(AttentionSwitches {
+                        split_heads: true,
+                        kv_split,
+                        order,
+                        workers: Some(4),
+                    });
+                    let at = usize::from(kv_split);
+                    let started = std::time::Instant::now();
+                    let logits = backend
+                        .logits(&mut ForwardContext {
+                            tokens: &tokens,
+                            new_tokens: &[next],
+                            first_position: tokens.len() as u32,
+                            block_table: &table,
+                            kv: &mut kv,
+                            tokens_per_block: BLOCK,
+                            bytes_per_token,
+                        })
+                        .expect("decode");
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    samples[at].push(elapsed);
+                    pair[at] = elapsed;
+                    tokens.push(next);
+                    next = argmax_t(&logits);
+                }
+                deltas.push(pair[1] - pair[0]);
+            }
+            clear_forced_switches();
+
+            let mut medians = [0.0; 2];
+            for (at, values) in samples.iter_mut().enumerate() {
+                values.sort_by(f64::total_cmp);
+                medians[at] = values[values.len() / 2];
+            }
+            let slower = deltas.iter().filter(|delta| **delta > 0.0).count();
+            deltas.sort_by(f64::total_cmp);
+            let paired = deltas[deltas.len() / 2];
+            println!(
+                "ctx {ctx}: head-split {:.2} ms/step, kv-split {:.2} ms/step ({:+.1}%), paired median {paired:+.2} ms, kv-split slower in {slower}/{STEPS} rounds",
+                medians[0],
+                medians[1],
+                100.0 * (medians[1] - medians[0]) / medians[0],
+            );
+        }
+    }
+
+    fn argmax_t(values: &[f32]) -> u32 {
+        let mut best = (0, f32::NEG_INFINITY);
+        for (at, value) in values.iter().enumerate() {
+            if *value > best.1 {
+                best = (at, *value);
+            }
+        }
+        best.0 as u32
     }
 }
