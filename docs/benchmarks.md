@@ -1913,3 +1913,34 @@ the strided row walk itself, which is the next thing to measure rather than gues
 Scaling check, since a flat 32k step invites the question of whether more threads help: 2 threads 64.7
 ms, 4 threads 44.8, 6 threads 40.8, 8 threads 37.4 (before the change). 8 is the ceiling on this
 4-core/8-thread box, so the thread count is not leaving anything on the table.
+
+**Inside the attention kernel, two changes, one discarded.** After batching the heads the kernel was
+still 7.85 ms for 57 MB of KV, so the question was whether it waits on memory or on arithmetic. A
+serial run answered it: 20.9 ms single-threaded is 17 GFLOP/s, which is a two-accumulator mul+add dot
+at its dependency-chain limit, not a bandwidth figure. So:
+
+- **Software prefetch of the next rows: no gain, reverted.** `for_each_row_range` reads one K row and
+  one V row per position out of a 28,672-byte token, so the hardware prefetcher does stop at the
+  first gap; asking for the next two rows' lines by hand changed attention from 7.75 to 7.74 ms. The
+  out-of-order window was already covering the two loads per position, and the chain was the limit.
+- **Interleave the heads of one KV head: kept.** One pass over the row, converted once, multiplied
+  into one accumulator pair per head — six independent chains instead of one, and one row load per
+  group instead of one per head, with a fused multiply-add in place of mul+add. The fused rounding
+  moves the window kernel's scores in the last bit relative to `dot_f16_f32`, which is why only this
+  batched path takes it: the two-pass window kernel and `VIPERA_EXACT_DOT` stay the reference, and
+  the kernel/tolerance tests still pass.
+
+At 32k, 8 threads, `VIPERA_ATTN_WINDOW=2048`:
+
+| attention kernel | attention | median ms/step | tok/s |
+|---|---|---|---|
+| per-head calls | 9.0 | 39.6 | 25.2 |
+| one call per KV head | 7.85 | 36.9 | 27.1 |
+| interleaved heads + FMA | **6.3** | 36.3 | **27.6** |
+
+30% off attention over the three versions, but only 4% off the step, and that is the honest headline:
+**attention is no longer where the time is.** q4k is 19.0 ms (52%) of a 36.3 ms step and q6k 10.9
+(29%), against the 30–36 GB/s that the two kernels themselves reach on a 191 MB tensor (35.9 GB/s at
+8 threads, i.e. 84% of the 43 GB/s ceiling). Everything left on this hardware is in the q4k stream.
+Greedy text is unchanged by all of it: `VIPERA_ATTN_WINDOW=16` (window smaller than the output, so the
+history's middle is really evicted) gives the same 40 tokens as before.

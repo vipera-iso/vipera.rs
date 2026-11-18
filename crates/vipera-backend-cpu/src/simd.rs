@@ -646,14 +646,28 @@ pub(crate) fn dot_f16_f32_heads(
     row: &[u8],
     out: &mut [f32],
 ) {
+    let fma = f16_fma_available();
     let fast = available() && std::is_x86_feature_detected!("f16c");
     let row_length = row.len() / 2;
     let length = head_dim.min(row_length);
+    if fma && length >= 16 && count <= HEADS_IN_REGISTERS && out.len() >= count {
+        // SAFETY: the features were detected above, `count` is inside the register budget and every
+        // head index below is inside `q` and `out`, which this function's slices bound at
+        // `head_dim` per head.
+        unsafe {
+            dot_f16_f32_heads_avx2_fma(q, first_head, count, head_dim, row, length, out);
+        }
+        return;
+    }
     for (member, slot) in out.iter_mut().take(count).enumerate() {
         let at = (first_head + member) * head_dim;
         let query = &q[at..at + head_dim];
         if length == 0 {
             *slot = 0.0;
+        } else if fma && length >= 8 {
+            // SAFETY: AVX2, F16C and FMA were detected once, before the loop, and the kernel reads
+            // only the first `length` values of both operands.
+            *slot = unsafe { dot_f16_f32_avx2_fma(query, row, length) };
         } else if fast && length >= 8 {
             // SAFETY: AVX2 and F16C were detected once, before the loop, and the kernel reads only
             // the first `length` values of both operands.
@@ -678,15 +692,32 @@ pub(crate) fn axpy_f16_f32_heads(
     weights: &[f32],
     row: &[u8],
 ) {
+    let fma = f16_fma_available();
     let fast = available() && std::is_x86_feature_detected!("f16c");
     let row_length = row.len() / 2;
     let length = head_dim.min(row_length);
+    if fma
+        && length >= 8
+        && weights.len() <= HEADS_IN_REGISTERS
+        && targets.len() >= weights.len() * head_dim
+    {
+        // SAFETY: the features were detected above, `weights` is inside the register budget and every
+        // row of `targets` below is inside the slice, which the caller sized at `head_dim` per head.
+        unsafe {
+            axpy_f16_f32_heads_avx2_fma(targets, head_dim, weights, row, length);
+        }
+        return;
+    }
     for (member, weight) in weights.iter().enumerate() {
         let target = &mut targets[member * head_dim..][..head_dim];
         if length == 0 {
             continue;
         }
-        if fast && length >= 8 {
+        if fma && length >= 8 {
+            // SAFETY: AVX2, F16C and FMA were detected once, before the loop, and the kernel writes
+            // only the first `length` values of the target row.
+            unsafe { axpy_f16_f32_avx2_fma(&mut target[..length], *weight, row) };
+        } else if fast && length >= 8 {
             // SAFETY: AVX2 and F16C were detected once, before the loop, and the kernel writes only
             // the first `length` values of the target row.
             unsafe { axpy_f16_f32_avx2(&mut target[..length], *weight, row) };
@@ -694,6 +725,208 @@ pub(crate) fn axpy_f16_f32_heads(
             for (value, chunk) in target.iter_mut().zip(row.as_chunks::<2>().0).take(length) {
                 *value += *weight * f16_to_f32(u16::from_le_bytes(*chunk));
             }
+        }
+    }
+}
+
+/// How many heads the interleaved kernels keep accumulators for at once.
+const HEADS_IN_REGISTERS: usize = 8;
+
+/// The interleaved K kernel: one pass over the row, one accumulator pair per head.
+///
+/// Loading the row once and multiplying it into every head's accumulator takes the dot off its
+/// dependency chain — each head's adds are independent — and removes one row load per head. Per head
+/// the tree is [`dot_f16_f32_avx2_fma`]'s, so this gives that kernel's bits.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, F16C and FMA; `count` must be at most [`HEADS_IN_REGISTERS`];
+/// `q` must hold `first_head + count` heads of `head_dim`; `out` must hold `count` floats; `length`
+/// must not exceed `head_dim` or `row`'s half.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn dot_f16_f32_heads_avx2_fma(
+    q: &[f32],
+    first_head: usize,
+    count: usize,
+    head_dim: usize,
+    row: &[u8],
+    length: usize,
+    out: &mut [f32],
+) {
+    // SAFETY: the caller's contract covers every pointer below; `head < count` keeps the query row
+    // inside `q` and the slot inside `out`, and every load stays before `length`.
+    unsafe {
+        let bytes = row.as_ptr();
+        let mut first = [_mm256_setzero_ps(); HEADS_IN_REGISTERS];
+        let mut second = [_mm256_setzero_ps(); HEADS_IN_REGISTERS];
+        let mut at = 0;
+        while at + 16 <= length {
+            let low = _mm256_cvtph_ps(_mm_loadu_si128(
+                bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+            ));
+            let high = _mm256_cvtph_ps(_mm_loadu_si128(
+                bytes.add((at + 8) * 2) as *const std::arch::x86_64::__m128i
+            ));
+            for head in 0..count {
+                let query = q.as_ptr().add((first_head + head) * head_dim + at);
+                first[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query), low, first[head]);
+                second[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query.add(8)), high, second[head]);
+            }
+            at += 16;
+        }
+        for head in 0..count {
+            let mut total = hsum(_mm256_add_ps(first[head], second[head]));
+            let query = q.as_ptr().add((first_head + head) * head_dim);
+            let mut left = at;
+            while left < length {
+                let low = std::ptr::read_unaligned(bytes.add(left * 2) as *const u16);
+                total += *query.add(left) * f16_to_f32(low);
+                left += 1;
+            }
+            *out.as_mut_ptr().add(head) = total;
+        }
+    }
+}
+
+/// The interleaved V kernel: one conversion of the row per eight values, for every head.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, F16C and FMA; `targets` must hold `weights.len()` rows of `head_dim`;
+/// `length` must not exceed `head_dim` or `row`'s half.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn axpy_f16_f32_heads_avx2_fma(
+    targets: &mut [f32],
+    head_dim: usize,
+    weights: &[f32],
+    row: &[u8],
+    length: usize,
+) {
+    // SAFETY: the caller's contract covers every pointer below; each store lands inside the head's
+    // own row of `targets` and before `length`.
+    unsafe {
+        let bytes = row.as_ptr();
+        let mut at = 0;
+        while at + 8 <= length {
+            let values = _mm256_cvtph_ps(_mm_loadu_si128(
+                bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+            ));
+            for (head, weight) in weights.iter().enumerate() {
+                let target = targets.as_mut_ptr().add(head * head_dim + at);
+                let scale = _mm256_set1_ps(*weight);
+                _mm256_storeu_ps(
+                    target,
+                    _mm256_fmadd_ps(scale, values, _mm256_loadu_ps(target)),
+                );
+            }
+            at += 8;
+        }
+        for (head, weight) in weights.iter().enumerate() {
+            let target = targets.as_mut_ptr().add(head * head_dim);
+            let mut left = at;
+            while left < length {
+                let low = std::ptr::read_unaligned(bytes.add(left * 2) as *const u16);
+                *target.add(left) += weight * f16_to_f32(low);
+                left += 1;
+            }
+        }
+    }
+}
+
+/// Whether the batched head kernels can use a fused multiply-add: AVX2, F16C and FMA, and no
+/// `VIPERA_NO_VNNI`-style opt-out beyond the ones the other kernels honour.
+pub(crate) fn f16_fma_available() -> bool {
+    static FMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FMA.get_or_init(|| {
+        available() && std::is_x86_feature_detected!("f16c") && std::is_x86_feature_detected!("fma")
+    })
+}
+
+/// [`dot_f16_f32_avx2`] with the multiply and the add fused.
+///
+/// The lane order and the two-accumulator tree are unchanged, so this rounds once where the
+/// unfused kernel rounds twice — the scores of the window kernel can differ in the last bit from
+/// [`dot_f16_f32`]. That is why only the batched head path takes it: the two-pass window kernel and
+/// the exact-dot path stay the reference the attention tests compare against.
+///
+/// # Safety
+///
+/// The CPU must support AVX2, F16C and FMA, and `length` must not exceed `a`'s length or `row`'s
+/// half.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn dot_f16_f32_avx2_fma(a: &[f32], row: &[u8], length: usize) -> f32 {
+    // SAFETY: the caller guarantees the features and `length`; every load reads eight halves or
+    // eight floats at an offset that leaves that many before `length`.
+    unsafe {
+        let (left, bytes) = (a.as_ptr(), row.as_ptr());
+        let mut first = _mm256_setzero_ps();
+        let mut second = _mm256_setzero_ps();
+        let mut at = 0;
+        while at + 16 <= length {
+            first = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.add(at)),
+                _mm256_cvtph_ps(_mm_loadu_si128(
+                    bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+                )),
+                first,
+            );
+            second = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.add(at + 8)),
+                _mm256_cvtph_ps(_mm_loadu_si128(
+                    bytes.add((at + 8) * 2) as *const std::arch::x86_64::__m128i
+                )),
+                second,
+            );
+            at += 16;
+        }
+        while at + 8 <= length {
+            first = _mm256_fmadd_ps(
+                _mm256_loadu_ps(left.add(at)),
+                _mm256_cvtph_ps(_mm_loadu_si128(
+                    bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+                )),
+                first,
+            );
+            at += 8;
+        }
+        let mut total = hsum(_mm256_add_ps(first, second));
+        while at < length {
+            let low = std::ptr::read_unaligned(bytes.add(at * 2) as *const u16);
+            total += *left.add(at) * f16_to_f32(low);
+            at += 1;
+        }
+        total
+    }
+}
+
+/// [`axpy_f16_f32_avx2`] with the fused multiply-add, same lane order and same caveat as
+/// [`dot_f16_f32_avx2_fma`].
+///
+/// # Safety
+///
+/// The CPU must support AVX2, F16C and FMA, and `target`'s length must not exceed `row`'s half.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn axpy_f16_f32_avx2_fma(target: &mut [f32], weight: f32, row: &[u8]) {
+    // SAFETY: the caller guarantees the features and that every load is inside `row`; the loop
+    // stops at the last whole block and the tail is one value at a time.
+    unsafe {
+        let length = target.len();
+        let scale = _mm256_set1_ps(weight);
+        let out = target.as_mut_ptr();
+        let input = row.as_ptr();
+        let mut at = 0;
+        while at + 8 <= length {
+            let scaled = _mm256_cvtph_ps(_mm_loadu_si128(
+                input.add(at * 2) as *const std::arch::x86_64::__m128i
+            ));
+            let current = _mm256_loadu_ps(out.add(at));
+            _mm256_storeu_ps(out.add(at), _mm256_fmadd_ps(scale, scaled, current));
+            at += 8;
+        }
+        while at < length {
+            let low = std::ptr::read_unaligned(input.add(at * 2) as *const u16);
+            *out.add(at) += weight * f16_to_f32(low);
+            at += 1;
         }
     }
 }
