@@ -1707,3 +1707,41 @@ never speed.
 256-value key/value width. The correct figure is 117.4 MB and 2.8 ms, so attention at 4096 is 5.8x its
 traffic floor rather than 11x. The conclusion does not change (16.2 ms is still far above any traffic
 floor, and the score pass is still the cost), but the ratio was wrong and is fixed here.
+
+### A sliding window makes large-context decode flat — 2026-11-18
+
+Every exact kernel tried above (online-softmax fusion, query blocking) left the step cost growing with
+context, because the arithmetic per token is O(positions) and nothing loop-shaped removes it. So the
+lever that actually keeps tok/s up at depth is to stop reading the middle of the history: attention
+over the first `sinks` tokens (StreamingLLM's stabiliser) plus the last `window` positions, one softmax
+over that union, one weighted sum of V. `VIPERA_ATTN_WINDOW=<positions>`, `VIPERA_ATTN_SINKS=<n>`
+(default 4), off unless set.
+
+Measured with `decode_cost_at_depth_without_prefill`: the KV cache is sized for the context and left at
+zero, which is a legal f16 row, so a decode step can be timed at 32k without paying for a 32k prefill
+(that prefill takes close to an hour). 8 threads, ms/step and tok/s:
+
+| ctx | full history | window 4096 | window 2048 | window 1024 |
+|---:|---:|---:|---:|---:|
+| 4096 | 55.8 ms (17.9) | 63.7 ms (15.7) | 54.0 ms (18.5) | 46.5 ms (21.5) |
+| 8192 | 73.7 ms (13.6) | 66.0 ms (15.2) | 51.7 ms (19.3) | 48.4 ms (20.7) |
+| 16384 | 104.5 ms (9.6) | 65.2 ms (15.3) | 50.4 ms (19.8) | 46.5 ms (21.5) |
+| 32768 | 183.7 ms (5.4) | 64.6 ms (15.5) | 52.0 ms (19.2) | 44.6 ms (22.4) |
+
+At the model's full 32,768-token context that is **5.4 to 19.2 tok/s** depending on the window, and the
+step stops caring about depth: window 2048 ranges 50.4-54.0 ms from 4k to 32k, against 55.8-183.7 ms
+for the full history. At 4096 or less the window is not applied at all (nothing to drop), which is why
+the 4096 row is flat and slightly worse for 4096: the window path does the same work with one more
+control branch.
+
+The kernel is `attention_window_heads`: it collects the kept positions' scores side by side, runs one
+softmax, then one weighted sum of V — exactly full causal attention over a history whose middle was
+dropped, and pinned by `the_window_kernel_matches_attention_over_the_positions_it_keeps` against a
+reference that sums the same positions by hand (1e-5). One integration detail that was needed for it to
+bite at all: the decode path at depth takes the KV-chunk split, which scans the whole history, so that
+branch stands aside when a window is set and the head split runs instead.
+
+**This is lossy and opt-in.** The model cannot see the middle of its history: a task that needs a fact
+from the start of a long prompt needs `sinks` large enough to hold it, or the window large enough to
+cover it. 2048-4096 is the range where the step is flat and most of a conversation is still visible;
+the default stays the full history.

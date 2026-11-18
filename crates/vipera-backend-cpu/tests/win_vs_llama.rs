@@ -477,6 +477,41 @@ fn decode_attention_scaling() {
     print_llama_hint("decode");
 }
 
+/// Decode at depth without paying for a prefill: the KV cache is allocated for the context and left
+/// at zero (zeros are a legal f16 row, so the softmax stays finite), and the step is timed at that
+/// position. Prefilling 32k takes close to an hour; this measures the same step in seconds.
+///
+/// ```text
+/// cargo test -p vipera-backend-cpu --release --test win_vs_llama -- --ignored --nocapture \
+///     decode_cost_at_depth_without_prefill
+/// VIPERA_ATTN_WINDOW=4096 ...   # the same measurement over a sliding window
+/// ```
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn decode_cost_at_depth_without_prefill() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    for ctx in [4096usize, 8192, 16384, 32768] {
+        let mut state = State::with_room(config, ctx + 4, KvCacheType::F16);
+        state.tokens = vec![1000_u32; ctx];
+        let mut next = 1000_u32;
+        let ms = timed_best(3, || {
+            let logits = backend
+                .logits(&mut state.context(&[next]))
+                .expect("decode at depth");
+            next = argmax(&logits) as u32;
+        });
+        println!(
+            "ctx {ctx:>6}: {ms:>7.1} ms/step ({:>6.1} tok/s)",
+            1000.0 / ms
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // So sánh với llama.cpp nếu có sẵn
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
 //! overrunning.
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::thread;
 
 use vipera_core::gguf::{GgmlType, GgufFile, TensorInfo, Value};
@@ -2009,6 +2010,174 @@ fn attention_streaming_heads(
     })
 }
 
+/// Tokens kept at the front of the history and positions kept before the current one, read from the
+/// environment: `VIPERA_ATTN_WINDOW=<positions>` (0 or unset leaves the full history) and
+/// `VIPERA_ATTN_SINKS=<tokens>` (default 4).
+///
+/// This is the only lever that makes a decode step cost the same at every depth, and it is lossy: the
+/// model stops seeing the middle of its history. It exists because attention at depth is O(positions)
+/// of real arithmetic (see `docs/benchmarks.md`, 2026-11-18) and no exact loop shape removes it.
+fn attention_window() -> Option<(usize, usize)> {
+    static WINDOW: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let window: usize = std::env::var("VIPERA_ATTN_WINDOW")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        if window == 0 {
+            return None;
+        }
+        let sinks: usize = std::env::var("VIPERA_ATTN_SINKS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(4);
+        Some((window, sinks))
+    })
+}
+
+/// Attention over the sinks and the last `window` positions, instead of the whole history.
+///
+/// The positions kept are the union of `[0, sinks)` and `[positions - window, positions)`; their
+/// scores are collected side by side and go through one softmax, then one weighted sum of V. That is
+/// exactly full causal attention over a history whose middle has been dropped, so the arithmetic per
+/// kept position is the streaming kernel's, and the cost stops growing once `positions` passes
+/// `window + sinks`.
+#[allow(clippy::too_many_arguments)]
+fn attention_window_heads(
+    q: &[f32],
+    kv: &KvRead<'_>,
+    order: RowOrder,
+    layer: usize,
+    positions: usize,
+    sinks: usize,
+    window: usize,
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
+    scratch: &mut AttnScratch,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let width = shape.kv_heads * head_dim;
+    let layer_bytes = kv.layout.bytes_per_row(width);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sequential = quant::exact_dot_requested();
+    let count = heads.end - heads.start;
+    if count == 0 || positions == 0 {
+        return Ok(());
+    }
+    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let sinks_end = sinks.min(positions);
+    let window_start = positions.saturating_sub(window).max(sinks_end);
+    let kept = sinks_end + (positions - window_start);
+    let ranges = [(0, sinks_end), (window_start, positions)];
+
+    let scores = &mut scratch.scores;
+    let row = &mut scratch.row;
+    let head_state = &mut scratch.head_state;
+    scores.clear();
+    scores.resize(count * kept, 0.0);
+    row.clear();
+    row.resize(width, 0.0);
+    head_state.clear();
+    head_state.resize(count, f32::NEG_INFINITY);
+
+    // Pass 1: the kept positions' scores, in increasing position order.
+    let mut slot = 0;
+    for (from, to) in ranges {
+        if from >= to {
+            continue;
+        }
+        let base_slot = slot;
+        kv.for_each_row_range(order, layer, layer_bytes, from, to, |position, base| {
+            if !in_place {
+                kv.layout
+                    .decode(&kv.storage[base..base + layer_bytes], row)?;
+            }
+            for kv_head in 0..shape.kv_heads {
+                let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                let packed = (base + kv_head * head_dim * 2)..;
+                for member in 0..group {
+                    let head = kv_head * group + member;
+                    if head < heads.start || head >= heads.end {
+                        continue;
+                    }
+                    let local = head - heads.start;
+                    let query = &q[head * head_dim..(head + 1) * head_dim];
+                    let dot = if sequential {
+                        query.iter().zip(key).map(|(q, k)| q * k).sum::<f32>()
+                    } else if in_place {
+                        crate::simd::dot_f16_f32(query, &kv.storage[packed.start..][..head_dim * 2])
+                    } else {
+                        crate::simd::dot_f32(query, key)
+                    };
+                    let score = dot * scale;
+                    scores[local * kept + base_slot + position - from] = score;
+                    head_state[local] = head_state[local].max(score);
+                }
+            }
+            Ok(())
+        })?;
+        slot += to - from;
+    }
+
+    // Softmax over the kept positions, in the order they collected.
+    for head in 0..count {
+        let best = head_state[head];
+        let window_scores = &mut scores[head * kept..(head + 1) * kept];
+        let mut total = 0.0_f32;
+        for score in window_scores.iter_mut() {
+            *score = (*score - best).exp();
+            total += *score;
+        }
+        head_state[head] = 1.0 / total;
+    }
+
+    // Pass 2: the weighted sum of V over the same positions.
+    out[..count * head_dim].fill(0.0);
+    slot = 0;
+    for (from, to) in ranges {
+        if from >= to {
+            continue;
+        }
+        let base_slot = slot;
+        kv.for_each_row_range(order, layer, layer_bytes, from, to, |position, base| {
+            let value_base = kv.value_row(order, base, layer_bytes);
+            if !in_place {
+                kv.layout
+                    .decode(&kv.storage[value_base..value_base + layer_bytes], row)?;
+            }
+            for kv_head in 0..shape.kv_heads {
+                let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                let packed = (value_base + kv_head * head_dim * 2)..;
+                for member in 0..group {
+                    let head = kv_head * group + member;
+                    if head < heads.start || head >= heads.end {
+                        continue;
+                    }
+                    let local = head - heads.start;
+                    let weight =
+                        scores[local * kept + base_slot + position - from] * head_state[local];
+                    let target = &mut out[local * head_dim..(local + 1) * head_dim];
+                    if in_place {
+                        crate::simd::axpy_f16_f32(
+                            target,
+                            weight,
+                            &kv.storage[packed.start..][..head_dim * 2],
+                        );
+                    } else {
+                        crate::simd::axpy_f32(target, weight, value);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        slot += to - from;
+    }
+    Ok(())
+}
+
 /// Decode attention split by KV position chunks: each worker computes a partial `(max, sum_exp,
 /// weighted_v)` over a disjoint range of positions for every requested head, then the caller merges
 /// the partials in increasing chunk order. The merge is associative in exact math but groups
@@ -2297,9 +2466,13 @@ fn attend_entries(
     // chunks and merging partial (max, sum, weighted-v) results parallelizes the memory-bound
     // scan well at depth, at the cost of floating-point merge grouping (~1e-7 max-abs vs serial),
     // so it is opt-in (`VIPERA_ATTN_KV_SPLIT=1`) and skipped in exact-dot mode.
+    // A window keeps only a slice of the history, so chunking the whole of it by position would
+    // scan the part the window drops. The head split below goes through [`attend_entry`], which is
+    // where the window is applied.
     if entries == 1
         && lanes >= PARALLEL_ATTENTION_MIN
         && switches.kv_split
+        && attention_window().is_none()
         && !quant::exact_dot_requested()
     {
         let threads = quant::max_threads().min(physical_cores());
@@ -2655,6 +2828,24 @@ fn algorithm_for(positions: usize) -> &'static dyn AttentionAlgorithm {
 }
 
 fn attend_entry(call: AttentionCall<'_, '_>, scratch: &mut AttnScratch) -> Result<(), ViperaError> {
+    // A window only changes the answer once the history is longer than what it keeps.
+    if let Some((window, sinks)) = attention_window()
+        && call.positions > window.saturating_add(sinks)
+    {
+        return attention_window_heads(
+            call.q,
+            call.kv,
+            AttentionSwitches::from_env().order,
+            call.layer,
+            call.positions,
+            sinks,
+            window,
+            call.shape,
+            call.heads,
+            scratch,
+            call.out,
+        );
+    }
     algorithm_for(call.positions).attend(call, scratch)
 }
 
@@ -4270,6 +4461,105 @@ mod tests {
                 100.0 * (medians[1] - medians[0]) / medians[0],
             );
         }
+    }
+
+    /// The window kernel must compute attention over exactly the positions it keeps: the sinks and
+    /// the last `window`, in increasing order, through one softmax and one weighted sum of V.
+    #[test]
+    fn the_window_kernel_matches_attention_over_the_positions_it_keeps() {
+        let shape = AttnShape {
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let positions = 200usize;
+        let sinks = 4usize;
+        let window = 32usize;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            positions,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let mut got = vec![0.0_f32; shape.heads * shape.head_dim];
+        attention_window_heads(
+            &q,
+            &read,
+            RowOrder::from_env(),
+            0,
+            positions,
+            sinks,
+            window,
+            shape,
+            0..shape.heads,
+            &mut AttnScratch::default(),
+            &mut got,
+        )
+        .expect("window kernel");
+
+        // The reference decodes the layer and sums the kept positions itself.
+        let mut k_all = Vec::new();
+        let mut v_all = Vec::new();
+        read.load_layer(0, shape, positions, &mut k_all, &mut v_all)
+            .expect("load layer");
+        let keep: Vec<usize> = (0..sinks)
+            .chain(positions - window..positions)
+            .collect();
+        let scale = 1.0 / (shape.head_dim as f32).sqrt();
+        let group = shape.heads / shape.kv_heads;
+        let mut want = vec![0.0_f32; shape.heads * shape.head_dim];
+        for head in 0..shape.heads {
+            let kv_head = head / group;
+            let query = &q[head * shape.head_dim..(head + 1) * shape.head_dim];
+            let mut scores: Vec<f32> = keep
+                .iter()
+                .map(|position| {
+                    let base = (position * shape.kv_heads + kv_head) * shape.head_dim;
+                    let dot: f32 = query
+                        .iter()
+                        .zip(&k_all[base..base + shape.head_dim])
+                        .map(|(q, k)| q * k)
+                        .sum();
+                    dot * scale
+                })
+                .collect();
+            let best = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0_f32;
+            for score in scores.iter_mut() {
+                *score = (*score - best).exp();
+                total += *score;
+            }
+            let target = &mut want[head * shape.head_dim..(head + 1) * shape.head_dim];
+            for (position, weight) in keep.iter().zip(&scores) {
+                let base = (position * shape.kv_heads + kv_head) * shape.head_dim;
+                for (target, value) in target.iter_mut().zip(&v_all[base..base + shape.head_dim]) {
+                    *target += weight / total * value;
+                }
+            }
+        }
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst <= 1e-5, "the window kernel differs by {worst}");
     }
 
     fn argmax_t(values: &[f32]) -> u32 {
