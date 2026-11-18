@@ -598,6 +598,210 @@ fn decode_cost_at_depth_with_ring_cache() {
     }
 }
 
+/// How far a verify pass's first row is from the same token decoded alone.
+///
+/// `logits_each` runs one entry per token of the chunk, all of them batched, while plain decoding
+/// runs the first token through `logits` on its own. The `run_batch_n` doc says an entry's logits are
+/// bit-identical to `logits` for that context alone; this measures that claim at depth. It holds
+/// with `VIPERA_THREADS=1` and does not hold with more: the batched kernels reduce across threads
+/// differently from the single-sequence ones, and by depth the difference is large enough to move an
+/// argmax, which is why speculative decoding cannot be claimed at a deep context yet.
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn a_verify_pass_matches_a_single_token_pass() {
+    let Some(path) = model_path() else {
+        return;
+    };
+    let depth: usize = std::env::var("VIPERA_SPEC_DEPTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4096);
+    const CHUNK: usize = 128;
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let window = attention_window();
+    let room = depth + 4 * 32 + CHUNK;
+    let mut state = match window {
+        Some(window) => State::with_ring(
+            config,
+            room,
+            KvCacheType::F16,
+            window.tokens as usize,
+            window.sinks as usize,
+        ),
+        None => State::with_room(config, room, KvCacheType::F16),
+    };
+    let pattern: [u32; 10] = [9707, 11, 1879, 264, 402, 5297, 13, 576, 682, 304];
+    let mut haystack = Vec::with_capacity(depth);
+    while haystack.len() < depth {
+        haystack.extend_from_slice(&pattern);
+    }
+    haystack.truncate(depth);
+    let mut logits = Vec::new();
+    for chunk in haystack.chunks(CHUNK) {
+        logits = backend
+            .logits(&mut state.context(chunk))
+            .expect("prefill fits");
+    }
+    state.tokens.extend_from_slice(&haystack);
+    let first = argmax(&logits) as u32;
+    let chunk = [first, 13, 576, 682, 304];
+
+    let mut alone = state.clone();
+    let single = backend
+        .logits(&mut alone.context(&chunk[..1]))
+        .expect("single pass");
+
+    for len in 1..=chunk.len() {
+        let mut batched = state.clone();
+        let each = backend
+            .logits_each(&mut batched.context(&chunk[..len]))
+            .expect("verify pass");
+        let worst = single
+            .iter()
+            .zip(&each[0])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        println!(
+            "depth {depth}: chunk {len}, row 0 vs single pass, max |delta| {worst:.3e}, argmax {} vs {} ({} threads)",
+            argmax(&single),
+            argmax(&each[0]),
+            std::env::var("VIPERA_THREADS").unwrap_or_else(|_| "default".into()),
+        );
+    }
+}
+
+/// Prompt-lookup speculation at a deep context, where the step is dominated by the weight stream.
+///
+/// Unlike `decode_cost_at_depth_without_prefill`, this really fills the KV: the history is prefilled
+/// in 128-token chunks, so a ring cache has to survive a chunk that reads a window still being
+/// written. Run as `VIPERA_ATTN_WINDOW=2048 cargo test --release -p vipera-backend-cpu --test
+/// win_vs_llama -- --ignored --nocapture speculative_decode_at_depth`.
+///
+/// It prints instead of asserting: at a deep context the verify pass is not bit-identical to plain
+/// decoding with more than one thread (`a_verify_pass_matches_a_single_token_pass`), so the stream
+/// it reports is not the stream plain decoding would produce, and that has to be fixed before a
+/// speedup here counts.
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn speculative_decode_at_depth() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let depth: usize = std::env::var("VIPERA_SPEC_DEPTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32_768);
+    const STEPS: usize = 32;
+    const CHUNK: usize = 128;
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let window = attention_window();
+    let room = depth + 4 * STEPS + CHUNK;
+    let mut state = match window {
+        Some(window) => State::with_ring(
+            config,
+            room,
+            KvCacheType::F16,
+            window.tokens as usize,
+            window.sinks as usize,
+        ),
+        None => State::with_room(config, room, KvCacheType::F16),
+    };
+    // A ten-token period, repeated to the depth being measured: prompt-lookup has something to
+    // find, and the history is long enough for the window to be doing its work.
+    let pattern: [u32; 10] = [9707, 11, 1879, 264, 402, 5297, 13, 576, 682, 304];
+    let mut haystack = Vec::with_capacity(depth);
+    while haystack.len() < depth {
+        haystack.extend_from_slice(&pattern);
+    }
+    haystack.truncate(depth);
+
+    let start = Instant::now();
+    let mut logits = Vec::new();
+    for chunk in haystack.chunks(CHUNK) {
+        logits = backend
+            .logits(&mut state.context(chunk))
+            .expect("prefill fits");
+    }
+    let prefill = start.elapsed().as_secs_f64();
+    state.tokens.extend_from_slice(&haystack);
+    println!(
+        "prefill {depth} tokens: {prefill:.1} s ({:.1} tok/s), KV {:.1} MB in {} blocks",
+        depth as f64 / prefill,
+        state.kv.len() as f64 / f64::from(1 << 20),
+        state.table.len(),
+    );
+    let first = argmax(&logits) as u32;
+
+    let mut plain_state = state.clone();
+    let start = Instant::now();
+    let plain = decode_plain(&mut backend, &mut plain_state, first, STEPS);
+    let plain_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Each round counts its accepted drafts, because at depth the number that matters is how many
+    // tokens one weight pass returns, not how fast the pass is.
+    let mut runs = Vec::new();
+    for (n, k) in [(1, 1), (1, 2), (1, 3), (2, 2), (2, 4)] {
+        let mut spec_state = state.clone();
+        let mut out: Vec<u32> = Vec::with_capacity(STEPS);
+        let mut next = first;
+        let (mut drafts, mut accepted_total, mut rounds) = (0_usize, 0_usize, 0_usize);
+        let start = Instant::now();
+        while out.len() < STEPS {
+            let draft = draft_from_ngram(&spec_state.tokens, n, k);
+            let mut chunk = Vec::with_capacity(draft.len() + 1);
+            chunk.push(next);
+            chunk.extend_from_slice(&draft);
+            let answers = backend
+                .logits_each(&mut spec_state.context(&chunk))
+                .expect("verify fits");
+            rounds += 1;
+            drafts += draft.len();
+            let mut accepted = 0;
+            while accepted < draft.len() && accepted + 1 < answers.len() {
+                let pick = argmax(&answers[accepted]) as u32;
+                if pick != draft[accepted] {
+                    break;
+                }
+                accepted += 1;
+                out.push(pick);
+                if out.len() == STEPS {
+                    break;
+                }
+            }
+            accepted_total += accepted;
+            let tail = argmax(&answers[accepted]) as u32;
+            spec_state.tokens.extend_from_slice(&chunk[..=accepted]);
+            out.push(tail);
+            next = tail;
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "  depth {depth}, draft n={n} k={k}: {ms:.1} ms ({:.1} tok/s), speedup {:.2}x, \
+             {rounds} passes for {STEPS} tokens, {accepted_total}/{drafts} drafts accepted, identical {}",
+            STEPS as f64 * 1000.0 / ms,
+            plain_ms / ms,
+            out[..out.len().min(STEPS)] == plain[..plain.len().min(STEPS)]
+        );
+        runs.push((ms, n, k));
+    }
+
+    let (spec_ms, n, k) = runs
+        .iter()
+        .copied()
+        .fold((f64::INFINITY, 0, 0), |best, run| {
+            if run.0 < best.0 { run } else { best }
+        });
+    println!(
+        "depth {depth}: plain {:.1} tok/s, best draft n={n} k={k} {:.1} tok/s, speedup {:.2}x",
+        STEPS as f64 * 1000.0 / plain_ms,
+        STEPS as f64 * 1000.0 / spec_ms,
+        plain_ms / spec_ms
+    );
+}
+
 fn print_llama_hint(what: &str) {
     let bench = std::env::var_os("LLAMA_BENCH")
         .map(PathBuf::from)

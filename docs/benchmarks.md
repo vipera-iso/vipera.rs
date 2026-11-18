@@ -1830,3 +1830,40 @@ A ring cannot park blocks for a prefix cache (`park` and `copy_from_parked` refu
 cache turns itself off when a window is set), and `release` sorts and dedups so aliased table entries
 free each physical block exactly once. Both are covered in `kv.rs` along with the slot count and the
 refusal to address past the context.
+
+### Speculative decoding at 32k with the ring cache — loses, and does not reproduce — 2026-11-18
+
+The remaining 32.5 ms of a windowed 32k step is the weight stream, so the obvious lever is more tokens
+per weight pass: prompt-lookup speculation. Measured with a real prefill (32,768 tokens of a ten-token
+period, 173 tok/s, into a ring cache — the prefill itself works, so a chunk reading a window it is
+still writing is fine), 8 threads, `VIPERA_ATTN_WINDOW=2048`, 32 tokens out:
+
+| draft | ms for 32 tokens | tok/s | speedup | passes | drafts accepted |
+|---|---|---|---|---|---|
+| plain | 1350 | 23.7 | — | 32 | — |
+| n=1 k=1 | 1621.2 | 19.7 | 0.83x | 31 | 1/11 |
+| n=1 k=2 | 1755.0 | 18.2 | 0.77x | 31 | 1/19 |
+| n=1 k=3 | 1868.5 | 17.1 | 0.72x | 31 | 1/26 |
+| n=2 k=2 | 1440.8 | 22.2 | 0.94x | 32 | 0/4 |
+| n=2 k=4 | 1551.8 | 20.6 | 0.87x | 32 | 0/8 |
+
+**It does not go past 25 tok/s; it goes backwards.** Two reasons, and the second one is the real
+result:
+
+- **The acceptance rate is ~zero on this prompt.** A ten-token period makes the last-occurrence draft
+  almost always wrong after the prefill: 1 of 11 for `n=1 k=1`, 0 of 4 for `n=2`. One rejected draft
+  still costs a 2-token pass (50 ms against 41.6), so every round pays more for one token. This is
+  prompt-dependent by construction and says nothing about a draft model, which is not implemented.
+- **The verify pass is not bit-identical to plain decoding at depth.** `a_verify_pass_matches_a_
+  single_token_pass` compares `logits_each` row 0 against `logits` for the same token, same KV: at
+  depth 1024 it differs by 1.9, at 4096 by 9.3, and the argmax flips in the window-off case. With
+  `VIPERA_THREADS=1` it is exactly 0, and it reproduces identically run to run at 8 threads, so it is
+  a summation-order difference in the batched kernels, not a race. It is not the window and not the
+  ring: it reproduces with the window off, and with a ring of the window's size it is if anything
+  smaller (7.8 vs 9.3 at 4096).
+
+So speculation at a deep context has no measured win here and cannot yet be claimed as token-exact;
+the blocked piece is that `run_batch_n`'s "entry `e`'s logits are bit-identical to `logits`" does not
+hold with more than one thread. Fixing that (one reduction order for batched and single passes) is
+the prerequisite for revisiting a draft model, which is the version that would actually pay: this
+n-gram drafter is out of ideas after 32k tokens of context.
