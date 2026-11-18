@@ -1559,3 +1559,48 @@ One numeric side effect of that design, noted because it would have mattered had
 the crew on, attention no longer takes the approximate KV-chunk path even when `VIPERA_ATTN_KV_SPLIT`
 is set, so the step was slightly *more* exact than the default, not merely faster — a second reason not
 to make it the default path.
+
+### Where a long context actually goes — 2026-11-18
+
+Asked to find an algorithm that keeps tok/s up as the context grows, so the first step was measuring
+the curve instead of assuming it is KV bandwidth. `decode_attention_scaling` extended to 2048 and 4096
+and to both KV layouts (`VIPERA_THREADS=8`, release, Qwen2.5-1.5B Q4_K_M, f16 vs q8_0 KV, best of 3
+steps per length, `attention+KV` is the step minus the ctx-32 step):
+
+| ctx | F16 ms/step | F16 tok/s | F16 attention | Q8_0 ms/step | Q8_0 tok/s | Q8_0 attention |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 27.9 | 35.8 | 0.0 ms | 29.7 | 33.6 | 0.0 ms |
+| 256 | 31.5 | 31.7 | 3.6 ms (11%) | 31.7 | 31.5 | 2.0 ms (6%) |
+| 1024 | 34.1 | 29.3 | 6.2 ms (18%) | 34.3 | 29.1 | 4.6 ms (13%) |
+| 2048 | 36.6 | 27.3 | 8.6 ms (24%) | 38.1 | 26.2 | 8.4 ms (22%) |
+| 4096 | 44.1 | 22.7 | 16.2 ms (37%) | 48.5 | 20.6 | 18.8 ms (39%) |
+
+Two readings that change the plan:
+
+- **Quantising the KV cache does not buy throughput.** It halves the bytes and loses end to end
+  (4096: 48.5 vs 44.1 ms), because the attention pass is not bandwidth-bound at these lengths: 58.7 MB
+  of K and V are read per token at 4096, which is **1.4 ms at the 41.7 GB/s ceiling**, against the
+  **16.2 ms** measured. q8_0 keeps its place as the lever that fits more context in RAM, not as a
+  speed lever.
+- **Attention is bound by kernel efficiency, by an order of magnitude.** 16.2 ms per token at 4096 is
+  ~11x its traffic floor and ~5% of the machine's f32 FMA peak (0.35 GFLOP of score+value work in
+  16.2 ms is 21.7 GFLOP/s against ~380 GFLOP/s peak). The streaming kernel scores one 64-wide dot per
+  (head, position) and walks the history twice, so it runs latency, not arithmetic.
+
+The algorithm with headroom is therefore the one that raises arithmetic intensity and reads KV once:
+**tiled attention with an online softmax** (flash-attention's shape, scalar/AVX2, no `unsafe`). Score a
+tile of keys against all of a layer's heads while the tile sits in L1, keep the running max and
+normaliser per head, and fold the value accumulation into the same walk instead of a second pass. At
+decode the tile is the key dimension: 64 K rows (16 KB, L1-resident) scored against all 12 heads into a
+196 KB score tile that is consumed by the fused softmax/value step while it is still in L2, instead of
+196 KB per head written and re-read. At prefill the same tile is scored against a 128-query block,
+which is where the 4096-token prefill loses to llama.cpp today (attention 49% of the late chunk).
+
+Expected ceiling, from the measured split rather than a guess: attention at 4096 would have to fall
+from 16.2 ms to ~4-5 ms to reach 2-3x, which puts the step at ~32 ms (31 tok/s) instead of 44.1 ms
+(22.7). Below ~2 ms the weights dominate and the step stops caring about context.
+
+Rejected before writing code, for the record: KV quantisation as a speed lever (measured above);
+attention sinks / sliding windows / eviction (they change the tokens, and they only pay once the kernel
+is efficient — at 16.2 ms the kernel is the problem, not the window); more threads (the split already
+caps at physical cores and the 2026-11-17 entries measured the contention).

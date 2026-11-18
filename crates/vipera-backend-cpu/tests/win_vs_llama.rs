@@ -446,25 +446,30 @@ fn decode_attention_scaling() {
     };
     let mut backend = CpuBackend::load(&path).expect("load model");
     let config = backend.config();
-    let mut steps: Vec<(usize, f64)> = Vec::new();
-    for &length in &[32usize, 256, 1024] {
-        let prompt: Vec<u32> = (0..length).map(|at| 1000 + (at % 400) as u32).collect();
-        let (mut state, mut next) =
-            prefill_chunked(&mut backend, config, &prompt, KvCacheType::F16);
-        let ms = timed_best(3, || {
-            let logits = backend.logits(&mut state.context(&[next])).expect("decode");
-            next = argmax(&logits) as u32;
-        });
-        steps.push((length, ms));
-    }
-    let base = steps[0].1;
-    for (ctx, ms) in &steps {
-        println!(
-            "decode ctx {ctx:>5}: {ms:>6.1} ms/step ({:.1} tok/s), attention+KV {:>5.1} ms ({:.0}%)",
-            1000.0 / ms,
-            ms - base,
-            100.0 * (ms - base) / ms
-        );
+    for ty in [KvCacheType::F16, KvCacheType::Q8_0] {
+        if config.kv_bytes_per_token_for(ty).is_none() {
+            println!("{ty:?} KV: this backend cannot store it, skipped");
+            continue;
+        }
+        let mut steps: Vec<(usize, f64)> = Vec::new();
+        for &length in &[32usize, 256, 1024, 2048, 4096] {
+            let prompt: Vec<u32> = (0..length).map(|at| 1000 + (at % 400) as u32).collect();
+            let (mut state, mut next) = prefill_chunked(&mut backend, config, &prompt, ty);
+            let ms = timed_best(3, || {
+                let logits = backend.logits(&mut state.context(&[next])).expect("decode");
+                next = argmax(&logits) as u32;
+            });
+            steps.push((length, ms));
+        }
+        let base = steps[0].1;
+        for (ctx, ms) in &steps {
+            println!(
+                "{ty:?} decode ctx {ctx:>5}: {ms:>6.1} ms/step ({:.1} tok/s), attention+KV {:>5.1} ms ({:.0}%)",
+                1000.0 / ms,
+                ms - base,
+                100.0 * (ms - base) / ms
+            );
+        }
     }
     println!(
         "Bài Mistral.rs: decode chậm do KV read tăng theo ctx; vipera đo cùng đường để đối chiếu llama.cpp tg."
