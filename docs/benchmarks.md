@@ -1745,3 +1745,42 @@ branch stands aside when a window is set and the head split runs instead.
 from the start of a long prompt needs `sinks` large enough to hold it, or the window large enough to
 cover it. 2048-4096 is the range where the step is flat and most of a conversation is still visible;
 the default stays the full history.
+
+### The window kernel was splitting the work the wrong way — 2026-11-18
+
+With `VIPERA_ATTN_WINDOW=2048` at 32k the step was 44.4 ms, and the profile put **13.4 ms of it
+(28%) in attention** — for a history the window had already cut to 2048 positions, while the
+full-history chunked kernel spent 63.2 ms on 16384 positions, i.e. 3.9 µs/position against the
+window kernel's 6.1. Same work, same KV, 1.6x worse per position, so the kernel was the problem.
+
+`attention_window_heads` partitioned by head: eight workers, each walking every kept row, so the four
+query heads that share a KV head read the same K row four times over (2 KB of reads per 512-byte
+row), and the scores went into a `heads x kept` array that was then walked twice, once for K and
+once for V. The chunked full-history kernel instead partitions positions, reads each row once for
+every head, and folds K and V into a running `(max, sum, weighted_v)` in one traversal.
+
+`attention_window_chunked_heads` is that shape with the window's kept ranges: a chunk is a slice of
+the kept-index space `[0, sinks + window)`, which may step over the dropped middle, and the workers
+merge in increasing chunk order. Measured at 32k, 8 threads, ms/step and tok/s:
+
+| window | two-pass window kernel | chunked window kernel | attention ms |
+|---|---|---|---|
+| 1024 | 42.8 (23.4) | 42.8 (23.4) | 7.45 -> 5.36 |
+| 2048 | 44.4 (22.5) | **40.0 (25.0)** | 13.42 -> 9.63 |
+| 4096 | 57.0 (17.5) | **47.9 (20.9)** | 26.24 -> 19.83 |
+
+11% on the step at 2048 and 16% at 4096 — the wider the window the more KV reads the head split was
+duplicating, which is why 4096 gains most. 1024's step did not move because attention there is only
+5.4 ms of a 43 ms step already dominated by the weight stream (21.0 ms of q4k plus 11.9 of q6k,
+against a 26 ms floor for 1.117 GB at the 43 GB/s read ceiling).
+
+`exact_dot` mode keeps the two-pass kernel, which is the summation-order reference; the chunked
+kernel groups the floating-point sums by chunk and differs by rounding (~1e-7). Both are checked
+against a hand-summed reference over the kept positions at 1, 3 and 8 workers
+(`the_window_kernel_matches_attention_over_the_positions_it_keeps`, 1e-5 for the two-pass kernel and
+1e-4 for the chunked one), and greedy output on a short prompt is unchanged by the switch.
+
+What this leaves: at 32k with a 2048 window the step is 40 ms, of which 32.5 ms is the weight stream
+at 34 GB/s — 79% of the 43 GB/s read ceiling. Attention is 9.6 ms; the rest is under a millisecond.
+So on this hardware the remaining large-context lever is bytes per token (or tokens per weight pass,
+which speculative decoding already does), not the context length.

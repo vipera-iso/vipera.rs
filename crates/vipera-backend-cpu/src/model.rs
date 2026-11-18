@@ -2397,6 +2397,225 @@ fn attention_kv_chunked_heads(
     Ok(())
 }
 
+/// Decode attention over a sliding window, split by kept-position chunks.
+///
+/// [`attention_window_heads`] partitions the work by head, which makes every worker walk every
+/// kept row and decode it again: the four query heads that share a KV head read the same K row, so
+/// the cache is read four times over. It also materialises the whole `heads x kept` score block and
+/// walks the rows twice, once for K and once for V. At a 2048-position window that cost 13.4 ms of
+/// a 44 ms step (see `docs/benchmarks.md`, 2026-11-18), against 3.9 ms per 16k positions for the
+/// chunked full-history kernel.
+///
+/// This kernel partitions the kept positions instead, so each row is read once and feeds every
+/// head, and it folds K and V into a running `(max, sum, weighted_v)` in one traversal. The merge
+/// groups the floating-point sums by chunk rather than strictly by position, so the result differs
+/// from the two-pass kernel by rounding (~1e-7); `exact_dot` mode therefore does not use it.
+#[allow(clippy::too_many_arguments)]
+fn attention_window_chunked_heads(
+    q: &[f32],
+    kv: &KvRead<'_>,
+    order: RowOrder,
+    layer: usize,
+    ranges: &[(usize, usize)],
+    shape: AttnShape,
+    heads: std::ops::Range<usize>,
+    out: &mut [f32],
+    workers: usize,
+) -> Result<(), ViperaError> {
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let width = shape.kv_heads * head_dim;
+    let layer_bytes = kv.layout.bytes_per_row(width);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sequential = quant::exact_dot_requested();
+    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let count = heads.end - heads.start;
+    let kept: usize = ranges.iter().map(|(from, to)| to.saturating_sub(*from)).sum();
+    if count == 0 || kept == 0 {
+        out[..count * head_dim].fill(0.0);
+        return Ok(());
+    }
+    let workers = workers.min(kept).max(1);
+
+    #[derive(Clone)]
+    struct Partial {
+        m: Vec<f32>,
+        d: Vec<f32>,
+        o: Vec<f32>,
+    }
+
+    let mut partials: Vec<Partial> = (0..workers)
+        .map(|_| Partial {
+            m: vec![f32::NEG_INFINITY; count],
+            d: vec![0.0_f32; count],
+            o: vec![0.0_f32; count * head_dim],
+        })
+        .collect();
+
+    // Kept indices are numbered `[0, kept)` across the ranges in order, so a chunk is a slice of
+    // that space and may cross the gap between the sinks and the window.
+    let compute_chunk = |part: &mut Partial, start: usize, end: usize| -> Result<(), ViperaError> {
+        if start >= end {
+            return Ok(());
+        }
+        let mut scores = vec![0.0_f32; count];
+        let mut row = vec![0.0_f32; width];
+
+        // Walk the chunk as it lies in the ranges: contiguous where the chunk stays inside one
+        // range, two runs where it steps over the dropped middle.
+        let mut base = 0;
+        for (from, to) in ranges {
+            let len = to.saturating_sub(*from);
+            let offset = base;
+            base += len;
+            let low = start.max(offset);
+            let high = end.min(offset + len);
+            if low >= high {
+                continue;
+            }
+            let run_from = *from + (low - offset);
+            let run_to = *from + (high - offset);
+            kv.for_each_row_range(order, layer, layer_bytes, run_from, run_to, |_position, k_base| {
+                if !in_place {
+                    kv.layout
+                        .decode(&kv.storage[k_base..k_base + layer_bytes], &mut row)?;
+                }
+                for kv_head in 0..shape.kv_heads {
+                    let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                    let packed_k = k_base + kv_head * head_dim * 2;
+                    for member in 0..group {
+                        let head = kv_head * group + member;
+                        if head < heads.start || head >= heads.end {
+                            continue;
+                        }
+                        let local = head - heads.start;
+                        let query = &q[head * head_dim..(head + 1) * head_dim];
+                        let dot = if sequential {
+                            query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
+                        } else if in_place {
+                            crate::simd::dot_f16_f32(query, &kv.storage[packed_k..][..head_dim * 2])
+                        } else {
+                            crate::simd::dot_f32(query, key)
+                        };
+                        scores[local] = dot * scale;
+                    }
+                }
+
+                let v_base = kv.value_row(order, k_base, layer_bytes);
+                if !in_place {
+                    kv.layout
+                        .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
+                }
+                for kv_head in 0..shape.kv_heads {
+                    let packed_v = v_base + kv_head * head_dim * 2;
+                    let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                    for member in 0..group {
+                        let head = kv_head * group + member;
+                        if head < heads.start || head >= heads.end {
+                            continue;
+                        }
+                        let local = head - heads.start;
+                        let score = scores[local];
+                        let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                        let weight = if score > part.m[local] {
+                            let alpha = (part.m[local] - score).exp();
+                            part.m[local] = score;
+                            part.d[local] = part.d[local] * alpha + 1.0;
+                            for value in target.iter_mut() {
+                                *value *= alpha;
+                            }
+                            1.0_f32
+                        } else {
+                            let beta = (score - part.m[local]).exp();
+                            part.d[local] += beta;
+                            beta
+                        };
+                        if in_place {
+                            crate::simd::axpy_f16_f32(
+                                target,
+                                weight,
+                                &kv.storage[packed_v..][..head_dim * 2],
+                            );
+                        } else {
+                            crate::simd::axpy_f32(target, weight, value);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    };
+
+    if workers == 1 {
+        compute_chunk(&mut partials[0], 0, kept)?;
+    } else {
+        // The caller takes the last chunk, so one fewer thread is spawned per layer.
+        let spawned = workers - 1;
+        let caller_range = (kept * spawned / workers)..(kept * (spawned + 1) / workers);
+        let (spawn_parts, tail) = partials.split_at_mut(spawned);
+        let caller_part = &mut tail[0];
+        let chunk_error: std::sync::Mutex<Option<ViperaError>> = std::sync::Mutex::new(None);
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(spawned);
+            for (worker, part) in spawn_parts.iter_mut().enumerate() {
+                let start = kept * worker / workers;
+                let end = kept * (worker + 1) / workers;
+                let err = &chunk_error;
+                let f = &compute_chunk;
+                handles.push(scope.spawn(move || {
+                    if let Err(e) = f(part, start, end) {
+                        *err.lock().expect("chunk error") = Some(e);
+                    }
+                }));
+            }
+            if let Err(e) = compute_chunk(caller_part, caller_range.start, caller_range.end) {
+                *chunk_error.lock().expect("chunk error") = Some(e);
+            }
+            for handle in handles {
+                handle.join().expect("an attention chunk worker panicked");
+            }
+        });
+        if let Some(err) = chunk_error.into_inner().expect("chunk error") {
+            return Err(err);
+        }
+    }
+
+    // Merge in increasing chunk order, then normalise.
+    out[..count * head_dim].fill(0.0);
+    let mut global_m = vec![f32::NEG_INFINITY; count];
+    let mut global_d = vec![0.0_f32; count];
+    for part in &partials {
+        for local in 0..count {
+            let m_new = global_m[local].max(part.m[local]);
+            let scale_a = if global_m[local] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (global_m[local] - m_new).exp()
+            };
+            let scale_b = if part.m[local] == f32::NEG_INFINITY {
+                0.0
+            } else {
+                (part.m[local] - m_new).exp()
+            };
+            global_d[local] = global_d[local] * scale_a + part.d[local] * scale_b;
+            let dst = &mut out[local * head_dim..(local + 1) * head_dim];
+            let src = &part.o[local * head_dim..(local + 1) * head_dim];
+            for (d, s) in dst.iter_mut().zip(src.iter()) {
+                *d = *d * scale_a + *s * scale_b;
+            }
+            global_m[local] = m_new;
+        }
+    }
+    for local in 0..count {
+        let inv = 1.0 / global_d[local];
+        for value in &mut out[local * head_dim..(local + 1) * head_dim] {
+            *value *= inv;
+        }
+    }
+    Ok(())
+}
+
 /// Attention for one layer, choosing the kernel by history length.
 ///
 /// Both arms compute the same values, bit for bit: they see the same K/V rows in the same order.
@@ -2462,13 +2681,43 @@ fn attend_entries(
         quant::max_threads().min(entries)
     };
 
+    // A window keeps only a slice of the history, and that slice is best split by position: the
+    // head split below walks every kept row once per head, so the four query heads that share a KV
+    // head read the same K row four times over. Splitting the kept positions reads each row once
+    // and folds K and V in a single traversal, and it is what makes the window cost a third of
+    // what the two-pass kernel did. `exact_dot` keeps the two-pass kernel, whose summation order is
+    // the reference.
+    if entries == 1
+        && !quant::exact_dot_requested()
+        && let Some((window, sinks)) = attention_window()
+        && positions[0] > window.saturating_add(sinks)
+    {
+        let sinks_end = sinks.min(positions[0]);
+        let window_start = positions[0].saturating_sub(window).max(sinks_end);
+        let kept = sinks_end + (positions[0] - window_start);
+        let threads = quant::max_threads().min(physical_cores());
+        let workers = threads.min(kept);
+        if workers > 1 {
+            let ranges = [(0, sinks_end), (window_start, positions[0])];
+            return attention_window_chunked_heads(
+                &q[..query],
+                &kv[0],
+                switches.order,
+                layer,
+                &ranges,
+                shape,
+                0..shape.heads,
+                &mut out[..query],
+                workers,
+            );
+        }
+    }
+
     // One entry with a long history has nothing to split by entry. Splitting the KV history into
     // chunks and merging partial (max, sum, weighted-v) results parallelizes the memory-bound
     // scan well at depth, at the cost of floating-point merge grouping (~1e-7 max-abs vs serial),
-    // so it is opt-in (`VIPERA_ATTN_KV_SPLIT=1`) and skipped in exact-dot mode.
-    // A window keeps only a slice of the history, so chunking the whole of it by position would
-    // scan the part the window drops. The head split below goes through [`attend_entry`], which is
-    // where the window is applied.
+    // so it is opt-in (`VIPERA_ATTN_KV_SPLIT=1`) and skipped in exact-dot mode. A window needs
+    // none of it: the chunked window kernel above already split the kept positions.
     if entries == 1
         && lanes >= PARALLEL_ATTENTION_MIN
         && switches.kv_split
@@ -4560,6 +4809,35 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f32, f32::max);
         assert!(worst <= 1e-5, "the window kernel differs by {worst}");
+
+        // The chunked kernel is what a decode step runs, and it sums by chunk instead of strictly
+        // by position, so it is checked against the same reference at worker counts that do and do
+        // not split the sinks from the window: 1, 3 (chunk boundary inside the gap), and 8.
+        let ranges = [(0, sinks), (positions - window, positions)];
+        for workers in [1, 3, 8] {
+            let mut chunked = vec![0.0_f32; shape.heads * shape.head_dim];
+            attention_window_chunked_heads(
+                &q,
+                &read,
+                RowOrder::from_env(),
+                0,
+                &ranges,
+                shape,
+                0..shape.heads,
+                &mut chunked,
+                workers,
+            )
+            .expect("chunked window kernel");
+            let worst = chunked
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                worst <= 1e-4,
+                "the chunked window kernel with {workers} workers differs by {worst}"
+            );
+        }
     }
 
     fn argmax_t(values: &[f32]) -> u32 {
