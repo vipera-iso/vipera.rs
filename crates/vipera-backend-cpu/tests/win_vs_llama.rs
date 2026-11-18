@@ -452,7 +452,7 @@ fn decode_attention_scaling() {
             continue;
         }
         let mut steps: Vec<(usize, f64)> = Vec::new();
-        for &length in &[32usize, 256, 1024, 2048, 4096] {
+        for &length in &[32usize, 256, 1024, 2048, 4096, 8192] {
             let prompt: Vec<u32> = (0..length).map(|at| 1000 + (at % 400) as u32).collect();
             let (mut state, mut next) = prefill_chunked(&mut backend, config, &prompt, ty);
             let ms = timed_best(3, || {

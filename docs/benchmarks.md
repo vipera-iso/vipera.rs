@@ -1578,14 +1578,14 @@ steps per length, `attention+KV` is the step minus the ctx-32 step):
 Two readings that change the plan:
 
 - **Quantising the KV cache does not buy throughput.** It halves the bytes and loses end to end
-  (4096: 48.5 vs 44.1 ms), because the attention pass is not bandwidth-bound at these lengths: 58.7 MB
-  of K and V are read per token at 4096, which is **1.4 ms at the 41.7 GB/s ceiling**, against the
+  (4096: 48.5 vs 44.1 ms), because the attention pass is not bandwidth-bound at these lengths: 117.4 MB
+  of K and V are read per token at 4096, which is **2.8 ms at the 41.7 GB/s ceiling**, against the
   **16.2 ms** measured. q8_0 keeps its place as the lever that fits more context in RAM, not as a
   speed lever.
-- **Attention is bound by kernel efficiency, by an order of magnitude.** 16.2 ms per token at 4096 is
-  ~11x its traffic floor and ~5% of the machine's f32 FMA peak (0.35 GFLOP of score+value work in
-  16.2 ms is 21.7 GFLOP/s against ~380 GFLOP/s peak). The streaming kernel scores one 64-wide dot per
-  (head, position) and walks the history twice, so it runs latency, not arithmetic.
+- **Attention is bound by kernel efficiency, by a large factor.** 16.2 ms per token at 4096 is ~5.8x
+  its traffic floor and ~5% of the machine's f32 FMA peak (0.35 GFLOP of score+value work in 16.2 ms
+  is 21.7 GFLOP/s against ~380 GFLOP/s peak). The streaming kernel scores one 64-wide dot per (head,
+  position) and walks the history twice, so it runs latency, not arithmetic.
 
 The algorithm with headroom is therefore the one that raises arithmetic intensity and reads KV once:
 **tiled attention with an online softmax** (flash-attention's shape, scalar/AVX2, no `unsafe`). Score a
@@ -1658,3 +1658,52 @@ attention is priced by its arithmetic, not by its addressing, and the remaining 
 kernel (AVX-512 f32/f16 dot and axpy) rather than a better loop shape. That lever changes the
 reduction order: the tests that pin the f16 dot to the decode-then-dot oracle bit for bit would have to
 become tolerance checks, so it is a separate decision, not a cleanup.
+
+### How much context fits in RAM, and what it costs — 2026-11-18
+
+Qwen2.5-1.5B Q4_K_M declares `context_limit: 32768`, so on this model the context ceiling is the
+model's training length, not memory. Per position the cache holds `2 * layers * kv_heads * head_dim`
+values (28 x 2 x 2 x 128 = 14,336), stored as f16 (2 B) or q8_0 (34 B per 32 values, and 256 is a
+multiple of 32):
+
+| ctx | f16 KV | q8_0 KV | host total, f16 | host total, q8_0 |
+|---:|---:|---:|---:|---:|
+| 4096 | 117.4 MB | 62.4 MB | 1.25 GB | 1.19 GB |
+| 8192 | 234.9 MB | 124.8 MB | — | — |
+| 16384 | 469.8 MB | 249.6 MB | — | — |
+| 32768 | 939.5 MB | 499.1 MB | 2.09 GB | 1.64 GB |
+
+Measured, not planned: `vipera verify --ctx 32768 --kv-type <t> --cpu` reports `kv_cache_bytes`
+939,524,096 (f16) and 499,122,176 (q8_0), `predicted_host_bytes` 2,050,894,336 / 1,610,492,416 against
+`measured_host_bytes` 2,081,525,760 / 1,641,201,664 (+1.5% / +1.9%). Weights are 1,111,370,240 B.
+On this machine (15.8 GB, ~10.9 GB available) a q8_0 instance at the full 32,768 context is 1.6 GB, so
+about six fit before anything swaps; f16 fits about five.
+
+RAM does not become the limit at this model's size: 10 GB of q8_0 cache is 690k positions, twenty times
+the model's maximum. It becomes one for larger models and long contexts, and q8_0's value is exactly
+halving that term — not speed, as the decode numbers below show.
+
+**The tok/s cost of depth** (`decode_attention_scaling`, 8 threads, ms/step and tok/s, best of 3;
+`attention+KV` is the step minus the ctx-32 step):
+
+| ctx | q8_0 ms/step | q8_0 tok/s | q8_0 attention | f16 ms/step | f16 tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 38.5 | 26.0 | 0.0 | 42.2 | 23.7 |
+| 1024 | 45.7 | 21.9 | 7.3 ms | 44.7 | 22.4 |
+| 2048 | 52.8 | 18.9 | 14.4 ms | 50.7 | 19.7 |
+| 4096 | 61.5 | 16.3 | 23.1 ms | 60.6 | 16.5 |
+| 8192 | 82.6 | **12.1** | 44.1 ms | 81.7 | 12.2 |
+| 16384 | *~127* | *~7.9* | *~88 ms* | — | — |
+| 32768 | *~215* | *~4.7* | *~176 ms* | — | — |
+
+Up to 8192 is measured; 16384 and 32768 are extrapolated from the measured 5.5 ms per 1024 positions
+(prefilling a 32k prompt at this engine's prefill speed takes close to an hour, so it was not run).
+q8_0 is 0.1 tok/s *slower* than f16 at 8192 and its attention is 4.6 ms more expensive: the cache is
+half the bytes but each row is dequantised, so on this kernel the trade is memory for a little speed,
+never speed.
+
+**Correction to the entry above.** That entry quoted "58.7 MB of K and V per token at 4096, which is
+1.4 ms at the 41.7 GB/s ceiling" -- it counted one 128-value K row per layer instead of K and V of a
+256-value key/value width. The correct figure is 117.4 MB and 2.8 ms, so attention at 4096 is 5.8x its
+traffic floor rather than 11x. The conclusion does not change (16.2 ms is still far above any traffic
+floor, and the score pass is still the cost), but the ratio was wrong and is fixed here.
