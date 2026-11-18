@@ -629,6 +629,75 @@ pub(crate) fn axpy_f16_f32(target: &mut [f32], weight: f32, row: &[u8]) {
     }
 }
 
+/// [`dot_f16_f32`] for several heads that share one K row, with the feature check and the row facts
+/// hoisted out of the per-head call.
+///
+/// The window kernel reads one K row and dots it against every head of a KV head — six of them at
+/// this model's shape — so the per-call cost of [`dot_f16_f32`] (an `OnceLock` load, two feature
+/// checks and a fresh loop setup) was paid six times for one 64-value dot. Each head's arithmetic is
+/// exactly [`dot_f16_f32`]'s, so the scores are bit-identical.
+///
+/// `q` holds `first_head` and the `count` heads after it back to back at `head_dim` each.
+pub(crate) fn dot_f16_f32_heads(
+    q: &[f32],
+    first_head: usize,
+    count: usize,
+    head_dim: usize,
+    row: &[u8],
+    out: &mut [f32],
+) {
+    let fast = available() && std::is_x86_feature_detected!("f16c");
+    let row_length = row.len() / 2;
+    let length = head_dim.min(row_length);
+    for (member, slot) in out.iter_mut().take(count).enumerate() {
+        let at = (first_head + member) * head_dim;
+        let query = &q[at..at + head_dim];
+        if length == 0 {
+            *slot = 0.0;
+        } else if fast && length >= 8 {
+            // SAFETY: AVX2 and F16C were detected once, before the loop, and the kernel reads only
+            // the first `length` values of both operands.
+            *slot = unsafe { dot_f16_f32_avx2(query, row, length) };
+        } else {
+            let mut total = 0.0_f32;
+            for (value, chunk) in query.iter().zip(row.as_chunks::<2>().0).take(length) {
+                total += value * f16_to_f32(u16::from_le_bytes(*chunk));
+            }
+            *slot = total;
+        }
+    }
+}
+
+/// `targets += weights[h] * row` for the heads of one KV head, again sharing the row work.
+///
+/// `targets` holds `weights.len()` rows back to back at `head_dim` each, and each row is one head's
+/// running weighted sum of V. Same arithmetic as [`axpy_f16_f32`] per head, so it is bit-identical.
+pub(crate) fn axpy_f16_f32_heads(
+    targets: &mut [f32],
+    head_dim: usize,
+    weights: &[f32],
+    row: &[u8],
+) {
+    let fast = available() && std::is_x86_feature_detected!("f16c");
+    let row_length = row.len() / 2;
+    let length = head_dim.min(row_length);
+    for (member, weight) in weights.iter().enumerate() {
+        let target = &mut targets[member * head_dim..][..head_dim];
+        if length == 0 {
+            continue;
+        }
+        if fast && length >= 8 {
+            // SAFETY: AVX2 and F16C were detected once, before the loop, and the kernel writes only
+            // the first `length` values of the target row.
+            unsafe { axpy_f16_f32_avx2(&mut target[..length], *weight, row) };
+        } else {
+            for (value, chunk) in target.iter_mut().zip(row.as_chunks::<2>().0).take(length) {
+                *value += *weight * f16_to_f32(u16::from_le_bytes(*chunk));
+            }
+        }
+    }
+}
+
 /// [`axpy_f16_f32`] in eight lanes.
 ///
 /// # Safety

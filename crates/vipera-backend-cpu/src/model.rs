@@ -2484,27 +2484,50 @@ fn attention_window_chunked_heads(
                         kv.layout
                             .decode(&kv.storage[k_base..k_base + layer_bytes], &mut row)?;
                     }
-                    for kv_head in 0..shape.kv_heads {
-                        let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                        let packed_k = k_base + kv_head * head_dim * 2;
-                        for member in 0..group {
-                            let head = kv_head * group + member;
-                            if head < heads.start || head >= heads.end {
-                                continue;
+                    // A decode step asks for every head, and the heads of one KV head share its
+                    // K row: batching them pays the per-call overhead (an `OnceLock` load, two
+                    // feature checks, a fresh loop setup) once per KV head instead of once per
+                    // head, for the same 64-value dot and the same `* scale`.
+                    let whole = heads.start == 0 && heads.end == shape.heads && group <= 16;
+                    if whole && in_place && !sequential {
+                        for kv_head in 0..shape.kv_heads {
+                            let packed_k = k_base + kv_head * head_dim * 2;
+                            let first = kv_head * group;
+                            crate::simd::dot_f16_f32_heads(
+                                q,
+                                first,
+                                group,
+                                head_dim,
+                                &kv.storage[packed_k..],
+                                &mut scores[first..first + group],
+                            );
+                        }
+                        for score in scores[..count].iter_mut() {
+                            *score *= scale;
+                        }
+                    } else {
+                        for kv_head in 0..shape.kv_heads {
+                            let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                            let packed_k = k_base + kv_head * head_dim * 2;
+                            for member in 0..group {
+                                let head = kv_head * group + member;
+                                if head < heads.start || head >= heads.end {
+                                    continue;
+                                }
+                                let local = head - heads.start;
+                                let query = &q[head * head_dim..(head + 1) * head_dim];
+                                let dot = if sequential {
+                                    query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
+                                } else if in_place {
+                                    crate::simd::dot_f16_f32(
+                                        query,
+                                        &kv.storage[packed_k..][..head_dim * 2],
+                                    )
+                                } else {
+                                    crate::simd::dot_f32(query, key)
+                                };
+                                scores[local] = dot * scale;
                             }
-                            let local = head - heads.start;
-                            let query = &q[head * head_dim..(head + 1) * head_dim];
-                            let dot = if sequential {
-                                query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
-                            } else if in_place {
-                                crate::simd::dot_f16_f32(
-                                    query,
-                                    &kv.storage[packed_k..][..head_dim * 2],
-                                )
-                            } else {
-                                crate::simd::dot_f32(query, key)
-                            };
-                            scores[local] = dot * scale;
                         }
                     }
 
@@ -2513,38 +2536,73 @@ fn attention_window_chunked_heads(
                         kv.layout
                             .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
                     }
-                    for kv_head in 0..shape.kv_heads {
-                        let packed_v = v_base + kv_head * head_dim * 2;
-                        let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                        for member in 0..group {
-                            let head = kv_head * group + member;
-                            if head < heads.start || head >= heads.end {
-                                continue;
+                    if whole && in_place {
+                        // Same online-softmax update per head, with the V row added for the whole
+                        // group in one call: a head that takes a new maximum has its row scaled
+                        // first, so the shared call can use its own weight unchanged.
+                        for kv_head in 0..shape.kv_heads {
+                            let packed_v = v_base + kv_head * head_dim * 2;
+                            let first = kv_head * group;
+                            let mut weights = [0.0_f32; 16];
+                            for (member, weight) in weights[..group].iter_mut().enumerate() {
+                                let local = first + member;
+                                let score = scores[local];
+                                let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                                *weight = if score > part.m[local] {
+                                    let alpha = (part.m[local] - score).exp();
+                                    part.m[local] = score;
+                                    part.d[local] = part.d[local] * alpha + 1.0;
+                                    for value in target.iter_mut() {
+                                        *value *= alpha;
+                                    }
+                                    1.0_f32
+                                } else {
+                                    let beta = (score - part.m[local]).exp();
+                                    part.d[local] += beta;
+                                    beta
+                                };
                             }
-                            let local = head - heads.start;
-                            let score = scores[local];
-                            let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
-                            let weight = if score > part.m[local] {
-                                let alpha = (part.m[local] - score).exp();
-                                part.m[local] = score;
-                                part.d[local] = part.d[local] * alpha + 1.0;
-                                for value in target.iter_mut() {
-                                    *value *= alpha;
+                            crate::simd::axpy_f16_f32_heads(
+                                &mut part.o[first * head_dim..(first + group) * head_dim],
+                                head_dim,
+                                &weights[..group],
+                                &kv.storage[packed_v..],
+                            );
+                        }
+                    } else {
+                        for kv_head in 0..shape.kv_heads {
+                            let packed_v = v_base + kv_head * head_dim * 2;
+                            let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                            for member in 0..group {
+                                let head = kv_head * group + member;
+                                if head < heads.start || head >= heads.end {
+                                    continue;
                                 }
-                                1.0_f32
-                            } else {
-                                let beta = (score - part.m[local]).exp();
-                                part.d[local] += beta;
-                                beta
-                            };
-                            if in_place {
-                                crate::simd::axpy_f16_f32(
-                                    target,
-                                    weight,
-                                    &kv.storage[packed_v..][..head_dim * 2],
-                                );
-                            } else {
-                                crate::simd::axpy_f32(target, weight, value);
+                                let local = head - heads.start;
+                                let score = scores[local];
+                                let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                                let weight = if score > part.m[local] {
+                                    let alpha = (part.m[local] - score).exp();
+                                    part.m[local] = score;
+                                    part.d[local] = part.d[local] * alpha + 1.0;
+                                    for value in target.iter_mut() {
+                                        *value *= alpha;
+                                    }
+                                    1.0_f32
+                                } else {
+                                    let beta = (score - part.m[local]).exp();
+                                    part.d[local] += beta;
+                                    beta
+                                };
+                                if in_place {
+                                    crate::simd::axpy_f16_f32(
+                                        target,
+                                        weight,
+                                        &kv.storage[packed_v..][..head_dim * 2],
+                                    );
+                                } else {
+                                    crate::simd::axpy_f32(target, weight, value);
+                                }
                             }
                         }
                     }

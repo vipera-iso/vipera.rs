@@ -1867,3 +1867,49 @@ the blocked piece is that `run_batch_n`'s "entry `e`'s logits are bit-identical 
 hold with more than one thread. Fixing that (one reduction order for batched and single passes) is
 the prerequisite for revisiting a draft model, which is the version that would actually pay: this
 n-gram drafter is out of ideas after 32k tokens of context.
+
+### The window kernel paid per-head call overhead, and the weight stream is not bit-limited — 2026-11-18
+
+With the ring cache in place, a 32k step with a 2048 window profiles as: **q4k 19.2 ms (48%), q6k
+11.1 ms (28%), attention 9.0 ms (23%), rest 0.7 ms (2%)** — 40 ms, 25.2 tok/s. Two things to test
+from there.
+
+**Lower-bit weights do not apply where they look like they do.** The kernel-level rates, from
+`kernel_gbps_fused_q4k_q6k` on this box:
+
+| tensor | type | MB/call | ms/call | GB/s |
+|---|---|---|---|---|
+| ffn_gate | Q4_K | 7.7 | 0.3 | 30.42 |
+| wq | Q4_K | 1.3 | 0.1 | 13.11 |
+| ffn_down | Q6_K | 11.3 | 0.4 | 29.02 |
+| output | Q6_K | 191.4 | 6.4 | 30.05 |
+
+Q4_K and Q6_K stream at the same rate (30 GB/s), so bytes map straight to time and requantizing the
+Q6_K tensors (`ffn_down`, `output`, 507 MB) down to Q4_K would save ~160 MB ≈ **5 ms** — but those
+are exactly the tensors the Q4_K_M mix keeps at six bits because they tolerate four worst; the layers
+that tolerate fewer bits are the ones already at Q4_K, and going below needs a Q3_K/Q2_K kernel this
+engine does not have. Not pursued: a naive requantization would spend accuracy on the sensitive half.
+The real weight-stream finding is that both kernels sit at **30 GB/s against a 43 GB/s read ceiling**,
+i.e. the q4k kernel's own unpack and reduction are the binding constraint, not the format's size.
+
+**Attention was paying a call per head per row.** `q4k_dot` and friends are cheap, but
+`attention_window_chunked_heads` called `dot_f16_f32` and `axpy_f16_f32` once per head per row — 24
+calls per (layer, position), 1.4M per step — and each call re-runs an `OnceLock` load, two
+`is_x86_feature_detected!` checks and a fresh loop setup for a 64-value dot. `dot_f16_f32_heads` and
+`axpy_f16_f32_heads` in `simd.rs` hoist all of that to one check per KV head and run the six query
+heads that share its row back to back; the per-head arithmetic is unchanged, so the scores are
+bit-identical. Measured at 32k, 8 threads, `VIPERA_ATTN_WINDOW=2048`:
+
+| | attention | ms/step | tok/s |
+|---|---|---|---|
+| per-head calls | 9.0–9.2 | 39.6 | 25.2 |
+| one call per KV head | **7.85** | **36.9** | **27.1** |
+
+7.4% off the step, 1.2 ms of the 9.0, and the per-position output is unchanged (greedy text at
+`VIPERA_ATTN_WINDOW=16`, which evicts the middle of the history, is byte-for-byte what it was). The
+remaining gap is not call overhead: 57 MB of KV per step at 7.85 ms is 7.4 GB/s, so what is left is
+the strided row walk itself, which is the next thing to measure rather than guess at.
+
+Scaling check, since a flat 32k step invites the question of whether more threads help: 2 threads 64.7
+ms, 4 threads 44.8, 6 threads 40.8, 8 threads 37.4 (before the change). 8 is the ceiling on this
+4-core/8-thread box, so the thread count is not leaving anything on the table.
