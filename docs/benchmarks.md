@@ -1632,3 +1632,29 @@ only helps if the tile is blocked over *queries* as well — 128 prefill queries
 the K rows are loaded once for 128 reductions — which is the prefill shape and not the decode shape. So
 for decode, the remaining lever is a blocked score pass over several heads at once, and the 2-3x this
 section hoped for is not available from fusing the value pass.
+
+### Query-blocked prefill attention — tried and reverted — 2026-11-18
+
+A prefill chunk is `B` consecutive positions of one sequence, so every entry scans almost the same
+keys, and `attend_entry` walks those rows once per entry. The block kernel scored a 64-row key tile
+against all `B` entries (8 at a time) and every head from one visit, with a running softmax per entry,
+so each key slice fed eight dots instead of one. It was checked against the per-entry kernel at every
+entry of a run (max deviation 1e-4 at 300-307 positions) and measured on the 1024/4096 prompt
+(`prefill_long_prompt`, 8 threads, two interleaved passes each):
+
+| prefill | block off | block on |
+|---:|---:|---:|
+| 1024 | 143.9 / 133.5 tok/s | 132.2 / 130.6 tok/s |
+| 4096 | 77.3 / 75.8 tok/s | 77.7 / 77.0 tok/s |
+
+No change at 4096 and slightly worse at 1024: the reuse saves bookkeeping, but the work that decides
+the time is inside the kernel, where nothing is reused. Reverted.
+
+**Why, with the split measured.** [`attention_cost_per_position`] separates the score dots from the
+rest at the same shape and count: at 1024 positions the two-pass attention is 0.55 ms and the dots
+alone 0.20 ms, so **36% is dot, ~64% is exp, max and the V axpy** — the value pass and the softmax,
+which every query needs for its own row and which no tiling removes. So for prefill at 4k, exact
+attention is priced by its arithmetic, not by its addressing, and the remaining lever is a wider
+kernel (AVX-512 f32/f16 dot and axpy) rather than a better loop shape. That lever changes the
+reduction order: the tests that pin the f16 dot to the decode-then-dot oracle bit for bit would have to
+become tolerance checks, so it is a separate decision, not a cleanup.
