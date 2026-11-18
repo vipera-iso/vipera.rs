@@ -1944,3 +1944,29 @@ At 32k, 8 threads, `VIPERA_ATTN_WINDOW=2048`:
 8 threads, i.e. 84% of the 43 GB/s ceiling). Everything left on this hardware is in the q4k stream.
 Greedy text is unchanged by all of it: `VIPERA_ATTN_WINDOW=16` (window smaller than the output, so the
 history's middle is really evicted) gives the same 40 tokens as before.
+
+### Prefill is attention-bound, and the same batching pays there — 2026-11-18
+
+A 4096-token prefill profiled at **attention 49%, q4k 36%, q6k 10%** — the mirror image of decode, and
+the reason prefill was the last big number left: 50.1 s for 4096 tokens, 81.8 tok/s, against
+llama.cpp's 217 on pp512. The earlier note here said the prefill lever would be "a wider kernel, and
+that changes the reduction order, so the tests that pin the f16 dot to the decode-then-dot oracle
+would have to become tolerance checks". It does not have to: the interleaved kernel takes a `fused`
+flag, and with it off it does the same multiply and the same add `dot_f16_f32_avx2` does, so
+`streaming_attention_is_bit_identical_to_decoding_the_layer_first` still holds bit for bit —
+`VIPERA_EXACT_DOT=1` and the unfused path agree exactly, as before.
+
+`dot_f16_f32_heads_exact` / `axpy_f16_f32_heads_exact` are now what the streaming kernel (prefill's hot
+path) calls when every head is wanted and the KV is f16 in place, which is what a prefill chunk always
+asks for. One row load and one feature check per KV head instead of one per head, six independent
+chains per row:
+
+| | before | after |
+|---|---|---|
+| pp1024 | 143.9 / 133.5 tok/s | **154.6** |
+| pp4096 | 81.8 (50.1 s) | **95.7** (42.8 s) |
+| attention in a 4096-token chunk, last pass | 683.9–695.9 ms | **503.4–512.3 ms** |
+
+16% on pp4096 and 26% off the attention phase, with prefill now 42% q4k, 41% attention, 12% q6k
+instead of half attention. Decode at 32k with the window is unmoved (median 36.1 ms, 27.7 tok/s, three
+runs), as it should be: this path is the streaming kernel, and a windowed decode does not take it.

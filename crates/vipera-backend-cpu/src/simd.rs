@@ -655,7 +655,7 @@ pub(crate) fn dot_f16_f32_heads(
         // head index below is inside `q` and `out`, which this function's slices bound at
         // `head_dim` per head.
         unsafe {
-            dot_f16_f32_heads_avx2_fma(q, first_head, count, head_dim, row, length, out);
+            dot_f16_f32_heads_avx2_fma(q, first_head, count, head_dim, row, length, out, true);
         }
         return;
     }
@@ -704,7 +704,7 @@ pub(crate) fn axpy_f16_f32_heads(
         // SAFETY: the features were detected above, `weights` is inside the register budget and every
         // row of `targets` below is inside the slice, which the caller sized at `head_dim` per head.
         unsafe {
-            axpy_f16_f32_heads_avx2_fma(targets, head_dim, weights, row, length);
+            axpy_f16_f32_heads_avx2_fma(targets, head_dim, weights, row, length, true);
         }
         return;
     }
@@ -744,6 +744,7 @@ const HEADS_IN_REGISTERS: usize = 8;
 /// `q` must hold `first_head + count` heads of `head_dim`; `out` must hold `count` floats; `length`
 /// must not exceed `head_dim` or `row`'s half.
 #[target_feature(enable = "avx2,f16c,fma")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn dot_f16_f32_heads_avx2_fma(
     q: &[f32],
     first_head: usize,
@@ -752,6 +753,7 @@ unsafe fn dot_f16_f32_heads_avx2_fma(
     row: &[u8],
     length: usize,
     out: &mut [f32],
+    fused: bool,
 ) {
     // SAFETY: the caller's contract covers every pointer below; `head < count` keeps the query row
     // inside `q` and the slot inside `out`, and every load stays before `length`.
@@ -769,8 +771,21 @@ unsafe fn dot_f16_f32_heads_avx2_fma(
             ));
             for head in 0..count {
                 let query = q.as_ptr().add((first_head + head) * head_dim + at);
-                first[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query), low, first[head]);
-                second[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query.add(8)), high, second[head]);
+                // `fused` picks the rounding, not the order: the unfused form is the multiply and
+                // the add `dot_f16_f32_avx2` does, so a head scored this way keeps that kernel's
+                // bits and the bit-for-bit oracle test still applies.
+                if fused {
+                    first[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query), low, first[head]);
+                    second[head] =
+                        _mm256_fmadd_ps(_mm256_loadu_ps(query.add(8)), high, second[head]);
+                } else {
+                    first[head] =
+                        _mm256_add_ps(first[head], _mm256_mul_ps(_mm256_loadu_ps(query), low));
+                    second[head] = _mm256_add_ps(
+                        second[head],
+                        _mm256_mul_ps(_mm256_loadu_ps(query.add(8)), high),
+                    );
+                }
             }
             at += 16;
         }
@@ -795,12 +810,14 @@ unsafe fn dot_f16_f32_heads_avx2_fma(
 /// The CPU must support AVX2, F16C and FMA; `targets` must hold `weights.len()` rows of `head_dim`;
 /// `length` must not exceed `head_dim` or `row`'s half.
 #[target_feature(enable = "avx2,f16c,fma")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn axpy_f16_f32_heads_avx2_fma(
     targets: &mut [f32],
     head_dim: usize,
     weights: &[f32],
     row: &[u8],
     length: usize,
+    fused: bool,
 ) {
     // SAFETY: the caller's contract covers every pointer below; each store lands inside the head's
     // own row of `targets` and before `length`.
@@ -814,10 +831,13 @@ unsafe fn axpy_f16_f32_heads_avx2_fma(
             for (head, weight) in weights.iter().enumerate() {
                 let target = targets.as_mut_ptr().add(head * head_dim + at);
                 let scale = _mm256_set1_ps(*weight);
-                _mm256_storeu_ps(
-                    target,
-                    _mm256_fmadd_ps(scale, values, _mm256_loadu_ps(target)),
-                );
+                let current = _mm256_loadu_ps(target);
+                let sum = if fused {
+                    _mm256_fmadd_ps(scale, values, current)
+                } else {
+                    _mm256_add_ps(current, _mm256_mul_ps(scale, values))
+                };
+                _mm256_storeu_ps(target, sum);
             }
             at += 8;
         }
@@ -928,6 +948,71 @@ unsafe fn axpy_f16_f32_avx2_fma(target: &mut [f32], weight: f32, row: &[u8]) {
             *out.add(at) += weight * f16_to_f32(low);
             at += 1;
         }
+    }
+}
+
+/// [`dot_f16_f32_heads`] with [`dot_f16_f32`]'s rounding: the same two-accumulator tree per head,
+/// with the multiply and the add kept apart.
+///
+/// This is the batched form for the paths that are pinned to the decoded-then-dot oracle bit for
+/// bit — the streaming attention kernel, which is what a prefill spends half its time in. Batching
+/// removes the per-head call overhead and the per-head row load; the arithmetic stays exactly the
+/// one [`dot_f16_f32`] does, so the oracle comparison still holds.
+pub(crate) fn dot_f16_f32_heads_exact(
+    q: &[f32],
+    first_head: usize,
+    count: usize,
+    head_dim: usize,
+    row: &[u8],
+    out: &mut [f32],
+) {
+    let fast = available()
+        && std::is_x86_feature_detected!("f16c")
+        && std::is_x86_feature_detected!("fma");
+    let row_length = row.len() / 2;
+    let length = head_dim.min(row_length);
+    if fast && length >= 16 && count <= HEADS_IN_REGISTERS && out.len() >= count {
+        // SAFETY: the features were detected above, `count` is inside the register budget and every
+        // head index below is inside `q` and `out`, which this function's slices bound at
+        // `head_dim` per head.
+        unsafe {
+            dot_f16_f32_heads_avx2_fma(q, first_head, count, head_dim, row, length, out, false);
+        }
+        return;
+    }
+    for (member, slot) in out.iter_mut().take(count).enumerate() {
+        let at = (first_head + member) * head_dim;
+        *slot = dot_f16_f32(&q[at..at + head_dim], row);
+    }
+}
+
+/// [`axpy_f16_f32_heads`] with [`axpy_f16_f32`]'s rounding, for the same bit-exact paths.
+pub(crate) fn axpy_f16_f32_heads_exact(
+    targets: &mut [f32],
+    head_dim: usize,
+    weights: &[f32],
+    row: &[u8],
+) {
+    let fast = available()
+        && std::is_x86_feature_detected!("f16c")
+        && std::is_x86_feature_detected!("fma");
+    let row_length = row.len() / 2;
+    let length = head_dim.min(row_length);
+    if fast
+        && length >= 8
+        && weights.len() <= HEADS_IN_REGISTERS
+        && targets.len() >= weights.len() * head_dim
+    {
+        // SAFETY: the features were detected above, `weights` is inside the register budget and
+        // every row of `targets` below is inside the slice, which the caller sized per head.
+        unsafe {
+            axpy_f16_f32_heads_avx2_fma(targets, head_dim, weights, row, length, false);
+        }
+        return;
+    }
+    for (member, weight) in weights.iter().enumerate() {
+        let target = &mut targets[member * head_dim..][..head_dim];
+        axpy_f16_f32(target, *weight, row);
     }
 }
 

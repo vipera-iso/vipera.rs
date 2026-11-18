@@ -1941,6 +1941,8 @@ fn attention_streaming_heads(
     row.resize(width, 0.0);
     head_state.clear();
     head_state.resize(count, f32::NEG_INFINITY);
+    // A decode or prefill step asks for every head, and the heads of one KV head share its row.
+    let whole = heads.start == 0 && heads.end == shape.heads && group <= 16;
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
     kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
@@ -1948,9 +1950,31 @@ fn attention_streaming_heads(
             kv.layout
                 .decode(&kv.storage[base..base + layer_bytes], row)?;
         }
+        // Heads that share a KV head read the same row, so they are scored in one call: same
+        // arithmetic as `dot_f16_f32` per head (the bit-for-bit oracle test still holds), one row
+        // load and one feature check instead of `group` of them.
         for kv_head in 0..shape.kv_heads {
             let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
             let packed = (base + kv_head * head_dim * 2)..;
+            if whole && in_place && !sequential {
+                let first = kv_head * group;
+                let mut dots = [0.0_f32; 16];
+                crate::simd::dot_f16_f32_heads_exact(
+                    q,
+                    first,
+                    group,
+                    head_dim,
+                    &kv.storage[packed.start..],
+                    &mut dots[..group],
+                );
+                for (member, dot) in dots[..group].iter().enumerate() {
+                    let local = first + member;
+                    let score = *dot * scale;
+                    scores[local * positions + position] = score;
+                    head_state[local] = head_state[local].max(score);
+                }
+                continue;
+            }
             for member in 0..group {
                 let head = kv_head * group + member;
                 if head < heads.start || head >= heads.end {
@@ -1996,6 +2020,21 @@ fn attention_streaming_heads(
         for kv_head in 0..shape.kv_heads {
             let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
             let packed = (v_base + kv_head * head_dim * 2)..;
+            if whole && in_place {
+                let first = kv_head * group;
+                let mut weights = [0.0_f32; 16];
+                for (member, weight) in weights[..group].iter_mut().enumerate() {
+                    let local = first + member;
+                    *weight = scores[local * positions + position] * head_state[local];
+                }
+                crate::simd::axpy_f16_f32_heads_exact(
+                    &mut out[first * head_dim..(first + group) * head_dim],
+                    head_dim,
+                    &weights[..group],
+                    &kv.storage[packed.start..],
+                );
+                continue;
+            }
             for member in 0..group {
                 let head = kv_head * group + member;
                 if head < heads.start || head >= heads.end {
