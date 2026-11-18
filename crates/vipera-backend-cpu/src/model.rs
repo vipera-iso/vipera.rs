@@ -10,7 +10,6 @@
 //! overrunning.
 
 use std::path::Path;
-use std::sync::OnceLock;
 use std::thread;
 
 use vipera_core::gguf::{GgmlType, GgufFile, TensorInfo, Value};
@@ -532,9 +531,15 @@ impl CpuBackend {
                 context.block_table.len()
             )));
         }
-        if context.kv.len()
-            < blocks * context.bytes_per_token as usize * context.tokens_per_block as usize
-        {
+        // The table does not have to name one distinct block per position: a ring cache repeats
+        // its blocks, so what the buffer must cover is the highest block any position names.
+        let block_bytes = context.bytes_per_token as usize * context.tokens_per_block as usize;
+        let reach = context.block_table[..blocks]
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |block| (block as usize + 1) * block_bytes);
+        if context.kv.len() < reach {
             return Err(ViperaError::internal(
                 "the KV buffer is smaller than its own block table implies",
             ));
@@ -856,9 +861,13 @@ impl CpuBackend {
                     context.block_table.len()
                 )));
             }
-            if kv.len()
-                < blocks * context.bytes_per_token as usize * context.tokens_per_block as usize
-            {
+            let block_bytes = context.bytes_per_token as usize * context.tokens_per_block as usize;
+            let reach = context.block_table[..blocks]
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |block| (block as usize + 1) * block_bytes);
+            if kv.len() < reach {
                 return Err(ViperaError::internal(
                     "the KV buffer is smaller than its own block table implies",
                 ));
@@ -2018,22 +2027,8 @@ fn attention_streaming_heads(
 /// model stops seeing the middle of its history. It exists because attention at depth is O(positions)
 /// of real arithmetic (see `docs/benchmarks.md`, 2026-11-18) and no exact loop shape removes it.
 fn attention_window() -> Option<(usize, usize)> {
-    static WINDOW: OnceLock<Option<(usize, usize)>> = OnceLock::new();
-    *WINDOW.get_or_init(|| {
-        let window: usize = std::env::var("VIPERA_ATTN_WINDOW")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()?;
-        if window == 0 {
-            return None;
-        }
-        let sinks: usize = std::env::var("VIPERA_ATTN_SINKS")
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(4);
-        Some((window, sinks))
-    })
+    vipera_core::window::attention_window()
+        .map(|window| (window.tokens as usize, window.sinks as usize))
 }
 
 /// Attention over the sinks and the last `window` positions, instead of the whole history.
@@ -4838,6 +4833,88 @@ mod tests {
                 "the chunked window kernel with {workers} workers differs by {worst}"
             );
         }
+    }
+
+    /// A ring KV keeps only the sinks and the window, so the block table points dropped positions
+    /// at the same physical slots as the positions that replaced them. The kernel must not notice:
+    /// what it reads for a kept position is that position's row, and what it computes must equal the
+    /// same attention over a cache that still held every position.
+    #[test]
+    fn the_window_kernel_reads_a_ring_table_like_a_linear_one() {
+        let shape = AttnShape {
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+        let width = shape.kv_heads * shape.head_dim;
+        let positions = 200usize;
+        let sinks = 4usize;
+        let window = 32usize;
+        let tokens_per_block = 16usize;
+        // One pinned block holds the sinks; four rolling blocks cover 64 positions, twice the
+        // window, so the window's own blocks are the ones that wrote last into each physical block.
+        let pinned_blocks = 1usize;
+        let rolling_blocks = 4usize;
+        let ring: Vec<u32> = (0..positions.div_ceil(tokens_per_block))
+            .map(|block| {
+                if block < pinned_blocks {
+                    block as u32
+                } else {
+                    (pinned_blocks + (block - pinned_blocks) % rolling_blocks) as u32
+                }
+            })
+            .collect();
+        let linear: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let run = |table: &[u32]| {
+            let mut storage = Vec::new();
+            filled_kv(
+                &mut storage,
+                KvLayout::F16,
+                shape,
+                tokens_per_block,
+                table,
+                positions,
+            );
+            let kv = KvView {
+                bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+                storage: &mut storage,
+                table,
+                tokens_per_block,
+                layout: KvLayout::F16,
+            };
+            let read = KvRead::of(&kv);
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            attention_window_heads(
+                &q,
+                &read,
+                RowOrder::from_env(),
+                0,
+                positions,
+                sinks,
+                window,
+                shape,
+                0..shape.heads,
+                &mut AttnScratch::default(),
+                &mut out,
+            )
+            .expect("window kernel over a ring table");
+            out
+        };
+        let want = run(&linear);
+        let got = run(&ring);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            worst <= 1e-5,
+            "a ring table changed the kept positions by {worst}"
+        );
     }
 
     fn argmax_t(values: &[f32]) -> u32 {

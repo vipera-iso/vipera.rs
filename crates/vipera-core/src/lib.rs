@@ -8,9 +8,11 @@
 pub mod gguf;
 pub mod hardware;
 pub mod planner;
+pub mod window;
 
 pub use gguf::{GgufFile, Header, Metadata, ModelDescriptor, TensorInfo};
 pub use hardware::SystemProbe;
 pub use planner::{
     KvCacheType, ModelShape, PlacementPlan, PlanRequest, Violation, plan, plan_shape,
 };
+pub use window::{Window, attention_window};

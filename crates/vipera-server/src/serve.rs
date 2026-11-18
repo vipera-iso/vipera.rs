@@ -32,6 +32,7 @@ use vipera_backend_cpu::CpuBackend;
 use vipera_core::gguf::GgufFile;
 use vipera_core::planner::KvCacheType;
 use vipera_core::{PlacementPlan, PlanRequest, SystemProbe, plan};
+use vipera_core::window::attention_window;
 use vipera_errors::ViperaError;
 use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, Generation, KvCache, KvConfig, StepReport,
@@ -677,13 +678,19 @@ impl Served {
         let file = GgufFile::parse(&bytes)?;
         let limit = file.describe().context_limit.unwrap_or(2048);
         let context_length = ctx.unwrap_or(limit.min(2048));
+        // The window makes the shapes past it unreachable, so the plan and the cache both pay for
+        // the sinks and the window instead of the whole context. One ring per sequence, because up
+        // to `max_batch` sequences are live at once.
+        let window = attention_window();
+        let sequences = 4;
         let placement = plan(
             &file,
             &hardware,
             &PlanRequest {
                 ctx: context_length,
                 kv_type,
-                batch_size: 1,
+                batch_size: if window.is_some() { sequences } else { 1 },
+                window,
             },
         )?;
         check_placement(&placement)?;
@@ -698,13 +705,12 @@ impl Served {
                 kv_type.as_str()
             ))
         })?;
-        let budget = context_length
-            .checked_mul(bytes_per_token)
-            .ok_or_else(|| ViperaError::invalid_argument("--ctx is too large for this model"))?;
-        let kv = KvCache::new(KvConfig::from_bytes(
-            budget,
+        let kv = KvCache::new(KvConfig::for_run(
             bytes_per_token,
             DEFAULT_TOKENS_PER_BLOCK,
+            context_length,
+            window.map(|window| (window.tokens, window.sinks)),
+            sequences,
         )?)?;
 
         let mut eos = Vec::new();
@@ -2787,6 +2793,7 @@ mod tests {
             ctx: 2048,
             kv_type: KvCacheType::F16,
             batch_size: 1,
+            window: None,
         }
     }
 

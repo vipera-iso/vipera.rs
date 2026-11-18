@@ -1784,3 +1784,49 @@ What this leaves: at 32k with a 2048 window the step is 40 ms, of which 32.5 ms 
 at 34 GB/s — 79% of the 43 GB/s read ceiling. Attention is 9.6 ms; the rest is under a millisecond.
 So on this hardware the remaining large-context lever is bytes per token (or tokens per weight pass,
 which speculative decoding already does), not the context length.
+
+### A ring cache: a windowed 32k run holds 61 MB of KV, not 896 MB — 2026-11-18
+
+The window made the *step* flat but not the *cache*: `KvConfig` still sized the KV by
+`ctx x bytes_per_token`, so `--ctx 32768` reserved 939,524,096 bytes of f16 KV while the kernel could
+only ever read the sinks and the last 2048 positions. Two thirds of that is reserve that no step can
+touch, and on a 16 GB box it is most of what stands between a 32k context and a second model.
+
+`KvConfig::ring` keeps a pinned block for the sinks and a ring of
+`ceil((window + PREFILL_HEADROOM + tpb) / tpb) + 1` blocks for the window. The block table does the
+rest: a slot that has been overwritten points its entry at the same physical block as the position
+that overwrote it, so **no kernel or `KvRead` change was needed** — the window kernel already only
+reads `[0, sinks)` and `[last - window, last)`, and those slots are never the ones a write is about
+to reuse. `KvConfig::for_run` chooses the ring only when `ctx > window + sinks + PREFILL_HEADROOM`;
+a small context would otherwise pay for a ring that holds everything anyway.
+
+`vipera verify --ctx 32768 --cpu`, same model, window off and on:
+
+| | kv blocks | kv_cache_bytes | predicted host | measured host |
+|---|---|---|---|---|
+| full history | 2048 | 939,524,096 | 2,050,894,336 | 2,081,591,296 (+1.50%) |
+| `VIPERA_ATTN_WINDOW=2048` | 139 | **63,766,528** | 1,174,792,704 | 1,205,768,192 (+2.64%) |
+
+14.7x less KV, and `plan` accounts for it without a second formula (`PlanRequest.window` feeds
+`ModelShape::window_kv_bytes`, deliberately an upper bound: it assumes a 16-token block and adds two
+blocks of slack).
+
+What it costs at the step, 32k, `VIPERA_ATTN_WINDOW=2048`, 8 threads, best of 3, both tables in the
+same run (`decode_cost_at_depth_with_ring_cache`):
+
+| table | KV held | ms/step | tok/s |
+|---|---|---|---|
+| linear (2049 blocks) | 896.4 MB | 34.8 | 28.8 |
+| ring (139 blocks) | **60.4 MB** | 35.3 | 28.3 |
+
+The 1.4% is inside this box's 8-15% window-to-window spread, and the work is identical by
+construction: same kept positions, same rows, one table lookup either way. Correctness is pinned in
+two places — `the_window_kernel_reads_a_ring_table_like_a_linear_one` runs the window kernel over a
+ring table and over a full one and requires the same output (1e-5), and greedy generation at
+`VIPERA_ATTN_WINDOW=16` (a window smaller than the output, so the middle really is evicted) produces
+the same 40 tokens from a ring cache and from a full table read through the same window.
+
+A ring cannot park blocks for a prefix cache (`park` and `copy_from_parked` refuse it; the prefix
+cache turns itself off when a window is set), and `release` sorts and dedups so aliased table entries
+free each physical block exactly once. Both are covered in `kv.rs` along with the slot count and the
+refusal to address past the context.

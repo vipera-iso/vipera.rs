@@ -14,6 +14,12 @@ use vipera_backend_cpu::CpuBackend;
 use vipera_core::gguf::{GgufFile, ModelDescriptor};
 use vipera_core::hardware::SystemProbe;
 use vipera_core::planner::{KvCacheType, ModelShape, PlacementPlan, PlanRequest, plan};
+use vipera_core::window::attention_window;
+
+/// The sinks and window the run will keep, as the runtime's plain numbers.
+fn kept_window() -> Option<(u64, u64)> {
+    attention_window().map(|window| (window.tokens, window.sinks))
+}
 use vipera_errors::ViperaError;
 use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, KvCache, KvConfig, Stage, peak_resident_bytes,
@@ -229,6 +235,7 @@ fn plan_command(args: &[String]) -> Result<u8, ViperaError> {
         ctx: ctx.unwrap_or(descriptor.context_limit.unwrap_or(4096)),
         kv_type,
         batch_size: 1,
+        window: attention_window(),
     };
     let placement = plan(&file, &hardware, &request)?;
 
@@ -349,6 +356,7 @@ fn verify_command(args: &[String]) -> Result<u8, ViperaError> {
         ctx: ctx.unwrap_or(descriptor.context_limit.unwrap_or(4096)),
         kv_type,
         batch_size: 1,
+        window: attention_window(),
     };
     let placement = plan(&file, &hardware, &request)?;
     if !placement.feasible {
@@ -368,8 +376,13 @@ fn verify_command(args: &[String]) -> Result<u8, ViperaError> {
     }
 
     let bytes_per_token = shape.kv_bytes(1, kv_type)?;
-    let kv_budget = shape.kv_bytes(request.ctx, kv_type)?;
-    let kv_config = KvConfig::from_bytes(kv_budget, bytes_per_token, DEFAULT_TOKENS_PER_BLOCK)?;
+    let kv_config = KvConfig::for_run(
+        bytes_per_token,
+        DEFAULT_TOKENS_PER_BLOCK,
+        request.ctx,
+        kept_window(),
+        1,
+    )?;
     let kv = KvCache::new(kv_config)?;
 
     let measured_host_bytes = match (baseline, peak_resident_bytes()) {
@@ -648,13 +661,12 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
         )));
     }
     let context_length = ctx.unwrap_or(context_limit.min(2048));
-    let budget = context_length
-        .checked_mul(bytes_per_token)
-        .ok_or_else(|| ViperaError::invalid_argument("--ctx is too large for this model"))?;
-    let kv = KvCache::new(KvConfig::from_bytes(
-        budget,
+    let kv = KvCache::new(KvConfig::for_run(
         bytes_per_token,
         DEFAULT_TOKENS_PER_BLOCK,
+        context_length,
+        kept_window(),
+        1,
     )?)?;
 
     let mut eos = Vec::new();

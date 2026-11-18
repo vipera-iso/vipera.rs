@@ -8,6 +8,7 @@ use vipera_errors::ViperaError;
 use vipera_traits::{DeviceKind, HardwareProfile};
 
 use crate::gguf::{GgufFile, Value};
+use crate::window::{PREFILL_HEADROOM, Window};
 
 /// Device overhead that is neither model weights nor KV cache: the CUDA context, allocator slack, and
 /// the compute buffer.
@@ -163,6 +164,29 @@ impl ModelShape {
         self.weights_bytes.saturating_sub(self.non_layer_bytes) / self.n_layer
     }
 
+    /// KV cache bytes a sliding window actually needs for a `ctx`-position table.
+    ///
+    /// This mirrors `KvConfig::ring` in the runtime, which allocates the blocks: the sinks plus a
+    /// window, plus [`crate::window::PREFILL_HEADROOM`], plus two blocks of rounding slack. It is an
+    /// upper bound on what the ring allocates, so a plan never under-claims memory a run will use.
+    pub fn window_kv_bytes(
+        &self,
+        ctx: u64,
+        kv_type: KvCacheType,
+        window: Window,
+    ) -> Result<u64, ViperaError> {
+        // The runtime's `DEFAULT_TOKENS_PER_BLOCK`, and two blocks of slack for the window's own
+        // block rounding: the ring in `KvConfig::ring` never asks for more than this.
+        const TOKENS_PER_BLOCK: u64 = 16;
+        let keep = window
+            .sinks
+            .saturating_add(window.tokens)
+            .saturating_add(PREFILL_HEADROOM)
+            .saturating_add(2 * TOKENS_PER_BLOCK)
+            .min(ctx);
+        self.kv_bytes(keep, kv_type)
+    }
+
     /// KV cache bytes for a full context at the given type.
     pub fn kv_bytes(&self, ctx: u64, kv_type: KvCacheType) -> Result<u64, ViperaError> {
         if self.n_head == 0 {
@@ -204,6 +228,9 @@ pub struct PlanRequest {
     pub kv_type: KvCacheType,
     /// Batch size. The KV estimate covers this many sequences.
     pub batch_size: u64,
+    /// Sliding-window attention, when the run is configured for it. The cache then only holds the
+    /// window and the sinks, so the estimate follows the cache rather than the context.
+    pub window: Option<Window>,
 }
 
 /// The answer: a placement and its predicted footprint.
@@ -257,7 +284,10 @@ pub fn plan_shape(
             "context length must be at least 1",
         ));
     }
-    let kv_per_sequence = shape.kv_bytes(request.ctx, request.kv_type)?;
+    let kv_per_sequence = match request.window {
+        Some(window) => shape.window_kv_bytes(request.ctx, request.kv_type, window)?,
+        None => shape.kv_bytes(request.ctx, request.kv_type)?,
+    };
     let kv_bytes = kv_per_sequence.saturating_mul(request.batch_size.max(1));
     let per_layer = shape.per_layer_bytes();
 
@@ -480,7 +510,30 @@ mod tests {
             ctx,
             kv_type: KvCacheType::F16,
             batch_size: 1,
+            window: None,
         }
+    }
+
+    #[test]
+    fn a_windowed_plan_pays_for_the_window_not_the_context() {
+        let window = Window {
+            tokens: 2048,
+            sinks: 4,
+        };
+        let full = shape().kv_bytes(32_768, KvCacheType::F16).unwrap();
+        let kept = shape()
+            .window_kv_bytes(32_768, KvCacheType::F16, window)
+            .unwrap();
+        assert!(kept * 10 < full, "{kept} bytes is not a window out of {full}");
+        // The estimate never claims less than a window has to hold, or a run would out-allocate
+        // its plan.
+        let floor = shape().kv_bytes(2048 + 4, KvCacheType::F16).unwrap();
+        assert!(kept >= floor);
+
+        let mut windowed = request(32_768);
+        windowed.window = Some(window);
+        let planned = plan_shape("m", &cpu_only(64 << 30), &shape(), &windowed).unwrap();
+        assert!(planned.predicted_host_bytes < shape().weights_bytes + full / 10);
     }
 
     #[test]

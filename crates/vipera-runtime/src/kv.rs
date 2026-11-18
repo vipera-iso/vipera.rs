@@ -9,6 +9,15 @@
 //! them again. Parked blocks are free for every purpose except that copy: [`KvCache::reserve`]
 //! takes them back, oldest first, whenever the free list runs out, so a parked sequence never
 //! makes an allocation fail.
+//!
+//! A cache built with [`KvConfig::ring`] is the exception to "a table's blocks are distinct": there
+//! the table still has one entry per block of the context, but the entries past the sinks repeat a
+//! small ring, so position 33000's KV overwrites position 1000's. Reads of the dropped positions
+//! return whatever the ring holds, which is why this only makes sense under a sliding window — the
+//! only reader, [`vipera_backend_cpu`]'s attention, then never asks for a position the window has
+//! dropped. Because table entries alias, a ring cannot park or copy blocks, and its blocks are the
+//! window and the sinks rather than the context: at 32k with a 2048-token window an f16 1.5B model
+//! keeps 64 MB instead of 939 MB.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -21,6 +30,25 @@ pub const DEFAULT_TOKENS_PER_BLOCK: u64 = 16;
 /// candidates a new request is compared against stays small.
 pub const PARKED_LIMIT: usize = 32;
 
+/// Tokens of a prompt chunk a ring has to keep behind the window: the chunk's positions are all
+/// written before the first of them reads its window, so the window has to reach back one chunk.
+pub const PREFILL_HEADROOM: u64 = 128;
+
+/// How a ring cache maps a context onto a few blocks.
+///
+/// Slots `0..pinned_slots` hold the sink positions and never move. Slots from `pinned_slots` on
+/// cycle through `rolling_slots` blocks, so a slot is `pinned_slots + (slot - pinned_slots) %
+/// rolling_slots`. The table itself still has [`Ring::slots`] entries, one per block of the context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ring {
+    /// Table entries the ring can address: `ceil(context / tokens_per_block)`.
+    pub slots: u64,
+    /// Blocks the sink positions own, counted from the start.
+    pub pinned_slots: u64,
+    /// Blocks the rest of the context cycles through.
+    pub rolling_slots: u64,
+}
+
 /// Geometry of a KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvConfig {
@@ -28,8 +56,10 @@ pub struct KvConfig {
     pub bytes_per_token: u64,
     /// Tokens a block holds.
     pub tokens_per_block: u64,
-    /// Blocks the cache owns.
+    /// Blocks the cache owns, across every sequence it was sized for.
     pub blocks: u64,
+    /// The ring a windowed cache maps its context onto, when it is one.
+    pub ring: Option<Ring>,
 }
 
 impl KvConfig {
@@ -68,6 +98,7 @@ impl KvConfig {
             bytes_per_token,
             tokens_per_block,
             blocks,
+            ring: None,
         };
         if config.total_bytes().is_none() {
             return Err(ViperaError::invalid_argument(
@@ -91,6 +122,77 @@ impl KvConfig {
         Self::new(bytes_per_token, tokens_per_block, blocks)
     }
 
+    /// Geometry for a cache that only has to *hold* a window, but must still be *addressed* by
+    /// position.
+    ///
+    /// The cache owns the sinks plus a rolling window, and `context_tokens` is what the table can
+    /// address. `sequences` caches are laid side by side, each with its own ring. `tokens_per_block`
+    /// rounds every part; the rolling part gets one extra block so a window that straddles a block
+    /// boundary never wraps onto itself, plus [`PREFILL_HEADROOM`] tokens because a prompt chunk
+    /// writes its whole chunk before the chunk's first position reads its window.
+    pub fn ring(
+        bytes_per_token: u64,
+        tokens_per_block: u64,
+        context_tokens: u64,
+        window_tokens: u64,
+        sink_tokens: u64,
+        sequences: u64,
+    ) -> Result<Self, ViperaError> {
+        if window_tokens == 0 {
+            return Err(ViperaError::invalid_argument(
+                "a ring KV cache needs a window to keep",
+            ));
+        }
+        if sequences == 0 {
+            return Err(ViperaError::invalid_argument(
+                "a ring KV cache needs at least one sequence",
+            ));
+        }
+        let per_block = tokens_per_block.max(1);
+        let pinned_slots = sink_tokens.div_ceil(per_block);
+        let rolling_slots = (window_tokens + PREFILL_HEADROOM + per_block).div_ceil(per_block) + 1;
+        let slots = context_tokens.div_ceil(per_block).max(pinned_slots + rolling_slots);
+        let blocks = (pinned_slots + rolling_slots).checked_mul(sequences).ok_or_else(|| {
+            ViperaError::invalid_argument("ring KV cache geometry overflows a 64-bit block count")
+        })?;
+        let mut config = Self::new(bytes_per_token, tokens_per_block, blocks)?;
+        config.ring = Some(Ring {
+            slots,
+            pinned_slots,
+            rolling_slots,
+        });
+        Ok(config)
+    }
+
+    /// The cache a run should allocate for `context_tokens` positions.
+    ///
+    /// A sliding window makes the positions the model can still reach far shorter than the context,
+    /// so the cache becomes a [`KvConfig::ring`] of the sinks and the window. When the context is no
+    /// longer than that, a ring would hold everything anyway, so the plain paged cache is used — it
+    /// is what a run without a window gets.
+    pub fn for_run(
+        bytes_per_token: u64,
+        tokens_per_block: u64,
+        context_tokens: u64,
+        window: Option<(u64, u64)>,
+        sequences: u64,
+    ) -> Result<Self, ViperaError> {
+        let budget = context_tokens
+            .checked_mul(bytes_per_token)
+            .ok_or_else(|| ViperaError::invalid_argument("context is too large for this model"))?;
+        match window {
+            Some((tokens, sinks)) if context_tokens > tokens + sinks + PREFILL_HEADROOM => Self::ring(
+                bytes_per_token,
+                tokens_per_block,
+                context_tokens,
+                tokens,
+                sinks,
+                sequences,
+            ),
+            Some(_) | None => Self::from_bytes(budget, bytes_per_token, tokens_per_block),
+        }
+    }
+
     /// Bytes a block occupies.
     pub fn block_bytes(&self) -> u64 {
         self.bytes_per_token.saturating_mul(self.tokens_per_block)
@@ -101,12 +203,17 @@ impl KvConfig {
         self.blocks.checked_mul(self.block_bytes())
     }
 
-    /// Tokens every block together can hold.
+    /// Tokens the table can address.
     pub fn capacity_tokens(&self) -> u64 {
-        self.blocks.saturating_mul(self.tokens_per_block)
+        self.slot_count().saturating_mul(self.tokens_per_block)
     }
 
-    /// Blocks needed to cover `tokens`.
+    /// Table entries the cache can hand out: one per block of the context.
+    pub fn slot_count(&self) -> u64 {
+        self.ring.map_or(self.blocks, |ring| ring.slots)
+    }
+
+    /// Blocks of the table needed to cover `tokens`.
     pub fn blocks_for(&self, tokens: u64) -> u64 {
         tokens.div_ceil(self.tokens_per_block)
     }
@@ -219,6 +326,9 @@ impl KvCache {
         tokens: u64,
         keep: Option<u64>,
     ) -> Result<(), ViperaError> {
+        if let Some(ring) = self.config.ring {
+            return self.reserve_ring(sequence, tokens, ring);
+        }
         let needed = self.config.blocks_for(tokens);
         if needed > self.config.blocks {
             return Err(ViperaError::infeasible(format!(
@@ -263,6 +373,54 @@ impl KvCache {
         Ok(())
     }
 
+    /// [`KvCache::reserve`] for a ring cache: the table grows to the position asked for, but only
+    /// the sinks and the ring's own blocks are ever allocated, and the entries past those repeat.
+    fn reserve_ring(
+        &mut self,
+        sequence: u64,
+        tokens: u64,
+        ring: Ring,
+    ) -> Result<(), ViperaError> {
+        let needed = self.config.blocks_for(tokens);
+        if needed > ring.slots {
+            return Err(ViperaError::infeasible(format!(
+                "{tokens} tokens need {needed} KV blocks but the ring addresses {}; shorten the \
+                 context",
+                ring.slots
+            )));
+        }
+        let pinned = ring.pinned_slots as usize;
+        let rolling = ring.rolling_slots as usize;
+        let per_sequence = pinned + rolling;
+        let target = (needed as usize).max(per_sequence);
+        let missing = per_sequence.saturating_sub(
+            self.tables.get(&sequence).map_or(0, |table| table.len()),
+        );
+        if (self.free.len() as u64) < missing as u64 {
+            let in_use = self.used_blocks();
+            return Err(ViperaError::infeasible(format!(
+                "KV cache is full: {in_use} blocks in use, {per_sequence} needed for sequence \
+                 {sequence}"
+            )));
+        }
+        let table = self.tables.entry(sequence).or_default();
+        // The sinks and the ring itself are real blocks, taken once.
+        while table.len() < per_sequence {
+            let block = self
+                .free
+                .pop()
+                .ok_or_else(|| ViperaError::internal("ring free list ran dry"))?;
+            table.push(block);
+        }
+        // Past that, an entry points at the block its position has wrapped onto.
+        while table.len() < target {
+            let slot = table.len();
+            let block = table[pinned + (slot - pinned) % rolling];
+            table.push(block);
+        }
+        Ok(())
+    }
+
     /// Free the oldest parked sequence other than `keep`.
     fn evict_oldest_except(&mut self, keep: Option<u64>) {
         let Some(position) = self.parked.iter().position(|(id, _)| Some(*id) != keep) else {
@@ -278,6 +436,9 @@ impl KvCache {
     ///
     /// At most [`PARKED_LIMIT`] sequences stay parked; the oldest beyond that is freed.
     pub fn park(&mut self, sequence: u64) -> bool {
+        if self.config.ring.is_some() {
+            return false;
+        }
         let Some(table) = self.tables.remove(&sequence) else {
             return false;
         };
@@ -304,6 +465,11 @@ impl KvCache {
         sequence: u64,
         tokens: u64,
     ) -> Result<(), ViperaError> {
+        if self.config.ring.is_some() {
+            return Err(ViperaError::unsupported(
+                "a ring KV cache aliases its blocks, so a parked sequence cannot be copied into it",
+            ));
+        }
         let needed = self.config.blocks_for(tokens) as usize;
         let Some(source) = self
             .parked
@@ -346,8 +512,15 @@ impl KvCache {
     }
 
     /// Drop blocks past `tokens`, keeping the sequence's earlier blocks.
+    ///
+    /// A ring has no per-position blocks to drop: it keeps its sinks and its ring, and the table
+    /// shrinks to whatever still addresses `tokens` but never below one ring.
     pub fn truncate(&mut self, sequence: u64, tokens: u64) {
-        let keep = self.config.blocks_for(tokens) as usize;
+        let floor = self
+            .config
+            .ring
+            .map_or(0, |ring| (ring.pinned_slots + ring.rolling_slots) as usize);
+        let keep = (self.config.blocks_for(tokens) as usize).max(floor);
         if let Some(table) = self.tables.get_mut(&sequence) {
             while table.len() > keep {
                 if let Some(block) = table.pop() {
@@ -362,7 +535,7 @@ impl KvCache {
 
     /// Release every block a sequence owns, parked or not. Returns the number of blocks freed.
     pub fn release(&mut self, sequence: u64) -> u64 {
-        let table = match self.tables.remove(&sequence) {
+        let mut table = match self.tables.remove(&sequence) {
             Some(table) => table,
             None => {
                 let Some(position) = self.parked.iter().position(|(id, _)| *id == sequence) else {
@@ -374,6 +547,10 @@ impl KvCache {
                     .unwrap_or_default()
             }
         };
+        // Ring tables repeat a block, so releasing an entry per slot would free the same block many
+        // times over and hand the same memory to two sequences.
+        table.sort_unstable();
+        table.dedup();
         let freed = table.len() as u64;
         for block in table {
             self.free.push(block);
@@ -605,6 +782,98 @@ mod tests {
         assert!(!cache.is_parked(1));
         assert_eq!(cache.free_blocks(), 4);
         assert_eq!(cache.release(1), 0);
+    }
+
+    /// A 32k cache whose table can address 32k positions but whose storage is a window plus sinks.
+    fn ring() -> KvCache {
+        let config = KvConfig::ring(64, 16, 32_768, 2048, 4, 1).unwrap();
+        KvCache::new(config).unwrap()
+    }
+
+    #[test]
+    fn a_run_only_gets_a_ring_when_the_window_is_shorter_than_its_context() {
+        let window = Some((2048, 4));
+        let ring = KvConfig::for_run(64, 16, 32_768, window, 1).unwrap();
+        assert!(ring.ring.is_some());
+        let paged = KvConfig::for_run(64, 16, 2048, window, 1).unwrap();
+        assert!(
+            paged.ring.is_none(),
+            "a window that keeps the whole context must not pay for a ring"
+        );
+        assert_eq!(paged.blocks, 128);
+        assert!(KvConfig::for_run(64, 16, 4096, None, 1).unwrap().ring.is_none());
+    }
+
+    #[test]
+    fn a_ring_owns_the_window_and_the_sinks_not_the_whole_context() {
+        let cache = ring();
+        let full = 32_768 * 64;
+        assert!(
+            cache.allocated_bytes() as u64 <= full / 10,
+            "{} bytes for a 32k context is not a window",
+            cache.allocated_bytes()
+        );
+        // The table still addresses every position of the context.
+        assert_eq!(cache.config().capacity_tokens(), 32_768);
+        assert_eq!(cache.config().blocks_for(32_768), 2048);
+        assert_eq!(cache.config().blocks_for(1), 1);
+    }
+
+    #[test]
+    fn a_ring_table_rewrites_dropped_positions_and_keeps_every_kept_slot_distinct() {
+        let mut cache = ring();
+        cache.reserve(1, 32_768).unwrap();
+        let table = cache.table(1).expect("table").to_vec();
+        assert_eq!(table.len(), 2048, "one entry per block of the context");
+
+        let (pinned, rolling) = {
+            let ring = cache.config().ring.expect("ring");
+            (ring.pinned_slots as usize, ring.rolling_slots as usize)
+        };
+        // Sink slots never move, so the first tokens of the history stay readable.
+        let sinks: Vec<u32> = table[..pinned].to_vec();
+        let mut pinned_unique = sinks.clone();
+        pinned_unique.sort_unstable();
+        pinned_unique.dedup();
+        assert_eq!(pinned_unique.len(), sinks.len(), "sink slots are distinct");
+        // The ring region is a cycle, and the table repeats it once it wraps.
+        assert_eq!(table[pinned + rolling], table[pinned]);
+        assert_eq!(table[pinned + rolling + 3], table[pinned + 3]);
+        assert_eq!(table[2047], table[pinned + (2047 - pinned) % rolling]);
+
+        // What a decode at the end of the context actually reads: the last window, whose slots
+        // must be distinct, so the window never reads a block it has already overwritten. A window
+        // is 2048 tokens, which straddles one more block than 2048 / 16.
+        let window_slots = (2048 + 16) / 16;
+        let mut kept: Vec<u32> = table[table.len() - window_slots..].to_vec();
+        let seen = kept.len();
+        kept.sort_unstable();
+        kept.dedup();
+        assert_eq!(kept.len(), seen, "kept slots must not collide");
+        // And a sink never shares a block with the ring, so evicting cannot eat the first tokens.
+        assert!(
+            kept.iter().all(|block| !sinks.contains(block)),
+            "the ring must not overwrite a sink block"
+        );
+    }
+
+    #[test]
+    fn a_ring_frees_each_physical_block_once() {
+        let mut cache = ring();
+        let blocks = cache.config().blocks;
+        cache.reserve(1, 32_768).unwrap();
+        assert_eq!(cache.used_blocks(), blocks);
+        assert_eq!(cache.release(1), blocks);
+        assert_eq!(cache.free_blocks(), blocks, "aliases must not leak blocks");
+    }
+
+    #[test]
+    fn a_ring_refuses_to_park_and_cannot_address_more_than_its_context() {
+        let mut cache = ring();
+        cache.reserve(1, 16).unwrap();
+        assert!(!cache.park(1), "a ring's blocks are aliased, so they cannot be reused");
+        let error = cache.reserve(2, 33_000).unwrap_err();
+        assert!(error.to_string().contains("KV blocks"), "{error}");
     }
 
     #[test]

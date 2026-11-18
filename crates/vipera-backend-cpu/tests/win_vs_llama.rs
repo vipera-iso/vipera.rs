@@ -31,6 +31,7 @@ use vipera_backend_cpu::quant::matvec;
 use vipera_backend_cpu::{CpuBackend, ModelConfig};
 use vipera_core::gguf::GgmlType;
 use vipera_core::planner::KvCacheType;
+use vipera_core::window::{PREFILL_HEADROOM, attention_window};
 use vipera_runtime::{ForwardContext, ForwardPass};
 
 const TOKENS_PER_BLOCK: u64 = 16;
@@ -78,6 +79,38 @@ impl State {
             tokens: Vec::new(),
             kv: vec![0; blocks * bytes_per_token as usize * TOKENS_PER_BLOCK as usize],
             table: (0..blocks as u32).collect(),
+            bytes_per_token,
+        }
+    }
+
+    /// The same sequence in a ring cache: one pinned block for the sinks, then a ring just long
+    /// enough for the window, so `kv` is the window's size instead of the context's.
+    fn with_ring(
+        config: ModelConfig,
+        positions: usize,
+        ty: KvCacheType,
+        window: usize,
+        sinks: usize,
+    ) -> Self {
+        let bytes_per_token = config
+            .kv_bytes_per_token_for(ty)
+            .expect("qwen2.5-1.5b width is a multiple of 32");
+        let tpb = TOKENS_PER_BLOCK as usize;
+        let pinned = sinks.div_ceil(tpb).max(1);
+        let rolling = (window + PREFILL_HEADROOM as usize).div_ceil(tpb) + 1;
+        let blocks = pinned + rolling;
+        Self {
+            tokens: Vec::new(),
+            kv: vec![0; blocks * bytes_per_token as usize * tpb],
+            table: (0..positions.div_ceil(tpb))
+                .map(|block| {
+                    if block < pinned {
+                        block as u32
+                    } else {
+                        (pinned + (block - pinned) % rolling) as u32
+                    }
+                })
+                .collect(),
             bytes_per_token,
         }
     }
@@ -515,6 +548,55 @@ fn decode_cost_at_depth_without_prefill() {
 // ---------------------------------------------------------------------------
 // So sánh với llama.cpp nếu có sẵn
 // ---------------------------------------------------------------------------
+
+/// The same 32k decode step with the KV in a ring cache instead of a linear one.
+///
+/// The window kernel reads the sinks and the last `window` positions either way, so this measures
+/// only what the ring changes: which physical block a row lives in. Run as
+/// `VIPERA_ATTN_WINDOW=2048 cargo test --release -p vipera-backend-cpu --test win_vs_llama
+///   -- --ignored --nocapture decode_cost_at_depth_with_ring_cache`.
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn decode_cost_at_depth_with_ring_cache() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let Some(window) = attention_window() else {
+        eprintln!("skipped: set VIPERA_ATTN_WINDOW to measure a ring cache");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let ctx = 32_768usize;
+    for ring in [false, true] {
+        let mut state = if ring {
+            State::with_ring(
+                config,
+                ctx + 4,
+                KvCacheType::F16,
+                window.tokens as usize,
+                window.sinks as usize,
+            )
+        } else {
+            State::with_room(config, ctx + 4, KvCacheType::F16)
+        };
+        let kv_mb = state.kv.len() as f64 / (1 << 20) as f64;
+        state.tokens = vec![1000_u32; ctx];
+        let mut next = 1000_u32;
+        let ms = timed_best(3, || {
+            let logits = backend
+                .logits(&mut state.context(&[next]))
+                .expect("decode at depth");
+            next = argmax(&logits) as u32;
+        });
+        println!(
+            "ctx {ctx}: {} cache {kv_mb:>7.1} MB, {ms:>7.1} ms/step ({:>6.1} tok/s)",
+            if ring { "ring  " } else { "linear" },
+            1000.0 / ms
+        );
+    }
+}
 
 fn print_llama_hint(what: &str) {
     let bench = std::env::var_os("LLAMA_BENCH")
