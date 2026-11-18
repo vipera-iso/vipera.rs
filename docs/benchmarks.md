@@ -1970,3 +1970,30 @@ chains per row:
 16% on pp4096 and 26% off the attention phase, with prefill now 42% q4k, 41% attention, 12% q6k
 instead of half attention. Decode at 32k with the window is unmoved (median 36.1 ms, 27.7 tok/s, three
 runs), as it should be: this path is the streaming kernel, and a windowed decode does not take it.
+
+### A 512-bit VNNI Q4_K matvec for decode — measured, not kept — 2026-11-18
+
+The largest remaining term is the q4k stream (42–52% of both a prefill chunk and a 32k decode step),
+so the obvious move is the AVX-512 VNNI form the prefill path already has. The engine has one:
+`q4k_matvec_tiled_range`, which scores 32 weight rows against one activation tile per pass. It is
+gated to `B >= 16` because this CPU double-pumps AVX-512 and a sixteen-entry tile wastes fifteen lanes
+for one row.
+
+Re-measured at the shape a decode step actually runs, on a synthetic Q4_K tensor of `ffn_gate`'s size
+(8960x1536, one activation, single thread, best of four), now that the row kernel has changed underneath:
+
+| kernel | GB/s |
+|---|---:|
+| row kernel (VNNI-256, `fill_rows`) | **11.47** |
+| 512-bit VNNI tile at B=1 | 2.80 |
+
+4.1x slower, which is the double-pumping arithmetic rather than a bug: on this core every 512-bit
+integer op is two 256-bit uops, so the wider form saves no issue slots, and a 1-row tile fills 1 of
+16 lanes. A row-shaped 512-bit kernel would not waste lanes, but it still pays two uops per
+instruction and two extra inserts per row (the low and high nibble planes of two adjacent 32-value
+runs are not contiguous in the activation vector), so the ceiling it could reach is the 256-bit one.
+
+So the answer to "write a 512-bit q4k matvec" is the measurement, not a patch: it does not improve
+decode, and prefill already takes the 512-bit path where it does pay (B=128). The measurement is kept
+as `a_512_bit_decode_row_is_measured_against_the_row_kernel` so the next person gets the number in a
+minute rather than in a rewrite.

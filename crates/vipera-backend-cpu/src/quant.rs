@@ -1225,6 +1225,89 @@ mod tests {
         });
     }
 
+    /// Whether a 512-bit VNNI Q4_K kernel is worth having for a decode batch of one.
+    ///
+    /// The comment on `fill_rows_batch` says a 512-bit port was already measured and lost at B=1
+    /// (6.95 against 11.87 GB/s, because this CPU double-pumps AVX-512 and a sixteen-entry tile
+    /// wastes fifteen lanes for one row). This re-measures it on the kernel that exists, at the shape
+    /// a decode step actually runs, so the claim is checked rather than inherited.
+    ///
+    /// Ignored by default:
+    /// `cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture a_512_bit_decode_row`
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn a_512_bit_decode_row_is_measured_against_the_row_kernel() {
+        use std::time::Instant;
+        if !crate::simd::vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let cols = 1536usize;
+        let rows = 8960usize;
+        let stride = row_bytes(GgmlType::Q4K, cols).expect("stride");
+        let mut state = 0x9E37_79B9_u32;
+        let mut byte = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let data: Vec<u8> = (0..stride * rows).map(|_| byte()).collect();
+        let x: Vec<f32> = (0..cols).map(|at| (at % 97) as f32 / 97.0 - 0.5).collect();
+        let xq = QuantizedX::new(&x);
+        let sums = x_sums(&x);
+        let mut row_out = vec![0.0_f32; rows];
+        let mut tile_out = vec![0.0_f32; rows];
+
+        let run_row = || {
+            let mut out = vec![0.0_f32; rows];
+            fill_rows(
+                GgmlType::Q4K,
+                &data,
+                stride,
+                0,
+                Activation {
+                    x: &x,
+                    sums: &sums,
+                    q: Some(&xq),
+                },
+                &mut out,
+            );
+            out
+        };
+        let run_tile = || {
+            let mut out = vec![0.0_f32; rows];
+            let xs = [&xq];
+            let sums = [sums.as_slice()];
+            assert!(crate::simd::try_q4k_matvec_tiled_range::<1>(
+                &data, stride, 0, rows, &xs, &sums, &mut out
+            ));
+            out
+        };
+
+        let mut best = [f64::MAX; 2];
+        for _ in 0..4 {
+            let start = Instant::now();
+            row_out = run_row();
+            best[0] = best[0].min(start.elapsed().as_secs_f64());
+            let start = Instant::now();
+            tile_out = run_tile();
+            best[1] = best[1].min(start.elapsed().as_secs_f64());
+        }
+        let megabytes = (stride * rows) as f64 / 1e6;
+        let worst = row_out
+            .iter()
+            .zip(&tile_out)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        println!(
+            "q4k {}x{}: row kernel {:.2} GB/s, 512-bit tile {:.2} GB/s ({:+.0}%), max |delta| {worst:.3e}",
+            rows,
+            cols,
+            megabytes / 1e3 / best[0],
+            megabytes / 1e3 / best[1],
+            100.0 * (best[1] - best[0]) / best[0],
+        );
+    }
+
     #[test]
     fn matvec_matches_a_hand_computed_product() {
         let mut data = Vec::new();
