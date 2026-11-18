@@ -1604,3 +1604,31 @@ Rejected before writing code, for the record: KV quantisation as a speed lever (
 attention sinks / sliding windows / eviction (they change the tokens, and they only pay once the kernel
 is efficient — at 16.2 ms the kernel is the problem, not the window); more threads (the split already
 caps at physical cores and the 2026-11-17 entries measured the contention).
+
+### A single-pass online-softmax decode kernel — tried and reverted — 2026-11-18
+
+The entry above named "read KV once with a running softmax" as the lever. It was built
+(`attention_online_heads`: 64-position tiles of K/V read in place from an f16 cache, scored against
+every head, folded into a running max, normaliser and weighted V sum; `VIPERA_ATTN_ONLINE`), checked
+against the two-pass kernel at 1, 37, 64, 65, 300 and 1024 positions (max deviation 8.2e-8), and
+measured. It does not pay:
+
+| positions | two pass ms/layer | online ms/layer | ratio |
+|---:|---:|---:|---:|
+| 512 | 0.13 | 0.12 | 1.08x |
+| 1024 | 0.27 | 0.25 | 1.05x |
+| 2048 | 0.51 | 0.48 | 1.07x |
+| 4096 | 0.96 | 1.01 | 0.95x |
+
+End to end (`decode_attention_scaling`, two runs interleaved, ms/step): 4096 44.4 offline vs 46.0
+online; 1024 42.0 vs 36.1, which is the same run-to-run spread the whole file warns about, not a win.
+Reverted; the kernel and its switch are gone.
+
+**What this rules out, and the correction.** The second walk over the history is not what costs: fusing
+it away moves nothing, so the score pass is essentially the whole 16.2 ms at 4096. That pass spends
+~20 ns per (head, position), about four times the 64-wide f16 dot it performs, which puts the cost in
+per-score overhead (reduction and dispatch), not in traffic and not in the extra pass. A tiled kernel
+only helps if the tile is blocked over *queries* as well — 128 prefill queries against one K tile, where
+the K rows are loaded once for 128 reductions — which is the prefill shape and not the decode shape. So
+for decode, the remaining lever is a blocked score pass over several heads at once, and the 2-3x this
+section hoped for is not available from fusing the value pass.
