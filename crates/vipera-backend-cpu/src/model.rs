@@ -2425,7 +2425,10 @@ fn attention_window_chunked_heads(
     let sequential = quant::exact_dot_requested();
     let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
     let count = heads.end - heads.start;
-    let kept: usize = ranges.iter().map(|(from, to)| to.saturating_sub(*from)).sum();
+    let kept: usize = ranges
+        .iter()
+        .map(|(from, to)| to.saturating_sub(*from))
+        .sum();
     if count == 0 || kept == 0 {
         out[..count * head_dim].fill(0.0);
         return Ok(());
@@ -2470,74 +2473,84 @@ fn attention_window_chunked_heads(
             }
             let run_from = *from + (low - offset);
             let run_to = *from + (high - offset);
-            kv.for_each_row_range(order, layer, layer_bytes, run_from, run_to, |_position, k_base| {
-                if !in_place {
-                    kv.layout
-                        .decode(&kv.storage[k_base..k_base + layer_bytes], &mut row)?;
-                }
-                for kv_head in 0..shape.kv_heads {
-                    let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                    let packed_k = k_base + kv_head * head_dim * 2;
-                    for member in 0..group {
-                        let head = kv_head * group + member;
-                        if head < heads.start || head >= heads.end {
-                            continue;
-                        }
-                        let local = head - heads.start;
-                        let query = &q[head * head_dim..(head + 1) * head_dim];
-                        let dot = if sequential {
-                            query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
-                        } else if in_place {
-                            crate::simd::dot_f16_f32(query, &kv.storage[packed_k..][..head_dim * 2])
-                        } else {
-                            crate::simd::dot_f32(query, key)
-                        };
-                        scores[local] = dot * scale;
+            kv.for_each_row_range(
+                order,
+                layer,
+                layer_bytes,
+                run_from,
+                run_to,
+                |_position, k_base| {
+                    if !in_place {
+                        kv.layout
+                            .decode(&kv.storage[k_base..k_base + layer_bytes], &mut row)?;
                     }
-                }
-
-                let v_base = kv.value_row(order, k_base, layer_bytes);
-                if !in_place {
-                    kv.layout
-                        .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
-                }
-                for kv_head in 0..shape.kv_heads {
-                    let packed_v = v_base + kv_head * head_dim * 2;
-                    let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
-                    for member in 0..group {
-                        let head = kv_head * group + member;
-                        if head < heads.start || head >= heads.end {
-                            continue;
-                        }
-                        let local = head - heads.start;
-                        let score = scores[local];
-                        let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
-                        let weight = if score > part.m[local] {
-                            let alpha = (part.m[local] - score).exp();
-                            part.m[local] = score;
-                            part.d[local] = part.d[local] * alpha + 1.0;
-                            for value in target.iter_mut() {
-                                *value *= alpha;
+                    for kv_head in 0..shape.kv_heads {
+                        let key = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        let packed_k = k_base + kv_head * head_dim * 2;
+                        for member in 0..group {
+                            let head = kv_head * group + member;
+                            if head < heads.start || head >= heads.end {
+                                continue;
                             }
-                            1.0_f32
-                        } else {
-                            let beta = (score - part.m[local]).exp();
-                            part.d[local] += beta;
-                            beta
-                        };
-                        if in_place {
-                            crate::simd::axpy_f16_f32(
-                                target,
-                                weight,
-                                &kv.storage[packed_v..][..head_dim * 2],
-                            );
-                        } else {
-                            crate::simd::axpy_f32(target, weight, value);
+                            let local = head - heads.start;
+                            let query = &q[head * head_dim..(head + 1) * head_dim];
+                            let dot = if sequential {
+                                query.iter().zip(key).map(|(a, b)| a * b).sum::<f32>()
+                            } else if in_place {
+                                crate::simd::dot_f16_f32(
+                                    query,
+                                    &kv.storage[packed_k..][..head_dim * 2],
+                                )
+                            } else {
+                                crate::simd::dot_f32(query, key)
+                            };
+                            scores[local] = dot * scale;
                         }
                     }
-                }
-                Ok(())
-            })?;
+
+                    let v_base = kv.value_row(order, k_base, layer_bytes);
+                    if !in_place {
+                        kv.layout
+                            .decode(&kv.storage[v_base..v_base + layer_bytes], &mut row)?;
+                    }
+                    for kv_head in 0..shape.kv_heads {
+                        let packed_v = v_base + kv_head * head_dim * 2;
+                        let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        for member in 0..group {
+                            let head = kv_head * group + member;
+                            if head < heads.start || head >= heads.end {
+                                continue;
+                            }
+                            let local = head - heads.start;
+                            let score = scores[local];
+                            let target = &mut part.o[local * head_dim..(local + 1) * head_dim];
+                            let weight = if score > part.m[local] {
+                                let alpha = (part.m[local] - score).exp();
+                                part.m[local] = score;
+                                part.d[local] = part.d[local] * alpha + 1.0;
+                                for value in target.iter_mut() {
+                                    *value *= alpha;
+                                }
+                                1.0_f32
+                            } else {
+                                let beta = (score - part.m[local]).exp();
+                                part.d[local] += beta;
+                                beta
+                            };
+                            if in_place {
+                                crate::simd::axpy_f16_f32(
+                                    target,
+                                    weight,
+                                    &kv.storage[packed_v..][..head_dim * 2],
+                                );
+                            } else {
+                                crate::simd::axpy_f32(target, weight, value);
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
     };
@@ -4763,9 +4776,7 @@ mod tests {
         let mut v_all = Vec::new();
         read.load_layer(0, shape, positions, &mut k_all, &mut v_all)
             .expect("load layer");
-        let keep: Vec<usize> = (0..sinks)
-            .chain(positions - window..positions)
-            .collect();
+        let keep: Vec<usize> = (0..sinks).chain(positions - window..positions).collect();
         let scale = 1.0 / (shape.head_dim as f32).sqrt();
         let group = shape.heads / shape.kv_heads;
         let mut want = vec![0.0_f32; shape.heads * shape.head_dim];

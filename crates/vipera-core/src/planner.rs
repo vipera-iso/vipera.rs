@@ -524,7 +524,10 @@ mod tests {
         let kept = shape()
             .window_kv_bytes(32_768, KvCacheType::F16, window)
             .unwrap();
-        assert!(kept * 10 < full, "{kept} bytes is not a window out of {full}");
+        assert!(
+            kept * 10 < full,
+            "{kept} bytes is not a window out of {full}"
+        );
         // The estimate never claims less than a window has to hold, or a run would out-allocate
         // its plan.
         let floor = shape().kv_bytes(2048 + 4, KvCacheType::F16).unwrap();

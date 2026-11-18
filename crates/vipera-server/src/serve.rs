@@ -31,8 +31,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vipera_backend_cpu::CpuBackend;
 use vipera_core::gguf::GgufFile;
 use vipera_core::planner::KvCacheType;
-use vipera_core::{PlacementPlan, PlanRequest, SystemProbe, plan};
 use vipera_core::window::attention_window;
+use vipera_core::{PlacementPlan, PlanRequest, SystemProbe, plan};
 use vipera_errors::ViperaError;
 use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, Generation, KvCache, KvConfig, StepReport,

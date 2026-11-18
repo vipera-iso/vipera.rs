@@ -151,10 +151,16 @@ impl KvConfig {
         let per_block = tokens_per_block.max(1);
         let pinned_slots = sink_tokens.div_ceil(per_block);
         let rolling_slots = (window_tokens + PREFILL_HEADROOM + per_block).div_ceil(per_block) + 1;
-        let slots = context_tokens.div_ceil(per_block).max(pinned_slots + rolling_slots);
-        let blocks = (pinned_slots + rolling_slots).checked_mul(sequences).ok_or_else(|| {
-            ViperaError::invalid_argument("ring KV cache geometry overflows a 64-bit block count")
-        })?;
+        let slots = context_tokens
+            .div_ceil(per_block)
+            .max(pinned_slots + rolling_slots);
+        let blocks = (pinned_slots + rolling_slots)
+            .checked_mul(sequences)
+            .ok_or_else(|| {
+                ViperaError::invalid_argument(
+                    "ring KV cache geometry overflows a 64-bit block count",
+                )
+            })?;
         let mut config = Self::new(bytes_per_token, tokens_per_block, blocks)?;
         config.ring = Some(Ring {
             slots,
@@ -181,14 +187,16 @@ impl KvConfig {
             .checked_mul(bytes_per_token)
             .ok_or_else(|| ViperaError::invalid_argument("context is too large for this model"))?;
         match window {
-            Some((tokens, sinks)) if context_tokens > tokens + sinks + PREFILL_HEADROOM => Self::ring(
-                bytes_per_token,
-                tokens_per_block,
-                context_tokens,
-                tokens,
-                sinks,
-                sequences,
-            ),
+            Some((tokens, sinks)) if context_tokens > tokens + sinks + PREFILL_HEADROOM => {
+                Self::ring(
+                    bytes_per_token,
+                    tokens_per_block,
+                    context_tokens,
+                    tokens,
+                    sinks,
+                    sequences,
+                )
+            }
             Some(_) | None => Self::from_bytes(budget, bytes_per_token, tokens_per_block),
         }
     }
@@ -375,12 +383,7 @@ impl KvCache {
 
     /// [`KvCache::reserve`] for a ring cache: the table grows to the position asked for, but only
     /// the sinks and the ring's own blocks are ever allocated, and the entries past those repeat.
-    fn reserve_ring(
-        &mut self,
-        sequence: u64,
-        tokens: u64,
-        ring: Ring,
-    ) -> Result<(), ViperaError> {
+    fn reserve_ring(&mut self, sequence: u64, tokens: u64, ring: Ring) -> Result<(), ViperaError> {
         let needed = self.config.blocks_for(tokens);
         if needed > ring.slots {
             return Err(ViperaError::infeasible(format!(
@@ -393,9 +396,8 @@ impl KvCache {
         let rolling = ring.rolling_slots as usize;
         let per_sequence = pinned + rolling;
         let target = (needed as usize).max(per_sequence);
-        let missing = per_sequence.saturating_sub(
-            self.tables.get(&sequence).map_or(0, |table| table.len()),
-        );
+        let missing =
+            per_sequence.saturating_sub(self.tables.get(&sequence).map_or(0, |table| table.len()));
         if (self.free.len() as u64) < missing as u64 {
             let in_use = self.used_blocks();
             return Err(ViperaError::infeasible(format!(
@@ -801,7 +803,12 @@ mod tests {
             "a window that keeps the whole context must not pay for a ring"
         );
         assert_eq!(paged.blocks, 128);
-        assert!(KvConfig::for_run(64, 16, 4096, None, 1).unwrap().ring.is_none());
+        assert!(
+            KvConfig::for_run(64, 16, 4096, None, 1)
+                .unwrap()
+                .ring
+                .is_none()
+        );
     }
 
     #[test]
@@ -871,7 +878,10 @@ mod tests {
     fn a_ring_refuses_to_park_and_cannot_address_more_than_its_context() {
         let mut cache = ring();
         cache.reserve(1, 16).unwrap();
-        assert!(!cache.park(1), "a ring's blocks are aliased, so they cannot be reused");
+        assert!(
+            !cache.park(1),
+            "a ring's blocks are aliased, so they cannot be reused"
+        );
         let error = cache.reserve(2, 33_000).unwrap_err();
         assert!(error.to_string().contains("KV blocks"), "{error}");
     }
