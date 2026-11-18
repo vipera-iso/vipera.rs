@@ -1407,3 +1407,155 @@ attention scales as O(n²) over the prompt. The next lever at 4k prefill is atte
 cutting matmul cost helps every chunk equally, but the late chunks that dominate a 4k prompt are now
 attention-bound (and the decode-time KV-chunk kernel is the one that would have to carry a batched
 prefill form).
+
+### Head-to-head against the llama.cpp fork, same model and threads — 2026-11-18
+
+Asked to settle "which one wins" with a run rather than a reading. Both engines: Qwen2.5-1.5B-Instruct
+Q4_K_M (`~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf`), 8 threads, `powersave` governor, two
+passes interleaved (llama.cpp, vipera, llama.cpp, vipera) because the frequency noise on this machine
+is larger than several of the differences below.
+
+- llama.cpp: `vipera.cpp/build-clang/bin/llama-bench -p 64,128,512 -n 64,128 -t 8 -r 3`, build
+  49e1485 (24), CPU backend, AVX-512 + VNNI.
+- vipera: `cargo test -p vipera-backend-cpu --release --test win_vs_llama -- --ignored --nocapture
+  prefill_vs_decode` with `VIPERA_THREADS=8`; `pp` is the chunked `run_positions` path, decode is a
+  step at ctx 32 (KV pre-filled), which matches the average depth of a 64-token `tg` run. Both use
+  an f16 KV cache, and neither count includes tokenizer or sampler time.
+
+| test | pass | llama.cpp tok/s | vipera tok/s | vipera / llama.cpp |
+|---|---|---:|---:|---:|
+| pp64 | 1 | 93.3 ± 6.3 | 153.3 | 1.64x |
+| pp64 | 2 | 128.9 ± 1.4 | 187.5 | 1.45x |
+| pp128 | 1 | 114.0 ± 9.4 | 185.6 | 1.63x |
+| pp128 | 2 | 140.3 ± 4.0 | 183.3 | 1.31x |
+| pp512 | 1 | 147.3 ± 4.6 | 167.7 | 1.14x |
+| pp512 | 2 | 141.8 ± 1.5 | 166.8 | 1.18x |
+| tg64/tg128 | 1 | 36.6 / 31.9 | 33.7 | 0.92x / 1.06x |
+| tg64/tg128 | 2 | 38.2 / 38.7 | 34.0 | 0.89x / 0.88x |
+
+**Result.** Prefill goes to vipera in both passes at every prompt length: the widest margin is the
+shortest prompt (1.45–1.64x at 64 tokens) and it narrows to 1.14–1.18x at 512, consistent with
+llama.cpp amortising its per-call overhead better but not closing the kernel gap. Decode is a loss or
+a wash: vipera is 8–12% behind `tg64`, and against `tg128` it is 6% ahead in one pass and 12% behind in
+the other — the pass-to-pass spread (llama's own `tg128` moved 31.9 → 38.7 tok/s) is as large as the
+difference, so the honest reading is "llama.cpp decodes slightly faster, within a wide noise band".
+
+This confirms the 2026-11-15 finding on a second day: the engine is not 4.6x behind; it leads prefill
+and trails decode by roughly 10%.
+
+### Long-prompt prefill against llama.cpp: vipera wins 1k, loses 4k — 2026-11-18
+
+Same rig, model, 8 threads and interleaved passes as the head-to-head above; `llama-bench -p
+1024,4096 -t 8 -r 3` against a new ignored test `prefill_long_prompt` in
+`crates/vipera-backend-cpu/tests/win_vs_llama.rs` (batch path only; `timed_best` does one warm-up and
+returns the fastest round, so the KV is already allotted).
+
+| prefill | pass | llama.cpp tok/s | vipera tok/s | vipera / llama.cpp |
+|---|---|---:|---:|---:|
+| 1024 | 1 | 142.7 ± 0.6 | 153.3 | 1.07x |
+| 1024 | 2 | 138.8 ± 0.2 | 147.1 | 1.06x |
+| 4096 | 1 | 118.6 ± 0.3 | 87.8 | 0.74x |
+| 4096 | 2 | 116.5 ± 0.2 | 85.2 | 0.73x |
+
+llama.cpp loses only 18% from 1k to 4k (142.7 → 118.6); vipera loses 40% (153.3 → 87.8). The crossover
+is between 1k and 4k, and it lines up with the phase split measured 2026-11-17: vipera's attention is
+6% of the first chunk, 24% by the end of 1k, 49% by the end of 4k, while its matmul cost per chunk is
+flat. llama.cpp's prompt processing does not degrade like that, which points at the batched attention
+path (the decode-time KV-chunk kernel has no batched prefill form yet) rather than at the Q4_K/Q6_K
+matvecs — those are the same at 4k as at 1k and are where vipera's 1k lead comes from.
+
+Consequence for the "which wins" question: vipera leads prefill up to roughly 1k tokens and loses it
+at 4k; decode is llama.cpp by ~10%. Attention at depth is the single biggest gap in the engine.
+
+### Lean pass: 77.8 MB less scratch, 59 s → 9.5 s builds — 2026-11-18
+
+Two findings from `REVIEW_vipera_rs_2026-11-15.md` (5 and 10) were still open; both are closed here.
+
+**Scratch.** `BatchScratch` allocated `MAX_BATCH * vocab` logits rows at load — 77.8 MB for Qwen2.5
+(128 x 151,936 x 4 B) — while chunked prefill already asks `run_batch` for the last row only
+(`only_last`). Only `logits_batch` (serving) and `logits_range` (speculative verify) want every row,
+so that buffer now starts empty and grows on first use. Verified: `logits_each_matches_single_passes`
+and the new `a_batch_that_splits_across_kernel_widths_matches_every_sequence_run_alone` pass, and
+`vipera verify` reports the same measured host bytes (2,081,792,000) because the untouched
+`vec![0.0; ...]` was never faulted in on the single-sequence path — the saving is address space
+(and RSS if a batch call ever grows it), not resident pages of a plain generate run.
+
+**Build.** `run_batch` instantiated `run_batch_n` for all 128 widths. The widths are now 1..=8 (a
+decode batch is never larger here) plus the multiples of 8 up to `MAX_BATCH`, and any other size runs
+as `width + remainder` (remainder < 8, one extra weight read of at most seven tokens). `run_batch_n`
+instantiations: 128 → 23.
+
+| | before | after |
+|---|---:|---:|
+| `cargo build -p vipera-backend-cpu --release`, after touching `model.rs` | 59.37 s | 9.52 s |
+| `libvipera_backend_cpu-*.rlib` | 25,284,014 B | 5,421,870 B |
+
+Prefill and decode throughput are unmoved, as expected: every measured length splits into supported
+widths (64 = 64, 512 = 4x128). `prefill_vs_decode` after the change: pp64 188.4, pp128 188.1,
+pp512 167.6 tok/s, decode ctx 32 33.9 tok/s, against 187.5 / 183.3 / 166.8 / 34.0 before.
+The new split test asserts a batch of 10 (8 + 2) is bit-identical to ten single-sequence steps.
+
+**Decode, tried and rejected.** Two hypotheses for the ~10% decode gap against llama.cpp, both
+measured and both dropped:
+
+- *Small shapes are dispatch-bound.* Profile shows `Q4_K 1536x1536` at 21.5 GB/s and
+  `Q4_K 256x1536` at 5.7 GB/s, 16% of a step. Making the worker count proportional to work
+  (`thread_budget` returning `product / PARALLEL_MIN_PRODUCT`) sent the 256-row shape to one worker
+  and left it at 39 us a call (was 36), i.e. it is small, not sync-bound. Decode: 33.8 / 34.3 tok/s
+  against 33.7-34.0 unchanged. Reverted.
+- *Huge pages.* Not a lever here: `/sys/kernel/mm/transparent_hugepage/enabled` is `always`, so the
+  weights already sit in huge pages.
+
+Where a decode step actually goes at ctx 32 (8 threads, 29.5 ms): q4k 64%, q6k 33%, attention 0%,
+norm 0.5%, rest 2%. The per-shape table gives 35.6 GB/s for the dominant `8960x1536` Q4_K read and
+36.4 GB/s for the Q6_K output projection, against the 41.7 GB/s read ceiling. llama.cpp's 38.3 GB/s
+sits between the two. So the remaining gap is the streaming efficiency of the Q4_K/Q6_K row reads,
+not dispatch, prefetch, blocking or scale conversion — all of which are already recorded above as
+measured negatives.
+
+### An attention crew that lives across the pass — measured, then reverted — 2026-11-18
+
+The 2026-11-17 entry above left one shape of the idea open: keep attention workers alive for the whole
+forward pass, with the KV buffer behind an `RwLock` (readers during a layer, writer between layers) so
+the layer loop can still append. It was built and measured (`Crew`, `CrewJob`, `CrewReply`,
+`DecodeAttention`, gated on `VIPERA_ATTN_CREW`), and then removed again: the numbers below say it does
+not pay, and the storage redesign it needs (KV behind a lock, `KvGeometry`, `attend_read`) is not worth
+carrying for a switch that never wins. The measurements stay here so the idea is not re-litigated.
+
+Three tests pinned it while it existed: a crew of any size computes what one thread computes, a crew
+reads what the pass wrote between two layers, and a layer that fails leaves the worker usable. The
+first two failed on first landing at 450 positions, because the reference was `attend_read`, which on
+this tree takes the approximate KV-chunk path once the history passes `STREAMING_MIN_POSITIONS`
+(`kv_split` is on by default), while the crew runs the exact per-head kernel. Comparing against
+`attend_entry` over all heads — the same arithmetic the crew splits — made them bit-identical, which
+is what the test meant by "what one thread computes".
+
+Kernel, `VIPERA_THREADS=8`, release, one layer, 12 heads, 64 head_dim:
+
+| positions | one thread | per-layer threads | crew | crew / per-layer |
+|---:|---:|---:|---:|---:|
+| 512 | 0.169 ms | 0.118 ms | 0.091 ms | **1.30x** |
+| 1024 | 0.368 ms | 0.182 ms | 0.191 ms | 0.96x |
+| 2048 | 0.712 ms | 0.444 ms | 0.364 ms | **1.22x** |
+| 4096 | 1.397 ms | 0.559 ms | 0.679 ms | 0.82x |
+
+End to end (`what_a_decode_step_spends_on_attention`, two interleaved rounds each, ms/step):
+
+| ctx | crew off | crew on |
+|---:|---:|---:|
+| 32 | 34.0, 30.1 | 31.9, 29.5 |
+| 256 | 32.1, 32.3 | 31.5, 33.0 |
+| 1024 | 35.4, 34.5 | 35.5, 36.9 |
+
+Verdict: **the crew moves the kernel but not the step.** At ctx 32 attention is 0% of a step, so
+nothing there can show; at 1024 the crew costs 1–2 ms instead of saving any, and the two rounds on
+each side overlap. This is the same conclusion as the 2026-11-17 entry, now measured through the
+storage redesign it named as the unblocker: a live team removes the ~1 ms of scopes, but attention is
+1.4 ms of a 35 ms step at ctx 1024, and the workers that stay parked contend with the matvec pool —
+the 2% ceiling was real. Output is byte-identical on a 12-token greedy run (`"The capital of France
+is"` → ` Paris. The capital of Italy is Rome. The capital of`) with the switch on and off.
+
+One numeric side effect of that design, noted because it would have mattered had the crew won: with
+the crew on, attention no longer takes the approximate KV-chunk path even when `VIPERA_ATTN_KV_SPLIT`
+is set, so the step was slightly *more* exact than the default, not merely faster — a second reason not
+to make it the default path.

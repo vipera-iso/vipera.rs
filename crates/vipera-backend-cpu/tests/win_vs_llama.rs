@@ -322,6 +322,40 @@ fn prefill_vs_decode() {
 }
 
 // ---------------------------------------------------------------------------
+// 3b. Prefill dài: 1024 và 4096 token, để đối chiếu `llama-bench -p 1024,4096`
+// ---------------------------------------------------------------------------
+//
+// Chỉ đo batch path: bản sequential ở trên tốn O(n) lượt decode nên ở 4k mất vài phút mỗi vòng.
+// `timed_best` warm-up một lần rồi lấy vòng nhanh nhất — KV đã cấp phát nên lần sau không còn fault.
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn prefill_long_prompt() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+
+    for (n, rounds) in [(1024usize, 2u32), (4096, 1)] {
+        let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
+        let mut state = State::with_room(config, n + 4, KvCacheType::F16);
+        let ms = timed_best(rounds, || {
+            state.tokens.clear();
+            backend
+                .logits(&mut state.context(&prompt))
+                .expect("prefill");
+        });
+        println!(
+            "prefill n={n:>4}: {ms:>8.1} ms ({:>6.1} tok/s)",
+            n as f64 / (ms / 1000.0)
+        );
+    }
+    print_llama_hint("prefill 1024/4096");
+}
+
+// ---------------------------------------------------------------------------
 // 4. Batched decode: 1 lần đọc weight cho B activation (continuous batching)
 // ---------------------------------------------------------------------------
 //

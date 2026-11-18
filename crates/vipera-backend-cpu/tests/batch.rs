@@ -210,6 +210,66 @@ fn a_batched_step_matches_every_sequence_run_alone() {
 }
 
 #[test]
+fn a_batch_that_splits_across_kernel_widths_matches_every_sequence_run_alone() {
+    // The kernels are instantiated for widths 1..=8 and multiples of 8, so a batch of 10 runs as
+    // 8 + 2 through two weight reads. Splitting may not reorder entries, drop one, or move a bit.
+    const SEQUENCES: usize = 10;
+
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load the model");
+    let config = backend.config();
+    let prompt: &[u32] = &[12095, 13, 576, 6722, 315];
+
+    let mut states: Vec<State> = (0..SEQUENCES).map(|_| State::new(config)).collect();
+    let mut nexts = Vec::with_capacity(SEQUENCES);
+    for state in states.iter_mut() {
+        let logits = backend
+            .logits(&mut state.context(prompt))
+            .expect("the prompt fits the sequence");
+        state.tokens.extend_from_slice(prompt);
+        nexts.push(argmax(&logits) as u32);
+    }
+
+    let expected: Vec<Vec<f32>> = states
+        .iter()
+        .zip(&nexts)
+        .map(|(state, next)| {
+            let mut alone = state.clone();
+            backend
+                .logits(&mut alone.context(&[*next]))
+                .expect("decode")
+        })
+        .collect();
+
+    let tokens: Vec<&[u32]> = nexts.iter().map(std::slice::from_ref).collect();
+    let mut shared = Shared::over(&states);
+    let mut batch_entries = entries(&states, &shared.tables, &tokens);
+    let mut batch = BatchContext {
+        kv: shared.kv.as_mut_slice(),
+        entries: batch_entries.as_mut_slice(),
+    };
+    let actual = backend.logits_batch(&mut batch).expect("batched decode");
+
+    assert_eq!(actual.len(), SEQUENCES);
+    for (entry, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(
+            actual
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "entry {entry} differs between the split batch and its own single-sequence step"
+        );
+    }
+}
+
+#[test]
 fn a_batch_of_one_is_the_single_sequence_path() {
     let Some(path) = model_path() else {
         eprintln!("skipped: no model; set VIPERA_TEST_MODEL");

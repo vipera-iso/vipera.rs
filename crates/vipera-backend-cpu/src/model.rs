@@ -326,7 +326,13 @@ struct BatchScratch {
     attn: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
+    /// The last entry's logits: the only row a prefill chunk or a single decode step asks for.
     logits: Vec<f32>,
+    /// One logits row per entry, for the callers that want every row (`logits_batch`,
+    /// `logits_range`). Empty until the first such call: a 128-row buffer is
+    /// `MAX_BATCH * vocab * 4` bytes (77.8 MB for a 151,936-token vocabulary), and the chunked
+    /// prefill path never looks past the last row.
+    logits_each: Vec<f32>,
     attn_scratch: AttnScratch,
 }
 
@@ -343,7 +349,8 @@ impl BatchScratch {
             attn: vec![0.0; MAX_BATCH * config.hidden],
             gate: vec![0.0; MAX_BATCH * config.ffn],
             up: vec![0.0; MAX_BATCH * config.ffn],
-            logits: vec![0.0; MAX_BATCH * config.vocab],
+            logits: vec![0.0; config.vocab],
+            logits_each: Vec::new(),
             attn_scratch: AttnScratch::default(),
         }
     }
@@ -762,32 +769,55 @@ impl CpuBackend {
                 })
                 .collect();
         }
-        macro_rules! dispatch {
-            ($($width:literal),* $(,)?) => {
-                match size {
-                    $(
-                        $width => self.run_batch_n(
-                            batch.kv,
-                            exactly::<$width, _>(batch.entries)?,
-                            need_logits,
-                            only_last,
-                        ),
-                    )*
-                    other => Err(ViperaError::invalid_argument(format!(
-                        "this backend batches up to {MAX_BATCH} sequences, not {other}"
-                    ))),
-                }
-            };
+        if size > MAX_BATCH {
+            return Err(ViperaError::invalid_argument(format!(
+                "this backend batches up to {MAX_BATCH} sequences, not {size}"
+            )));
         }
-        dispatch!(
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
-            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
-            69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-            91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
-            110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126,
-            127, 128,
-        )
+        // `run_batch_n` is monomorphised per const width, so every width it is instantiated at costs
+        // a copy of the whole layer stack in compile time and code size — 128 of them for 128 widths
+        // of nearly identical kernels. Keep every width 1..=8 (a decode batch never exceeds it here)
+        // and the multiples of 8 up to MAX_BATCH; any other size runs as a multiple of 8 followed by
+        // a remainder under 8, which is one extra weight read of at most seven tokens. Each pass
+        // writes its entries' K/V before the next begins, so the order of the batch is preserved.
+        let BatchContext { kv, entries } = batch;
+        let mut rest: &mut [BatchEntry<'_>] = entries;
+        let mut results: Vec<Vec<f32>> = Vec::with_capacity(size);
+        while !rest.is_empty() {
+            let width = if rest.len() <= 8 {
+                rest.len()
+            } else {
+                (rest.len() & !7).min(MAX_BATCH)
+            };
+            let is_last_piece = rest.len() == width;
+            let piece_need_logits = need_logits && (!only_last || is_last_piece);
+            let piece_only_last = only_last && is_last_piece;
+            let (head, tail) = rest.split_at_mut(width);
+            rest = tail;
+            macro_rules! dispatch {
+                ($($width:literal),* $(,)?) => {
+                    match width {
+                        $(
+                            $width => self.run_batch_n(
+                                kv,
+                                exactly::<$width, _>(head)?,
+                                piece_need_logits,
+                                piece_only_last,
+                            )
+                            .map(|piece| results.extend(piece)),
+                        )*
+                        other => Err(ViperaError::invalid_argument(format!(
+                            "this backend has no kernel for a batch of {other} sequences"
+                        ))),
+                    }
+                };
+            }
+            dispatch!(
+                1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
+                128,
+            )?;
+        }
+        Ok(results)
     }
 
     /// One decode step for `B` sequences, reading each weight tensor once for all of them.
@@ -1043,11 +1073,14 @@ impl CpuBackend {
                         &mut batch.h[entry * hidden..][..hidden],
                     );
                 }
+                if batch.logits_each.len() < B * vocab {
+                    batch.logits_each.resize(B * vocab, 0.0);
+                }
                 output.matvec_batch::<B>(
                     &pool,
                     file,
                     &rows::<B>(&batch.h, hidden),
-                    &mut batch.logits[..B * vocab],
+                    &mut batch.logits_each[..B * vocab],
                 )?;
             }
             crate::profile::finish_pass(pass);
@@ -1060,7 +1093,7 @@ impl CpuBackend {
                 return Ok(results);
             }
             Ok((0..B)
-                .map(|entry| batch.logits[entry * vocab..][..vocab].to_vec())
+                .map(|entry| batch.logits_each[entry * vocab..][..vocab].to_vec())
                 .collect())
         })
     }
