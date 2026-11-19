@@ -1997,3 +1997,45 @@ So the answer to "write a 512-bit q4k matvec" is the measurement, not a patch: i
 decode, and prefill already takes the 512-bit path where it does pay (B=128). The measurement is kept
 as `a_512_bit_decode_row_is_measured_against_the_row_kernel` so the next person gets the number in a
 minute rather than in a rewrite.
+
+## Prompt-chunk rotary, and two dead ends — 2026-11-19
+
+Setup as above: `VIPERA_THREADS=8`, Qwen2.5-1.5B Q4_K_M, one session, arms back to back.
+
+**The waste.** `rope` was called once per layer per tensor, and each call rebuilt the position's
+angles: 64 `powf` plus 64 `sin_cos` per call, 56 calls per position, for values that depend only on
+the position. It also computed the `inv_freq` table and never read it. A new measurement test
+(`norm_phase_cost`, `--ignored`) prices the two parts of the profile's `Norm` phase for one 128-token
+chunk on one thread:
+
+| per 128-token chunk | before | after |
+|---|---:|---:|
+| rotary, one table built per call (as before) | 10.27 ms | 9.48 ms |
+| rotary, one table per position reused by all 28 layers | — | 3.76 ms |
+| `rms_norm` (unchanged) | 11.83 ms | 11.83 ms |
+
+The chunk pass now builds `RopeAngles` per position before the first layer and rotates Q and K from
+it. The phase split of the same run says the work moved: `rest` per 128-token chunk went from
+**48.9–50.1 ms to 43.3–44.2 ms** (−5.8 ms, −12%), while `q4k`, `q6k`, `attention` and `norm` sat
+where they were. `pp1024` was 6399.1 ms (160.0 tok/s) after and 6407.0 ms (159.8 tok/s) before —
+inside this machine's run-to-run spread, so the end-to-end claim is only "no slower"; the 0.9% of a
+chunk the phase table removes cannot be resolved by a whole-model number here. The rotary arithmetic
+itself is untouched, element by element, so no logit moved: `batch.rs`'s bit-for-bit
+batched-versus-alone checks pass.
+
+`rms_norm`'s 11.8 ms is the other half of the `Norm` phase and it is latency, not throughput: the
+sum is a serial `f32` chain (1536 dependent adds, ~4 cycles each) that cannot be reassociated without
+changing the logits, so it is left alone and recorded here.
+
+**Dead end 1: walk K/V once per chunk.** Attention currently decodes the same K/V rows once per
+query row. Sharing the walk across a whole 128-row chunk was implemented bit-exactly
+(`a_joint_chunk_walk_is_bit_identical_to_attending_each_row_alone` passed for f16 and Q8_0, contiguous
+and gapped positions) and measured **153.1 tok/s at 1k and 88.3 at 4k against 165.7 / 106.1** — 8% and
+17% slower. The score matrix of 16 rows per worker is 3 MB and leaves L2, which the per-entry path's
+196 KB does not. Reverted in full. A sharing group of 4 rows (≈768 KB, still inside L2) is the
+untried version of this idea.
+
+**Dead end 2: fewer prefetch hints in the tiled Q4_K kernel.** The tiled kernel issues three
+`prefetch_ahead` per row per block, ~19% of the inner loop's uops. Cutting them to one measured
+6581.1 ms / 40119.0 ms for 1k / 4k against 6407.0 / 39517.3 — no worse inside the spread, and no
+better. The hints stay.

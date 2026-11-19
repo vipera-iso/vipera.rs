@@ -915,6 +915,13 @@ impl CpuBackend {
                 tok_embd.read_row(file, row, &mut batch.x[entry * hidden..][..hidden])?;
             }
 
+            // The chunk's positions are fixed before the first layer, and a rotary angle belongs to
+            // the position alone, so the tables are built once here and shared by all 28 layers.
+            let rope_angles: Vec<RopeAngles> = positions
+                .iter()
+                .map(|position| RopeAngles::new(*position, shape.head_dim, config.rope_base))
+                .collect();
+
             for (index, layer) in layers.iter().enumerate() {
                 let at = crate::profile::stamp();
                 for entry in 0..B {
@@ -950,19 +957,17 @@ impl CpuBackend {
 
                 for entry in 0..B {
                     let position = positions[entry];
-                    rope(
+                    rope_with(
                         &mut batch.q[entry * query..][..query],
-                        position,
+                        &rope_angles[entry],
                         shape.heads,
                         shape.head_dim,
-                        config.rope_base,
                     );
-                    rope(
+                    rope_with(
                         &mut batch.k[entry * kv_width..][..kv_width],
-                        position,
+                        &rope_angles[entry],
                         shape.kv_heads,
                         shape.head_dim,
-                        config.rope_base,
                     );
                     let context = &contexts[entry];
                     let mut view = KvView {
@@ -3203,44 +3208,93 @@ fn attend_entry(call: AttentionCall<'_, '_>, scratch: &mut AttnScratch) -> Resul
     algorithm_for(call.positions).attend(call, scratch)
 }
 
-/// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
-fn rope(vector: &mut [f32], position: usize, heads: usize, head_dim: usize, base: f32) {
-    let half = head_dim / 2;
-    // Precompute inv_freq once per call on the stack (head-independent).
-    let mut inv_freq = [0.0f32; 64];
-    if half <= 64 {
-        for (index, slot) in inv_freq.iter_mut().enumerate().take(half) {
-            let exponent = 2.0 * index as f32 / head_dim as f32;
-            *slot = 1.0 / base.powf(exponent);
-        }
-    }
-    // Compute sin/cos once per frequency (shared across heads) instead
-    // of per (head, pair): heads*half sincos -> half sincos.
-    let (positions_n, _heads) = (position, heads);
-    let mut sincos = [(0.0f32, 0.0f32); 64];
-    if half <= 64 {
-        for (index, slot) in sincos.iter_mut().enumerate().take(half) {
-            let exponent = 2.0 * index as f32 / head_dim as f32;
-            let inv = 1.0 / base.powf(exponent);
-            *slot = (positions_n as f32 * inv).sin_cos();
-        }
-    }
-    for head in 0..heads {
-        let head = &mut vector[head * head_dim..(head + 1) * head_dim];
-        for index in 0..half {
-            let (sin, cos) = if half <= 64 {
-                sincos[index]
-            } else {
+/// The rotary angles of one position: `sin_cos(position * inv_freq)` for every pair index.
+///
+/// An angle depends on the position and the pair index, not on the layer or the tensor that is
+/// being rotated, so a prompt chunk builds one table per position and every layer turns its Q and
+/// K from it. Building it inside each call instead repeats the same 64 transcendental values 56
+/// times per position — once per Q and once per K, in each of the 28 layers — for 10.3 ms of a
+/// 128-token chunk, against 3.8 ms for the rotation itself (see `norm_phase_cost`).
+#[derive(Clone, Copy)]
+struct RopeAngles {
+    position: usize,
+    head_dim: usize,
+    base: f32,
+    /// `sin_cos(position * inv_freq[index])`, filled when `head_dim / 2 <= 64`.
+    pairs: [(f32, f32); 64],
+    /// Whether `pairs` holds every index, i.e. `head_dim / 2 <= 64`.
+    tabled: bool,
+}
+
+impl RopeAngles {
+    fn new(position: usize, head_dim: usize, base: f32) -> Self {
+        let half = head_dim / 2;
+        let mut angles = Self {
+            position,
+            head_dim,
+            base,
+            pairs: [(0.0, 0.0); 64],
+            tabled: half <= 64,
+        };
+        if angles.tabled {
+            for (index, slot) in angles.pairs.iter_mut().enumerate().take(half) {
                 let exponent = 2.0 * index as f32 / head_dim as f32;
                 let inv = 1.0 / base.powf(exponent);
-                (positions_n as f32 * inv).sin_cos()
-            };
+                *slot = (position as f32 * inv).sin_cos();
+            }
+        }
+        angles
+    }
+
+    /// The `(sin, cos)` of pair `index`, computed on the fly for a width the table does not cover.
+    fn at(&self, index: usize) -> (f32, f32) {
+        if self.tabled {
+            return self.pairs[index];
+        }
+        let exponent = 2.0 * index as f32 / self.head_dim as f32;
+        let inv = 1.0 / self.base.powf(exponent);
+        (self.position as f32 * inv).sin_cos()
+    }
+}
+
+/// Rotate every head of `vector` by one position's angles, NeoX layout: pairs
+/// `(i, i + head_dim / 2)`.
+fn rope_with(vector: &mut [f32], angles: &RopeAngles, heads: usize, head_dim: usize) {
+    let half = head_dim / 2;
+    if angles.tabled {
+        // The two halves are rotated together but live apart, so each is reached through its own
+        // slice: a pair at a time through one slice would carry a bounds check and a shifted index
+        // per element, and neither loop below vectorises.
+        let pairs = &angles.pairs[..half];
+        for head in vector.chunks_exact_mut(head_dim).take(heads) {
+            let (first, second) = head.split_at_mut(half);
+            for (index, (sin, cos)) in pairs.iter().enumerate() {
+                let (low, high) = (first[index], second[index]);
+                first[index] = low * cos - high * sin;
+                second[index] = low * sin + high * cos;
+            }
+        }
+        return;
+    }
+    for head in vector.chunks_exact_mut(head_dim).take(heads) {
+        for index in 0..half {
+            let (sin, cos) = angles.at(index);
             let first = head[index];
             let second = head[index + half];
             head[index] = first * cos - second * sin;
             head[index + half] = first * sin + second * cos;
         }
     }
+}
+
+/// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
+fn rope(vector: &mut [f32], position: usize, heads: usize, head_dim: usize, base: f32) {
+    rope_with(
+        vector,
+        &RopeAngles::new(position, head_dim, base),
+        heads,
+        head_dim,
+    )
 }
 
 fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, out: &mut [f32]) {
@@ -3429,6 +3483,59 @@ mod tests {
             elapsed * 1e6 / (layers * per_layer) as f64
         );
         std::hint::black_box(&up);
+    }
+
+    /// Measurement: the two parts of the profile's `Norm` phase for one 128-token chunk, the norm
+    /// itself and the rotary embedding beside it, plus what the hoisted rotary path costs in the
+    /// chunk pass. Run with:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib norm_phase_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn norm_phase_cost() {
+        let layers = 28usize;
+        let tokens = 128usize;
+        let (heads, kv_heads, head_dim) = (12usize, 2usize, 128usize);
+        let mut q = vec![0.1_f32; heads * head_dim];
+        let mut k = vec![0.1_f32; kv_heads * head_dim];
+        let start = std::time::Instant::now();
+        for _ in 0..layers {
+            for token in 0..tokens {
+                rope(&mut q, token, heads, head_dim, 1_000_000.0);
+                rope(&mut k, token, kv_heads, head_dim, 1_000_000.0);
+            }
+        }
+        let rope_ms = start.elapsed().as_secs_f64() * 1e3;
+
+        // The chunk pass builds one table per position and rotates from it in every layer.
+        let start = std::time::Instant::now();
+        let angles: Vec<RopeAngles> = (0..tokens)
+            .map(|token| RopeAngles::new(token, head_dim, 1_000_000.0))
+            .collect();
+        for _ in 0..layers {
+            for table in &angles {
+                rope_with(&mut q, table, heads, head_dim);
+                rope_with(&mut k, table, kv_heads, head_dim);
+            }
+        }
+        let hoisted_ms = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box((&q, &k));
+
+        let hidden = 1536usize;
+        let x: Vec<f32> = (0..hidden).map(|i| (i % 71) as f32 * 0.03 - 1.0).collect();
+        let weight = vec![1.0_f32; hidden];
+        let mut out = vec![0.0_f32; hidden];
+        let start = std::time::Instant::now();
+        for _ in 0..layers * tokens * 2 {
+            rms_norm(&x, &weight, 1e-6, &mut out);
+        }
+        let norm_ms = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&out);
+        println!(
+            "norm phase per 128-token chunk: rope per call {rope_ms:.2} ms, rotary hoisted {hoisted_ms:.2} ms, rms_norm {norm_ms:.2} ms"
+        );
     }
 
     #[test]
