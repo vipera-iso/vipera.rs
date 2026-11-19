@@ -2467,3 +2467,59 @@ The prefill figures are steady because eight busy threads hold the clock up.
 **Repeatable measurement:** `scripts/bench-4k.sh` runs a 4k prompt twice per attention-switch arm and
 prints prefill, the attention share of it, decode, and llama-bench's own numbers when
 `LLAMA_BENCH=/path/to/llama-bench` is set.
+
+### The sliding-window kernels share K/V rows too — 2026-11-19
+
+`VIPERA_ATTN_GQA_SHARE` only reached the full-history kernels. A run with `VIPERA_ATTN_WINDOW` set —
+the one configuration where decode cost stops growing with depth, and so the one where decode
+attention matters most — went through `attention_window_heads` and
+`attention_window_chunked_heads`, which had no shared arm and read each K and V row once per query
+head. Both take the switch now. The two-pass window kernel scores each kept K row against a key
+head's whole group in one `simd::dot_f16_group` call and folds the kept V rows sixteen at a time
+through `fold_value_block` (`positions` became `stride`, with the score slot passed explicitly, so
+the kept positions stay numbered `[0, kept)` across the gap the dropped middle leaves). The chunked
+window kernel, which is what a decode step runs, folds each chunk through `fold_chunk_block`, the
+same block online-softmax the full-history KV-chunk kernel uses.
+
+Both remain within rounding of their per-head arms rather than bit-identical, and `q8_0` rows, the
+sequential `VIPERA_EXACT_DOT=1` path and groups over 16 heads keep the per-head kernels bit for bit:
+`shared_window_matches_the_per_head_kernel_within_rounding` holds them to 1e-5 across group sizes
+1/3/6/7, head ranges that cut a group, kept-position counts of 12/19/20/21/44 that straddle the
+sixteen-row blocks, and 2/3/4 workers, and checks the `q8_0` arm for equality.
+
+The end-to-end A/B the section above describes is runnable again — `decode_gqa_share_switch` and
+`prefill_gqa_share_switch` force the switch per call (`force_share`) instead of reading the
+environment, so one process times both arms. Qwen2.5-1.5B Q4_K_M, i5-11300H, 8 threads, arms
+interleaved, decode with the KV chunk and four workers on in both arms:
+
+| | per-head | shared |
+|---|---|---|
+| decode, ctx 1024 | 39.15 ms/step | 37.47 ms/step (-4.3%, slower in 18/60 rounds) |
+| decode, ctx 4096 | 51.21 ms/step | 43.07 ms/step (-15.9%, slower in 1/60) |
+| decode, ctx 4096, `VIPERA_ATTN_WINDOW=2048` | 42.40 ms/step | 39.31 ms/step (-7.3%) |
+| prefill 1024, best of 3 | 164.8 tok/s | 171.4 tok/s (+4.0%) |
+| prefill 4096, best of 2 | 112.4 tok/s | 125.7 tok/s (+11.8%) |
+
+The `VIPERA_ATTN_WINDOW=2048` row is the chunked window kernel (ctx 4096 is past the window plus
+sinks); the ctx 1024 row of that run is still the full-history kernel, since the window only applies
+once the history outgrows it. That is the end-to-end gain for the window path specifically: 3.1 ms
+of a 42.4 ms step.
+
+The same pairs on Qwen2.5-7B Q4_K_M, where the step is bandwidth-bound and attention is a smaller
+share, so the ratio shrinks with the model:
+
+| | per-head | shared |
+|---|---|---|
+| decode, ctx 1024 | 136.26 ms/step | 132.20 ms/step (-3.0%) |
+| decode, ctx 4096 | 166.22 ms/step | 147.76 ms/step (-11.1%, slower in 0/60 rounds) |
+| prefill 1024, best of 3 | 42.7 tok/s | 43.1 tok/s (+1.0%) |
+| prefill 4096, best of 2 | 32.2 tok/s | 34.5 tok/s (+6.5%) |
+
+The 14B GGUF on this machine is `qwen3`, which the CPU backend does not implement (it reads the
+qwen2/llama block layout), so no 14B figure was taken.
+
+```bash
+cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch  -- --ignored --nocapture
+cargo test --release -p vipera-backend-cpu --lib prefill_gqa_share_switch -- --ignored --nocapture
+VIPERA_ATTN_WINDOW=2048 cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch -- --ignored --nocapture
+```
