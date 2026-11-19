@@ -1892,31 +1892,31 @@ fn in_place_kv_enabled() -> bool {
 
 /// Whether the streaming kernel lets the query heads of one key head share each K and V row.
 ///
-/// Off unless `VIPERA_ATTN_GQA_SHARE` is set to something other than `0`, `false`, `off` or `no`,
-/// because it fuses the multiply-add and regroups each head's sum, so it is not bit-identical to
-/// the per-head kernel the golden tokens were recorded with. Read once.
+/// On unless `VIPERA_ATTN_GQA_SHARE` is set to `0`, `false`, `off` or `no`. It fuses the multiply-add
+/// and regroups each head's sum, so it is not bit-identical to the per-head kernel: the tests hold
+/// the two within rounding of each other rather than equal. Read once.
 fn gqa_share_enabled() -> bool {
     static SHARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SHARE.get_or_init(|| {
-        std::env::var("VIPERA_ATTN_GQA_SHARE").is_ok_and(|value| {
+        std::env::var("VIPERA_ATTN_GQA_SHARE").map_or(true, |value| {
             let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
         })
     })
 }
 
 /// Whether the softmax pass takes [`crate::simd::exp_sum_shifted`] instead of `f32::exp`.
 ///
-/// Off unless `VIPERA_FAST_SOFTMAX` is set to something other than `0`, `false`, `off` or `no`,
-/// because it evaluates the exponent with the polynomial [`crate::model::exp`] rather than libm's
-/// `expf`: the two agree to about 2e-6 relative, which is not the same bits, so the tokens a run
-/// produces are not the ones the libm path produces. Read once.
+/// On unless `VIPERA_FAST_SOFTMAX` is set to `0`, `false`, `off` or `no`. It evaluates the exponent
+/// with the polynomial [`crate::model::exp`] rather than libm's `expf`: the two agree to about 2e-6
+/// relative, which is not the same bits, so a run's tokens are not bit-identical to the libm path.
+/// Read once.
 fn fast_softmax_enabled() -> bool {
     static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FAST.get_or_init(|| {
-        std::env::var("VIPERA_FAST_SOFTMAX").is_ok_and(|value| {
+        std::env::var("VIPERA_FAST_SOFTMAX").map_or(true, |value| {
             let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
         })
     })
 }
@@ -4262,8 +4262,11 @@ mod tests {
         }
     }
 
+    /// The buffered kernel against the streaming one with sharing off: same bits, at every block
+    /// boundary. Sharing is pinned off here because the shared kernel regroups each head's sum and
+    /// is only held within rounding, by the test below.
     #[test]
-    fn streaming_attention_is_bit_identical_to_decoding_the_layer_first() {
+    fn streaming_attention_without_sharing_is_bit_identical_to_decoding_the_layer_first() {
         let shape = AttnShape {
             heads: 6,
             kv_heads: 2,
@@ -4302,18 +4305,8 @@ mod tests {
                         &mut expected,
                     );
 
-                    let mut scratch = AttnScratch::default();
-                    let mut actual = vec![f32::NAN; shape.heads * shape.head_dim];
-                    attention_streaming(
-                        &q,
-                        &kv,
-                        layer,
-                        positions,
-                        shape,
-                        &mut scratch,
-                        &mut actual,
-                    )
-                    .expect("attention");
+                    let actual =
+                        streaming_with(false, &q, &kv, layer, positions, shape, 0..shape.heads);
                     let bits = |values: &[f32]| -> Vec<u32> {
                         values.iter().map(|value| value.to_bits()).collect()
                     };
@@ -4523,9 +4516,10 @@ mod tests {
         );
     }
 
-    /// The gate in [`attend`] must not change a number, including when one scratch crosses the
-    /// threshold: the short-history arm fills `k_all`/`v_all`, and the streaming arm must not leave
-    /// anything behind that the next short write reads.
+    /// The gate in [`attend`] must not change a number beyond the regrouping the shared kernel
+    /// does, including when one scratch crosses the threshold: the short-history arm fills
+    /// `k_all`/`v_all`, and the streaming arm must not leave anything behind that the next short
+    /// write reads.
     #[test]
     fn attend_crosses_the_streaming_threshold_without_changing_the_result() {
         let shape = AttnShape {
@@ -4575,13 +4569,15 @@ mod tests {
             &mut scores,
             &mut expected,
         );
-        let bits = |values: &[f32]| {
-            values
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(bits(&out), bits(&expected));
+        let magnitude = expected
+            .iter()
+            .fold(0.0_f32, |max, value| max.max(value.abs()));
+        for (at, (streamed, buffered)) in out.iter().zip(&expected).enumerate() {
+            assert!(
+                (streamed - buffered).abs() <= 1e-5 * magnitude.max(1.0),
+                "element {at}: streaming {streamed} against buffered {buffered}"
+            );
+        }
     }
 
     /// The kernel choice is one function, so this pins it to the documented threshold — and the
@@ -4645,12 +4641,17 @@ mod tests {
                     &mut scratch,
                 )
                 .expect("attention");
-            outputs.push(out.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+            outputs.push(out);
         }
-        assert_eq!(
-            outputs[0], outputs[1],
-            "the kernels disagree at the boundary"
-        );
+        let magnitude = outputs[0]
+            .iter()
+            .fold(0.0_f32, |max, value| max.max(value.abs()));
+        for (at, (streamed, buffered)) in outputs[1].iter().zip(&outputs[0]).enumerate() {
+            assert!(
+                (streamed - buffered).abs() <= 1e-5 * magnitude.max(1.0),
+                "the kernels disagree at the boundary, element {at}: {streamed} against {buffered}"
+            );
+        }
     }
 
     /// What one layer of one decode step pays for its K/V: decode the history, then attend.
@@ -5729,11 +5730,13 @@ mod tests {
         }
 
         let mut one = vec![0.0_f32; shape.heads * shape.head_dim];
+        // One worker must fall through to the serial kernel the caller itself would pick, so it
+        // takes the sharing switch from the same place [`attend_entry`] does.
         attention_kv_chunked_heads(
             &q,
             &read,
             RowOrder::LayerMajor,
-            false,
+            gqa_share_enabled(),
             0,
             positions,
             shape,

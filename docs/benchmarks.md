@@ -2390,3 +2390,27 @@ three runs); a 4k prefill with both switches 30.17 -> 29.85 s.
 **Not attempted here, and the honest next lever:** the streaming pass takes the whole position walk on
 one thread per layer. Splitting that walk across the existing attention workers — the KV-chunk decode
 kernel already does it — is worth far more than another instruction of the dot kernels.
+
+### The two attention switches are now the default — 2026-11-19
+
+`VIPERA_ATTN_GQA_SHARE` and `VIPERA_FAST_SOFTMAX` both defaulted off while their numbers were taken,
+because neither is bit-identical to the kernels that came before: the first regroups each head's sum,
+the second evaluates the exponent with a polynomial that agrees with libm to 1.9e-6 relative. Both
+have been measured, both hold their accuracy tests, so they are on unless the variable says `0`.
+
+Default binary, 4001-token prompt, `--ctx 4096`:
+
+| | prefill | attention | share of chunk |
+|---|---|---|---|
+| switches off (`=0`) | 33.3–34.1 s | 9243–9452 ms | 27.7% |
+| defaults | 30.3–30.7 s | 6153–6186 ms | 20.0–20.4% |
+
+Decode at 4k, median of three steps after the first: attention 30.2 -> 18.1 ms, step 79.0 -> 67.8 ms.
+The machine was noisier than the prefill runs (the same arm read 46–79 ms across runs), so the step
+figure is the weaker of the two; the attention figure is the one to trust.
+
+The tests that pinned "the streaming kernel equals the buffered kernel bit for bit" now pin it for the
+per-head kernel with sharing passed explicitly (`streaming_with(false, ...)`); through `attend`, which
+takes the default, they hold the two within 1e-5 of the largest magnitude, like the shared-kernel test
+next to them. The one-worker KV-chunk fallback still has to be bit-identical, and it takes its switch
+from the same place the caller does.
