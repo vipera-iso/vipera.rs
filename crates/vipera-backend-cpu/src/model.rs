@@ -1885,6 +1885,25 @@ fn in_place_kv_enabled() -> bool {
     })
 }
 
+/// Whether the streaming kernel lets the query heads of one key head share each K and V row.
+///
+/// Off unless `VIPERA_ATTN_GQA_SHARE` is set to something other than `0`, `false`, `off` or `no`,
+/// because it fuses the multiply-add and regroups each head's sum, so it is not bit-identical to
+/// the per-head kernel the golden tokens were recorded with. Read once.
+fn gqa_share_enabled() -> bool {
+    static SHARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| {
+        std::env::var("VIPERA_ATTN_GQA_SHARE").is_ok_and(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+    })
+}
+
+/// The most query heads per key head the shared kernels take; a layer with a larger group keeps the
+/// per-head kernels. Sizes the stack arrays below.
+const MAX_SHARED_GROUP: usize = 16;
+
 /// Causal grouped-query attention read straight from the KV blocks.
 ///
 /// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
@@ -1912,6 +1931,7 @@ fn attention_streaming(
         q,
         &KvRead::of(kv),
         AttentionSwitches::from_env().order,
+        gqa_share_enabled(),
         layer,
         positions,
         shape,
@@ -1965,11 +1985,20 @@ fn sum_v_block<const P: usize>(
 /// [`attention_streaming`] for `heads` alone, writing their own scratch buffers so several
 /// workers can run at once. Everything each head sums is unchanged, in the same order, so a head
 /// computes the same bits whichever worker holds it.
+///
+/// With `share` and `f16` rows read in place, the heads of one key head score each K row together
+/// and fold each block of V rows together ([`crate::simd::dot_f16_group`],
+/// [`crate::simd::axpy_f16_group`]): the row is converted once per group instead of once per head,
+/// and the output accumulators stay in registers across a block of positions. That is the same sum
+/// in the same position order, fused and regrouped, so it is within rounding of the per-head
+/// kernel and not bit-identical to it. Every other layout, and `share` off, runs the per-head
+/// kernel unchanged.
 #[allow(clippy::too_many_arguments)]
 fn attention_streaming_heads(
     q: &[f32],
     kv: &KvRead<'_>,
     order: RowOrder,
+    share: bool,
     layer: usize,
     positions: usize,
     shape: AttnShape,
@@ -1990,6 +2019,7 @@ fn attention_streaming_heads(
     // is the same one), no 2 MB of row buffer per layer per pass. `VIPERA_INPLACE_KV=0` keeps the
     // decoded arm for an A/B in one binary.
     let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let shared = share && in_place && group <= MAX_SHARED_GROUP;
     let count = heads.end - heads.start;
     scores.clear();
     scores.resize(count * positions, 0.0);
@@ -2002,6 +2032,31 @@ fn attention_streaming_heads(
 
     // Pass 1: every score, and each head's maximum, in increasing position order.
     kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+        if shared {
+            for kv_head in 0..shape.kv_heads {
+                let first = (kv_head * group).max(heads.start);
+                let last = ((kv_head + 1) * group).min(heads.end);
+                if first >= last {
+                    continue;
+                }
+                let used = last - first;
+                let key = &kv.storage[base + kv_head * head_dim * 2..][..head_dim * 2];
+                let mut dots = [0.0_f32; MAX_SHARED_GROUP];
+                crate::simd::dot_f16_group(
+                    &q[first * head_dim..last * head_dim],
+                    head_dim,
+                    key,
+                    &mut dots[..used],
+                );
+                for (member, dot) in dots[..used].iter().enumerate() {
+                    let local = first + member - heads.start;
+                    let score = dot * scale;
+                    scores[local * positions + position] = score;
+                    head_state[local] = head_state[local].max(score);
+                }
+            }
+            return Ok(());
+        }
         if !in_place {
             kv.layout
                 .decode(&kv.storage[base..base + layer_bytes], row)?;
@@ -2067,6 +2122,45 @@ fn attention_streaming_heads(
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
     out[..count * head_dim].fill(0.0);
+    if shared {
+        let mut value_bases = [0_usize; crate::simd::GROUP_ROWS];
+        let mut value_positions = [0_usize; crate::simd::GROUP_ROWS];
+        let mut pending = 0;
+        kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+            value_bases[pending] = kv.value_row(order, base, layer_bytes);
+            value_positions[pending] = position;
+            pending += 1;
+            if pending == crate::simd::GROUP_ROWS {
+                fold_value_block(
+                    kv.storage,
+                    &value_bases,
+                    &value_positions,
+                    shape,
+                    &heads,
+                    positions,
+                    scores,
+                    head_state,
+                    out,
+                );
+                pending = 0;
+            }
+            Ok(())
+        })?;
+        if pending > 0 {
+            fold_value_block(
+                kv.storage,
+                &value_bases[..pending],
+                &value_positions[..pending],
+                shape,
+                &heads,
+                positions,
+                scores,
+                head_state,
+                out,
+            );
+        }
+        return Ok(());
+    }
     // Eight positions at a time keeps each head's accumulator in registers between positions, so the
     // targets are loaded and stored once per eight rows instead of once per row. Per element the
     // additions still run in increasing position order, so the result is the per-row kernel's bits.
@@ -2318,6 +2412,152 @@ fn attention_window_heads(
     Ok(())
 }
 
+/// Folds a block of V rows into the outputs of `heads`, every key head's group of query heads
+/// together. `bases[i]` is the byte offset of the V row for position `positions_at[i]`, and the
+/// weight of a head at a position is its softmax numerator times its normalizer, as the per-head
+/// pass computes it.
+#[allow(clippy::too_many_arguments)]
+fn fold_value_block(
+    storage: &[u8],
+    bases: &[usize],
+    positions_at: &[usize],
+    shape: AttnShape,
+    heads: &std::ops::Range<usize>,
+    positions: usize,
+    scores: &[f32],
+    head_state: &[f32],
+    out: &mut [f32],
+) {
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let rows_in_block = bases.len().min(positions_at.len());
+    for kv_head in 0..shape.kv_heads {
+        let first = (kv_head * group).max(heads.start);
+        let last = ((kv_head + 1) * group).min(heads.end);
+        if first >= last {
+            continue;
+        }
+        let used = last - first;
+        let mut weights = [0.0_f32; crate::simd::GROUP_ROWS * MAX_SHARED_GROUP];
+        let mut rows: [&[u8]; crate::simd::GROUP_ROWS] = [&[]; crate::simd::GROUP_ROWS];
+        for slot in 0..rows_in_block {
+            rows[slot] = &storage[bases[slot] + kv_head * head_dim * 2..][..head_dim * 2];
+            for member in 0..used {
+                let local = first + member - heads.start;
+                weights[slot * used + member] =
+                    scores[local * positions + positions_at[slot]] * head_state[local];
+            }
+        }
+        crate::simd::axpy_f16_group(
+            &mut out[(first - heads.start) * head_dim..(last - heads.start) * head_dim],
+            head_dim,
+            used,
+            &weights[..rows_in_block * used],
+            &rows[..rows_in_block],
+        );
+    }
+}
+
+/// One block of up to [`crate::simd::GROUP_ROWS`] consecutive positions folded into a KV chunk's
+/// running `(max, sum_exp, weighted_v)` for every head in `heads`, the query heads of each key head
+/// together.
+///
+/// The online softmax advances a block at a time instead of a position at a time: the block's scores
+/// are computed first ([`crate::simd::dot_f16_group`]), each head's running maximum is raised to the
+/// block's once and the accumulator and the sum rescaled once if it moved, then every position's
+/// weight `exp(score - max)` is taken (one `exp` per head per position, as before) and the block's
+/// V rows are folded in together ([`crate::simd::axpy_f16_group`]). The same softmax, regrouped, so
+/// it is within rounding of the per-position update and not bit-identical to it.
+///
+/// `key_bases[i]` and `value_bases[i]` are the byte offsets of position `i`'s K and V rows;
+/// `block_scores` holds `GROUP_ROWS` slots per head; `m`, `d` and `o` are the chunk's running state,
+/// `o` with `head_dim` values per head.
+#[allow(clippy::too_many_arguments)]
+fn fold_chunk_block(
+    storage: &[u8],
+    key_bases: &[usize],
+    value_bases: &[usize],
+    q: &[f32],
+    shape: AttnShape,
+    heads: &std::ops::Range<usize>,
+    scale: f32,
+    block_scores: &mut [f32],
+    m: &mut [f32],
+    d: &mut [f32],
+    o: &mut [f32],
+) {
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let count = heads.end - heads.start;
+    let rows_in_block = key_bases.len().min(value_bases.len());
+    for (slot, &base) in key_bases[..rows_in_block].iter().enumerate() {
+        for kv_head in 0..shape.kv_heads {
+            let first = (kv_head * group).max(heads.start);
+            let last = ((kv_head + 1) * group).min(heads.end);
+            if first >= last {
+                continue;
+            }
+            let used = last - first;
+            let key = &storage[base + kv_head * head_dim * 2..][..head_dim * 2];
+            let mut dots = [0.0_f32; MAX_SHARED_GROUP];
+            crate::simd::dot_f16_group(
+                &q[first * head_dim..last * head_dim],
+                head_dim,
+                key,
+                &mut dots[..used],
+            );
+            for (member, dot) in dots[..used].iter().enumerate() {
+                let local = first + member - heads.start;
+                block_scores[local * crate::simd::GROUP_ROWS + slot] = dot * scale;
+            }
+        }
+    }
+    for local in 0..count {
+        let scores = &mut block_scores[local * crate::simd::GROUP_ROWS..][..rows_in_block];
+        let block_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if block_max > m[local] {
+            // A new maximum rescales the running sum and the accumulator by `exp(old_max - max)`.
+            let alpha = (m[local] - block_max).exp();
+            m[local] = block_max;
+            d[local] *= alpha;
+            for value in &mut o[local * head_dim..(local + 1) * head_dim] {
+                *value *= alpha;
+            }
+        }
+        let mut sum = 0.0_f32;
+        for score in scores.iter_mut() {
+            *score = (*score - m[local]).exp();
+            sum += *score;
+        }
+        d[local] += sum;
+    }
+    for kv_head in 0..shape.kv_heads {
+        let first = (kv_head * group).max(heads.start);
+        let last = ((kv_head + 1) * group).min(heads.end);
+        if first >= last {
+            continue;
+        }
+        let used = last - first;
+        let mut weights = [0.0_f32; crate::simd::GROUP_ROWS * MAX_SHARED_GROUP];
+        let mut rows: [&[u8]; crate::simd::GROUP_ROWS] = [&[]; crate::simd::GROUP_ROWS];
+        for slot in 0..rows_in_block {
+            rows[slot] = &storage[value_bases[slot] + kv_head * head_dim * 2..][..head_dim * 2];
+            for member in 0..used {
+                let local = first + member - heads.start;
+                weights[slot * used + member] =
+                    block_scores[local * crate::simd::GROUP_ROWS + slot];
+            }
+        }
+        crate::simd::axpy_f16_group(
+            &mut o[(first - heads.start) * head_dim..(last - heads.start) * head_dim],
+            head_dim,
+            used,
+            &weights[..rows_in_block * used],
+            &rows[..rows_in_block],
+        );
+    }
+}
+
 /// Decode attention split by KV position chunks: each worker computes a partial `(max, sum_exp,
 /// weighted_v)` over a disjoint range of positions for every requested head, then the caller merges
 /// the partials in increasing chunk order. The merge is associative in exact math but groups
@@ -2329,6 +2569,7 @@ fn attention_kv_chunked_heads(
     q: &[f32],
     kv: &KvRead<'_>,
     order: RowOrder,
+    share: bool,
     layer: usize,
     positions: usize,
     shape: AttnShape,
@@ -2348,6 +2589,7 @@ fn attention_kv_chunked_heads(
             q,
             kv,
             order,
+            share,
             layer,
             positions,
             shape,
@@ -2368,6 +2610,7 @@ fn attention_kv_chunked_heads(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sequential = quant::exact_dot_requested();
     let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let shared = share && in_place && group <= MAX_SHARED_GROUP;
 
     #[derive(Clone)]
     struct Partial {
@@ -2389,6 +2632,50 @@ fn attention_kv_chunked_heads(
     // in two passes also removes the per-worker `heads x positions` score buffer.
     let compute_chunk = |part: &mut Partial, start: usize, end: usize| -> Result<(), ViperaError> {
         if start >= end {
+            return Ok(());
+        }
+        if shared {
+            let mut key_bases = [0_usize; crate::simd::GROUP_ROWS];
+            let mut value_bases = [0_usize; crate::simd::GROUP_ROWS];
+            let mut block_scores = vec![0.0_f32; count * crate::simd::GROUP_ROWS];
+            let mut pending = 0;
+            kv.for_each_row_range(order, layer, layer_bytes, start, end, |_position, base| {
+                key_bases[pending] = base;
+                value_bases[pending] = kv.value_row(order, base, layer_bytes);
+                pending += 1;
+                if pending == crate::simd::GROUP_ROWS {
+                    fold_chunk_block(
+                        kv.storage,
+                        &key_bases,
+                        &value_bases,
+                        q,
+                        shape,
+                        &heads,
+                        scale,
+                        &mut block_scores,
+                        &mut part.m,
+                        &mut part.d,
+                        &mut part.o,
+                    );
+                    pending = 0;
+                }
+                Ok(())
+            })?;
+            if pending > 0 {
+                fold_chunk_block(
+                    kv.storage,
+                    &key_bases[..pending],
+                    &value_bases[..pending],
+                    q,
+                    shape,
+                    &heads,
+                    scale,
+                    &mut block_scores,
+                    &mut part.m,
+                    &mut part.d,
+                    &mut part.o,
+                );
+            }
             return Ok(());
         }
         let mut scores = vec![0.0_f32; count];
@@ -2943,6 +3230,7 @@ fn attend_entries(
                 &q[..query],
                 &kv[0],
                 switches.order,
+                gqa_share_enabled(),
                 layer,
                 positions[0],
                 shape,
@@ -3261,6 +3549,7 @@ impl AttentionAlgorithm for StreamingAttention {
             call.q,
             call.kv,
             AttentionSwitches::from_env().order,
+            gqa_share_enabled(),
             call.layer,
             call.positions,
             call.shape,
@@ -4006,6 +4295,175 @@ mod tests {
         }
     }
 
+    /// Runs the streaming kernel with the sharing switch passed explicitly, so a test never
+    /// depends on the process environment.
+    #[allow(clippy::too_many_arguments)]
+    fn streaming_with(
+        share: bool,
+        q: &[f32],
+        kv: &KvView<'_>,
+        layer: usize,
+        positions: usize,
+        shape: AttnShape,
+        heads: std::ops::Range<usize>,
+    ) -> Vec<f32> {
+        let mut out = vec![f32::NAN; (heads.end - heads.start) * shape.head_dim];
+        let (mut scores, mut row, mut head_state) = (Vec::new(), Vec::new(), Vec::new());
+        attention_streaming_heads(
+            q,
+            &KvRead::of(kv),
+            AttentionSwitches::from_env().order,
+            share,
+            layer,
+            positions,
+            shape,
+            heads,
+            &mut scores,
+            &mut row,
+            &mut head_state,
+            &mut out,
+        )
+        .expect("attention");
+        out
+    }
+
+    /// With sharing on, the streaming kernel is within rounding of the per-head kernel and not
+    /// equal to it, so that is what is pinned: for group sizes of 1, 3, 6 and 7, whole layers and
+    /// head ranges that cut a group, at position counts around the sixteen-row value blocks and
+    /// the KV block boundaries, over a block table that is not in logical order. Rows that are
+    /// not read in place (`q8_0`) take the per-head kernel whatever the switch says, bit for bit.
+    #[test]
+    fn shared_group_attention_matches_the_per_head_kernel_within_rounding() {
+        for (heads, kv_heads, head_dim) in [
+            (6_usize, 2_usize, 64_usize),
+            (12, 2, 128),
+            (4, 4, 64),
+            (14, 2, 64),
+        ] {
+            let shape = AttnShape {
+                heads,
+                kv_heads,
+                head_dim,
+            };
+            let q: Vec<f32> = (0..heads * head_dim)
+                .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let table: Vec<u32> = (0..20_u32).map(|block| block * 7 % 20).collect();
+            for layout in [KvLayout::F16, KvLayout::Q8_0] {
+                let mut storage = Vec::new();
+                filled_kv(&mut storage, layout, shape, 16, &table, 300);
+                let width = shape.kv_heads * shape.head_dim;
+                let kv = KvView {
+                    bytes_per_token: 2 * 2 * layout.bytes_per_row(width),
+                    storage: &mut storage,
+                    table: &table,
+                    tokens_per_block: 16,
+                    layout,
+                };
+                let mut ranges = vec![0..heads, 0..1];
+                if heads > 2 {
+                    ranges.push(1..heads - 1);
+                }
+                for layer in 0..2 {
+                    for positions in [1_usize, 15, 16, 17, 100, 300] {
+                        for range in &ranges {
+                            let exact = streaming_with(
+                                false,
+                                &q,
+                                &kv,
+                                layer,
+                                positions,
+                                shape,
+                                range.clone(),
+                            );
+                            let shared = streaming_with(
+                                true,
+                                &q,
+                                &kv,
+                                layer,
+                                positions,
+                                shape,
+                                range.clone(),
+                            );
+                            for (at, (shared, exact)) in shared.iter().zip(&exact).enumerate() {
+                                let context = format!(
+                                    "{layout:?} {heads}/{kv_heads}x{head_dim} layer {layer} positions {positions} heads {range:?} element {at}"
+                                );
+                                if layout == KvLayout::F16 {
+                                    assert!(
+                                        (shared - exact).abs() <= 1e-5 + 1e-5 * exact.abs(),
+                                        "{context}: {shared} against {exact}"
+                                    );
+                                } else {
+                                    assert_eq!(shared.to_bits(), exact.to_bits(), "{context}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One layer's streaming attention for one entry, per-head kernel against shared groups, on
+    /// the Qwen2.5-1.5B shape (12 query heads over 2 key heads of 128), `f16` rows read in place.
+    /// Both arms run in one process, interleaved, so the ratio is what is worth reading. It is a
+    /// measurement, not a check, so it is `#[ignore]`d:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib attention_gqa_share_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn attention_gqa_share_cost() {
+        use std::time::Instant;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        for positions in [256_usize, 1024, 4096] {
+            let blocks = positions.div_ceil(16);
+            let mut table: Vec<u32> = (0..blocks as u32).collect();
+            // A fixed shuffle, so the rows are not walked in physical order.
+            for at in (1..table.len()).rev() {
+                table.swap(at, at * 2654435761 % (at + 1));
+            }
+            let mut storage = Vec::new();
+            filled_kv(&mut storage, KvLayout::F16, shape, 16, &table, positions);
+            let width = shape.kv_heads * shape.head_dim;
+            let kv = KvView {
+                bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+                storage: &mut storage,
+                table: &table,
+                tokens_per_block: 16,
+                layout: KvLayout::F16,
+            };
+            let calls = (2_000_000 / positions).max(4);
+            let mut best = [f64::INFINITY; 2];
+            for _ in 0..7 {
+                for (arm, slot) in best.iter_mut().enumerate() {
+                    let started = Instant::now();
+                    for _ in 0..calls {
+                        let out =
+                            streaming_with(arm == 1, &q, &kv, 0, positions, shape, 0..shape.heads);
+                        std::hint::black_box(out);
+                    }
+                    *slot = slot.min(started.elapsed().as_secs_f64() * 1e3 / calls as f64);
+                }
+            }
+            println!(
+                "positions {positions:>5}: per-head {:.3} ms, shared {:.3} ms per layer ({:.2}x)",
+                best[0],
+                best[1],
+                best[0] / best[1]
+            );
+        }
+    }
+
     #[test]
     fn streaming_attention_reports_a_position_with_no_block() {
         let shape = AttnShape {
@@ -4353,6 +4811,7 @@ mod tests {
                         &q,
                         read,
                         order,
+                        false,
                         layer,
                         positions,
                         shape,
@@ -5011,6 +5470,159 @@ mod tests {
         }
     }
 
+    /// With sharing on, the KV-chunk decode kernel is within rounding of the serial per-head kernel
+    /// it already was within rounding of: whole layers and head ranges that cut a group, worker
+    /// counts that give chunks shorter and longer than the sixteen-row blocks, and a block table
+    /// that is not in logical order.
+    #[test]
+    fn shared_kv_chunk_matches_the_serial_kernel_within_rounding() {
+        for (heads, kv_heads, head_dim) in [
+            (12_usize, 2_usize, 128_usize),
+            (6, 2, 64),
+            (4, 4, 64),
+            (14, 2, 64),
+        ] {
+            let shape = AttnShape {
+                heads,
+                kv_heads,
+                head_dim,
+            };
+            let width = kv_heads * head_dim;
+            let q: Vec<f32> = (0..heads * head_dim)
+                .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.05)
+                .collect();
+            let table: Vec<u32> = (0..20_u32).map(|block| block * 7 % 20).collect();
+            let mut storage = Vec::new();
+            filled_kv(&mut storage, KvLayout::F16, shape, 16, &table, 300);
+            let kv = KvView {
+                bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+                storage: &mut storage,
+                table: &table,
+                tokens_per_block: 16,
+                layout: KvLayout::F16,
+            };
+            let read = KvRead::of(&kv);
+            let mut ranges = vec![0..heads, 0..1];
+            if heads > 2 {
+                ranges.push(1..heads - 1);
+            }
+            for positions in [17_usize, 100, 300] {
+                for range in &ranges {
+                    let count = range.end - range.start;
+                    let mut expected = vec![0.0_f32; count * head_dim];
+                    let mut scratch = AttnScratch::default();
+                    attention_streaming_heads(
+                        &q,
+                        &read,
+                        RowOrder::LayerMajor,
+                        false,
+                        0,
+                        positions,
+                        shape,
+                        range.clone(),
+                        &mut scratch.scores,
+                        &mut scratch.row,
+                        &mut scratch.head_state,
+                        &mut expected,
+                    )
+                    .expect("serial attention");
+                    let magnitude = expected.iter().fold(0.0_f32, |max, v| max.max(v.abs()));
+                    for workers in [2_usize, 3, 4] {
+                        let mut shared = vec![f32::NAN; count * head_dim];
+                        attention_kv_chunked_heads(
+                            &q,
+                            &read,
+                            RowOrder::LayerMajor,
+                            true,
+                            0,
+                            positions,
+                            shape,
+                            range.clone(),
+                            &mut shared,
+                            workers,
+                        )
+                        .expect("shared chunked attention");
+                        for (at, (shared, serial)) in shared.iter().zip(&expected).enumerate() {
+                            assert!(
+                                (shared - serial).abs() <= 1e-5 * magnitude.max(1.0),
+                                "{heads}/{kv_heads}x{head_dim} positions {positions} heads {range:?} workers {workers} element {at}: {shared} against {serial}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One layer of single-entry decode attention through the KV-chunk kernel, per-head against
+    /// shared groups, on the Qwen2.5-1.5B shape. Both arms run in one process, interleaved, with the
+    /// same worker count; with fewer cores than workers the arms time-slice, so the ratio measures
+    /// the work and not the parallel speedup. It is a measurement, not a check, so it is
+    /// `#[ignore]`d:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib attention_kv_chunk_share_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn attention_kv_chunk_share_cost() {
+        use std::time::Instant;
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.05)
+            .collect();
+        let workers = 4;
+        for positions in [1024_usize, 4096, 8192] {
+            let table: Vec<u32> = (0..positions.div_ceil(16) as u32).collect();
+            let mut storage = Vec::new();
+            filled_kv(&mut storage, KvLayout::F16, shape, 16, &table, positions);
+            let width = shape.kv_heads * shape.head_dim;
+            let kv = KvView {
+                bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(width),
+                storage: &mut storage,
+                table: &table,
+                tokens_per_block: 16,
+                layout: KvLayout::F16,
+            };
+            let read = KvRead::of(&kv);
+            let calls = (4_000_000 / positions).max(4);
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            let mut best = [f64::INFINITY; 2];
+            for _ in 0..7 {
+                for (arm, slot) in best.iter_mut().enumerate() {
+                    let started = Instant::now();
+                    for _ in 0..calls {
+                        attention_kv_chunked_heads(
+                            &q,
+                            &read,
+                            RowOrder::LayerMajor,
+                            arm == 1,
+                            0,
+                            positions,
+                            shape,
+                            0..shape.heads,
+                            &mut out,
+                            workers,
+                        )
+                        .expect("chunked attention");
+                        std::hint::black_box(&out);
+                    }
+                    *slot = slot.min(started.elapsed().as_secs_f64() * 1e3 / calls as f64);
+                }
+            }
+            println!(
+                "positions {positions:>5}: per-head {:.3} ms, shared {:.3} ms per layer, {workers} workers ({:.2}x)",
+                best[0],
+                best[1],
+                best[0] / best[1]
+            );
+        }
+    }
+
     /// The KV-chunk arm regroups the softmax sums, so it is held to a tight tolerance against the
     /// serial kernel instead of bit equality; one worker must take the serial kernel unchanged.
     #[test]
@@ -5066,6 +5678,7 @@ mod tests {
             &q,
             &read,
             RowOrder::LayerMajor,
+            false,
             0,
             positions,
             shape,
@@ -5088,6 +5701,7 @@ mod tests {
             &q,
             &read,
             RowOrder::LayerMajor,
+            false,
             0,
             positions,
             shape,

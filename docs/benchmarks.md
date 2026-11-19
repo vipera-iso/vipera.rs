@@ -2243,3 +2243,65 @@ The honest summary of the whole line of attack, after two attempts: at this shap
 ~0.08 ms of a 0.39 ms row at a 2048-position history, one fifth of attention, and attention is under a
 tenth of a prompt chunk at 1k. The best a perfectly shared walk can return is a few percent of pp4096,
 and both measured attempts paid more for the sharing than the walk was worth.
+
+### Query heads of one key head share each K and V row in streaming attention — opt-in, 2026-11-19
+
+`VIPERA_ATTN_GQA_SHARE=1` (off by default) makes `attention_streaming_heads` treat the query heads of
+one key head as a group. Pass 1 scores a K row against the whole group with `simd::dot_f16_group`: the
+row is converted from f16 once per sixteen values and feeds up to four heads from the same registers,
+where the per-head kernel converts and loads it once per head. Pass 2 folds V rows with
+`simd::axpy_f16_group`: sixteen positions at a time, one conversion per value vector for up to eight
+heads, the output accumulators held in registers across the sixteen positions instead of loaded and
+stored per head and position. Every element still accumulates in increasing position order. The
+KV-chunk decode kernel takes the same switch, sixteen positions per block (`fold_chunk_block`), one
+rescale per block instead of one per new maximum. Only `f16` rows read in place take it; `q8_0`, the
+sequential `VIPERA_EXACT_DOT=1` path, and groups larger than 16 keep the per-head kernels unchanged.
+
+**It is not bit-identical.** Fused multiply-add and the regrouped sums round differently from the
+per-head kernel, within a few ulps of the sum of absolute terms. That is why it is a switch and not the
+default.
+
+Correctness is pinned by four tests: `group_scores_stay_within_rounding_of_the_exact_sum` and
+`group_fold_stays_within_rounding_of_the_exact_sum` (kernels against the exact `f64` sum),
+`shared_group_attention_matches_the_per_head_kernel_within_rounding` (whole streaming kernel, group
+sizes 1/3/6/7, head ranges that cut a group, positions around the 16-row blocks, shuffled block table;
+`q8_0` stays bit-equal) and `shared_kv_chunk_matches_the_serial_kernel_within_rounding` (KV-chunk
+kernel, 2/3/4 workers).
+
+**Measured on the i5-11300H, not on the AVX-512 sandbox these numbers were first taken on**, so the
+ratios are lower than that draft reported: this machine's per-head kernel is not the same baseline.
+Single thread, arms interleaved, best of 7, f16 KV, shuffled block table, 12 query heads over 2 key
+heads of 128.
+
+| layer-level, single entry | per-head | shared | ratio |
+|---|---|---|---|
+| 256 positions | 0.060 ms | 0.044 ms | 1.36x |
+| 1024 | 0.242 ms | 0.181 ms | 1.33x |
+| 4096 | 1.005 ms | 0.782 ms | 1.29x |
+
+| KV-chunk decode, 4 workers | per-head | shared | ratio |
+|---|---|---|---|
+| 1024 positions | 0.171 ms | 0.095 ms | 1.80x |
+| 4096 | 0.585 ms | 0.274 ms | 2.14x |
+| 8192 | 1.209 ms | 0.558 ms | 2.17x |
+
+At kernel level (`attention_group_throughput`, head dim 128) the score pass is 2.0–2.4x and the value
+pass 2.3–3.1x for groups of 3 to 7 — the kernels themselves behave as intended; the layer-level ratio
+is what is left after the softmax, the row walk and memory.
+
+**End to end, one binary, 901-token prompt, `VIPERA_PROFILE_STEP=1`:**
+
+| | per-head | shared |
+|---|---|---|
+| prefill chunk 6 (attention) | 110.8 ms | 95.7 ms (1.16x) |
+| prefill chunk 7 | 125.4 ms | 108.4 ms (1.16x) |
+| prefill chunk 8 | 111.8 ms | 96.5 ms (1.16x) |
+| three chunks, compute total | 841.8 / 856.3 / 760.2 ms | 822.5 / 837.6 / 743.2 ms (~2%) |
+| decode at ~900 positions (attention) | 6.4 / 11.2 / 9.4 ms | 4.7 / 9.0 / 7.7 ms (1.2–1.4x) |
+| decode step total | 42.5 / 71.5 / 60.7 ms | 41.2 / 66.6 / 59.0 ms |
+
+Attention is 11–16% of a decode step and 13% of a prefill chunk at this prompt length on this machine,
+so a 1.2–1.4x faster attention is about 3% of a decode step and about 2% of a prefill chunk — not the
+20% an earlier projection implied, which assumed attention was half the chunk on a 4k prompt and a
+sandbox baseline. On this hardware the switch is a small, honest win, and it stays off by default
+because it is not bit-identical to the kernel the golden numbers were recorded with.

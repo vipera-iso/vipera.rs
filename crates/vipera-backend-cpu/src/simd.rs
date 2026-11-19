@@ -1139,6 +1139,278 @@ unsafe fn axpy_f16_f32_avx2(target: &mut [f32], weight: f32, row: &[u8]) {
     }
 }
 
+/// Query heads one [`score_block`] call keeps in registers: four heads hold eight accumulators and
+/// the two key vectors, which is what fits beside the query loads in sixteen vector registers.
+const SCORE_BLOCK: usize = 4;
+
+/// Query heads one [`fold_block`] call keeps in registers: one accumulator each, plus the value
+/// vector and a broadcast weight.
+const VALUE_BLOCK: usize = 8;
+
+/// Positions one [`axpy_f16_group`] call folds with its accumulators held in registers; callers
+/// with more rows pass them in as many calls.
+pub(crate) const GROUP_ROWS: usize = 16;
+
+/// The scores of several query heads against one `f16` key row: `out[head]` is head `head`'s dot.
+///
+/// `queries` holds the heads back to back, `head_dim` values each, which is how a grouped-query
+/// layer lays out the query heads that share one key head. [`dot_f16_f32`] run once per head
+/// converts and loads the same key row once per head; this converts it once and feeds every head
+/// from the same registers, so a group of six reads the row a sixth as often. It uses fused
+/// multiply-adds and two accumulators per head, so it rounds differently from [`dot_f16_f32`] (the
+/// measured difference is a few `f32` ulps of the sum of the absolute terms); it is not a
+/// replacement where the bits have to match.
+///
+/// Safe to call: it needs AVX2, F16C and FMA and a `head_dim` that is a multiple of 16, and
+/// otherwise runs [`dot_f16_f32`] per head.
+pub(crate) fn dot_f16_group(queries: &[f32], head_dim: usize, row: &[u8], out: &mut [f32]) {
+    let heads = out.len();
+    let fits = head_dim > 0
+        && head_dim.is_multiple_of(16)
+        && queries.len() >= heads * head_dim
+        && row.len() >= head_dim * 2;
+    if heads > 0
+        && fits
+        && available()
+        && std::is_x86_feature_detected!("f16c")
+        && std::is_x86_feature_detected!("fma")
+    {
+        // SAFETY: AVX2, F16C and FMA were just detected; `queries` holds `heads * head_dim` values,
+        // `row` holds `head_dim` halves and `out` holds `heads` slots, all checked above.
+        unsafe {
+            dot_f16_group_avx2(
+                queries.as_ptr(),
+                head_dim,
+                row.as_ptr(),
+                out.as_mut_ptr(),
+                heads,
+            );
+        }
+        return;
+    }
+    for (head, slot) in out.iter_mut().enumerate() {
+        let query = queries
+            .get(head * head_dim..(head + 1) * head_dim)
+            .unwrap_or(&[]);
+        *slot = dot_f16_f32(query, row);
+    }
+}
+
+/// # Safety
+///
+/// AVX2, F16C and FMA; `queries` must hold `heads * head_dim` values, `row` `head_dim` halves, `out`
+/// `heads` slots, and `head_dim` must be a multiple of 16.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn dot_f16_group_avx2(
+    queries: *const f32,
+    head_dim: usize,
+    row: *const u8,
+    out: *mut f32,
+    heads: usize,
+) {
+    // SAFETY: the caller guarantees the features and the extents; each block reads its own heads.
+    unsafe {
+        let mut head = 0;
+        while head < heads {
+            let block_queries = queries.add(head * head_dim);
+            let block_out = out.add(head);
+            match (heads - head).min(SCORE_BLOCK) {
+                4 => score_block::<4>(block_queries, head_dim, row, block_out),
+                3 => score_block::<3>(block_queries, head_dim, row, block_out),
+                2 => score_block::<2>(block_queries, head_dim, row, block_out),
+                _ => score_block::<1>(block_queries, head_dim, row, block_out),
+            }
+            head += SCORE_BLOCK;
+        }
+    }
+}
+
+/// Eight `f16` values from `bytes[at * 2..]` as `f32` lanes.
+///
+/// # Safety
+///
+/// AVX2 and F16C, and sixteen readable bytes at `bytes + at * 2`.
+#[target_feature(enable = "avx2,f16c")]
+#[inline]
+unsafe fn load_half(bytes: *const u8, at: usize) -> __m256 {
+    // SAFETY: the caller guarantees the features and the sixteen bytes.
+    unsafe {
+        _mm256_cvtph_ps(_mm_loadu_si128(
+            bytes.add(at * 2) as *const std::arch::x86_64::__m128i
+        ))
+    }
+}
+
+/// `HEADS` query heads against one key row, the row converted once per sixteen values.
+///
+/// # Safety
+///
+/// As [`dot_f16_group_avx2`], for `HEADS` heads.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn score_block<const HEADS: usize>(
+    queries: *const f32,
+    head_dim: usize,
+    row: *const u8,
+    out: *mut f32,
+) {
+    // SAFETY: the caller guarantees the features and the extents; every load is inside `head_dim`.
+    unsafe {
+        let mut low = [_mm256_setzero_ps(); HEADS];
+        let mut high = [_mm256_setzero_ps(); HEADS];
+        let mut at = 0;
+        while at < head_dim {
+            let key_low = load_half(row, at);
+            let key_high = load_half(row, at + 8);
+            for head in 0..HEADS {
+                let query = queries.add(head * head_dim + at);
+                low[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query), key_low, low[head]);
+                high[head] = _mm256_fmadd_ps(_mm256_loadu_ps(query.add(8)), key_high, high[head]);
+            }
+            at += 16;
+        }
+        for head in 0..HEADS {
+            *out.add(head) = hsum(_mm256_add_ps(low[head], high[head]));
+        }
+    }
+}
+
+/// `targets[head] += weights[position * heads + head] * rows[position]` for every head and
+/// position: several query heads folding the same value rows into their outputs.
+///
+/// `targets` holds the heads back to back, `head_dim` values each. Each value row is converted once
+/// and feeds every head, and the accumulators stay in registers across up to [`GROUP_ROWS`]
+/// positions, where [`axpy_f16_f32`] per head and position loads and stores the target for each.
+/// Each element still accumulates in increasing position order, but with a fused multiply-add, so
+/// it rounds differently from [`axpy_f16_f32`].
+///
+/// Safe to call: it needs AVX2, F16C and FMA and a `head_dim` that is a multiple of 8, and otherwise
+/// runs [`axpy_f16_f32`] per head and position.
+pub(crate) fn axpy_f16_group(
+    targets: &mut [f32],
+    head_dim: usize,
+    heads: usize,
+    weights: &[f32],
+    rows: &[&[u8]],
+) {
+    let fits = head_dim > 0
+        && head_dim.is_multiple_of(8)
+        && heads > 0
+        && targets.len() >= heads * head_dim
+        && weights.len() >= rows.len() * heads
+        && rows.iter().all(|row| row.len() >= head_dim * 2);
+    if fits
+        && available()
+        && std::is_x86_feature_detected!("f16c")
+        && std::is_x86_feature_detected!("fma")
+    {
+        for (chunk, rows) in rows.chunks(GROUP_ROWS).enumerate() {
+            let mut pointers = [std::ptr::null::<u8>(); GROUP_ROWS];
+            for (slot, row) in pointers.iter_mut().zip(rows) {
+                *slot = row.as_ptr();
+            }
+            // SAFETY: AVX2, F16C and FMA were just detected; the extents of `targets`, `weights`
+            // (`rows.len() * heads` values, of which this chunk starts at `chunk * GROUP_ROWS *
+            // heads`) and every row were checked above.
+            unsafe {
+                axpy_f16_group_avx2(
+                    targets.as_mut_ptr(),
+                    head_dim,
+                    heads,
+                    weights.as_ptr().add(chunk * GROUP_ROWS * heads),
+                    pointers.as_ptr(),
+                    rows.len(),
+                );
+            }
+        }
+        return;
+    }
+    for (position, row) in rows.iter().enumerate() {
+        for head in 0..heads {
+            let weight = weights.get(position * heads + head).copied().unwrap_or(0.0);
+            if let Some(target) = targets.get_mut(head * head_dim..(head + 1) * head_dim) {
+                axpy_f16_f32(target, weight, row);
+            }
+        }
+    }
+}
+
+/// # Safety
+///
+/// AVX2, F16C and FMA; `targets` must hold `heads * head_dim` values, `weights` `count * heads`,
+/// `rows` `count` pointers to `head_dim` readable halves each, with `count` at most
+/// [`GROUP_ROWS`], and `head_dim` must be a multiple of 8.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn axpy_f16_group_avx2(
+    targets: *mut f32,
+    head_dim: usize,
+    heads: usize,
+    weights: *const f32,
+    rows: *const *const u8,
+    count: usize,
+) {
+    // SAFETY: the caller guarantees the features and the extents; each block touches its own heads.
+    unsafe {
+        let mut head = 0;
+        while head < heads {
+            let block_targets = targets.add(head * head_dim);
+            let block_weights = weights.add(head);
+            match (heads - head).min(VALUE_BLOCK) {
+                8 => fold_block::<8>(block_targets, head_dim, block_weights, heads, rows, count),
+                7 => fold_block::<7>(block_targets, head_dim, block_weights, heads, rows, count),
+                6 => fold_block::<6>(block_targets, head_dim, block_weights, heads, rows, count),
+                5 => fold_block::<5>(block_targets, head_dim, block_weights, heads, rows, count),
+                4 => fold_block::<4>(block_targets, head_dim, block_weights, heads, rows, count),
+                3 => fold_block::<3>(block_targets, head_dim, block_weights, heads, rows, count),
+                2 => fold_block::<2>(block_targets, head_dim, block_weights, heads, rows, count),
+                _ => fold_block::<1>(block_targets, head_dim, block_weights, heads, rows, count),
+            }
+            head += VALUE_BLOCK;
+        }
+    }
+}
+
+/// `HEADS` heads folding `count` value rows, eight values at a time, accumulators in registers.
+///
+/// # Safety
+///
+/// As [`axpy_f16_group_avx2`], for `HEADS` heads; `weight_stride` is the distance between
+/// positions in `weights`.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn fold_block<const HEADS: usize>(
+    targets: *mut f32,
+    head_dim: usize,
+    weights: *const f32,
+    weight_stride: usize,
+    rows: *const *const u8,
+    count: usize,
+) {
+    // SAFETY: the caller guarantees the features and the extents; every access is inside them.
+    unsafe {
+        let mut at = 0;
+        while at < head_dim {
+            let mut accumulators = [_mm256_setzero_ps(); HEADS];
+            for (head, accumulator) in accumulators.iter_mut().enumerate() {
+                *accumulator = _mm256_loadu_ps(targets.add(head * head_dim + at));
+            }
+            for position in 0..count {
+                let value = load_half(*rows.add(position), at);
+                let row_weights = weights.add(position * weight_stride);
+                for (head, accumulator) in accumulators.iter_mut().enumerate() {
+                    *accumulator = _mm256_fmadd_ps(
+                        _mm256_set1_ps(*row_weights.add(head)),
+                        value,
+                        *accumulator,
+                    );
+                }
+            }
+            for (head, accumulator) in accumulators.iter().enumerate() {
+                _mm256_storeu_ps(targets.add(head * head_dim + at), *accumulator);
+            }
+            at += 8;
+        }
+    }
+}
+
 /// The AVX2 dot for a Q4_K row, or `None` when this CPU has no AVX2 or the format is another one.
 ///
 /// Safe to call: it checks the feature itself, and the lengths were validated by the caller's
@@ -2631,6 +2903,187 @@ mod tests {
             super::axpy_f16_f32(&mut fast, 1.75, &row);
             super::axpy_f32(&mut slow, 1.75, &decoded);
             assert_eq!(fast, slow, "axpy over {length} values");
+        }
+    }
+
+    fn half_row(rng: &mut Rng, length: usize, spread: f32) -> (Vec<u8>, Vec<f32>) {
+        let row: Vec<u8> = (0..length)
+            .flat_map(|_| crate::quant::f32_to_f16((rng.unit() - 0.5) * spread).to_le_bytes())
+            .collect();
+        let mut decoded = vec![0.0_f32; length];
+        super::half_to_float(&row, &mut decoded);
+        (row, decoded)
+    }
+
+    /// The shared score kernel has no bit-exact oracle, only an error budget: it fuses the multiply
+    /// and the add and splits each head's sum over two accumulators, so what is pinned is that every
+    /// head stays within a few `f32` ulps of the exact sum, measured against the sum of the
+    /// absolute terms. The head counts cross the kernel's four-head blocks and the head dimensions
+    /// include two that take the per-head fallback.
+    #[test]
+    fn group_scores_stay_within_rounding_of_the_exact_sum() {
+        let mut rng = Rng(0x5eed_6709_0000_0001);
+        for head_dim in [8usize, 16, 24, 64, 96, 128] {
+            for heads in 1..=9usize {
+                let queries: Vec<f32> = (0..heads * head_dim)
+                    .map(|_| (rng.unit() - 0.5) * 2.0)
+                    .collect();
+                let (row, key) = half_row(&mut rng, head_dim, 8.0);
+                let mut out = vec![f32::NAN; heads];
+                super::dot_f16_group(&queries, head_dim, &row, &mut out);
+                for (head, got) in out.iter().enumerate() {
+                    let terms = queries[head * head_dim..(head + 1) * head_dim]
+                        .iter()
+                        .zip(&key)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b));
+                    let exact: f64 = terms.clone().sum();
+                    let magnitude: f64 = terms.map(f64::abs).sum();
+                    let error = (f64::from(*got) - exact).abs();
+                    assert!(
+                        error <= 1e-6 * magnitude.max(f64::MIN_POSITIVE),
+                        "head {head} of {heads}, head_dim {head_dim}: {got} against {exact}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The shared value kernel against the exact accumulation: every target element starts from
+    /// its own value and adds one weighted element per row, in increasing row order. The row counts
+    /// cross the sixteen-position blocks and the head counts the eight-head blocks.
+    #[test]
+    fn group_fold_stays_within_rounding_of_the_exact_sum() {
+        let mut rng = Rng(0x5eed_6709_0000_0002);
+        for head_dim in [8usize, 16, 64, 128] {
+            for heads in [1usize, 2, 5, 6, 8, 9, 17] {
+                for count in [1usize, 2, 15, 16, 17, 40] {
+                    let start: Vec<f32> = (0..heads * head_dim)
+                        .map(|_| (rng.unit() - 0.5) * 2.0)
+                        .collect();
+                    let weights: Vec<f32> = (0..count * heads).map(|_| rng.unit()).collect();
+                    let rows: Vec<(Vec<u8>, Vec<f32>)> = (0..count)
+                        .map(|_| half_row(&mut rng, head_dim, 4.0))
+                        .collect();
+                    let refs: Vec<&[u8]> = rows.iter().map(|(row, _)| row.as_slice()).collect();
+                    let mut targets = start.clone();
+                    super::axpy_f16_group(&mut targets, head_dim, heads, &weights, &refs);
+                    for head in 0..heads {
+                        for at in 0..head_dim {
+                            let mut exact = f64::from(start[head * head_dim + at]);
+                            let mut magnitude = exact.abs();
+                            for (position, (_, decoded)) in rows.iter().enumerate() {
+                                let term = f64::from(weights[position * heads + head])
+                                    * f64::from(decoded[at]);
+                                exact += term;
+                                magnitude += term.abs();
+                            }
+                            let got = targets[head * head_dim + at];
+                            assert!(
+                                (f64::from(got) - exact).abs() <= 5e-6 * magnitude,
+                                "head {head}/{heads} element {at}, {count} rows, head_dim {head_dim}: {got} against {exact}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-position cost of the shared group kernels against the per-head calls they replace, for
+    /// one key head's group of query heads over 1024 `f16` rows of head dimension 128. It is a
+    /// measurement, not a check, so it is `#[ignore]`d:
+    ///
+    /// ```text
+    /// cargo test -p vipera-backend-cpu --release --lib attention_group_throughput -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement"]
+    fn attention_group_throughput() {
+        use std::time::Instant;
+        if !super::available()
+            || !std::is_x86_feature_detected!("f16c")
+            || !std::is_x86_feature_detected!("fma")
+        {
+            println!("attention_group_throughput: AVX2, F16C and FMA are required; not run");
+            return;
+        }
+        const DIM: usize = 128;
+        const POSITIONS: usize = 1024;
+        let mut rng = Rng(0x5eed_6709_0000_0003);
+        for group in [3usize, 4, 6, 7] {
+            let queries: Vec<f32> = (0..group * DIM).map(|_| (rng.unit() - 0.5) * 2.0).collect();
+            let rows: Vec<Vec<u8>> = (0..POSITIONS)
+                .map(|_| half_row(&mut rng, DIM, 2.0).0)
+                .collect();
+            let refs: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+            let weights: Vec<f32> = (0..POSITIONS * group).map(|_| rng.unit() * 0.01).collect();
+            let mut scores = vec![0.0_f32; group];
+            let mut targets = vec![0.0_f32; group * DIM];
+            let repeats = 40;
+            let mut best = [f64::MAX; 4];
+            for _ in 0..7 {
+                for (arm, slot) in best.iter_mut().enumerate() {
+                    targets.fill(0.0);
+                    let started = Instant::now();
+                    for _ in 0..repeats {
+                        match arm {
+                            0 => {
+                                for row in &refs {
+                                    for (head, score) in scores.iter_mut().enumerate() {
+                                        *score = super::dot_f16_f32(
+                                            &queries[head * DIM..(head + 1) * DIM],
+                                            row,
+                                        );
+                                    }
+                                    std::hint::black_box(&scores);
+                                }
+                            }
+                            1 => {
+                                for row in &refs {
+                                    super::dot_f16_group(&queries, DIM, row, &mut scores);
+                                    std::hint::black_box(&scores);
+                                }
+                            }
+                            2 => {
+                                for (position, row) in refs.iter().enumerate() {
+                                    for head in 0..group {
+                                        super::axpy_f16_f32(
+                                            &mut targets[head * DIM..(head + 1) * DIM],
+                                            weights[position * group + head],
+                                            row,
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                for (block, rows) in refs.chunks(super::GROUP_ROWS).enumerate() {
+                                    let first = block * super::GROUP_ROWS * group;
+                                    super::axpy_f16_group(
+                                        &mut targets,
+                                        DIM,
+                                        group,
+                                        &weights[first..first + rows.len() * group],
+                                        rows,
+                                    );
+                                }
+                            }
+                        }
+                        std::hint::black_box(&targets);
+                    }
+                    let per_position =
+                        started.elapsed().as_secs_f64() * 1e9 / (repeats * POSITIONS) as f64;
+                    *slot = slot.min(per_position);
+                }
+            }
+            println!(
+                "group {group}: score per-head {:>6.1} ns -> shared {:>6.1} ns ({:.2}x) | value per-head {:>6.1} ns -> shared {:>6.1} ns ({:.2}x)",
+                best[0],
+                best[1],
+                best[0] / best[1],
+                best[2],
+                best[3],
+                best[2] / best[3]
+            );
         }
     }
 
