@@ -68,6 +68,25 @@ welcome; adding to the count is not.
 | Planner unit tests | 0 (tests cover gguf, hardware, a risk gate only) | must increase with every planner change |
 | Diff-scoped checks | available — this is a git repository, and every change lands through a PR whose CI run is the confirmation | every performance claim also carries a before/after in `docs/benchmarks.md` |
 
+## Rejected performance directions (measured, do not re-run blind)
+
+Measured on the reference machine (i5-11300H, 8 threads, Qwen2.5-1.5B Q4_K_M) against
+llama.cpp `e574a17` (pp128 230.8 tok/s, tg64 37.7 tok/s). Baseline vipera: pp128 186 tok/s,
+decode 30–33 tok/s. Full ledger in `HANDOFF.md` (local, gitignored).
+
+| Direction | Measurement | Verdict |
+|---|---|---|
+| Prefetch the next two rows in `fill_rows_batch` | decode 33.5–34.2 → 37.5–37.7 ms/step; prefill 186 → 172 tok/s | rejected: the real 900 MB stream is slower; `ffn_gate`'s 7.7 MB tensor is L3-hot and hid it |
+| `MAX_BATCH` 128 → 256 | `q4k_tiled_batch_sweep` GFLOPS/token 161 (B=16) → 191 (32) → 185 (64) → 203 (128); fit of `prefill n=64/128` puts per-chunk weight cost at ≈0 | rejected: prefill is compute-bound, a wider chunk buys <2% for 16 more monomorphized layer stacks |
+| AVX-512 integer tile at `B = 1` (decode) | decode 32.7–34.6 → 112–115 ms/step | rejected: 15 of the tile's 16 `dpbusd` columns are zeros |
+| Thread count 4 / 6 instead of 8 | decode 26.7 / 28.7 tok/s vs 33.4 | rejected: 8 logical CPUs are the best setting here |
+| Port llama.cpp's `bsums`-based Q6_K kernel | `output` Q6_K already 5.2 ms/call = 36.5 GB/s, near the ~43 GB/s read ceiling | not attempted: the bytes, not the kernel, are the limit |
+
+Where the time actually goes (measured, `VIPERA_PROFILE_STEP=1`): prefill chunk q4_k 68%,
+q6_k 19%, attention 5%, norm 2%, rest 6%; decode q4_k 61%, q6_k 28%, attention 7%. So attention
+is not the prefill bottleneck, and any further work has to move Q4_K streaming (~30 GB/s against
+llama.cpp's ~39 GB/s over the whole step).
+
 ## Exceptions
 
 | ID | Rule | Path | Reason | Owner | Expires |
