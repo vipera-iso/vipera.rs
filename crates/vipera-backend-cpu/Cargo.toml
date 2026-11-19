@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 vipera-core.workspace = true
+memmap2.workspace = true
 vipera-errors.workspace = true
 vipera-runtime.workspace = true
 

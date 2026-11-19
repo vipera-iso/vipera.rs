@@ -358,7 +358,8 @@ impl BatchScratch {
 
 /// Qwen2/Llama weights plus the scratch buffers a forward pass reuses.
 pub struct CpuBackend {
-    bytes: Vec<u8>,
+    /// The weights and where they live: mapped from the file, or a caller's buffer.
+    weights: crate::bus::WeightSource,
     config: ModelConfig,
     /// The architecture family the model declared; reported, not recomputed.
     architecture: String,
@@ -384,15 +385,24 @@ pub struct CpuBackend {
 
 impl CpuBackend {
     /// Read a model file and prepare it for inference.
+    /// The file is mapped, not read: the weights stay on disk until a pass touches them, and a
+    /// narrowed RAM window (`VIPERA_RAM_LAYERS`) pages them back out behind the pass.
     pub fn load(path: &Path) -> Result<Self, ViperaError> {
-        let bytes = std::fs::read(path)?;
-        let file = GgufFile::parse(&bytes)?;
-        Self::from_bytes(bytes, &file)
+        let (weights, file) = crate::bus::WeightSource::open(path)?;
+        Self::from_weights(weights, &file)
     }
 
     /// Build from a file that is already in memory, so a caller that also needs the metadata does not
     /// read the model twice.
     pub fn from_bytes(bytes: Vec<u8>, file: &GgufFile) -> Result<Self, ViperaError> {
+        Self::from_weights(crate::bus::WeightSource::from_bytes(bytes, file), file)
+    }
+
+    fn from_weights(
+        weights: crate::bus::WeightSource,
+        file: &GgufFile,
+    ) -> Result<Self, ViperaError> {
+        let bytes = weights.bytes();
         let config = ModelConfig::from_gguf(file)?;
         let architecture = file
             .metadata
@@ -406,13 +416,13 @@ impl CpuBackend {
 
         let tok_embd = matrix(file, "token_embd.weight", config.hidden, config.vocab)?;
         let output = matrix(file, "output.weight", config.hidden, config.vocab).unwrap_or(tok_embd);
-        let output_norm = vector(file, &bytes, "output_norm.weight", config.hidden)?;
+        let output_norm = vector(file, bytes, "output_norm.weight", config.hidden)?;
 
         let mut layers = Vec::with_capacity(config.layers);
         for index in 0..config.layers {
             let name = |suffix: &str| format!("blk.{index}.{suffix}");
             layers.push(Layer {
-                attn_norm: vector(file, &bytes, &name("attn_norm.weight"), config.hidden)?,
+                attn_norm: vector(file, bytes, &name("attn_norm.weight"), config.hidden)?,
                 wq: matrix(
                     file,
                     &name("attn_q.weight"),
@@ -421,7 +431,7 @@ impl CpuBackend {
                 )?,
                 bq: vector(
                     file,
-                    &bytes,
+                    bytes,
                     &name("attn_q.bias"),
                     config.heads * config.head_dim,
                 )?,
@@ -433,7 +443,7 @@ impl CpuBackend {
                 )?,
                 bk: vector(
                     file,
-                    &bytes,
+                    bytes,
                     &name("attn_k.bias"),
                     config.kv_heads * config.head_dim,
                 )?,
@@ -445,7 +455,7 @@ impl CpuBackend {
                 )?,
                 bv: vector(
                     file,
-                    &bytes,
+                    bytes,
                     &name("attn_v.bias"),
                     config.kv_heads * config.head_dim,
                 )?,
@@ -455,7 +465,7 @@ impl CpuBackend {
                     config.hidden,
                     config.hidden,
                 )?,
-                ffn_norm: vector(file, &bytes, &name("ffn_norm.weight"), config.hidden)?,
+                ffn_norm: vector(file, bytes, &name("ffn_norm.weight"), config.hidden)?,
                 wg: matrix(file, &name("ffn_gate.weight"), config.hidden, config.ffn)?,
                 wu: matrix(file, &name("ffn_up.weight"), config.hidden, config.ffn)?,
                 wd: matrix(file, &name("ffn_down.weight"), config.ffn, config.hidden)?,
@@ -464,7 +474,7 @@ impl CpuBackend {
 
         Ok(Self {
             config,
-            bytes,
+            weights,
             architecture,
             tok_embd,
             output,
@@ -546,7 +556,7 @@ impl CpuBackend {
         }
 
         let Self {
-            bytes,
+            weights,
             tok_embd,
             output,
             output_norm,
@@ -578,7 +588,7 @@ impl CpuBackend {
 
         // The bytes are borrowed for the whole pass so the pool's workers can hold them; the
         // scratch buffers stay mutable because they are separate fields.
-        let file: &[u8] = bytes;
+        let file: &[u8] = weights.bytes();
         let threads =
             quant::thread_budget(config.vocab, config.hidden.saturating_mul(config.vocab));
         thread::scope(|scope| {
@@ -597,6 +607,7 @@ impl CpuBackend {
                 tok_embd.read_row(file, row, x)?;
 
                 for (index, layer) in layers.iter().enumerate() {
+                    weights.advance(index);
                     rms_norm(x, &layer.attn_norm, config.rms_eps, h);
                     layer.wq.matvec(&pool, file, h, q)?;
                     add_assign(q, &layer.bq);
@@ -878,7 +889,7 @@ impl CpuBackend {
 
         let counts: Vec<usize> = positions.iter().map(|position| position + 1).collect();
         let Self {
-            bytes,
+            weights,
             tok_embd,
             output,
             output_norm,
@@ -897,7 +908,7 @@ impl CpuBackend {
             kv_heads: config.kv_heads,
             head_dim: config.head_dim,
         };
-        let file: &[u8] = bytes;
+        let file: &[u8] = weights.bytes();
         let threads = quant::thread_budget(vocab, hidden.saturating_mul(vocab).saturating_mul(B));
 
         thread::scope(|scope| {
@@ -923,6 +934,7 @@ impl CpuBackend {
                 .collect();
 
             for (index, layer) in layers.iter().enumerate() {
+                weights.advance(index);
                 let at = crate::profile::stamp();
                 for entry in 0..B {
                     rms_norm(

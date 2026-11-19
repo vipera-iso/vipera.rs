@@ -11,6 +11,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bus;
 pub mod model;
 mod pool;
 pub mod profile;
