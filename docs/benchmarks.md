@@ -2414,3 +2414,56 @@ per-head kernel with sharing passed explicitly (`streaming_with(false, ...)`); t
 takes the default, they hold the two within 1e-5 of the largest magnitude, like the shared-kernel test
 next to them. The one-worker KV-chunk fallback still has to be bit-identical, and it takes its switch
 from the same place the caller does.
+
+### Where a 4k prefill chunk's q4k time goes, and llama.cpp on the same model — 2026-11-19
+
+**The chunk.** Profile of one 128-token chunk at the end of a 4001-token prompt (`--ctx 4096`,
+`VIPERA_PROFILE_STEP=1`, i5-11300H, 8 threads), 1045 ms:
+
+| phase | ms | share |
+|---|---|---|
+| Q4_K products | 507 | 48% |
+| attention | 328 | 31% |
+| Q6_K products | 153 | 15% |
+| rest (rope, adds, copies) | 43 | 4% |
+| RMS norm | 15 | 1% |
+
+**Inside the 660 ms of products**, by tensor shape (ms per chunk, `SHAPES` in the profile):
+
+| tensor | format | calls | ms | share of products |
+|---|---|---|---|---|
+| FFN gate + up, 8960x1536 | Q4_K | 56 | 292 | 44% |
+| FFN down, 1536x8960 | Q6_K (14 layers) + Q4_K (14) | 28 | 137 + 112 | 38% |
+| attention q + o, 1536x1536 | Q4_K | 56 | 75 | 11% |
+| attention k + v, 256x1536 | Q4_K + Q6_K | 56 | 23 + 8 | 5% |
+| lm_head, 151936x1536 | Q6_K | 1 | 6 | 1% |
+
+So the feed-forward block is 82% of the prefill's matrix work and the attention projections 16%,
+which is why chunked prefill (one weight read for 128 activations) is worth what it is.
+
+**It is compute-bound, not bandwidth-bound.** A chunk reads the 1.04 GiB of weights once for 128
+tokens: 1.12 GB in 0.66 s is 1.7 GB/s, and the same matrices are 228 GMAC in that time, 345 GMAC/s.
+Whatever is left is the dequantisation and activation quantisation inside the kernel, not DRAM.
+
+**The same model against llama.cpp**, built from source on this machine
+(`cmake -DGGML_NATIVE=ON`, build 4db8b76, `-t 8`), both with the same 4010-token prompt:
+
+| | prefill | decode at ~4k |
+|---|---|---|
+| vipera (defaults) | 134–137 tok/s | 13.4–13.6 tok/s (73–75 ms/step) |
+| llama.cpp `llama-cli` | 146–151 tok/s | 23.0–23.7 tok/s (42–43 ms/step) |
+| llama-bench, `pp4096` / `tg @ d4096` | 138–142 tok/s | 21.4–22.7 tok/s |
+
+Prefill is within 10% and slightly behind. Decode at depth is 1.7x behind, and the profile says where:
+a decode step reads the same 1.04 GiB for one token, which at 73 ms is 15 GB/s where llama.cpp's 43 ms
+is 26 GB/s. The matvec at batch 1 — not attention, which is 27 ms of the 73 — is the gap.
+
+**A caveat on this host, and it is not small.** `intel_pstate` runs in `powersave` and is not ours to
+change (no root): during a decode burst the clock reads 0.8–1.4 GHz, and one 25-token run drifted
+64 → 120 ms/step while the prompt before it ran at 3.2 GHz. Decode figures here are only comparable
+between arms measured back to back in the same session, which is how every number above was taken.
+The prefill figures are steady because eight busy threads hold the clock up.
+
+**Repeatable measurement:** `scripts/bench-4k.sh` runs a 4k prompt twice per attention-switch arm and
+prints prefill, the attention share of it, decode, and llama-bench's own numbers when
+`LLAMA_BENCH=/path/to/llama-bench` is set.

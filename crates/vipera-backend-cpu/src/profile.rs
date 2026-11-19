@@ -158,15 +158,16 @@ fn bits_per_weight(label: &str) -> f64 {
     }
 }
 
-/// Print the per-shape table, biggest total first, as an average over the decode passes timed.
-fn print_shapes(steps: u64) {
+/// Print the per-shape table, biggest total first, as an average over the passes timed.
+fn print_shapes(steps: u64, prefill: bool) {
     let shapes = SHAPES.lock().unwrap_or_else(|error| error.into_inner());
     if shapes.is_empty() {
         return;
     }
     let mut ordered: Vec<&Shape> = shapes.iter().collect();
     ordered.sort_by_key(|shape| std::cmp::Reverse(shape.nanos));
-    eprintln!("SHAPES over {steps} decode passes (ms per pass, ms per call, GB/s):");
+    let kind = if prefill { "chunk" } else { "decode" };
+    eprintln!("SHAPES over {steps} {kind} passes (ms per pass, ms per call, GB/s):");
     for shape in ordered {
         if steps == 0 {
             continue;
@@ -174,11 +175,21 @@ fn print_shapes(steps: u64) {
         let bytes = shape.rows as f64 * shape.cols as f64 * bits_per_weight(shape.label) / 8.0;
         let per_call = shape.nanos as f64 / shape.calls as f64 / 1e6;
         if shape.batch > 1 {
-            // A chunk pass carries `batch` activations, so its cost is compute per activation, not
-            // a stream of this tensor: per-pass and GB/s would both describe nothing.
+            // A chunk pass carries `batch` activations, so GB/s would be the rate of a stream that
+            // does not happen: the tensor is read once per chunk whatever the batch. Per pass is
+            // what the tensor costs the chunk, and per call is that divided by its calls in it.
+            let per_pass = shape.nanos as f64 / steps as f64 / 1e6;
+            let gbps = bytes / (per_pass / 1e3) / 1e9;
             eprintln!(
-                "SHAPE {:>6} b{:<3} {:>6}x{:<6} {:>4} calls  {:>6.3} ms/call  (batch)",
-                shape.label, shape.batch, shape.rows, shape.cols, shape.calls, per_call
+                "SHAPE {:>6} b{:<3} {:>6}x{:<6} {:>4} calls  {:>7.2} ms/pass  {:>6.3} ms/call  {:>5.1} GB/s",
+                shape.label,
+                shape.batch,
+                shape.rows,
+                shape.cols,
+                shape.calls,
+                per_pass,
+                per_call,
+                gbps
             );
             continue;
         }
@@ -228,8 +239,10 @@ pub fn finish_pass(start: Option<Instant>) {
     ));
     eprintln!("{line}");
     // One table per run, once the caches and the pool are warm: the first passes carry the fault-in
-    // cost of the weights, which is not what a steady-state question is about.
-    if !prefill && steps == 20 {
-        print_shapes(steps);
+    // cost of the weights, which is not what a steady-state question is about. A prompt makes fewer,
+    // longer passes than a decode run, so its table is printed every sixteen chunks, as a running
+    // average: a 4k prompt over a 128-token chunk is 32 of them.
+    if (!prefill && steps == 20) || (prefill && steps % 16 == 0) {
+        print_shapes(steps, prefill);
     }
 }
