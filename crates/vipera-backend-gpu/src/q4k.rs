@@ -10,6 +10,7 @@ use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
 use vipera_errors::ViperaError;
 
 use crate::device::{Device, DeviceBuffer};
+use crate::q8::{Q8, Q8Device};
 
 /// Values per Q4_K super-block.
 pub const QK_K: usize = 256;
@@ -24,13 +25,23 @@ const ROWS_PER_BLOCK: usize = 8;
 const THREADS: usize = 32 * ROWS_PER_BLOCK;
 
 const SOURCE: &str = include_str!("q4k_matvec.cu");
+const SOURCE_Q8: &str = include_str!("q4k_matvec_q8.cu");
+
+/// The kernels this module compiles, one NVRTC program each: they share helper functions, so
+/// concatenating the sources would redefine them.
+pub(crate) fn sources() -> [&'static str; 3] {
+    [SOURCE, SOURCE_Q8, crate::q6k::SOURCE]
+}
+
+/// Names in the order [`sources`] returns them.
+pub(crate) const FUNCTIONS: [&str; 3] = ["q4k_matvec", "q4k_matvec_q8", "q6k_matvec"];
 
 /// Compile the kernel for `context`'s device.
 ///
 /// PTX for an older architecture runs on a newer one through the driver's JIT, so the exact
 /// capability is an optimisation rather than a requirement; it is still asked for so a Turing card
 /// does not pay for codegen aimed at Hopper.
-pub(crate) fn compile(context: &cudarc::driver::CudaContext) -> Result<Ptx, String> {
+pub(crate) fn compile(context: &cudarc::driver::CudaContext, source: &str) -> Result<Ptx, String> {
     use cudarc::driver::sys::{CUdevice_attribute, CUdevice_attribute_enum};
     let major = context
         .attribute(
@@ -49,7 +60,7 @@ pub(crate) fn compile(context: &cudarc::driver::CudaContext) -> Result<Ptx, Stri
         options: vec![format!("--gpu-architecture=compute_{major}{minor}")],
         ..Default::default()
     };
-    compile_ptx_with_opts(SOURCE, options).map_err(|error| error.to_string())
+    compile_ptx_with_opts(source, options).map_err(|error| error.to_string())
 }
 
 /// A Q4_K matrix that lives on the device between calls.
@@ -145,5 +156,90 @@ impl Q4kMatrix {
         })?;
 
         out.download(device)
+    }
+
+    /// `y = W · x` on the int8 path.
+    ///
+    /// The weights stay as they are on the device; the activations are quantized to [`Q8`] by the
+    /// caller (or with [`Q8::quantize`]) and meet the 4-bit quants in `__dp4a`, four products per
+    /// instruction. This is the path that can beat the CPU's SIMD tile, because there a value costs a
+    /// dequantize and a multiply while here it costs a quarter of one instruction.
+    pub fn matvec_q8(&self, device: &Device, x: &Q8) -> Result<Vec<f32>, ViperaError> {
+        if x.qs.len() != self.cols {
+            return Err(ViperaError::invalid_argument(format!(
+                "the activation vector is {} values, the matrix has {} columns",
+                x.qs.len(),
+                self.cols
+            )));
+        }
+        if x.groups() != self.cols / 32 {
+            return Err(ViperaError::invalid_argument(format!(
+                "{} activation groups for {} columns",
+                x.groups(),
+                self.cols
+            )));
+        }
+        let quants: DeviceBuffer<i8> = device.upload(&x.qs)?;
+        let scales: DeviceBuffer<f32> = device.upload(&x.d)?;
+        let sums: DeviceBuffer<f32> = device.upload(&x.s)?;
+        let mut out: DeviceBuffer<f32> = device.alloc(self.rows)?;
+
+        let config = LaunchConfig {
+            grid_dim: (self.rows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+            block_dim: (THREADS as u32, 1, 1),
+            shared_mem_bytes: (ROWS_PER_BLOCK * self.blocks_per_row * BLOCK_BYTES) as u32,
+        };
+        let rows_arg = self.rows as i32;
+        let blocks_arg = self.blocks_per_row as i32;
+        let mut launch = device.stream.launch_builder(&device.q4k_matvec_q8);
+        launch.arg(&self.weights.slice);
+        launch.arg(&quants.slice);
+        launch.arg(&scales.slice);
+        launch.arg(&sums.slice);
+        launch.arg(&mut out.slice);
+        launch.arg(&rows_arg);
+        launch.arg(&blocks_arg);
+        // SAFETY: same contract as `matvec`; the two extra buffers hold exactly `cols` quants and
+        // `cols/32` scales and sums, which is what the kernel indexes.
+        unsafe { launch.launch(config) }
+            .map_err(|error| ViperaError::internal(format!("Q4_K int8 launch failed: {error}")))?;
+
+        out.download(device)
+    }
+
+    /// `y = W · x` writing into a caller's buffer, so a layer's chain stays on the device.
+    pub fn matvec_q8_into(
+        &self,
+        device: &Device,
+        x: &Q8Device,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), ViperaError> {
+        if out.len() != self.rows {
+            return Err(ViperaError::internal(format!(
+                "the output buffer is {} rows, the matrix has {}",
+                out.len(),
+                self.rows
+            )));
+        }
+        let config = LaunchConfig {
+            grid_dim: (self.rows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+            block_dim: (THREADS as u32, 1, 1),
+            shared_mem_bytes: (ROWS_PER_BLOCK * self.blocks_per_row * BLOCK_BYTES) as u32,
+        };
+        let rows_arg = self.rows as i32;
+        let blocks_arg = self.blocks_per_row as i32;
+        let mut launch = device.stream.launch_builder(&device.q4k_matvec_q8);
+        launch.arg(&self.weights.slice);
+        launch.arg(&x.qs.slice);
+        launch.arg(&x.d.slice);
+        launch.arg(&x.s.slice);
+        launch.arg(&mut out.slice);
+        launch.arg(&rows_arg);
+        launch.arg(&blocks_arg);
+        // SAFETY: the activations hold at least `cols` quants and `cols/32` groups (checked by the
+        // caller's `quantize_into`), and `out` is exactly `rows` (checked above).
+        unsafe { launch.launch(config) }
+            .map_err(|error| ViperaError::internal(format!("Q4_K int8 launch failed: {error}")))?;
+        Ok(())
     }
 }

@@ -8,6 +8,7 @@
 pub mod gguf;
 pub mod hardware;
 pub mod planner;
+pub mod vram;
 pub mod window;
 
 pub use gguf::{GgufFile, Header, Metadata, ModelDescriptor, TensorInfo};

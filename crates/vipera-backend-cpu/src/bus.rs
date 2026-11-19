@@ -21,7 +21,10 @@
 //! follows it.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use vipera_core::vram::VramSink;
 
 use vipera_core::gguf::GgufFile;
 use vipera_errors::ViperaError;
@@ -99,6 +102,8 @@ pub struct WeightSource {
     window: usize,
     /// Start of the window the last [`WeightSource::advance`] installed, so a layer is advised once.
     placed: AtomicUsize,
+    /// Where the window's layers also go, when the process has a device to put them on.
+    vram: Option<Arc<dyn VramSink>>,
 }
 
 enum Backing {
@@ -132,6 +137,7 @@ impl WeightSource {
             backing: Backing::Mapped(map),
             window: window_from_env(),
             placed: AtomicUsize::new(usize::MAX),
+            vram: None,
         };
         source.report();
         Ok((source, file))
@@ -144,6 +150,7 @@ impl WeightSource {
             backing: Backing::Heap(bytes),
             window: window_from_env(),
             placed: AtomicUsize::new(usize::MAX),
+            vram: None,
         };
         source.report();
         source
@@ -170,11 +177,36 @@ impl WeightSource {
     /// The tier a layer is in under the window the pass last installed.
     pub fn tier_of(&self, layer: usize) -> Tier {
         let start = self.placed.load(Ordering::Relaxed);
+        if self.vram.is_some() && layer >= start && layer < start + self.window {
+            return Tier::Vram;
+        }
         if self.window == 0 || start == usize::MAX || layer < start + self.window {
             Tier::Ram
         } else {
             Tier::Ssd
         }
+    }
+
+    /// Give the bus a device to copy the window's layers to.
+    ///
+    /// Called once, before the first pass, by whoever opened the device. Without it the bus is the
+    /// mmap-and-page-cache path it was before; with it, every layer that enters the window is also
+    /// handed to the sink, and the ones that leave are released.
+    pub fn install_vram(&mut self, sink: Arc<dyn VramSink>) {
+        self.vram = Some(sink);
+        // Nothing has been placed yet, so the first `advance` decides the window from scratch.
+        self.placed.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    /// Bytes the device holds, or zero when there is no device.
+    pub fn vram_bytes(&self) -> usize {
+        self.vram.as_ref().map_or(0, |sink| sink.held_bytes())
+    }
+
+    /// Layer `layer`'s bytes, for a sink that wants its own copy.
+    fn layer_bytes(&self, layer: usize) -> Option<&[u8]> {
+        let span = self.spans.get(layer)?;
+        self.bytes().get(span.start..span.start + span.len)
     }
 
     /// Move the resident window so it covers `layer` and the `window` layers after it.
@@ -196,6 +228,32 @@ impl WeightSource {
         let end = (layer + self.window).min(self.spans.len());
         for span in &self.spans[layer.min(end)..end] {
             let _ = map.advise_range(memmap2::Advice::WillNeed, span.start, span.len);
+        }
+        if let Some(sink) = &self.vram {
+            // Two windows: the one that was resident and the one that replaces it. A layer is
+            // brought when it is in the new one and was not in the old, released the other way
+            // round. Both loops are over the window, not the model.
+            let len = self.spans.len();
+            let new_start = layer.min(len);
+            let new_end = (layer + self.window).min(len);
+            let old_start = previous.min(len);
+            let old_end = if previous == usize::MAX {
+                new_start
+            } else {
+                (previous + self.window).min(len)
+            };
+            for index in new_start..new_end {
+                if (index < old_start || index >= old_end)
+                    && let Some(bytes) = self.layer_bytes(index)
+                {
+                    sink.bring(index, bytes);
+                }
+            }
+            for index in old_start..old_end {
+                if index < new_start || index >= new_end {
+                    sink.release(index);
+                }
+            }
         }
         // Only the layers that left the window are handed back: advising a layer the pass is about
         // to touch again would just cost a fault.
@@ -299,6 +357,7 @@ mod tests {
             spans: Vec::new(),
             window: 1,
             placed: AtomicUsize::new(usize::MAX),
+            vram: None,
         };
         source.advance(0);
         assert_eq!(source.bytes(), &bytes[..]);
