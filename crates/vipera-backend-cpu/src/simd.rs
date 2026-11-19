@@ -383,6 +383,69 @@ unsafe fn exp_x8(value: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 
     _mm256_mul_ps(polynomial, _mm256_castsi256_ps(exponent))
 }
 
+/// `sum(e^(values[i] - shift))` for every i, each value replaced by its exponential: one head's
+/// softmax numerator, written the way [`crate::model::exp`] computes it, in eight lanes.
+///
+/// The vector lanes and the scalar remainder are the same polynomial and the same rounding trick, so
+/// every value written here is the scalar `exp`'s bits; only the order the lanes are added across
+/// differs, which moves the total by a few ulps. It exists because the softmax pass is
+/// `heads * positions` libm calls per layer, and a call is a function call.
+///
+/// Safe to call: it needs AVX2 for the vector path and falls back otherwise.
+pub(crate) fn exp_sum_shifted(values: &mut [f32], shift: f32) -> f32 {
+    if values.len() >= 8 && available() {
+        // SAFETY: AVX2 was just detected, and the kernel reads and writes `len` values.
+        return unsafe { exp_sum_shifted_avx2(values.as_mut_ptr(), values.len(), shift) };
+    }
+    let mut total = 0.0_f32;
+    for value in values.iter_mut() {
+        let exponential = crate::model::exp(*value - shift);
+        *value = exponential;
+        total += exponential;
+    }
+    total
+}
+
+/// # Safety
+///
+/// The CPU must support AVX2, and `values` must hold `len` writable values.
+#[target_feature(enable = "avx2")]
+unsafe fn exp_sum_shifted_avx2(values: *mut f32, len: usize, shift: f32) -> f32 {
+    // SAFETY: the caller guarantees AVX2 and the extent; every step is inside it.
+    unsafe {
+        let broadcast = _mm256_set1_ps(shift);
+        let mut low = _mm256_setzero_ps();
+        let mut high = _mm256_setzero_ps();
+        let mut at = 0;
+        while at + 16 <= len {
+            let first = exp_x8(_mm256_sub_ps(_mm256_loadu_ps(values.add(at)), broadcast));
+            let second = exp_x8(_mm256_sub_ps(
+                _mm256_loadu_ps(values.add(at + 8)),
+                broadcast,
+            ));
+            _mm256_storeu_ps(values.add(at), first);
+            _mm256_storeu_ps(values.add(at + 8), second);
+            low = _mm256_add_ps(low, first);
+            high = _mm256_add_ps(high, second);
+            at += 16;
+        }
+        while at + 8 <= len {
+            let block = exp_x8(_mm256_sub_ps(_mm256_loadu_ps(values.add(at)), broadcast));
+            _mm256_storeu_ps(values.add(at), block);
+            low = _mm256_add_ps(low, block);
+            at += 8;
+        }
+        let mut total = hsum(_mm256_add_ps(low, high));
+        while at < len {
+            let exponential = crate::model::exp(*values.add(at) - shift);
+            *values.add(at) = exponential;
+            total += exponential;
+            at += 1;
+        }
+        total
+    }
+}
+
 /// [`half_to_float`] in eight-value steps.
 ///
 /// # Safety
@@ -4528,6 +4591,71 @@ mod tests {
     /// over every activation of a chunk, and a changed bit would move the sampling. Checked on a
     /// dense sweep, on random bit patterns (which reach the subnormals and the huge magnitudes), and
     /// on the special values.
+    /// The softmax exponent kernel writes the scalar `exp`'s bits, lane for lane, at every length
+    /// that crosses the sixteen-value and eight-value steps and the tail; the only thing that
+    /// differs is the order the lanes are added across.
+    #[test]
+    fn exp_sum_shifted_matches_the_scalar_exp_bit_for_bit() {
+        if !available() {
+            eprintln!("skipped: this CPU has no AVX2");
+            return;
+        }
+        let mut bits = 0x9e37_79b9_u32;
+        let mut inputs: Vec<f32> = (-40 * 64..=2 * 64).map(|step| step as f32 / 64.0).collect();
+        for _ in 0..50_000 {
+            bits = bits.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            inputs.push(f32::from_bits(bits));
+        }
+        for shift in [0.0_f32, -3.5, 12.0, 40.0] {
+            for length in [0_usize, 1, 7, 8, 9, 15, 16, 17, 31, 33, 1024] {
+                let mut values = inputs[..length.min(inputs.len())].to_vec();
+                if values.len() < length {
+                    values.resize(length, 0.5);
+                }
+                let mut expected = values.clone();
+                let mut expected_sum = 0.0_f32;
+                for value in expected.iter_mut() {
+                    *value = crate::model::exp(*value - shift);
+                    expected_sum += *value;
+                }
+                let sum = exp_sum_shifted(&mut values, shift);
+                for (at, (actual, expected)) in values.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "length {length} shift {shift} index {at}: {actual} against {expected}"
+                    );
+                }
+                assert!(
+                    (sum - expected_sum).abs() <= 1e-6 * expected_sum.abs().max(f32::MIN_POSITIVE),
+                    "length {length} shift {shift}: {sum} against {expected_sum}"
+                );
+            }
+        }
+    }
+
+    /// The scalar exponent the kernel reproduces, against libm's: this is the assumption the opt-in
+    /// `VIPERA_FAST_SOFTMAX` rests on, so it is measured rather than claimed.
+    #[test]
+    fn the_polynomial_exp_stays_within_a_quarter_ppm_of_libm() {
+        let (mut weighted, mut tail) = (0.0_f64, 0.0_f64);
+        let mut value = -60.0_f32;
+        while value <= 5.0 {
+            let reference = f64::from(value.exp());
+            let poly = f64::from(crate::model::exp(value));
+            let error = ((poly - reference) / reference).abs();
+            if value >= -40.0 {
+                weighted = weighted.max(error);
+            } else {
+                tail = tail.max(error);
+            }
+            value += 0.0007;
+        }
+        println!("worst relative error: {weighted:.2e} in [-40, 5], {tail:.2e} in [-60, -40)");
+        assert!(weighted < 2.5e-6, "the polynomial drifted: {weighted:.2e}");
+        assert!(tail < 5e-6, "the denormal tail drifted: {tail:.2e}");
+    }
+
     #[test]
     fn silu_mul_matches_the_scalar_one_bit_for_bit() {
         if !available() {

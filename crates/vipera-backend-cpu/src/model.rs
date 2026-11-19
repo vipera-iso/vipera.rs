@@ -1698,11 +1698,16 @@ fn attention_heads(
             best = best.max(*score);
         }
         let window = &mut scores[..positions];
-        let mut total = 0.0_f32;
-        for score in window.iter_mut() {
-            *score = (*score - best).exp();
-            total += *score;
-        }
+        let total = if fast_softmax_enabled() {
+            crate::simd::exp_sum_shifted(window, best)
+        } else {
+            let mut total = 0.0_f32;
+            for score in window.iter_mut() {
+                *score = (*score - best).exp();
+                total += *score;
+            }
+            total
+        };
         let inverse = 1.0 / total;
         let output = &mut out[(head - heads.start) * head_dim..][..head_dim];
         output.fill(0.0);
@@ -1894,6 +1899,22 @@ fn gqa_share_enabled() -> bool {
     static SHARE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SHARE.get_or_init(|| {
         std::env::var("VIPERA_ATTN_GQA_SHARE").is_ok_and(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+    })
+}
+
+/// Whether the softmax pass takes [`crate::simd::exp_sum_shifted`] instead of `f32::exp`.
+///
+/// Off unless `VIPERA_FAST_SOFTMAX` is set to something other than `0`, `false`, `off` or `no`,
+/// because it evaluates the exponent with the polynomial [`crate::model::exp`] rather than libm's
+/// `expf`: the two agree to about 2e-6 relative, which is not the same bits, so the tokens a run
+/// produces are not the ones the libm path produces. Read once.
+fn fast_softmax_enabled() -> bool {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAST.get_or_init(|| {
+        std::env::var("VIPERA_FAST_SOFTMAX").is_ok_and(|value| {
             let value = value.trim().to_ascii_lowercase();
             !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
         })
@@ -2109,14 +2130,20 @@ fn attention_streaming_heads(
     })?;
 
     // Softmax per head, summed in increasing position order.
+    let fast_softmax = fast_softmax_enabled();
     for local in 0..count {
         let best = head_state[local];
         let window = &mut scores[local * positions..(local + 1) * positions];
-        let mut total = 0.0_f32;
-        for score in window.iter_mut() {
-            *score = (*score - best).exp();
-            total += *score;
-        }
+        let total = if fast_softmax {
+            crate::simd::exp_sum_shifted(window, best)
+        } else {
+            let mut total = 0.0_f32;
+            for score in window.iter_mut() {
+                *score = (*score - best).exp();
+                total += *score;
+            }
+            total
+        };
         head_state[local] = 1.0 / total;
     }
 
@@ -2524,11 +2551,16 @@ fn fold_chunk_block(
                 *value *= alpha;
             }
         }
-        let mut sum = 0.0_f32;
-        for score in scores.iter_mut() {
-            *score = (*score - m[local]).exp();
-            sum += *score;
-        }
+        let sum = if fast_softmax_enabled() {
+            crate::simd::exp_sum_shifted(scores, m[local])
+        } else {
+            let mut sum = 0.0_f32;
+            for score in scores.iter_mut() {
+                *score = (*score - m[local]).exp();
+                sum += *score;
+            }
+            sum
+        };
         d[local] += sum;
     }
     for kv_head in 0..shape.kv_heads {
@@ -3703,7 +3735,7 @@ fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, out: &mut [f32]) {
 /// which stay in registers. The split is exact in the sense that matters here: the polynomial's
 /// argument is the true rounded fraction, so the error is the polynomial's own, under 1e-7.
 #[inline]
-fn exp(value: f32) -> f32 {
+pub(crate) fn exp(value: f32) -> f32 {
     const LOG2_E: f32 = std::f32::consts::LOG2_E;
     // Round to nearest by adding and subtracting 1.5 * 2^23, which forces the
     // low mantissa bits to hold the integer part without a branch.

@@ -2305,3 +2305,50 @@ so a 1.2–1.4x faster attention is about 3% of a decode step and about 2% of a 
 20% an earlier projection implied, which assumed attention was half the chunk on a 4k prompt and a
 sandbox baseline. On this hardware the switch is a small, honest win, and it stays off by default
 because it is not bit-identical to the kernel the golden numbers were recorded with.
+
+### The softmax exponent in eight lanes — opt-in, 2026-11-19
+
+`VIPERA_FAST_SOFTMAX=1` (off by default) replaces the softmax pass's `f32::exp` calls with
+`simd::exp_sum_shifted`: the subtract, the exponent and the sum run eight values at a time through the
+same degree-five polynomial and exponent-byte trick that `model::exp` uses for the SwiGLU sigmoid, so
+a lane writes the scalar polynomial's bits exactly (`exp_sum_shifted_matches_the_scalar_exp_bit_for_bit`,
+lengths 0/1/7/8/9/15/16/17/31/33/1024 against the scalar loop, plus a random sweep and the special
+values). All four softmax sites take it: the streaming kernel's per-head pass, the simple short-context
+pass, and the KV-chunk kernel's sixteen-position block.
+
+**The measurement that started this does not support the premise.** `f32::exp` costs 2.5 ns on this
+machine (not the 4.5 ns the `model::exp` docstring records), and the scalar polynomial is *slower* at
+4.4 ns — libm's `expf` wins scalar. Vectorising it is where the win is, and the pass it sits in is
+12% of a 4096-position attention layer, not the majority: the two dot passes are ~80%.
+
+**It is not bit-identical, and the error is bigger than the docstring claimed.** Measured against
+libm over `[-40, 5]`, the polynomial's worst relative error is **1.9e-6** (about sixteen `f32` ulps),
+not the "<1e-7" the comment claimed; below -40 it grows to 3.5e-6 in the denormal tail, where the
+value is under 1e-17 and contributes nothing. `the_polynomial_exp_stays_within_a_quarter_ppm_of_libm`
+pins both bands.
+
+Measured on the i5-11300H, one process per arm, arms interleaved inside the run, best of 7, single
+thread, f16 KV, shuffled block table, 12 heads over 2 key heads of 128:
+
+| streaming layer, 1024 positions | fast off | fast on | |
+|---|---|---|---|
+| per-head kernel | 0.239–0.245 ms | 0.209–0.213 ms | 1.14x |
+| shared kernel (`VIPERA_ATTN_GQA_SHARE=1`) | 0.181–0.185 ms | 0.152–0.153 ms | 1.19x |
+
+| streaming layer, 4096 positions | fast off | fast on | |
+|---|---|---|---|
+| per-head kernel | 1.003–1.026 ms | 0.887–0.919 ms | 1.11–1.13x |
+| shared kernel | 0.773–0.799 ms | 0.666–0.681 ms | 1.15–1.18x |
+
+| KV-chunk decode, 4 workers, shared kernel | fast off | fast on | |
+|---|---|---|---|
+| 4096 positions | 0.271 ms | 0.240 ms | 1.13x |
+| 8192 positions | 0.557 ms | 0.489 ms | 1.14x |
+
+End to end, one binary, 901-token prompt, `VIPERA_PROFILE_STEP=1`, two runs: prefill attention
+96.5/109.6/123.9/110.3 ms -> 90.6/102.5/115.0/102.0 ms (1.06–1.08x), chunk compute 815/833/849/753 ms
+-> 810/825/838/744 ms (~1%); decode attention at ~900 positions 6.3/8.9 ms -> 6.1/8.1 ms.
+
+So a softmax that is 12% of the layer, made ~2x cheaper per value, is worth a tenth of the layer and
+about 1% of a prefill chunk. Off by default: it is not the libm bits, and no golden-token run has been
+made with it on.
