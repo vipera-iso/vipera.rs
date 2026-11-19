@@ -1,0 +1,35 @@
+[package]
+name = "vipera-backend-gpu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CUDA backend for vipera: device allocation and the first Q4_K matvec."
+
+[dependencies]
+vipera-core.workspace = true
+vipera-errors.workspace = true
+# CUDA driver + NVRTC. `fallback-dynamic-loading` dlopens `libcuda`, so a machine without a driver
+# still builds and reports the reason instead of failing to link (EXC-006).
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "fallback-dynamic-loading",
+    # `cudarc` refuses to build without a version, and the machine carries CUDA 13.4. The driver
+    # interfaces are backward compatible, so an older driver still loads; bump with the toolkit.
+    "cuda-13040",
+] }
+
+[dev-dependencies]
+# The parity test holds the kernel to the CPU's dequantizer; the CPU crate is not a runtime
+# dependency of the GPU one.
+vipera-backend-cpu.workspace = true
+
+# Every call into the CUDA driver is `unsafe`; the whole crate is the FFI boundary, and
+# `device.rs` documents the contract each wrapper upholds.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

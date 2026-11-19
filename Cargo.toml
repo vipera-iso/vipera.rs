@@ -8,6 +8,7 @@ members = [
     "crates/vipera-sampler",
     "crates/vipera-runtime",
     "crates/vipera-backend-cpu",
+    "crates/vipera-backend-gpu",
     "crates/vipera-core",
     "crates/vipera-server",
     "bins/vipera",
@@ -27,6 +28,7 @@ vipera-tokenizer = { path = "crates/vipera-tokenizer" }
 vipera-sampler = { path = "crates/vipera-sampler" }
 vipera-runtime = { path = "crates/vipera-runtime" }
 vipera-backend-cpu = { path = "crates/vipera-backend-cpu" }
+vipera-backend-gpu = { path = "crates/vipera-backend-gpu" }
 vipera-server = { path = "crates/vipera-server" }
 vipera-core = { path = "crates/vipera-core" }
 # TLS for `vipera serve`. `ring` keeps the provider to one audited C-free-API backend and
