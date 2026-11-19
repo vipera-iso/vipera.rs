@@ -951,6 +951,95 @@ unsafe fn axpy_f16_f32_avx2_fma(target: &mut [f32], weight: f32, row: &[u8]) {
     }
 }
 
+/// `targets += w * row` for the heads of one KV head and a whole block of positions at once.
+///
+/// The per-position form loads and stores every target row once per position: at this model's shape
+/// that is 6 rows of 128 floats read and written for each 512-byte V row, so the weighted sum spends
+/// most of its memory traffic on the accumulator it is accumulating into. Holding the accumulator in
+/// registers for `P` positions and touching the target rows once per block removes that, and the
+/// arithmetic per element is unchanged — the same multiply and add, in the same increasing position
+/// order — so the result is bit-identical to [`axpy_f16_f32_heads_exact`] called once per position.
+///
+/// `weights` is position-major: `weights[p * count + head]`, with `count = weights.len() / P`.
+pub(crate) fn axpy_f16_f32_heads_exact_block<const P: usize>(
+    targets: &mut [f32],
+    head_dim: usize,
+    weights: &[f32],
+    rows: &[&[u8]; P],
+) {
+    if P == 0 || weights.is_empty() {
+        return;
+    }
+    let count = weights.len() / P;
+    if count == 0 || count > HEADS_IN_REGISTERS || targets.len() < count * head_dim {
+        return;
+    }
+    let length = head_dim.min(rows.iter().map(|row| row.len() / 2).min().unwrap_or(0));
+    if length >= 8 && available() && std::is_x86_feature_detected!("f16c") {
+        // SAFETY: the CPU was checked here, `count` is inside the register budget and each head's row
+        // is inside `targets`; every row was length-checked above.
+        unsafe {
+            axpy_f16_f32_heads_block_avx2::<P>(targets, head_dim, weights, rows, count, length);
+        }
+        return;
+    }
+    for (p, row) in rows.iter().enumerate() {
+        axpy_f16_f32_heads_exact(targets, head_dim, &weights[p * count..(p + 1) * count], row);
+    }
+}
+
+/// # Safety
+///
+/// The CPU must support AVX2 and F16C; `count` must be at most [`HEADS_IN_REGISTERS`]; `targets` must
+/// hold `count` rows of `head_dim`; `length` must not exceed `head_dim` nor any row's half; `weights`
+/// must hold `P * count` values.
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn axpy_f16_f32_heads_block_avx2<const P: usize>(
+    targets: &mut [f32],
+    head_dim: usize,
+    weights: &[f32],
+    rows: &[&[u8]; P],
+    count: usize,
+    length: usize,
+) {
+    // SAFETY: the caller's contract covers every pointer below; each store lands inside the head's
+    // own row of `targets` and before `length`.
+    unsafe {
+        let base = targets.as_mut_ptr();
+        let mut at = 0;
+        while at + 8 <= length {
+            let mut acc = [_mm256_setzero_ps(); HEADS_IN_REGISTERS];
+            for (head, slot) in acc.iter_mut().enumerate().take(count) {
+                *slot = _mm256_loadu_ps(base.add(head * head_dim + at));
+            }
+            for (p, row) in rows.iter().enumerate() {
+                let values = _mm256_cvtph_ps(_mm_loadu_si128(
+                    row.as_ptr().add(at * 2) as *const std::arch::x86_64::__m128i
+                ));
+                for (head, slot) in acc.iter_mut().enumerate().take(count) {
+                    let scale = _mm256_set1_ps(*weights.get_unchecked(p * count + head));
+                    *slot = _mm256_add_ps(*slot, _mm256_mul_ps(scale, values));
+                }
+            }
+            for (head, slot) in acc.iter().enumerate().take(count) {
+                _mm256_storeu_ps(base.add(head * head_dim + at), *slot);
+            }
+            at += 8;
+        }
+        for (p, row) in rows.iter().enumerate() {
+            for (head, weight) in weights[p * count..(p + 1) * count].iter().enumerate() {
+                let target = base.add(head * head_dim);
+                let mut left = at;
+                while left < length {
+                    let low = std::ptr::read_unaligned(row.as_ptr().add(left * 2) as *const u16);
+                    *target.add(left) += weight * f16_to_f32(low);
+                    left += 1;
+                }
+            }
+        }
+    }
+}
+
 /// [`dot_f16_f32_heads`] with [`dot_f16_f32`]'s rounding: the same two-accumulator tree per head,
 /// with the multiply and the add kept apart.
 ///

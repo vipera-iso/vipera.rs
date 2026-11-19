@@ -1,28 +1,38 @@
 # Benchmarks
 
+The measurement ledger. Every performance claim in this repository points at a dated section below,
+and the experiments that lost stay in it: a dead end that is written down is a dead end nobody builds
+twice.
+
+## The machine these numbers come from
+
+Unless a section says otherwise: Intel i5-11300H (4 cores, 8 threads, AVX2, F16C, AVX-512 VNNI but
+double-pumped), 2×DDR4-3200, Linux, the toolchain pinned by `rust-toolchain.toml`, Qwen2.5-1.5B-Instruct
+Q4_K_M, `VIPERA_THREADS=8`, f16 KV cache. The measured DRAM ceiling on this box is 43 GB/s, and that
+number is what most of the percentages below are relative to.
+
+Two habits the numbers depend on:
+
+- **Quote ratios, not milliseconds.** Absolute times here move by ~20% between runs because the
+  session's own tooling holds a core; two arms measured back to back do not move by more than a point
+  or two.
+- **Compare the arms inside one process** when a change only moves scheduling, a cache hint or an
+  address. The recipe is "How to measure a switch on this machine" below, and
+  [`benchmarks/README.md`](benchmarks/README.md) indexes the rest of this directory.
+
 ## Template
 
-Chạy các lệnh sau trên từng cấu hình hardware:
+Run on each hardware configuration, and record the model and the thread count with the result:
 
 ```bash
-vipera profile > profile.json
-vipera plan -m model.gguf --json > plan.json
-vipera verify -m model.gguf --json > verify.json
+vipera profile --json
+vipera plan model.gguf --ctx 4096 --json
+vipera verify model.gguf --ctx 4096 --json
 ```
 
-Ghi rõ:
-- GPU model, VRAM, driver version
-- llama.cpp version
-- OS + kernel version
-- Model GGUF (arch, quant, size)
-
-## Kết quả (điền sau khi chạy)
-
-| GPU | Model | n_gpu_layers | Predicted VRAM | Actual VRAM | Predicted RAM | Actual RAM | Throughput | Error VRAM | Error RAM | Pass? |
-|-----|-------|--------------|----------------|-------------|---------------|------------|------------|------------|-----------|-------|
-| GTX 1650 4GB | Qwen2.5-1.5B-Q4_K | 14 | 3200 MB | ? | 2100 MB | ? | 6.5 t/s | ? | ? | ? |
-| RTX 3060 12GB | Qwen2.5-7B-Q4_K | ? | ? | ? | ? | ? | ? | ? | ? | ? |
-| RX 6600 8GB | Qwen2.5-7B-Q4_K | ? | ? | ? | ? | ? | ? | ? | ? | ? |
+Record: CPU model, physical cores and `VIPERA_THREADS`; OS and `rustc --version`; the GGUF (arch,
+quant, size); the llama.cpp build when comparing; and the exact command that produced the timing. A
+number without those is not reproducible and does not settle an argument.
 
 ## DRAM ceiling — i5-11300H, 4 cores / 8 threads, 2×DDR4
 
@@ -1998,6 +2008,126 @@ decode, and prefill already takes the 512-bit path where it does pay (B=128). Th
 as `a_512_bit_decode_row_is_measured_against_the_row_kernel` so the next person gets the number in a
 minute rather than in a rewrite.
 
+### Prefill attention in three parts: the V sum was the expensive one — 2026-11-18
+
+After the head batching, prefill's attention was 41% of a 4096-token chunk, and the profile could not
+say which of its three passes to attack: the score dots, the softmax's `exp`, and the weighted sum of
+V all hide behind one "attention" line. Timed separately on one 2048-position history, one thread, f16
+KV read in place, at this model's shape (12 heads, 2 KV heads, 128 values per head) — `prefill_attention_parts`
+in `model.rs`, which needs no model file:
+
+| part | ms per history |
+|---|---:|
+| score dots, `dot_f16_f32_heads_exact` | 0.20 |
+| softmax: `exp` and the sum | 0.06 |
+| V sum, `axpy_f16_f32_heads_exact` once per position | 0.16 |
+
+The same pass timed with the row walk inside the loop reads 0.28 ms, because the walk's block lookup
+and stride step cost as much as the arithmetic at this size: the kernel, not the traversal, is what a
+change should be measured against.
+
+The V sum is the largest term, and most of what it moved was its own accumulator: six output rows of
+128 floats loaded and stored once per position, against one 512-byte V row. Holding those rows in
+registers for eight positions and touching them once per block
+(`axpy_f16_f32_heads_exact_block` called from `sum_v_block`) removes 7/8 of that traffic. Per element
+the arithmetic is unchanged — the same multiply, then the same add, in increasing position order — so
+the result is bit-identical to the per-row kernel, and
+`streaming_attention_is_bit_identical_to_decoding_the_layer_first` still passes unchanged.
+
+| | before | after |
+|---|---:|---:|
+| V sum per 2048-position history | 0.16 ms | **0.13 ms** |
+| pp4096 | 95.7 tok/s | **99.7, 100.1** (41.1, 40.9 s) |
+| pp1024 | 154.6 tok/s | 153.9 |
+| decode 32k, window 2048 | 36.1 ms median | 35.1–35.7 ms |
+
+4% on pp4096 and nothing anywhere else, which is roughly what 0.03 ms of 0.39 ms of attention in a
+4k chunk predicts. Run twice back to back at 99.7 and 100.1 tok/s against a 95.7 baseline from the same
+command and environment, so the 4% is the change and not the machine. A sixteen-position block measures 0.12 ms against 0.13 and was not taken: that is
+the run-to-run spread, and it costs register pressure on any core with a narrower register file.
+
+Where this leaves the pass: 3.1M values in 0.13 ms is 24 G values/s on one core, at a load, a convert,
+a multiply, an add and a store per eight values, so it is at the instruction limit and there is little
+left in it. The remaining term is `exp` (0.06 ms), and every way to shorten it — a polynomial, a
+vectorized approximation — changes the last bits of the softmax, which is exactly what the
+bit-identity test exists to forbid. That trade is not taken without an explicit decision to drop the
+exact path; the number is here so the decision can be made with the cost in front of it.
+
+### The whole engine re-measured against upstream llama.cpp: prefill is a loss at every length — 2026-11-19
+
+Asked to re-run the comparison now that the batched prefill attention and the blocked V sum have landed,
+and to correct the README if the numbers moved. They moved, and the first thing they corrected was the
+reference build.
+
+The llama.cpp column the README carried came from `vipera.cpp/build-clang`, the fork's build `49e1485`
+(24) of 2026-11-05. Re-run in this session, that binary still measures **143.6 / 150.0 / 115.6 tok/s**
+on `pp128 / 512 / 4096`. Upstream `e574a17` (466), the newest on this disk, measures **205–230 /
+217–227 / 159–168** on the same box. Every "1.3–1.6x ahead" line the README had, and the conclusion
+"vipera leads prefill up to roughly 1k" in the two 2026-11-18 head-to-head sections above, came from the
+slower binary. Against the project's own newest build the direction is the other way at every length.
+
+Method, one session, one machine (`powersave`, other tooling down): Qwen2.5-1.5B-Instruct Q4_K_M,
+`VIPERA_THREADS=8`, f16 KV both sides, two interleaved passes (llama, vipera, llama, vipera) with the
+vipera tests run one at a time. Prefill on the llama side is the default `n_ubatch` (512) — the arm
+that flatters llama.cpp — with a matched-width arm below.
+
+```bash
+M=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+llama-latest/build/bin/llama-bench -m $M -p 128,512,1024,4096 -n 0 -t 8 -r 3 -ngl 0
+llama-latest/build/bin/llama-bench -m $M -p 0 -n 128 -t 8 -r 3 -ngl 0
+llama-latest/build/bin/llama-bench -m $M -p 0 -n 128 -d 4096 -t 8 -r 3 -ngl 0
+VIPERA_THREADS=8 VIPERA_TEST_MODEL=$M cargo test --release -p vipera-backend-cpu \
+  --test win_vs_llama -- --ignored --nocapture prefill_vs_decode
+VIPERA_THREADS=8 VIPERA_TEST_MODEL=$M cargo test --release -p vipera-backend-cpu \
+  --test win_vs_llama -- --ignored --nocapture prefill_long_prompt
+```
+
+| workload | pass | llama.cpp `e574a17` | vipera | vipera / llama.cpp |
+|---|---|---:|---:|---:|
+| pp128 | 1 | 204.7 ± 22.7 | 188.1 | 0.92x |
+| pp128 | 2 | 230.3 ± 2.0 | 188.3 | 0.82x |
+| pp512 | 1 | 216.7 ± 1.9 | 172.0 | 0.79x |
+| pp512 | 2 | 226.9 ± 0.9 | 172.0 | 0.76x |
+| pp1024 | 1 | 203.7 ± 0.7 | 164.0 | 0.81x |
+| pp1024 | 2 | 211.5 ± 5.0 | 164.0 | 0.78x |
+| pp4096 | 1 | 159.3 ± 1.9 | 104.7 | 0.66x |
+| pp4096 | 2 | 168.1 ± 0.9 | 104.7 | 0.62x |
+| tg128, depth 0 | 1 | 33.9 ± 0.6 | 34.6 | 1.02x |
+| tg128, depth 0 | 2 | 36.7 ± 0.9 | 34.6 | 0.94x |
+| tg128, depth 4096, full history | 1 | 25.3 ± 0.2 | 24.2 | 0.96x |
+
+The engine's `pp4096` reads 104.7 here against 99.7–100.1 in yesterday's section on the same binary:
+that is the machine (other tooling down today), not a change. The ratio measured in one session is the
+number to compare, which is why both arms are paired above.
+
+The engine's own prefill batch width is 128, so llama.cpp was also run at `-ub 128`: **215.6 / 203.2 /
+189.7 / 138.7** for 128 / 512 / 1024 / 4096, i.e. vipera is 0.87x, 0.85x, 0.86x and 0.75x of a
+same-width llama.cpp. Matching the width closes about half of the 4k gap (61% → 33%) and none of the story:
+llama.cpp is 15–18% ahead at short and medium prompts and 33% ahead at 4k even then.
+
+The gap widens with length on both sides, and faster on ours: from 128 to 4096 llama.cpp loses 36%
+(215.6 → 138.7 at matched width) and vipera loses 44% (188.3 → 104.7). That is the same
+signature the 2026-11-18 three-part measurement found from the inside — prefill attention is 41% of a
+4k chunk and only 6% of the first one — and it says the next lever is still attention, not the Q4_K
+stream: the matvecs cost the same per chunk at 4k as at 1k, while attention grows with the history.
+
+Decode is level, as it has been for four sessions: 0.94–1.02x at depth 0 and 0.96x at 4k of history.
+
+Full-history decode on the engine, from the same state-fabricating test (`decode_cost_at_depth_without_prefill`,
+no window): 24.2 tok/s at 4k, 18.3 at 8k, 11.5 at 16k, **6.8 at 32k** (147.2 ms/step). With
+`VIPERA_ATTN_WINDOW=2048` that 32k step is 35.8 ms, **28.0 tok/s**.
+
+Two numbers in the 2026-11-18 ring-cache section sit away from these: 183.7 ms full history and
+52.0 ms with the 2048 window at 32k, against 147.2 and 35.8 today. Both were real runs, so this is
+recorded as unresolved rather than reconciled — a 45% swing on the windowed step is not clock noise.
+The ratios inside one session are what the table above uses. llama.cpp above 4k depth was not measured
+here either: a `-d 32768` arm prefills 32k tokens per repetition, so three repetitions would spend ten
+minutes of prefill to time 128 decode steps.
+
+**Reading.** Prefill: llama.cpp wins, by 9–22% at 128 tokens, 26–32% at 512, 24–29% at 1024 and 52–61%
+at 4096. Decode: a wash. Long context: the engine's only lead is the one it buys with the window, which
+is lossy and opt-in. The README now says that, and quotes `e574a17` rather than the fork build.
+
 ## Prompt-chunk rotary, and two dead ends — 2026-11-19
 
 Setup as above: `VIPERA_THREADS=8`, Qwen2.5-1.5B Q4_K_M, one session, arms back to back.
@@ -2039,3 +2169,77 @@ untried version of this idea.
 `prefetch_ahead` per row per block, ~19% of the inner loop's uops. Cutting them to one measured
 6581.1 ms / 40119.0 ms for 1k / 4k against 6407.0 / 39517.3 — no worse inside the spread, and no
 better. The hints stay.
+
+### Four-accumulator rms_norm: 3.1x on the norm, 0.3 on the logits — reverted — 2026-11-19
+
+`rms_norm`'s sum is one dependent chain of 1536 `f32` adds, so each add waits for the one before it.
+Four independent accumulators, combined pairwise at the end, break the chain without changing the
+values being summed. Measured with `norm_phase_cost` on one thread, per 128-token chunk:
+
+| per 128-token chunk | ms |
+|---|---:|
+| `rms_norm`, serial chain | 12.25 |
+| `rms_norm`, four accumulators | 3.95 |
+
+In the real pass (`VIPERA_PROFILE_STEP=1`, 8 threads, `prefill_vs_decode`) the profile's `norm` line
+per 128-token prompt chunk goes from **7.51–7.76 ms to 2.49–2.52 ms** (−67%), with `q4k`, `q6k`,
+`attention` and `rest` unchanged. That is ~5 ms of a ~600 ms chunk, about 0.8%.
+
+**What it costs.** Logits for a fixed 96-token prompt plus 12 forced decode steps (so both builds
+stay on the same token path), 13 vectors of 151,936 values:
+
+| step | max abs | mean abs | same argmax | same top-5 |
+|---|---:|---:|---|---|
+| prefill | 0.37 | 0.061 | yes | 5/5 |
+| decode 1–12 | 0.27–0.60 | 0.047–0.101 | yes, 12/12 | 12/13 |
+
+The greedy stream is the same and the argmax never moves on these 13 steps, but the numbers are not
+"last bits": a 1e-6 relative change in a norm surfaces as ~0.1 in a logit. Something downstream
+amplifies it — the per-block i8 activation quantization is the likely mechanism (a last-bit change in
+one activation flips its quantized value by a whole 1/127 step), plus 28 layers of residual
+propagation. That is a hypothesis, not a measurement.
+
+**Verdict: reverted.** The tolerance class this repository has recorded for an approximate path is
+~1e-7 (`VIPERA_ATTN_KV_SPLIT`, a merge of partial softmaxes, opt-in). 0.1 mean-abs is five orders of
+magnitude past it and would be a change to the model's answers, not a rounding detail — a policy
+decision of the same kind as the KV split, made deliberately and behind a switch, not an
+optimization slipped into the default path. The end-to-end arms agree that nothing is on the table
+anyway: `pp1024` 7584.8 ms four-lane against 7728.3 ms serial, `pp4096` 47983.2 against 46059.1 —
+the machine slowed by ~20% during this window (the same test read 6407.0 / 39517.3 ms earlier in the
+session), and the chunk totals moved with it between arms, so neither direction is attributable while
+the `norm` line is.
+
+### Four rows sharing one K/V walk: the L2 budget was not the only problem — 2026-11-19
+
+The idea, stated properly this time: a causal prompt chunk's rows all read the same cache, and each
+row reads a *prefix* of what the next one reads, so four adjacent rows can decode and load each K and
+V row once and use it for all four. Four rows of 12 heads at a 4k history is a 786 KB score buffer,
+against 196 KB for one row and 3 MB for the sixteen-row version that lost 8–17% earlier the same day,
+so this was the version the earlier attempt should have been.
+
+It is bit-identical, and that was checked before any timing: the same per-head dot, the same softmax
+in increasing position order, one position at a time into each output element. A test compared four
+rows of lengths 61/48/33/17 (stopping on either side of 16-token block boundaries, blocks out of
+logical order) against attending each row alone, on both row orders and both layers, and the output
+bits matched. It was reverted after the measurement, so the test is not in the tree either.
+
+Prefill, 8 threads, `prefill_long_prompt`, arms interleaved in one binary (`VIPERA_ATTN_ROW_GROUPS`):
+
+| | pp1024 | pp4096 |
+|---|---:|---:|
+| one row per walk | **6865.7, 6957.1 ms** (149.1, 147.2 tok/s) | **42469.2, 42759.9 ms** (96.4, 95.8 tok/s) |
+| four rows per walk | 7354.2, 7392.9 ms (139.2, 138.5 tok/s) | 50968.2, 48609.9 ms (80.4, 84.3 tok/s) |
+
+So: 7% slower at 1k and 14–19% slower at 4k, against a 786 KB buffer that was supposed to fit. The
+measurement refutes the model I had for the sixteen-row loss — 3 MB of scores spilling L2 would give a
+loss that shrinks with the buffer, and 786 KB loses as much. What the grouped kernel actually does
+differently is two walks of the group's longest prefix (one for the dots, one for the V sum) instead of
+one walk per row, so the group reads `4 x longest` rows where four separate rows read
+`sum(lengths) ≈ 4 x longest - 6` — the saving is real but it is ~6 rows in 16,000. Against that it
+pays four predicate tests per (position, row) in both walks, four live score streams, and a working
+set that is now a whole group wide, which is the part the per-row kernel keeps narrow on purpose.
+
+The honest summary of the whole line of attack, after two attempts: at this shape the K/V row walk is
+~0.08 ms of a 0.39 ms row at a 2048-position history, one fifth of attention, and attention is under a
+tenth of a prompt chunk at 1k. The best a perfectly shared walk can return is a few percent of pp4096,
+and both measured attempts paid more for the sharing than the walk was worth.

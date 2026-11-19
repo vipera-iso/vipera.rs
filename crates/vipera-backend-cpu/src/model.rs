@@ -1911,6 +1911,45 @@ fn attention_streaming(
     )
 }
 
+/// The weighted sum of V for a block of positions, all heads at once: one call per KV head into
+/// [`axpy_f16_f32_heads_exact_block`](crate::simd::axpy_f16_f32_heads_exact_block), so each head's
+/// output row is read and written once per block rather than once per position.
+#[allow(clippy::too_many_arguments)]
+fn sum_v_block<const P: usize>(
+    out: &mut [f32],
+    storage: &[u8],
+    scores: &[f32],
+    head_state: &[f32],
+    positions: usize,
+    kv_heads: usize,
+    group: usize,
+    head_dim: usize,
+    bases: &[usize; P],
+    at_positions: &[usize; P],
+) {
+    for kv_head in 0..kv_heads {
+        let first = kv_head * group;
+        let mut weights = [0.0_f32; 128];
+        for (p, position) in at_positions.iter().enumerate() {
+            for member in 0..group {
+                let local = first + member;
+                weights[p * group + member] =
+                    scores[local * positions + position] * head_state[local];
+            }
+        }
+        let mut rows: [&[u8]; P] = [&[]; P];
+        for (p, base) in bases.iter().enumerate() {
+            rows[p] = &storage[base + kv_head * head_dim * 2..];
+        }
+        crate::simd::axpy_f16_f32_heads_exact_block::<P>(
+            &mut out[first * head_dim..(first + group) * head_dim],
+            head_dim,
+            &weights[..P * group],
+            &rows,
+        );
+    }
+}
+
 /// [`attention_streaming`] for `heads` alone, writing their own scratch buffers so several
 /// workers can run at once. Everything each head sums is unchanged, in the same order, so a head
 /// computes the same bits whichever worker holds it.
@@ -2016,6 +2055,56 @@ fn attention_streaming_heads(
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
     out[..count * head_dim].fill(0.0);
+    // Eight positions at a time keeps each head's accumulator in registers between positions, so the
+    // targets are loaded and stored once per eight rows instead of once per row. Per element the
+    // additions still run in increasing position order, so the result is the per-row kernel's bits.
+    if whole && in_place && !sequential && group <= 8 {
+        const BATCH: usize = 8;
+        let mut bases = [0usize; BATCH];
+        let mut at_positions = [0usize; BATCH];
+        let mut held = 0usize;
+        kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+            bases[held] = kv.value_row(order, base, layer_bytes);
+            at_positions[held] = position;
+            held += 1;
+            if held == BATCH {
+                sum_v_block(
+                    out,
+                    kv.storage,
+                    scores,
+                    head_state,
+                    positions,
+                    shape.kv_heads,
+                    group,
+                    head_dim,
+                    &bases,
+                    &at_positions,
+                );
+                held = 0;
+            }
+            Ok(())
+        })?;
+        // A remainder shorter than a block keeps the per-row kernel, which is the same arithmetic.
+        for slot in 0..held {
+            let position = at_positions[slot];
+            let row = &kv.storage[bases[slot]..];
+            for kv_head in 0..shape.kv_heads {
+                let first = kv_head * group;
+                let mut weights = [0.0_f32; 16];
+                for (member, weight) in weights[..group].iter_mut().enumerate() {
+                    let local = first + member;
+                    *weight = scores[local * positions + position] * head_state[local];
+                }
+                crate::simd::axpy_f16_f32_heads_exact(
+                    &mut out[first * head_dim..(first + group) * head_dim],
+                    head_dim,
+                    &weights[..group],
+                    &row[kv_head * head_dim * 2..],
+                );
+            }
+        }
+        return Ok(());
+    }
     kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
         let v_base = kv.value_row(order, base, layer_bytes);
         if !in_place {
@@ -3533,8 +3622,36 @@ mod tests {
         }
         let norm_ms = start.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(&out);
+
+        // The four-accumulator sum that was measured and reverted (see `docs/benchmarks.md`,
+        // 2026-11-19): it breaks the serial add chain, and it moves the logits by ~0.1 because the
+        // per-block i8 activation quantization downstream turns a last-bit change into a discrete
+        // jump. Kept here as the number, not as a path.
+        fn rms_norm_four_lanes(input: &[f32], weight: &[f32], epsilon: f32, out: &mut [f32]) {
+            let mut sums = [0.0_f32; 4];
+            let (chunks, remainder) = input.as_chunks::<4>();
+            for chunk in chunks {
+                for (slot, value) in sums.iter_mut().zip(chunk) {
+                    *slot += value * value;
+                }
+            }
+            let mut total = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+            for value in remainder {
+                total += value * value;
+            }
+            let inverse = 1.0 / (total / input.len() as f32 + epsilon).sqrt();
+            for ((dst, weight), input) in out.iter_mut().zip(weight).zip(input) {
+                *dst = input * inverse * weight;
+            }
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..layers * tokens * 2 {
+            rms_norm_four_lanes(&x, &weight, 1e-6, &mut out);
+        }
+        let lanes_ms = start.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(&out);
         println!(
-            "norm phase per 128-token chunk: rope per call {rope_ms:.2} ms, rotary hoisted {hoisted_ms:.2} ms, rms_norm {norm_ms:.2} ms"
+            "norm phase per 128-token chunk: rope per call {rope_ms:.2} ms, rotary hoisted {hoisted_ms:.2} ms, rms_norm {norm_ms:.2} ms, rms_norm four lanes {lanes_ms:.2} ms"
         );
     }
 
@@ -3613,6 +3730,162 @@ mod tests {
                 dot_round(positions)
             );
         }
+    }
+
+    /// Where a prefill's attention time actually goes, in the three parts it is built from.
+    ///
+    /// A 4096-token chunk profiles as ~41% attention, and the phases inside it are the score dots,
+    /// the softmax's `exp`, and the weighted sum of V. This times each on the shape the model uses
+    /// (12 heads, 2 KV heads, 128 values per head, f16 KV in place) at a deep history, so a change
+    /// can be aimed at the part that is actually there rather than at the one that looks expensive.
+    ///
+    /// `cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture prefill_attention_parts`
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn prefill_attention_parts() {
+        let shape = AttnShape {
+            heads: 12,
+            kv_heads: 2,
+            head_dim: 128,
+        };
+        let positions = 2048usize;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..positions.div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            positions,
+        );
+        let kv = KvView {
+            bytes_per_token: 2 * 2 * KvLayout::F16.bytes_per_row(shape.kv_heads * shape.head_dim),
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            layout: KvLayout::F16,
+        };
+        let read = KvRead::of(&kv);
+        let layer = 0usize;
+        let layer_bytes = KvLayout::F16.bytes_per_row(shape.kv_heads * shape.head_dim);
+        let group = shape.heads / shape.kv_heads;
+        let q: Vec<f32> = (0..shape.heads * shape.head_dim)
+            .map(|at| ((at * 7 % 23) as f32 - 11.0) * 0.005)
+            .collect();
+        let mut scores = vec![0.0_f32; shape.heads * positions];
+
+        // Pass 1: one call per KV head, the interleaved exact kernel.
+        let round = |name: &str, body: &mut dyn FnMut()| {
+            let rounds = 40;
+            body();
+            let mut best = f64::MAX;
+            for _ in 0..rounds {
+                let started = std::time::Instant::now();
+                body();
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            println!("  {name:<16} {:>6.2} ms per history", best * 1e3);
+        };
+
+        round("score dots", &mut || {
+            let mut index = 0;
+            read.for_each_row(
+                order_for_test(),
+                layer,
+                layer_bytes,
+                positions,
+                |_at, base| {
+                    for kv_head in 0..shape.kv_heads {
+                        let packed = base + kv_head * shape.head_dim * 2;
+                        let first = kv_head * group;
+                        crate::simd::dot_f16_f32_heads_exact(
+                            &q,
+                            first,
+                            group,
+                            shape.head_dim,
+                            &read.storage[packed..],
+                            &mut scores[first..first + group],
+                        );
+                    }
+                    index += 1;
+                    let _ = index;
+                    Ok(())
+                },
+            )
+            .expect("dots");
+        });
+
+        // The softmax without its dots: exp and sum over every score.
+        round("exp and sum", &mut || {
+            let mut total = 0.0_f32;
+            for local in 0..shape.heads {
+                let window = &mut scores[local * positions..(local + 1) * positions];
+                for score in window.iter_mut() {
+                    *score = score.exp();
+                    total += *score;
+                }
+            }
+            std::hint::black_box(total);
+        });
+
+        // Pass 2: V rows weighted into twelve accumulators, one call per KV head.
+        let mut bases = Vec::new();
+        read.for_each_row(
+            order_for_test(),
+            layer,
+            layer_bytes,
+            positions,
+            |_at, base| {
+                bases.push(read.value_row(order_for_test(), base, layer_bytes));
+                Ok(())
+            },
+        )
+        .expect("bases");
+
+        round("V axpy row", &mut || {
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            let weights = [0.001_f32; 16];
+            for &v_base in &bases {
+                for kv_head in 0..shape.kv_heads {
+                    let packed = v_base + kv_head * shape.head_dim * 2;
+                    let first = kv_head * group;
+                    crate::simd::axpy_f16_f32_heads_exact(
+                        &mut out[first * shape.head_dim..(first + group) * shape.head_dim],
+                        shape.head_dim,
+                        &weights[..group],
+                        &read.storage[packed..],
+                    );
+                }
+            }
+            std::hint::black_box(out[0]);
+        });
+
+        let block_weights = vec![0.001_f32; 8 * group];
+        round("V axpy block", &mut || {
+            let mut out = vec![0.0_f32; shape.heads * shape.head_dim];
+            for chunk in bases.as_chunks::<8>().0 {
+                for kv_head in 0..shape.kv_heads {
+                    let mut rows: [&[u8]; 8] = [&[]; 8];
+                    for (slot, &v_base) in rows.iter_mut().zip(chunk) {
+                        *slot = &read.storage[v_base + kv_head * shape.head_dim * 2..];
+                    }
+                    let first = kv_head * group;
+                    crate::simd::axpy_f16_f32_heads_exact_block::<8>(
+                        &mut out[first * shape.head_dim..(first + group) * shape.head_dim],
+                        shape.head_dim,
+                        &block_weights,
+                        &rows,
+                    );
+                }
+            }
+            std::hint::black_box(out[0]);
+        });
+    }
+
+    fn order_for_test() -> RowOrder {
+        RowOrder::from_env()
     }
 
     /// A KV cache of `blocks` physical blocks, two layers, filled with a fixed pseudo-random
