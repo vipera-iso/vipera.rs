@@ -2515,11 +2515,32 @@ share, so the ratio shrinks with the model:
 | prefill 1024, best of 3 | 42.7 tok/s | 43.1 tok/s (+1.0%) |
 | prefill 4096, best of 2 | 32.2 tok/s | 34.5 tok/s (+6.5%) |
 
-The 14B GGUF on this machine is `qwen3`, which the CPU backend does not implement (it reads the
-qwen2/llama block layout), so no 14B figure was taken.
+The 14B GGUF on this machine is Hermes 4 14B, which is `qwen3`. The CPU backend reads that layout
+too now — `qwen3` blocks differ from `qwen2` by per-head q/k RMSNorm before RoPE, no attention
+biases, and a head width that comes from `attention.key_length` — so the same pair was taken on it
+(Hermes 4 14B Q4_K_M, 40 layers, 40 heads / 8 KV heads, head width 128, 40k context):
+
+| | per-head | shared |
+|---|---|---|
+| decode, ctx 1024 | 254.29 ms/step | 246.79 ms/step (-3.0%, slower in 13/60 rounds) |
+| decode, ctx 4096 | 320.07 ms/step | 274.72 ms/step (-14.2%, slower in 0/60 rounds) |
+| prefill 1024, best of 3 | 22.0 tok/s | 22.0 tok/s (+0.3% time) |
+| prefill 4096, best of 2 | 15.9 tok/s | 16.7 tok/s (-5.2% time) |
+
+At 4k the 14B decode step saves 45 ms, the largest absolute saving of the three models, and it is
+the same ratio as the 7B because the step is bandwidth-bound for both. The 1024 prefill is a wash
+(46.4 s against 46.6 s, inside run-to-run noise at this size) and the 4096 one gains 5%.
+
+The qwen3 path was checked by loading the 14B file and generating greedily: coherent text from the
+first token. It is not held to llama.cpp's exact continuation — neither is the qwen2 path, which
+leaves llama.cpp's greedy text at the third token of the same prompt — the token-level parity
+checks under `scripts/` are the place that comparison lives.
 
 ```bash
 cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch  -- --ignored --nocapture
 cargo test --release -p vipera-backend-cpu --lib prefill_gqa_share_switch -- --ignored --nocapture
 VIPERA_ATTN_WINDOW=2048 cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch -- --ignored --nocapture
+# the 14B rows: point the measurement at the qwen3 file
+VIPERA_TEST_MODEL=~/.vipera/models/hermes4-14b-q4km.gguf \
+  cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch -- --ignored --nocapture
 ```

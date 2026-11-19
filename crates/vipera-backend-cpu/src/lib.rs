@@ -5,8 +5,8 @@
 //! runtime's own KV buffer, and reads its rotary and norm parameters from the file's metadata rather
 //! than from constants that would quietly be wrong for another model.
 //!
-//! Scope, stated plainly: the qwen2/llama block layout, F32/F16/Q8_0/Q4_K/Q6_K weights, and an `f16`
-//! or `q8_0` KV cache. On x86-64 with AVX2 the hot dots run through `simd`, which the tests hold to the scalar
+//! Scope, stated plainly: the qwen2, qwen3 and llama block layouts, F32/F16/Q8_0/Q4_K/Q6_K weights,
+//! and an `f16` or `q8_0` KV cache. On x86-64 with AVX2 the hot dots run through `simd`, which the tests hold to the scalar
 //! result; every other CPU falls back to the same portable code. A model outside that is refused by name instead of being run approximately.
 
 #![warn(missing_docs)]

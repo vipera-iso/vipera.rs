@@ -297,6 +297,10 @@ fn dot_phase(ty: GgmlType) -> crate::profile::Phase {
 }
 
 /// One transformer block's weights.
+///
+/// `bq`/`bk`/`bv` are empty where the architecture has no attention bias (llama, qwen3); adding an
+/// empty slice is a no-op. `q_norm`/`k_norm` are empty everywhere but qwen3, which normalises each
+/// head's query and key vector on its own after the projection and before RoPE.
 struct Layer {
     attn_norm: Vec<f32>,
     wq: Tensor,
@@ -306,6 +310,8 @@ struct Layer {
     wv: Tensor,
     bv: Vec<f32>,
     wo: Tensor,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
     wg: Tensor,
     wu: Tensor,
@@ -356,7 +362,7 @@ impl BatchScratch {
     }
 }
 
-/// Qwen2/Llama weights plus the scratch buffers a forward pass reuses.
+/// Qwen2/Qwen3/Llama weights plus the scratch buffers a forward pass reuses.
 pub struct CpuBackend {
     /// The weights and where they live: mapped from the file, or a caller's buffer.
     weights: crate::bus::WeightSource,
@@ -429,7 +435,7 @@ impl CpuBackend {
                     config.hidden,
                     config.heads * config.head_dim,
                 )?,
-                bq: vector(
+                bq: optional_vector(
                     file,
                     bytes,
                     &name("attn_q.bias"),
@@ -441,7 +447,7 @@ impl CpuBackend {
                     config.hidden,
                     config.kv_heads * config.head_dim,
                 )?,
-                bk: vector(
+                bk: optional_vector(
                     file,
                     bytes,
                     &name("attn_k.bias"),
@@ -453,7 +459,7 @@ impl CpuBackend {
                     config.hidden,
                     config.kv_heads * config.head_dim,
                 )?,
-                bv: vector(
+                bv: optional_vector(
                     file,
                     bytes,
                     &name("attn_v.bias"),
@@ -465,6 +471,8 @@ impl CpuBackend {
                     config.hidden,
                     config.hidden,
                 )?,
+                q_norm: optional_vector(file, bytes, &name("attn_q_norm.weight"), config.head_dim)?,
+                k_norm: optional_vector(file, bytes, &name("attn_k_norm.weight"), config.head_dim)?,
                 ffn_norm: vector(file, bytes, &name("ffn_norm.weight"), config.hidden)?,
                 wg: matrix(file, &name("ffn_gate.weight"), config.hidden, config.ffn)?,
                 wu: matrix(file, &name("ffn_up.weight"), config.hidden, config.ffn)?,
@@ -615,6 +623,22 @@ impl CpuBackend {
                     add_assign(k, &layer.bk);
                     layer.wv.matvec(&pool, file, h, v)?;
                     add_assign(v, &layer.bv);
+                    if !layer.q_norm.is_empty() {
+                        per_head_rms_norm(
+                            q,
+                            &layer.q_norm,
+                            config.rms_eps,
+                            shape.heads,
+                            shape.head_dim,
+                        );
+                        per_head_rms_norm(
+                            k,
+                            &layer.k_norm,
+                            config.rms_eps,
+                            shape.kv_heads,
+                            shape.head_dim,
+                        );
+                    }
 
                     rope(q, position, shape.heads, shape.head_dim, config.rope_base);
                     rope(
@@ -961,10 +985,27 @@ impl CpuBackend {
                     &activations,
                     &mut batch.v[..B * kv_width],
                 )?;
+                let per_head_norm = !layer.q_norm.is_empty();
                 for entry in 0..B {
                     add_assign(&mut batch.q[entry * query..][..query], &layer.bq);
                     add_assign(&mut batch.k[entry * kv_width..][..kv_width], &layer.bk);
                     add_assign(&mut batch.v[entry * kv_width..][..kv_width], &layer.bv);
+                    if per_head_norm {
+                        per_head_rms_norm(
+                            &mut batch.q[entry * query..][..query],
+                            &layer.q_norm,
+                            epsilon,
+                            shape.heads,
+                            shape.head_dim,
+                        );
+                        per_head_rms_norm(
+                            &mut batch.k[entry * kv_width..][..kv_width],
+                            &layer.k_norm,
+                            epsilon,
+                            shape.kv_heads,
+                            shape.head_dim,
+                        );
+                    }
                 }
 
                 for entry in 0..B {
@@ -1194,9 +1235,9 @@ impl ModelConfig {
             .and_then(Value::as_str)
             .ok_or_else(|| ViperaError::unsupported("model does not declare general.architecture"))?
             .to_owned();
-        if !matches!(architecture.as_str(), "qwen2" | "llama") {
+        if !matches!(architecture.as_str(), "qwen2" | "qwen3" | "llama") {
             return Err(ViperaError::unsupported(format!(
-                "the CPU backend implements the qwen2/llama block layout, and this model is \
+                "the CPU backend implements the qwen2/qwen3/llama block layouts, and this model is \
                  \"{architecture}\""
             )));
         }
@@ -1235,9 +1276,23 @@ impl ModelConfig {
             .map(|value| *value as usize)
             .ok_or_else(|| ViperaError::unsupported("model has no token_embd.weight"))?;
 
-        if heads == 0 || hidden % heads != 0 {
+        // qwen3 states the head width explicitly (`attention.key_length`); qwen2 and llama leave it
+        // implicit as `hidden / heads`. They agree on every model here, and reading it lets a head
+        // narrower than the average still load.
+        let head_dim = match u64_of("attention.key_length") {
+            Some(explicit) => explicit,
+            None => {
+                if heads == 0 || hidden % heads != 0 {
+                    return Err(ViperaError::unsupported(format!(
+                        "{hidden} hidden values do not divide into {heads} heads"
+                    )));
+                }
+                hidden / heads
+            }
+        };
+        if head_dim == 0 || head_dim % 2 != 0 {
             return Err(ViperaError::unsupported(format!(
-                "{hidden} hidden values do not divide into {heads} heads"
+                "a head width of {head_dim} cannot be rotated"
             )));
         }
         if kv_heads == 0 || heads % kv_heads != 0 {
@@ -1251,7 +1306,7 @@ impl ModelConfig {
             hidden,
             heads,
             kv_heads,
-            head_dim: hidden / heads,
+            head_dim,
             ffn,
             vocab,
             rms_eps: f32_of("attention.layer_norm_rms_epsilon", 1e-6),
@@ -3914,6 +3969,30 @@ fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, out: &mut [f32]) {
     }
 }
 
+/// [`rms_norm`] over each head's vector on its own, in place: qwen3's `attn_q_norm` and
+/// `attn_k_norm`, applied to the projected queries and keys before RoPE.
+///
+/// The per-element arithmetic is `rms_norm`'s, so a head here is the same bits as the same values
+/// pushed through the whole-vector kernel when there is one head.
+fn per_head_rms_norm(
+    values: &mut [f32],
+    weight: &[f32],
+    epsilon: f32,
+    heads: usize,
+    head_dim: usize,
+) {
+    for head in 0..heads {
+        let Some(slice) = values.get_mut(head * head_dim..(head + 1) * head_dim) else {
+            return;
+        };
+        let mean = slice.iter().map(|value| value * value).sum::<f32>() / head_dim as f32;
+        let inverse = 1.0 / (mean + epsilon).sqrt();
+        for (value, weight) in slice.iter_mut().zip(weight) {
+            *value = *value * inverse * weight;
+        }
+    }
+}
+
 /// `e^value` without the libm call.
 ///
 /// The feed-forward block evaluates 11.0M sigmoids per 128-token chunk, every one of them a
@@ -4007,6 +4086,20 @@ fn matrix(file: &GgufFile, name: &str, cols: usize, rows: usize) -> Result<Tenso
     })
 }
 
+/// [`vector`] for a tensor the architecture may not have: empty if it is absent, which is what the
+/// bias and per-head-norm slots of an architecture without them read as.
+fn optional_vector(
+    file: &GgufFile,
+    data: &[u8],
+    name: &str,
+    len: usize,
+) -> Result<Vec<f32>, ViperaError> {
+    if !file.tensors.iter().any(|tensor| tensor.name == name) {
+        return Ok(Vec::new());
+    }
+    vector(file, data, name, len)
+}
+
 fn vector(file: &GgufFile, data: &[u8], name: &str, len: usize) -> Result<Vec<f32>, ViperaError> {
     let info = find(file, name)?;
     if info.dims.len() != 1 || info.dims[0] as usize != len {
@@ -4044,6 +4137,33 @@ mod tests {
         let expected = 1.0 / (12.5_f32).sqrt();
         assert!((out[0] - 3.0 * expected).abs() < 1e-6);
         assert!((out[1] - 4.0 * expected).abs() < 1e-6);
+    }
+
+    /// qwen3's per-head norms must be `rms_norm` on each head's own vector, with the same weight
+    /// for every head: two heads of different magnitude scale independently, and the result is the
+    /// whole-vector kernel's bits when there is one head.
+    #[test]
+    fn per_head_rms_norm_is_rms_norm_on_each_head() {
+        let weight = [0.5_f32, 1.0, 2.0, -1.0];
+        let start = [3.0_f32, 4.0, 0.0, 0.0, -1.0, 2.0, 2.0, 1.0];
+        let mut got = start;
+        per_head_rms_norm(&mut got, &weight, 1e-6, 2, 4);
+        let mut want = [0.0_f32; 8];
+        for head in 0..2 {
+            rms_norm(
+                &start[head * 4..(head + 1) * 4],
+                &weight,
+                1e-6,
+                &mut want[head * 4..(head + 1) * 4],
+            );
+        }
+        assert_eq!(got, want);
+
+        let mut single = start[..4].to_vec();
+        let mut whole = [0.0_f32; 4];
+        rms_norm(&start[..4], &weight, 1e-6, &mut whole);
+        per_head_rms_norm(&mut single, &weight, 1e-6, 1, 4);
+        assert_eq!(single, whole);
     }
 
     /// The in-register exponential has to stay inside libm's shadow on the value the model actually
