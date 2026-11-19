@@ -1202,9 +1202,9 @@ unsafe fn axpy_f16_f32_avx2(target: &mut [f32], weight: f32, row: &[u8]) {
     }
 }
 
-/// Query heads one [`score_block`] call keeps in registers: four heads hold eight accumulators and
-/// the two key vectors, which is what fits beside the query loads in sixteen vector registers.
-const SCORE_BLOCK: usize = 4;
+/// Query heads one [`score_block`] call keeps in registers: one accumulator each, beside the two
+/// key vectors and the query loads, which is what fits in sixteen vector registers.
+const SCORE_BLOCK: usize = 6;
 
 /// Query heads one [`fold_block`] call keeps in registers: one accumulator each, plus the value
 /// vector and a broadcast weight.
@@ -1278,6 +1278,8 @@ unsafe fn dot_f16_group_avx2(
             let block_queries = queries.add(head * head_dim);
             let block_out = out.add(head);
             match (heads - head).min(SCORE_BLOCK) {
+                6 => score_block_single::<6>(block_queries, head_dim, row, block_out),
+                5 => score_block_single::<5>(block_queries, head_dim, row, block_out),
                 4 => score_block::<4>(block_queries, head_dim, row, block_out),
                 3 => score_block::<3>(block_queries, head_dim, row, block_out),
                 2 => score_block::<2>(block_queries, head_dim, row, block_out),
@@ -1309,6 +1311,42 @@ unsafe fn load_half(bytes: *const u8, at: usize) -> __m256 {
 /// # Safety
 ///
 /// As [`dot_f16_group_avx2`], for `HEADS` heads.
+#[target_feature(enable = "avx2,f16c,fma")]
+unsafe fn score_block_single<const HEADS: usize>(
+    queries: *const f32,
+    head_dim: usize,
+    row: *const u8,
+    out: *mut f32,
+) {
+    // SAFETY: the caller guarantees the features and the extents; every load is inside `head_dim`.
+    unsafe {
+        // One accumulator per head: the chains are independent, so five or six of them cover the
+        // multiply-add latency between one head's steps, and six is the group a 12/2 layer has, so
+        // its K row is converted once instead of once per four-head block.
+        let mut sums = [_mm256_setzero_ps(); HEADS];
+        let mut at = 0;
+        while at < head_dim {
+            let key_low = load_half(row, at);
+            let key_high = load_half(row, at + 8);
+            for (head, sum) in sums.iter_mut().enumerate() {
+                let query = queries.add(head * head_dim + at);
+                *sum = _mm256_fmadd_ps(_mm256_loadu_ps(query), key_low, *sum);
+                *sum = _mm256_fmadd_ps(_mm256_loadu_ps(query.add(8)), key_high, *sum);
+            }
+            at += 16;
+        }
+        for (head, sum) in sums.iter().enumerate() {
+            *out.add(head) = hsum(*sum);
+        }
+    }
+}
+
+/// [`score_block_single`] with two accumulators per head instead, which is faster for the small
+/// groups where the extra chains cost nothing: four heads fill the registers where six would spill.
+///
+/// # Safety
+///
+/// As [`score_block_single`], for `HEADS` heads.
 #[target_feature(enable = "avx2,f16c,fma")]
 unsafe fn score_block<const HEADS: usize>(
     queries: *const f32,
@@ -3073,7 +3111,7 @@ mod tests {
         const DIM: usize = 128;
         const POSITIONS: usize = 1024;
         let mut rng = Rng(0x5eed_6709_0000_0003);
-        for group in [3usize, 4, 6, 7] {
+        for group in [1usize, 2, 4, 6] {
             let queries: Vec<f32> = (0..group * DIM).map(|_| (rng.unit() - 0.5) * 2.0).collect();
             let rows: Vec<Vec<u8>> = (0..POSITIONS)
                 .map(|_| half_row(&mut rng, DIM, 2.0).0)

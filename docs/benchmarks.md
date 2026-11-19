@@ -2352,3 +2352,41 @@ End to end, one binary, 901-token prompt, `VIPERA_PROFILE_STEP=1`, two runs: pre
 So a softmax that is 12% of the layer, made ~2x cheaper per value, is worth a tenth of the layer and
 about 1% of a prefill chunk. Off by default: it is not the libm bits, and no golden-token run has been
 made with it on.
+
+### Where a 4k prefill chunk goes, and what the two dot passes will and will not give — 2026-11-19
+
+**The 4k A/B asked for.** 4001-token prompt, `--ctx 4096`, 32 chunks of 128, one run per arm,
+`VIPERA_PROFILE_STEP=1`, i5-11300H:
+
+| arm | prefill | attention | share of chunk |
+|---|---|---|---|
+| baseline | 31.75 s | 8753 ms | **27.6%** |
+| `VIPERA_ATTN_GQA_SHARE=1` | 30.68 s | 7164 ms | 23.4% |
+| `VIPERA_FAST_SOFTMAX=1` | 32.18 s | 8122 ms | 25.2% |
+| both | 30.17 s | 6322 ms | 21.0% |
+| both, after the score-kernel change below | 29.85 s | 6002 ms | 20.1% |
+
+So at 4k attention is a quarter to a third of a prefill chunk, not the majority — the matmuls are.
+The two switches together buy ~5% of the chunk wall clock at this length, and more of the attention
+itself (1.46x).
+
+**The split inside a layer.** With the fold pass short-circuited, the score pass plus softmax is 65%
+of a 4096-position streaming layer and the value fold 35%. At kernel level (`attention_group_throughput`,
+group 6, 128-wide, per position) the score pass is 28.7 ns and the fold 19.7 ns for the same 768
+multiply-adds, so the score pass is the odd one out: it re-reads the six query rows from L1 for every
+K row (96 unaligned 32-byte loads per position) where the fold keeps its accumulators in registers
+across sixteen positions.
+
+**What did not work.** A sixteen-lane AVX-512 version of both kernels is **1.6x slower** (4096-position
+layer 0.773 -> 1.246 ms): this compiler's stdarch has no `_mm512_fmadd_ps`, so the fused multiply-add
+becomes a separate multiply and add, and the wider path gives back the rest in frequency. Reverted.
+
+**What did.** Six heads in one `score_block_single` call with one accumulator each — the group a 12/2
+layer has, so its K row is converted once instead of once per four-head block — while groups of four
+and fewer keep the two-accumulator kernel that fills the registers better. Score kernel per position:
+28.7 -> 25.5–26.2 ns (1.10–1.13x); the 4096-position shared layer 0.80 -> 0.77 ms (1.04x, medians of
+three runs); a 4k prefill with both switches 30.17 -> 29.85 s.
+
+**Not attempted here, and the honest next lever:** the streaming pass takes the whole position walk on
+one thread per layer. Splitting that walk across the existing attention workers — the KV-chunk decode
+kernel already does it — is worth far more than another instruction of the dot kernels.
