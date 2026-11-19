@@ -26,15 +26,21 @@ const THREADS: usize = 32 * ROWS_PER_BLOCK;
 
 const SOURCE: &str = include_str!("q4k_matvec.cu");
 const SOURCE_Q8: &str = include_str!("q4k_matvec_q8.cu");
+const SOURCE_Q8_BATCH: &str = include_str!("q4k_matvec_q8_batch.cu");
 
 /// The kernels this module compiles, one NVRTC program each: they share helper functions, so
 /// concatenating the sources would redefine them.
-pub(crate) fn sources() -> [&'static str; 3] {
-    [SOURCE, SOURCE_Q8, crate::q6k::SOURCE]
+pub(crate) fn sources() -> [&'static str; 4] {
+    [SOURCE, SOURCE_Q8, crate::q6k::SOURCE, SOURCE_Q8_BATCH]
 }
 
 /// Names in the order [`sources`] returns them.
-pub(crate) const FUNCTIONS: [&str; 3] = ["q4k_matvec", "q4k_matvec_q8", "q6k_matvec"];
+pub(crate) const FUNCTIONS: [&str; 4] = [
+    "q4k_matvec",
+    "q4k_matvec_q8",
+    "q6k_matvec",
+    "q4k_matvec_q8_batch",
+];
 
 /// Compile the kernel for `context`'s device.
 ///
@@ -105,6 +111,25 @@ impl Q4kMatrix {
             blocks_per_row,
             weights: device.upload(weights)?,
         })
+    }
+
+    /// A view of one row, for the embedding lookup.
+    pub fn row_view(
+        &self,
+        row: usize,
+        cols: usize,
+    ) -> Result<cudarc::driver::CudaView<'_, u8>, ViperaError> {
+        let stride = (cols / QK_K) * BLOCK_BYTES;
+        let start = row * stride;
+        if start + stride > self.weights.len() {
+            return Err(ViperaError::invalid_argument("row outside the matrix"));
+        }
+        Ok(self.weights.slice.slice(start..start + stride))
+    }
+
+    /// A view of the whole matrix, for the free functions that take one.
+    pub fn view(&self) -> cudarc::driver::CudaView<'_, u8> {
+        self.weights.slice.slice(..)
     }
 
     /// Rows in the matrix.
@@ -214,32 +239,116 @@ impl Q4kMatrix {
         x: &Q8Device,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), ViperaError> {
-        if out.len() != self.rows {
-            return Err(ViperaError::internal(format!(
-                "the output buffer is {} rows, the matrix has {}",
-                out.len(),
-                self.rows
-            )));
-        }
-        let config = LaunchConfig {
-            grid_dim: (self.rows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
-            block_dim: (THREADS as u32, 1, 1),
-            shared_mem_bytes: (ROWS_PER_BLOCK * self.blocks_per_row * BLOCK_BYTES) as u32,
-        };
-        let rows_arg = self.rows as i32;
-        let blocks_arg = self.blocks_per_row as i32;
-        let mut launch = device.stream.launch_builder(&device.q4k_matvec_q8);
-        launch.arg(&self.weights.slice);
-        launch.arg(&x.qs.slice);
-        launch.arg(&x.d.slice);
-        launch.arg(&x.s.slice);
-        launch.arg(&mut out.slice);
-        launch.arg(&rows_arg);
-        launch.arg(&blocks_arg);
-        // SAFETY: the activations hold at least `cols` quants and `cols/32` groups (checked by the
-        // caller's `quantize_into`), and `out` is exactly `rows` (checked above).
-        unsafe { launch.launch(config) }
-            .map_err(|error| ViperaError::internal(format!("Q4_K int8 launch failed: {error}")))?;
-        Ok(())
+        matvec_q8_view(
+            device,
+            &self.weights.slice.slice(..),
+            self.rows,
+            self.cols,
+            x,
+            out,
+        )
     }
+}
+
+/// `out = W · X` for `batch` activations at once: one weight read for the whole chunk.
+///
+/// `x` holds `batch * cols` quants and `batch * cols/32` scales and sums, entry-major; `out` holds
+/// `batch * rows`, also entry-major.
+pub fn matvec_q8_batch_view(
+    device: &Device,
+    weights: &cudarc::driver::CudaView<'_, u8>,
+    rows: usize,
+    cols: usize,
+    x: &Q8Device,
+    batch: usize,
+    out: &mut DeviceBuffer<f32>,
+) -> Result<(), ViperaError> {
+    if batch == 0 || batch > 8 {
+        return Err(ViperaError::invalid_argument(format!(
+            "the batch kernel takes 1 to 8 entries, got {batch}"
+        )));
+    }
+    if out.len() < batch * rows {
+        return Err(ViperaError::internal(format!(
+            "the output buffer holds {} values, {batch}x{rows} needs {}",
+            out.len(),
+            batch * rows
+        )));
+    }
+    let blocks_per_row = cols / QK_K;
+    if weights.len() < rows * blocks_per_row * BLOCK_BYTES {
+        return Err(ViperaError::invalid_argument(
+            "the weight view is smaller than the matrix",
+        ));
+    }
+    let config = LaunchConfig {
+        grid_dim: (rows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+        block_dim: (THREADS as u32, 1, 1),
+        shared_mem_bytes: (ROWS_PER_BLOCK * blocks_per_row * BLOCK_BYTES) as u32,
+    };
+    let rows_arg = rows as i32;
+    let blocks_arg = blocks_per_row as i32;
+    let batch_arg = batch as i32;
+    let mut launch = device.stream.launch_builder(&device.q4k_matvec_q8_batch);
+    launch.arg(weights);
+    launch.arg(&x.qs.slice);
+    launch.arg(&x.d.slice);
+    launch.arg(&x.s.slice);
+    launch.arg(&mut out.slice);
+    launch.arg(&rows_arg);
+    launch.arg(&blocks_arg);
+    launch.arg(&batch_arg);
+    // SAFETY: the activations hold `batch*cols` quants and `batch*cols/32` groups (the caller
+    // quantized a `batch x cols` buffer), `weights` was checked, and `out` holds `batch*rows`.
+    unsafe { launch.launch(config) }
+        .map_err(|error| ViperaError::internal(format!("Q4_K batch launch failed: {error}")))?;
+    Ok(())
+}
+
+/// `out = W · x` for a matrix that lives somewhere in a buffer — a pool slot, or an owned upload.
+///
+/// This is the shape a [`crate::pool::VramPool`] slot needs: the weights are a view into one big
+/// per-layer allocation, so the kernel starts at `weights` and reads `rows * blocks * 144` bytes.
+pub fn matvec_q8_view(
+    device: &Device,
+    weights: &cudarc::driver::CudaView<'_, u8>,
+    rows: usize,
+    cols: usize,
+    x: &Q8Device,
+    out: &mut DeviceBuffer<f32>,
+) -> Result<(), ViperaError> {
+    if out.len() != rows {
+        return Err(ViperaError::internal(format!(
+            "the output buffer is {} rows, the matrix has {rows}",
+            out.len()
+        )));
+    }
+    let blocks_per_row = cols / QK_K;
+    if weights.len() < rows * blocks_per_row * BLOCK_BYTES {
+        return Err(ViperaError::invalid_argument(format!(
+            "the weight view is {} bytes, {rows}x{cols} needs {}",
+            weights.len(),
+            rows * blocks_per_row * BLOCK_BYTES
+        )));
+    }
+    let config = LaunchConfig {
+        grid_dim: (rows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+        block_dim: (THREADS as u32, 1, 1),
+        shared_mem_bytes: (ROWS_PER_BLOCK * blocks_per_row * BLOCK_BYTES) as u32,
+    };
+    let rows_arg = rows as i32;
+    let blocks_arg = blocks_per_row as i32;
+    let mut launch = device.stream.launch_builder(&device.q4k_matvec_q8);
+    launch.arg(weights);
+    launch.arg(&x.qs.slice);
+    launch.arg(&x.d.slice);
+    launch.arg(&x.s.slice);
+    launch.arg(&mut out.slice);
+    launch.arg(&rows_arg);
+    launch.arg(&blocks_arg);
+    // SAFETY: the activations hold at least `cols` quants and `cols/32` groups (checked by the
+    // caller's `quantize_into`), `weights` was checked above, and `out` is exactly `rows`.
+    unsafe { launch.launch(config) }
+        .map_err(|error| ViperaError::internal(format!("Q4_K int8 launch failed: {error}")))?;
+    Ok(())
 }

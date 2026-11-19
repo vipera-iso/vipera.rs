@@ -11,6 +11,7 @@
 use std::time::Instant;
 
 use vipera_backend_cpu::quant;
+use vipera_backend_gpu::pool::VramPool;
 use vipera_backend_gpu::q8::Q8;
 use vipera_backend_gpu::{Device, q4k};
 use vipera_core::gguf::{GgmlType, GgufFile};
@@ -275,6 +276,142 @@ fn q4k_matvec_q8_throughput() {
         "{rows}x{cols} Q4_K int8: {:.3} ms/call, {gbps:.1} GB/s (weights resident)",
         elapsed * 1e3
     );
+}
+
+#[test]
+#[ignore = "needs a CUDA device and a model"]
+fn q4k_matvec_reads_weights_from_the_pool() {
+    use std::sync::Arc;
+
+    use vipera_backend_gpu::pool::Format;
+    use vipera_core::vram::VramSink;
+
+    let device = match Device::open(0) {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipped: {error}");
+            return;
+        }
+    };
+    let Some((weights, rows, cols)) = tensor(&model_path(), "blk.0.ffn_gate.weight") else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let owned = q4k::Q4kMatrix::upload(&device, &weights, rows, cols).expect("upload");
+
+    // The pool slot is exactly what the bus hands over: one layer's bytes, copied once.
+    let pool = Arc::new(VramPool::new(device.clone()));
+    pool.bring(3, &weights);
+    let pooled = pool
+        .matrix(3, 0, rows, cols, Format::Q4)
+        .expect("a pooled view");
+    assert_eq!(pooled.bytes(), weights.len());
+
+    let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.004).sin()).collect();
+    let quantized = Q8::quantize(&x);
+    let mut via_pool = device.alloc::<f32>(rows).expect("alloc");
+    let mut q8 = vipera_backend_gpu::q8::Q8Device::allocate(&device, cols).expect("alloc");
+    let device_x = device.upload(&x).expect("upload");
+    device
+        .quantize_into(&device_x, &mut q8, cols / 32)
+        .expect("quantize");
+    pooled
+        .project(&device, &device_x, &mut q8, &mut via_pool)
+        .expect("pooled matvec");
+    let pooled_out = via_pool.download(&device).expect("download");
+    let owned_out = owned.matvec_q8(&device, &quantized).expect("owned matvec");
+
+    let worst = pooled_out
+        .iter()
+        .zip(&owned_out)
+        .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+        .fold(0.0_f32, f32::max);
+    println!("pooled vs owned matvec: {worst:.2e} over {rows} rows");
+    assert!(worst < 1e-5, "the pooled read differs: {worst:.2e}");
+}
+
+#[test]
+#[ignore = "needs a CUDA device and a model"]
+fn q4k_batch_reuses_one_weight_read() {
+    let device = match Device::open(0) {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipped: {error}");
+            return;
+        }
+    };
+    let Some((weights, rows, cols)) = tensor(&model_path(), "blk.0.ffn_gate.weight") else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let matrix = q4k::Q4kMatrix::upload(&device, &weights, rows, cols).expect("upload");
+
+    let batch = 8usize;
+    let rows_x: Vec<f32> = (0..batch * cols)
+        .map(|i| ((i as f32) * 0.0031).sin() * 0.5)
+        .collect();
+    let mut quantized =
+        vipera_backend_gpu::q8::Q8Device::allocate(&device, batch * cols).expect("alloc");
+    let device_x = device.upload(&rows_x).expect("upload");
+    device
+        .quantize_into(&device_x, &mut quantized, batch * cols / 32)
+        .expect("quantize");
+    let mut out = device.alloc::<f32>(batch * rows).expect("alloc");
+
+    q4k::matvec_q8_batch_view(
+        &device,
+        &matrix.view(),
+        rows,
+        cols,
+        &quantized,
+        batch,
+        &mut out,
+    )
+    .expect("batch");
+    let batched = out.download(&device).expect("download");
+
+    // Every entry must equal the single-row kernel's answer for that row.
+    let mut worst: f32 = 0.0;
+    for entry in 0..batch {
+        let single = matrix
+            .matvec_q8(
+                &device,
+                &vipera_backend_gpu::q8::Q8::quantize(&rows_x[entry * cols..][..cols]),
+            )
+            .expect("single");
+        for row in 0..rows.min(16) {
+            let reference = single[row];
+            worst = worst
+                .max((batched[entry * rows + row] - reference).abs() / reference.abs().max(1.0));
+        }
+    }
+    println!("batch vs single worst relative difference: {worst:.2e}");
+    assert!(worst < 1e-4, "the batch kernel disagrees: {worst:.2e}");
+
+    let rounds = 30;
+    let start = Instant::now();
+    for _ in 0..rounds {
+        q4k::matvec_q8_batch_view(
+            &device,
+            &matrix.view(),
+            rows,
+            cols,
+            &quantized,
+            batch,
+            &mut out,
+        )
+        .expect("batch");
+    }
+    // Launches are asynchronous: without this the loop only measures how fast the host can enqueue.
+    let _ = out.download(&device).expect("download");
+    let per_call = start.elapsed().as_secs_f64() / rounds as f64;
+    println!(
+        "{rows}x{cols} Q4_K int8 x{batch}: {:.3} ms/call, {:.1} GB/s of weights ({:.3} ms/token)",
+        per_call * 1e3,
+        matrix.bytes() as f64 / per_call / 1e9,
+        per_call * 1e3 / batch as f64
+    );
+    println!("[cpu] the same shape reads 28-31 GB/s and batches 128 tokens per read");
 }
 
 #[test]

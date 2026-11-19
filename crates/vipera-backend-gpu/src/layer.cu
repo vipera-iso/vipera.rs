@@ -3,6 +3,31 @@
 // Every kernel here is a straight port of the CPU function of the same name in
 // `vipera-backend-cpu/src/model.rs`; the comments name which one.
 
+__device__ __forceinline__ void scale_min_k4(int j, const unsigned char *q, unsigned char *d, unsigned char *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+__device__ __forceinline__ float h2f16(unsigned short h) {
+    const unsigned int sign = (h >> 15) & 1u;
+    const unsigned int exp = (h >> 10) & 0x1fu;
+    const unsigned int man = h & 0x3ffu;
+    float v;
+    if (exp == 0u) {
+        v = ldexpf((float)man, -24);
+    } else if (exp == 31u) {
+        v = man ? __int_as_float(0x7fc00000) : __int_as_float(0x7f800000);
+    } else {
+        v = ldexpf((float)(man | 0x400u), (int)exp - 25);
+    }
+    return sign ? -v : v;
+}
+
 // `rms_norm`: out = x / sqrt(mean(x^2) + eps) * weight. One block, one thread per value.
 extern "C" __global__ void rmsnorm(
     const float * __restrict__ x,
@@ -212,5 +237,27 @@ extern "C" __global__ void quantize_q8(
     }
     if (lane == 0) {
         s[group] = scratch[0];
+    }
+}
+
+// One row of Q4_K weights as f32: the token embedding lookup, which a matvec would compute by
+// multiplying 151,936 rows by a one-hot vector.
+extern "C" __global__ void q4k_row(
+    const unsigned char * __restrict__ row,
+    float * __restrict__ out,
+    int cols)
+{
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const unsigned char *blk = row + b * 144;
+    const float d = h2f16(*(const unsigned short *)blk);
+    const float dmin = h2f16(*(const unsigned short *)(blk + 2));
+    for (int v = tid; v < 256; v += blockDim.x) {
+        const int j = v >> 5;
+        unsigned char sc, m;
+        scale_min_k4(j, blk + 4, &sc, &m);
+        const int qi = ((j >> 1) << 5) + (v & 31);
+        const unsigned char q = (j & 1) ? (unsigned char)(blk[16 + qi] >> 4) : (unsigned char)(blk[16 + qi] & 0xF);
+        out[b * 256 + v] = d * (float)sc * (float)q - dmin * (float)m;
     }
 }

@@ -16,9 +16,11 @@
 
 pub mod device;
 pub mod layer;
+pub mod model;
 pub mod pool;
 pub mod q4k;
 pub mod q6k;
 pub mod q8;
 
 pub use device::{Device, DeviceBuffer};
+pub use model::GpuModel;

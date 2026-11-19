@@ -11,11 +11,27 @@
 use vipera_errors::ViperaError;
 
 use crate::device::{Device, DeviceBuffer};
+use crate::pool::{Format, PooledMatrix, VramPool};
 use crate::q4k::Q4kMatrix;
 use crate::q6k::Q6kMatrix;
 use crate::q8::Q8Device;
 
 pub(crate) const SOURCE: &str = include_str!("layer.cu");
+
+/// f16 by bit pattern, for the tensors the file stores as halves.
+pub fn f16(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let man = (h & 0x3ff) as f32;
+    let value = if exp == 0 {
+        man * 2f32.powi(-24)
+    } else if exp == 31 {
+        if man == 0.0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (man + 1024.0) * 2f32.powi(exp - 25)
+    };
+    if sign == 1 { -value } else { value }
+}
 
 /// Everything the layer's kernels need to know about the model.
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +81,8 @@ pub enum Matrix {
     Q4(Q4kMatrix),
     /// Q6_K, fed float activations.
     Q6(Q6kMatrix),
+    /// A view into a [`VramPool`] slot: the weights were copied up once, with the layer.
+    Pooled(PooledMatrix),
 }
 
 impl Matrix {
@@ -73,6 +91,7 @@ impl Matrix {
         match self {
             Self::Q4(matrix) => matrix.bytes(),
             Self::Q6(matrix) => matrix.bytes(),
+            Self::Pooled(matrix) => matrix.bytes(),
         }
     }
 
@@ -102,8 +121,22 @@ impl Matrix {
                 matrix.matvec_q8_into(device, q8, out)
             }
             Self::Q6(matrix) => matrix.matvec_into(device, input, out),
+            Self::Pooled(matrix) => matrix.project(device, input, q8, out),
         }
     }
+}
+
+/// Where one tensor sits inside a pooled layer, and what shape it has.
+#[derive(Clone, Copy, Debug)]
+pub struct Spec {
+    /// Bytes from the start of the layer's span.
+    pub offset: usize,
+    /// Rows.
+    pub rows: usize,
+    /// Columns.
+    pub cols: usize,
+    /// Packed format.
+    pub format: Format,
 }
 
 /// The Q4_K bytes and norms of one layer, as they sit in the file.
@@ -188,6 +221,74 @@ impl GpuLayer {
         })
     }
 
+    /// Build the same layer out of a pool slot instead of seven uploads.
+    ///
+    /// `specs` are `wq, wk, wv, wo, wg, wu, wd`, with offsets measured from the start of the
+    /// layer's span in the file (the bytes the bus coped up). Nothing is copied here: every
+    /// projection is a view into the one buffer the bus already filled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_pool(
+        device: &Device,
+        shape: LayerShape,
+        pool: &VramPool,
+        layer: usize,
+        specs: [Spec; 7],
+        attn_norm: &[f32],
+        ffn_norm: &[f32],
+        biases: [Option<&[f32]>; 3],
+    ) -> Result<Self, ViperaError> {
+        let mut matrices = Vec::with_capacity(7);
+        for spec in specs {
+            matrices.push(Matrix::Pooled(pool.matrix(
+                layer,
+                spec.offset,
+                spec.rows,
+                spec.cols,
+                spec.format,
+            )?));
+        }
+        let mut drain = matrices.into_iter();
+        let (wq, wk, wv, wo, wg, wu, wd) = (
+            drain.next().expect("wq"),
+            drain.next().expect("wk"),
+            drain.next().expect("wv"),
+            drain.next().expect("wo"),
+            drain.next().expect("wg"),
+            drain.next().expect("wu"),
+            drain.next().expect("wd"),
+        );
+        let query = shape.query_width();
+        let kv = shape.kv_width();
+        Ok(Self {
+            shape,
+            attn_norm: device.upload(attn_norm)?,
+            ffn_norm: device.upload(ffn_norm)?,
+            wq,
+            wk,
+            wv,
+            wo,
+            wg,
+            wu,
+            wd,
+            bq: biases[0].map(|b| device.upload(b)).transpose()?,
+            bk: biases[1].map(|b| device.upload(b)).transpose()?,
+            bv: biases[2].map(|b| device.upload(b)).transpose()?,
+            k_cache: device.alloc(shape.max_positions * kv)?,
+            v_cache: device.alloc(shape.max_positions * kv)?,
+            residual: device.alloc(shape.hidden)?,
+            normed: device.alloc(shape.hidden)?,
+            q: device.alloc(query)?,
+            k: device.alloc(kv)?,
+            v: device.alloc(kv)?,
+            attn: device.alloc(query)?,
+            projection: device.alloc(shape.hidden)?,
+            gate: device.alloc(shape.ffn)?,
+            up: device.alloc(shape.ffn)?,
+            activated: device.alloc(shape.ffn)?,
+            q8: Q8Device::allocate(device, shape.hidden.max(shape.ffn).max(query))?,
+        })
+    }
+
     /// The shape this layer was built for.
     pub fn shape(&self) -> LayerShape {
         self.shape
@@ -213,22 +314,21 @@ impl GpuLayer {
         x: &[f32],
         position: usize,
     ) -> Result<Vec<f32>, ViperaError> {
+        device.copy_into(x, &mut self.residual)?;
+        self.step_device(device, position)?;
+        self.residual.download(device)
+    }
+
+    /// The same step with the residual row already on the device: what a model loop wants, so a
+    /// layer's output never travels to the host and back.
+    pub fn step_device(&mut self, device: &Device, position: usize) -> Result<(), ViperaError> {
         let shape = self.shape;
-        if x.len() != shape.hidden {
-            return Err(ViperaError::invalid_argument(format!(
-                "the residual row is {} values, the layer takes {}",
-                x.len(),
-                shape.hidden
-            )));
-        }
         if position >= shape.max_positions {
             return Err(ViperaError::invalid_argument(format!(
                 "position {position} is past the cache of {}",
                 shape.max_positions
             )));
         }
-        device.copy_into(x, &mut self.residual)?;
-
         device.rmsnorm(
             &self.residual,
             &self.attn_norm,
@@ -301,8 +401,26 @@ impl GpuLayer {
         self.wd
             .project(device, &self.activated, &mut self.q8, &mut self.projection)?;
         device.add_inplace(&mut self.residual, &self.projection, shape.hidden)?;
+        Ok(())
+    }
 
-        self.residual.download(device)
+    /// The layer's output row, still on the device.
+    pub fn residual(&self) -> &DeviceBuffer<f32> {
+        &self.residual
+    }
+
+    /// Load a residual row that is already on the device.
+    pub fn load_residual(
+        &mut self,
+        device: &Device,
+        x: &DeviceBuffer<f32>,
+    ) -> Result<(), ViperaError> {
+        device.copy_buffer(x, &mut self.residual)
+    }
+
+    /// Load a residual row into the layer before [`Self::step_device`].
+    pub fn set_residual(&mut self, device: &Device, x: &[f32]) -> Result<(), ViperaError> {
+        device.copy_into(x, &mut self.residual)
     }
 
     /// Whether the model's QKV projections carry biases.

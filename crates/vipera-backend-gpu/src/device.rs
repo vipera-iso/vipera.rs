@@ -28,6 +28,8 @@ pub struct Device {
     pub(crate) q4k_matvec_q8: Arc<CudaFunction>,
     /// `q6k_matvec`, for the tensors a Q4_K_M file keeps at 6 bits.
     pub(crate) q6k_matvec: Arc<CudaFunction>,
+    /// `q4k_matvec_q8_batch`, the prefill path: one weight read for up to eight tokens.
+    pub(crate) q4k_matvec_q8_batch: Arc<CudaFunction>,
     /// The elementwise and attention kernels that make a whole layer possible.
     pub(crate) ops: Ops,
 }
@@ -41,6 +43,7 @@ pub(crate) struct Ops {
     pub(crate) swiglu: Arc<CudaFunction>,
     pub(crate) add_inplace: Arc<CudaFunction>,
     pub(crate) quantize_q8: Arc<CudaFunction>,
+    pub(crate) q4k_row: Arc<CudaFunction>,
 }
 
 impl Device {
@@ -67,6 +70,7 @@ impl Device {
             })?;
             loaded.push(Arc::new(function));
         }
+        let batch = loaded.pop().expect("kernels compiled");
         let q6k = loaded.pop().expect("kernels compiled");
         let int8 = loaded.pop().expect("kernels compiled");
         let float = loaded.pop().expect("kernels compiled");
@@ -90,6 +94,7 @@ impl Device {
             swiglu: op("swiglu")?,
             add_inplace: op("add_inplace")?,
             quantize_q8: op("quantize_q8")?,
+            q4k_row: op("q4k_row")?,
         };
         Ok(Self {
             context,
@@ -97,6 +102,7 @@ impl Device {
             q4k_matvec: float,
             q4k_matvec_q8: int8,
             q6k_matvec: q6k,
+            q4k_matvec_q8_batch: batch,
             ops,
         })
     }
@@ -156,6 +162,20 @@ impl Device {
         self.stream
             .memcpy_htod(host, &mut dst.slice)
             .map_err(|error| ViperaError::internal(format!("copy to the device failed: {error}")))
+    }
+
+    /// Copy one device buffer into another of the same length.
+    pub fn copy_buffer(
+        &self,
+        src: &DeviceBuffer<f32>,
+        dst: &mut DeviceBuffer<f32>,
+    ) -> Result<(), ViperaError> {
+        if src.len() != dst.len() {
+            return Err(ViperaError::internal("a buffer copy changed length"));
+        }
+        self.stream
+            .memcpy_dtod(&src.slice, &mut dst.slice)
+            .map_err(|error| ViperaError::internal(format!("device copy failed: {error}")))
     }
 
     /// `rms_norm` for one row.
@@ -275,6 +295,35 @@ impl Device {
         // `kv_heads*head_dim` and `positions` is checked against it by the caller's slot check.
         unsafe { launch.launch(config) }
             .map_err(|error| ViperaError::internal(format!("attention launch failed: {error}")))?;
+        Ok(())
+    }
+
+    /// Dequantize one Q4_K row into `out`.
+    pub fn q4k_row(
+        &self,
+        row: &cudarc::driver::CudaView<'_, u8>,
+        cols: usize,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), ViperaError> {
+        if row.len() < (cols / 256) * crate::q4k::BLOCK_BYTES || out.len() < cols {
+            return Err(ViperaError::invalid_argument(
+                "the row view or the output is too small for the width",
+            ));
+        }
+        let config = LaunchConfig {
+            grid_dim: ((cols / 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cols_arg = cols as i32;
+        let mut launch = self.stream.launch_builder(&self.ops.q4k_row);
+        launch.arg(row);
+        launch.arg(&mut out.slice);
+        launch.arg(&cols_arg);
+        // SAFETY: one block per 256 values; the view holds `cols/256*144` bytes (checked) and the
+        // kernel writes `cols` floats into a buffer at least that long.
+        unsafe { launch.launch(config) }
+            .map_err(|error| ViperaError::internal(format!("q4k_row launch failed: {error}")))?;
         Ok(())
     }
 
