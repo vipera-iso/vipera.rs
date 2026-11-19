@@ -11,7 +11,12 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "acme")]
+pub mod acme;
+pub mod handler;
+pub mod http;
 pub mod json;
 pub mod serve;
+pub mod tls;
 
 pub use serve::command;

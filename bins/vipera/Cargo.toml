@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# EXC-003: pass the ACME provisioning feature through to the server crate.
+acme = ["vipera-server/acme"]
+
 [dependencies]
 vipera-core.workspace = true
 vipera-errors.workspace = true

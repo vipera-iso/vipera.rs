@@ -1,9 +1,12 @@
 //! What a repeated prompt costs: two requests that share a prompt, one engine with the prefix
 //! cache on and one with it off.
 //!
-//! This is a measurement, not a correctness check; `#[ignore]`d like the other benches here. With
-//! the cache on, the second request copies the KV of the tokens it shares with the first and only
-//! computes the tail, so the two columns should differ by the size of the shared prefix.
+//! Both tests assert — a copied prefix must produce the tokens a computed prefix produces, for every
+//! KV type — so they are not skipped for being measurements. They are `#[ignore]`d only because a
+//! debug build cannot prefill 480 tokens in a usable time: the gate runs them in release with
+//! `--ignored`, and without a model they print the reason and return, the way the other
+//! model-dependent tests here do. With a model, the printed time and `processed` columns show the
+//! reuse as well as checking it:
 //!
 //!   VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
 //!   cargo test -p vipera-backend-cpu --release --test prefix_cache -- --ignored --nocapture
@@ -90,7 +93,7 @@ fn request(
 }
 
 #[test]
-#[ignore = "measurement, not a correctness check"]
+#[ignore = "prefill is a release-mode measurement; the gate runs it with --ignored --release"]
 fn prefix_cache_reuses_a_shared_prompt() {
     let Some(path) = model_path() else {
         eprintln!("no model: set VIPERA_TEST_MODEL");
@@ -137,7 +140,7 @@ fn supported(path: &PathBuf, kv_type: KvCacheType) -> bool {
     backend.config().kv_bytes_per_token_for(kv_type).is_some()
 }
 #[test]
-#[ignore = "measurement, not a correctness check"]
+#[ignore = "prefill is a release-mode measurement; the gate runs it with --ignored --release"]
 fn prefix_cache_gives_the_same_tokens_for_every_kv_type() {
     let Some(path) = model_path() else {
         eprintln!("no model: set VIPERA_TEST_MODEL");

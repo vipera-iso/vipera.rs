@@ -32,6 +32,12 @@ vipera-core = { path = "crates/vipera-core" }
 # TLS for `vipera serve`. `ring` keeps the provider to one audited C-free-API backend and
 # `std`/`tls12` are what a server needs; nothing else in the workspace takes a third-party crate.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# ACME provisioning for `vipera serve` behind the `acme` feature (EXC-003, default off).
+# `ring` keeps the provider to the one rustls already links; `rcgen` is what the client's
+# `finalize()` uses to build the CSR and the certificate key.
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "net", "io-util"] }
+serde_json = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

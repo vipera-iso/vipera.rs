@@ -32,7 +32,17 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Lint
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        # `acme` is off by default, so it is named here: code the default build never compiles is
+        # code the gate never checks.
+        run: cargo clippy --workspace --all-targets --locked --features acme -- -D warnings
 
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Test the ACME feature
+        run: cargo test -p vipera-server --features acme --locked
+
+      - name: Test the release-mode measurements
+        # These assert, so they belong in the gate; they are `#[ignore]`d only because a debug build
+        # cannot prefill or time them. Without a model they print the reason and pass.
+        run: cargo test -p vipera-backend-cpu --release --locked --test prefix_cache --test alignment_probe -- --ignored

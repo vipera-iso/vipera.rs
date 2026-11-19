@@ -9,6 +9,9 @@
 !/rust-toolchain.toml
 !/README.md
 !/CONTRIBUTING.md
+# GitHub's community profile looks for this one, and a repository that asks people to behave well
+# should say where to report it when they do not.
+!/CODE_OF_CONDUCT.md
 # How to report a vulnerability, and what the project holds itself to when it is reported.
 !/SECURITY.md
 # The written quality bar and its exception table (EXC-001) must travel with the code: an ADR

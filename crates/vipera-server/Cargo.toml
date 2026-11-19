@@ -5,8 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# EXC-003: ACME certificate provisioning, default off. Without the feature the crate links
+# exactly what it linked before (rustls only) and `--acme-*` is an unknown flag.
+acme = ["dep:instant-acme", "dep:tokio", "dep:serde_json"]
+
 [dependencies]
 rustls.workspace = true
+instant-acme = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 vipera-backend-cpu.workspace = true
 vipera-core.workspace = true
 vipera-errors.workspace = true

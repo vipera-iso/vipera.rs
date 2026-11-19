@@ -250,10 +250,17 @@ fn render_llama2(messages: &[ChatMessage], add_generation_prompt: bool) -> Strin
 
     let mut out = String::from("<s>");
     let mut first_instruction = true;
+    // An assistant turn closes itself with `</s>`. Two user turns in a row have nothing between
+    // them, so the earlier instruction has to be closed here; otherwise the model sees
+    // `[/INST]<s>[INST]`, which is not a shape it was trained on.
+    let mut previous_was_assistant = true;
     for message in turns {
         match message.role {
             Role::User => {
                 if !first_instruction {
+                    if !previous_was_assistant {
+                        out.push_str("</s>");
+                    }
                     out.push_str("<s>");
                 }
                 out.push_str("[INST] ");
@@ -265,11 +272,13 @@ fn render_llama2(messages: &[ChatMessage], add_generation_prompt: bool) -> Strin
                 out.push_str(&message.content);
                 out.push_str(" [/INST]");
                 first_instruction = false;
+                previous_was_assistant = false;
             }
             Role::Assistant => {
                 out.push(' ');
                 out.push_str(&message.content);
                 out.push_str(" </s>");
+                previous_was_assistant = true;
             }
             Role::System => {}
         }
@@ -360,6 +369,17 @@ mod tests {
         assert_eq!(
             render(LLAMA2, &messages, true).unwrap(),
             "<s>[INST] <<SYS>>\nbe brief\n<</SYS>>\n\nhi [/INST] hello </s><s>[INST] again [/INST]"
+        );
+    }
+
+    #[test]
+    fn llama2_closes_an_unanswered_instruction_before_opening_the_next() {
+        // Two user turns in a row: the first was never answered, but the template still needs its
+        // `</s>` before the next `<s>`, or the model reads `[/INST]<s>[INST]`.
+        let messages = [ChatMessage::user("a"), ChatMessage::user("b")];
+        assert_eq!(
+            render(LLAMA2, &messages, true).unwrap(),
+            "<s>[INST] a [/INST]</s><s>[INST] b [/INST]"
         );
     }
 

@@ -11,10 +11,14 @@
 //! No HTTP crate and no JSON crate: a chat endpoint is a request line, headers, one JSON body and one
 //! response, and the project keeps its dependency list empty on purpose (`research.md`, R3).
 //!
+//! The surface is split by job: [`crate::http`] reads a request and writes a response, [`crate::tls`]
+//! builds and reloads the TLS configuration, [`crate::handler`] turns a JSON body into a turn and a
+//! turn into frames, and this module owns the process — the flags, the model load, the scheduler, the
+//! connection loop, auth and metrics.
+//!
 //! What Phase 1 does not do, stated here rather than implied: request bodies must be `Content-Length`
-//! framed (chunked bodies are refused with `invalid_request`), `stop` sequences are parsed and ignored,
-//! and a client that disconnects mid-stream still lets the current turn finish before the
-//! connection is dropped. Requests carry a per-key (or, without a key, per peer) budget of 600 a
+//! framed (chunked bodies are refused with `invalid_request`), and a client that disconnects
+//! mid-stream still lets the current turn finish before the connection is dropped. Requests carry a per-key (or, without a key, per peer) budget of 600 a
 //! minute by default (`429` + `Retry-After` when exceeded); `--rate-limit N` changes the budget and
 //! `--rate-limit 0` turns it off. Without a key every `authorization` value is caller-chosen, so it
 //! cannot name a client. At most [`MAX_CONNECTIONS`] connections are served at once; past that the
@@ -26,7 +30,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use vipera_backend_cpu::CpuBackend;
 use vipera_core::gguf::GgufFile;
@@ -37,16 +41,19 @@ use vipera_errors::ViperaError;
 use vipera_runtime::{
     DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, Generation, KvCache, KvConfig, StepReport,
 };
-use vipera_sampler::{MAX_LOGIT_BIAS, SamplerConfig};
-use vipera_tokenizer::{ChatMessage, Tokenizer};
+use vipera_sampler::SamplerConfig;
+use vipera_tokenizer::Tokenizer;
 use vipera_traits::HardwareProbe;
 
-use crate::json::{Json, quote};
+use crate::handler::{chat, completions};
+use crate::http::{
+    Incoming, Request, Transport, read_request, respond, respond_error, respond_error_retry,
+    respond_preflight,
+};
+use crate::json::quote;
+use crate::tls::TlsSource;
 
-/// Bodies larger than this are refused instead of buffered.
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-/// Request line plus headers must fit here; anything larger is not a chat request.
-const MAX_HEAD_BYTES: usize = 64 * 1024;
+pub use crate::tls::tls_config;
 
 /// Connections that may be open at once. Each one owns a thread and up to [`MAX_BODY_BYTES`], so this
 /// is a memory bound rather than a concurrency target.
@@ -60,10 +67,10 @@ const LOAD_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BUCKETS: usize = 4096;
 
 /// OpenAI accepts at most four stop sequences per request.
-const MAX_STOP_SEQUENCES: usize = 4;
+pub(crate) const MAX_STOP_SEQUENCES: usize = 4;
 
 /// The engine batches at most four turns, so that is the ceiling for `n`.
-const MAX_CHOICES: usize = 4;
+pub(crate) const MAX_CHOICES: usize = 4;
 
 /// Requests per minute per key (or, without a key, per peer address) unless `--rate-limit` says
 /// otherwise. One conversation streams well under this; the budget is there so a runaway client
@@ -85,6 +92,14 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
     let mut rate_limit: Option<u32> = Some(DEFAULT_RATE_LIMIT);
     let mut tls_cert: Option<&str> = None;
     let mut tls_key: Option<&str> = None;
+    #[cfg(feature = "acme")]
+    let mut acme_domain: Option<String> = None;
+    #[cfg(feature = "acme")]
+    let mut acme_contact: Option<String> = None;
+    #[cfg(feature = "acme")]
+    let mut acme_directory = "https://acme-v02.api.letsencrypt.org/directory".to_owned();
+    #[cfg(feature = "acme")]
+    let mut acme_http_address = "0.0.0.0:80".to_owned();
 
     let mut index = 0;
     while index < args.len() {
@@ -126,6 +141,26 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
                 rate_limit = budget_from_flag(next_number(args, index, "--rate-limit")?);
                 index += 1;
             }
+            #[cfg(feature = "acme")]
+            "--acme-domain" => {
+                acme_domain = Some(next_value(args, index, "--acme-domain")?.to_owned());
+                index += 1;
+            }
+            #[cfg(feature = "acme")]
+            "--acme-contact" => {
+                acme_contact = Some(next_value(args, index, "--acme-contact")?.to_owned());
+                index += 1;
+            }
+            #[cfg(feature = "acme")]
+            "--acme-directory" => {
+                acme_directory = next_value(args, index, "--acme-directory")?.to_owned();
+                index += 1;
+            }
+            #[cfg(feature = "acme")]
+            "--acme-http-address" => {
+                acme_http_address = next_value(args, index, "--acme-http-address")?.to_owned();
+                index += 1;
+            }
             flag if flag.starts_with('-') => {
                 return Err(ViperaError::usage(format!(
                     "unknown flag \"{flag}\" for serve"
@@ -145,6 +180,39 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
 
     let path = path.ok_or_else(|| ViperaError::usage("serve needs a model path"))?;
     let model_id = model_id.unwrap_or_else(|| default_model_id(path));
+
+    // `--acme-domain` turns the `--tls-cert`/`--tls-key` pair into files this process writes and
+    // then keeps current; the challenge listener has to come up before TLS can, and on a first
+    // issuance there is nothing to serve until the CA has answered.
+    #[cfg(feature = "acme")]
+    if let Some(domain) = acme_domain {
+        let (Some(cert), Some(key)) = (tls_cert, tls_key) else {
+            return Err(ViperaError::usage(
+                "--acme-domain needs --tls-cert and --tls-key: they name the files the certificate \
+                 is written to",
+            ));
+        };
+        crate::acme::spawn(
+            crate::acme::Options {
+                domain,
+                contact: acme_contact,
+                directory: acme_directory,
+                http_address: acme_http_address,
+                // `vipera serve` talks to a CA the platform already trusts; the test suite is the
+                // only caller that names another root.
+                root_cert: None,
+            },
+            std::path::Path::new(cert),
+            std::path::Path::new(key),
+        )?;
+        if !std::path::Path::new(cert).is_file() || !std::path::Path::new(key).is_file() {
+            crate::acme::wait_for_certificate(
+                std::path::Path::new(cert),
+                std::path::Path::new(key),
+                std::time::Duration::from_secs(120),
+            )?;
+        }
+    }
 
     let tls = match (tls_cert, tls_key) {
         (None, None) => None,
@@ -360,13 +428,13 @@ fn rate_limit_client(api_key: Option<&str>, request: &Request, peer: &str) -> St
 ///
 /// Every accepted socket owns a thread and can buffer [`MAX_BODY_BYTES`] of request, so an unbounded
 /// accept loop is an unbounded allocation with a network trigger.
-struct ConnectionBudget {
+pub(crate) struct ConnectionBudget {
     limit: usize,
     active: AtomicUsize,
 }
 
 impl ConnectionBudget {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit,
             active: AtomicUsize::new(0),
@@ -374,7 +442,7 @@ impl ConnectionBudget {
     }
 
     /// Take a slot, or `None` when every slot is busy. The slot returns its count when dropped.
-    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionSlot> {
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ConnectionSlot> {
         let mut active = self.active.load(Ordering::Relaxed);
         loop {
             if active >= self.limit {
@@ -398,7 +466,7 @@ impl ConnectionBudget {
 }
 
 /// One connection's slot in a [`ConnectionBudget`].
-struct ConnectionSlot {
+pub(crate) struct ConnectionSlot {
     budget: Arc<ConnectionBudget>,
 }
 
@@ -409,7 +477,7 @@ impl Drop for ConnectionSlot {
 }
 
 /// Token bucket per client, shared across handler threads.
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     per_minute: f64,
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
 }
@@ -463,196 +531,18 @@ impl RateLimiter {
 }
 
 /// The loaded model plus everything the handlers share.
-struct Served {
-    engine: Arc<Mutex<Engine<CpuBackend>>>,
-    router: Arc<Router>,
-    tokenizer: Tokenizer,
-    model: String,
-    context_length: usize,
-    api_key: Option<String>,
-    rate_limit: Option<Arc<RateLimiter>>,
-    metrics: Mutex<Metrics>,
+pub(crate) struct Served {
+    pub(crate) engine: Arc<Mutex<Engine<CpuBackend>>>,
+    pub(crate) router: Arc<Router>,
+    pub(crate) tokenizer: Tokenizer,
+    pub(crate) model: String,
+    pub(crate) context_length: usize,
+    pub(crate) api_key: Option<String>,
+    pub(crate) rate_limit: Option<Arc<RateLimiter>>,
+    pub(crate) metrics: Mutex<Metrics>,
     /// `None` serves plain HTTP. `Some` completes a TLS handshake before reading the request, with
     /// the certificate and key `--tls-cert` / `--tls-key` named, re-read when they change.
     tls: Option<Arc<TlsSource>>,
-}
-
-/// Whatever a connection speaks: a plain `TcpStream`, or the same socket under rustls.
-///
-/// The request path only ever reads and writes bytes, so it is written against this rather than
-/// against `TcpStream`; the address and the socket timeouts stay at the accept loop, where the
-/// socket still is.
-trait Transport: std::io::Read + std::io::Write {}
-
-impl Transport for TcpStream {}
-
-impl Transport for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {}
-
-/// A TLS configuration that follows the files it was built from.
-///
-/// Renewing a certificate is a file write here, not a restart: the accept loop compares the pair's
-/// length and modification time before each connection and rebuilds the configuration when they
-/// move. A file that does not parse keeps the previous configuration, so a half-written renewal
-/// cannot take a working server down, and the bad stamp is remembered so it is reported once.
-struct TlsSource {
-    cert: std::path::PathBuf,
-    key: std::path::PathBuf,
-    current: std::sync::Mutex<TlsCurrent>,
-}
-
-struct TlsCurrent {
-    config: Arc<rustls::ServerConfig>,
-    stamp: StampPair,
-}
-
-/// The pair of stamps a configuration was built from, `None` when a file is missing.
-type StampPair = (Option<FileStamp>, Option<FileStamp>);
-
-/// Just enough of a file's metadata to notice a rotation, without reading it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-impl FileStamp {
-    fn of(path: &std::path::Path) -> Option<Self> {
-        let metadata = std::fs::metadata(path).ok()?;
-        Some(Self {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-        })
-    }
-}
-
-impl TlsSource {
-    fn new(cert: &str, key: &str) -> Result<Self, String> {
-        let cert = std::path::PathBuf::from(cert);
-        let key = std::path::PathBuf::from(key);
-        let (config, stamp) = Self::build(&cert, &key)?;
-        Ok(Self {
-            cert,
-            key,
-            current: std::sync::Mutex::new(TlsCurrent { config, stamp }),
-        })
-    }
-
-    fn build(
-        cert: &std::path::Path,
-        key: &std::path::Path,
-    ) -> Result<(Arc<rustls::ServerConfig>, StampPair), String> {
-        let stamp = (FileStamp::of(cert), FileStamp::of(key));
-        let cert_pem = std::fs::read(cert)
-            .map_err(|error| format!("cannot read {}: {error}", cert.display()))?;
-        let key_pem = std::fs::read(key)
-            .map_err(|error| format!("cannot read {}: {error}", key.display()))?;
-        Ok((tls_config(&cert_pem, &key_pem)?, stamp))
-    }
-
-    /// The configuration to hand the next handshake.
-    fn config(&self) -> Arc<rustls::ServerConfig> {
-        Arc::clone(&self.current.lock().expect("TLS configuration").config)
-    }
-
-    /// Rebuilds the configuration when either file moved. Returns whether it was replaced.
-    fn refresh(&self) -> bool {
-        let stamp = (FileStamp::of(&self.cert), FileStamp::of(&self.key));
-        if self.current.lock().expect("TLS configuration").stamp == stamp {
-            return false;
-        }
-        match Self::build(&self.cert, &self.key) {
-            Ok((config, stamp)) => {
-                let mut current = self.current.lock().expect("TLS configuration");
-                current.config = config;
-                current.stamp = stamp;
-                true
-            }
-            Err(error) => {
-                let mut current = self.current.lock().expect("TLS configuration");
-                current.stamp = stamp;
-                eprintln!("vipera: keeping the previous certificate: {error}");
-                false
-            }
-        }
-    }
-}
-
-/// A server configuration from PEM certificate and key bytes.
-///
-/// The certificate chain comes first in the file, leaf first; the key may be PKCS#8, SEC1 or
-/// PKCS#1, because every tool writes one of the three and the tag says which.
-pub fn tls_config(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
-    let chain: Vec<rustls::pki_types::CertificateDer<'static>> = pem_blocks(cert_pem)
-        .into_iter()
-        .filter(|(tag, _)| tag.ends_with("CERTIFICATE"))
-        .map(|(_, der)| rustls::pki_types::CertificateDer::from(der))
-        .collect();
-    if chain.is_empty() {
-        return Err("no CERTIFICATE block in the certificate file".to_owned());
-    }
-    let (tag, der) = pem_blocks(key_pem)
-        .into_iter()
-        .find(|(tag, _)| tag.ends_with("PRIVATE KEY"))
-        .ok_or_else(|| "no PRIVATE KEY block in the key file".to_owned())?;
-    let key = rustls::pki_types::PrivateKeyDer::try_from(der)
-        .map_err(|error| format!("{tag} is not a key rustls accepts: {error}"))?;
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map_err(|error| format!("certificate and key do not go together: {error}"))?;
-    Ok(Arc::new(config))
-}
-
-/// The DER bytes of every PEM block, with its tag (`CERTIFICATE`, `PRIVATE KEY`, …).
-///
-/// Hand-rolled on purpose: the workspace takes one third-party crate for TLS and no base64 crate
-/// for twenty lines of decoding, and the tests below cover the padding and the line breaks.
-fn pem_blocks(pem: &[u8]) -> Vec<(String, Vec<u8>)> {
-    let text = String::from_utf8_lossy(pem);
-    let mut blocks = Vec::new();
-    let mut tag = None;
-    let mut body = String::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("-----BEGIN ") {
-            tag = Some(rest.trim_end_matches("-----").to_owned());
-            body.clear();
-        } else if line.starts_with("-----END ") {
-            if let Some(tag) = tag.take()
-                && let Some(der) = base64_decode(&body)
-            {
-                blocks.push((tag, der));
-            }
-        } else if tag.is_some() {
-            body.push_str(line);
-        }
-    }
-    blocks
-}
-
-/// Standard base64 with optional padding, ignoring anything outside the alphabet.
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for byte in text.bytes() {
-        if byte == b'=' {
-            break;
-        }
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        let value = ALPHABET.iter().position(|known| *known == byte)? as u32;
-        acc = (acc << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
 }
 
 impl Served {
@@ -763,7 +653,7 @@ impl Served {
 }
 
 /// What a handler receives from the scheduler: one token, the end of its turn, or a failure.
-enum Event {
+pub(crate) enum Event {
     Token {
         token: u32,
         logprob: Option<f32>,
@@ -779,7 +669,7 @@ enum Event {
 /// A handler takes the engine lock only to attach its sampler and queue its turn, then waits on its
 /// own channel; the scheduler batches whatever is queued into one forward pass and posts each token
 /// to the handler that owns it.
-struct Router {
+pub(crate) struct Router {
     routes: Mutex<HashMap<u64, mpsc::Sender<Event>>>,
     /// Whether a turn was queued since the scheduler last looked.
     pending: Mutex<bool>,
@@ -787,7 +677,7 @@ struct Router {
     /// Handlers waiting for the engine lock to queue a new turn. The scheduler yields the engine
     /// while this is above zero: `std::sync::Mutex` is unfair, and a scheduler that reacquires it
     /// at once can keep a new request out for a whole prompt.
-    admitting: AtomicUsize,
+    pub(crate) admitting: AtomicUsize,
 }
 
 impl Router {
@@ -801,7 +691,7 @@ impl Router {
     }
 
     /// Note that a handler is about to queue a turn, and undo it when done.
-    fn admitting(&self) -> AdmitGuard<'_> {
+    pub(crate) fn admitting(&self) -> AdmitGuard<'_> {
         self.admitting.fetch_add(1, Ordering::SeqCst);
         AdmitGuard { router: self }
     }
@@ -813,21 +703,21 @@ impl Router {
 
     /// Point `sequence`'s tokens at `sender`. Called before the turn is queued, so a step can never
     /// draw a token for a sequence nobody is listening to.
-    fn register(&self, sequence: u64, sender: mpsc::Sender<Event>) {
+    pub(crate) fn register(&self, sequence: u64, sender: mpsc::Sender<Event>) {
         if let Ok(mut routes) = self.routes.lock() {
             routes.insert(sequence, sender);
         }
     }
 
     /// Drop a route: the handler already has its generation, or the client is gone.
-    fn unregister(&self, sequence: u64) {
+    pub(crate) fn unregister(&self, sequence: u64) {
         if let Ok(mut routes) = self.routes.lock() {
             routes.remove(&sequence);
         }
     }
 
     /// Tell the scheduler that a turn was queued.
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         if let Ok(mut pending) = self.pending.lock() {
             *pending = true;
         }
@@ -888,6 +778,17 @@ impl Router {
         for (_, sender) in routes.drain() {
             let _ = sender.send(Event::Failed(message.to_owned()));
         }
+    }
+}
+
+/// Keeps the router's "a handler is waiting to queue" count honest while one does.
+pub(crate) struct AdmitGuard<'a> {
+    router: &'a Router,
+}
+
+impl Drop for AdmitGuard<'_> {
+    fn drop(&mut self) {
+        self.router.admitting.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -956,12 +857,19 @@ fn serve_connection(
     stream: &mut dyn Transport,
     peer: &str,
 ) -> std::io::Result<()> {
-    let Some(request) = read_request(stream)? else {
-        return Ok(());
-    };
     let started = Instant::now();
-    let status = route(served, stream, &request, started, peer)?;
-    let endpoint = endpoint_name(&request.path);
+    let (method, path, status) = match read_request(stream)? {
+        Incoming::Closed => return Ok(()),
+        // A refusal is a response too. Without this arm a body that was too large, or a header
+        // block that never ended, would be answered and then leave no trace in the log or on
+        // `/metrics`, which is exactly what an operator needs when the server is being flooded.
+        Incoming::Rejected { status } => (String::new(), String::new(), status),
+        Incoming::Request(request) => {
+            let status = route(served, stream, &request, started, peer)?;
+            (request.method, request.path, status)
+        }
+    };
+    let endpoint = endpoint_name(&path);
     if let Ok(mut metrics) = served.metrics.lock() {
         metrics.record(endpoint, status, started.elapsed().as_secs_f64());
     }
@@ -971,8 +879,8 @@ fn serve_connection(
         eprintln!(
             "{{\"event\":\"request\",\"peer\":{},\"method\":{},\"path\":{},\"status\":{status},\"micros\":{}}}",
             quote(peer),
-            quote(&request.method),
-            quote(&request.path),
+            quote(&method),
+            quote(&path),
             started.elapsed().as_micros()
         );
     }
@@ -993,14 +901,6 @@ fn access_log_enabled_for(value: Option<&str>) -> bool {
         !matches!(value.as_str(), "0" | "false" | "off" | "no")
     })
 }
-
-/// Headers that let a page call the server directly.
-///
-/// Authentication is a bearer header rather than a cookie, so a wildcard origin does not expose
-/// credentials; `authorization` stays an allowed request header.
-const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
-    Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-    Access-Control-Allow-Headers: authorization, content-type\r\n";
 
 fn route(
     served: &Served,
@@ -1096,1547 +996,8 @@ fn endpoint_name(path: &str) -> &'static str {
     }
 }
 
-fn chat(
-    served: &Served,
-    stream: &mut dyn Transport,
-    request: &Request,
-    started: Instant,
-) -> std::io::Result<u16> {
-    let body = match std::str::from_utf8(&request.body) {
-        Ok(text) => text,
-        Err(_) => {
-            respond_error(stream, 400, "invalid_request", "body is not UTF-8")?;
-            return Ok(400);
-        }
-    };
-    let parsed = match Json::parse(body) {
-        Ok(value) => value,
-        Err(error) => {
-            respond_error(stream, 400, "invalid_request", &error)?;
-            return Ok(400);
-        }
-    };
-    if let Some(model) = parsed.get("model").and_then(Json::as_str)
-        && model != served.model
-    {
-        respond_error(
-            stream,
-            404,
-            "model_not_found",
-            &format!("no model named {model:?}"),
-        )?;
-        return Ok(404);
-    }
-
-    let messages = match messages_of(&parsed) {
-        Ok(messages) => messages,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    let streaming = parsed
-        .get("stream")
-        .and_then(Json::as_bool)
-        .unwrap_or(false);
-    let include_usage = include_usage_of(&parsed);
-
-    let ids = match served.tokenizer.encode_chat(&messages, true) {
-        Ok(ids) => ids,
-        Err(error) => {
-            respond_error(stream, 500, "internal_error", &error.to_string())?;
-            return Ok(500);
-        }
-    };
-    if ids.len() >= served.context_length {
-        respond_error(
-            stream,
-            422,
-            "context_too_long",
-            &format!(
-                "prompt is {} tokens but the context holds {}",
-                ids.len(),
-                served.context_length
-            ),
-        )?;
-        return Ok(422);
-    }
-
-    let remaining = (served.context_length - ids.len()) as u32;
-    let requested = parsed
-        .get("max_tokens")
-        .and_then(Json::as_u32)
-        .unwrap_or(256)
-        .max(1);
-    let max_tokens = requested.min(remaining);
-    let sampler = match sampler_of(&parsed) {
-        Ok(sampler) => sampler,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    let stops = match stop_sequences_of(&parsed) {
-        Ok(stops) => stops,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    let json_mode = match json_mode_of(&parsed) {
-        Ok(mode) => mode,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    if json_mode && streaming {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "response_format json_object needs stream: false",
-        )?;
-        return Ok(400);
-    }
-    let wants_logprobs = parsed
-        .get("logprobs")
-        .and_then(Json::as_bool)
-        .unwrap_or(false);
-    let top_n = parsed
-        .get("top_logprobs")
-        .and_then(Json::as_u32)
-        .unwrap_or(0) as usize;
-    if top_n > 5 {
-        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
-        return Ok(400);
-    }
-    if top_n > 0 && !wants_logprobs {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "top_logprobs needs logprobs: true",
-        )?;
-        return Ok(400);
-    }
-    let id = format!("chatcmpl-{}", request_id());
-    let created = now_seconds();
-    let n = match choices_of(&parsed) {
-        Ok(n) => n,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    if streaming && n > 1 {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "n greater than 1 needs stream: false",
-        )?;
-        return Ok(400);
-    }
-    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
-    {
-        Ok(turns) => turns,
-        Err((status, code, message)) => {
-            respond_error(stream, status, code, &message)?;
-            return Ok(status);
-        }
-    };
-
-    if streaming {
-        let (sequence, receiver) = turns.remove(0);
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{CORS_HEADERS}\
-             Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
-        )?;
-        let mut seen: Vec<u32> = Vec::new();
-        let mut shown = String::new();
-        let mut first = true;
-        let mut disconnected = false;
-        let mut stopped = false;
-        let mut finished: Option<Generation> = None;
-        let mut failure: Option<String> = None;
-        for event in receiver {
-            let (token, logprob, top) = match event {
-                Event::Token {
-                    token,
-                    logprob,
-                    top_logprobs,
-                } => (token, logprob, top_logprobs),
-                Event::Finished(generation) => {
-                    finished = Some(*generation);
-                    break;
-                }
-                Event::Failed(message) => {
-                    failure = Some(message);
-                    break;
-                }
-            };
-            seen.push(token);
-            let Ok(text) = served.tokenizer.decode(&seen) else {
-                continue;
-            };
-            if !text.starts_with(shown.as_str()) {
-                continue;
-            }
-            // A stop sequence may arrive across token boundaries, so search the text decoded so far
-            // and emit only what precedes it. The held-back tail is what keeps a stop from leaking
-            // out one token at a time.
-            let stop_at = stops.iter().filter_map(|stop| text.find(stop)).min();
-            let cut = match stop_at {
-                Some(at) => {
-                    stopped = true;
-                    at
-                }
-                None => emit_boundary(&text, shown.len(), &stops, false),
-            };
-            if cut > shown.len() {
-                let delta = &text[shown.len()..cut];
-                let entry = logprob
-                    .map(|logprob| stream_logprob_json(&served.tokenizer, delta, logprob, &top));
-                let frame = chunk(
-                    &id,
-                    created,
-                    &served.model,
-                    Some(delta),
-                    None,
-                    entry.as_deref(),
-                );
-                if sse(stream, &frame).is_err() {
-                    // The client is gone: stop the turn instead of generating into a dead socket.
-                    disconnected = true;
-                    break;
-                }
-                if first {
-                    first = false;
-                    if let Ok(mut metrics) = served.metrics.lock() {
-                        metrics.time_to_first_token(started.elapsed().as_secs_f64());
-                    }
-                }
-                shown.push_str(delta);
-                if let Ok(mut metrics) = served.metrics.lock() {
-                    metrics.tokens_generated(1);
-                }
-            }
-            if stopped {
-                break;
-            }
-        }
-        if (disconnected || stopped)
-            && let Ok(mut engine) = served.engine.lock()
-        {
-            let _ = engine.cancel(sequence);
-        }
-        served.router.unregister(sequence);
-        if let Ok(mut engine) = served.engine.lock() {
-            let _ = engine.release(sequence);
-        }
-        if disconnected {
-            let _ = stream.flush();
-            return Ok(200);
-        }
-        if let Some(message) = failure {
-            let _ = sse(stream, &format!(r#"{{"error":{}}}"#, quote(&message)));
-            let _ = sse(stream, "[DONE]");
-            let _ = stream.flush();
-            return Ok(200);
-        }
-        if stopped {
-            let frame = chunk(&id, created, &served.model, None, Some("stop"), None);
-            let _ = sse(stream, &frame);
-            if include_usage {
-                let usage = usage_chunk(
-                    &id,
-                    created,
-                    &served.model,
-                    "chat.completion.chunk",
-                    ids.len(),
-                    seen.len(),
-                );
-                let _ = sse(stream, &usage);
-            }
-            let _ = sse(stream, "[DONE]");
-            let _ = stream.flush();
-            return Ok(200);
-        }
-        let Some(finished) = finished else {
-            let _ = stream.flush();
-            return Ok(200);
-        };
-        // Anything held back because it was not a complete string yet.
-        if let Ok(text) = served.tokenizer.decode(&finished.tokens)
-            && text.starts_with(shown.as_str())
-            && text.len() > shown.len()
-        {
-            let _ = sse(
-                stream,
-                &chunk(
-                    &id,
-                    created,
-                    &served.model,
-                    Some(&text[shown.len()..]),
-                    None,
-                    None,
-                ),
-            );
-        }
-        let reason = finish_reason(&finished.finish);
-        let final_frame = chunk(&id, created, &served.model, None, Some(reason), None);
-        let _ = sse(stream, &final_frame);
-        if include_usage {
-            let usage = usage_chunk(
-                &id,
-                created,
-                &served.model,
-                "chat.completion.chunk",
-                ids.len(),
-                finished.tokens.len(),
-            );
-            let _ = sse(stream, &usage);
-        }
-        let _ = sse(stream, "[DONE]");
-        let _ = stream.flush();
-        return Ok(200);
-    }
-
-    let prompt_tokens = ids.len();
-    let mut completion_tokens = 0usize;
-    let mut index = 0usize;
-    let mut choices = String::new();
-    while !turns.is_empty() {
-        let (sequence, receiver) = turns.remove(0);
-        let mut finished: Option<Generation> = None;
-        let mut failure: Option<String> = None;
-        for event in receiver {
-            match event {
-                // A non-streaming caller only needs the generation; the tokens are in it.
-                Event::Token { .. } => {}
-                Event::Finished(generation) => {
-                    finished = Some(*generation);
-                    break;
-                }
-                Event::Failed(message) => {
-                    failure = Some(message);
-                    break;
-                }
-            }
-        }
-        release_sequence(served, sequence);
-        if let Some(message) = failure {
-            for (sequence, _) in turns.drain(..) {
-                release_sequence(served, sequence);
-            }
-            respond_error(stream, 500, "internal_error", &message)?;
-            return Ok(500);
-        }
-        let Some(generation) = finished else {
-            for (sequence, _) in turns.drain(..) {
-                release_sequence(served, sequence);
-            }
-            respond_error(
-                stream,
-                500,
-                "internal_error",
-                "the turn ended without a generation",
-            )?;
-            return Ok(500);
-        };
-        let text = served
-            .tokenizer
-            .decode(&generation.tokens)
-            .unwrap_or_default();
-        let (text, stopped) = without_stop(&text, &stops);
-        if json_mode && !is_json_object(text) {
-            for (sequence, _) in turns.drain(..) {
-                release_sequence(served, sequence);
-            }
-            respond_error(
-                stream,
-                422,
-                "invalid_json_output",
-                "model output is not a valid JSON object",
-            )?;
-            return Ok(422);
-        }
-        let reason = if stopped {
-            "stop"
-        } else {
-            finish_reason(&generation.finish)
-        };
-        completion_tokens += generation.tokens.len();
-        let choice_logprobs = if wants_logprobs {
-            logprobs_json(
-                &served.tokenizer,
-                &generation.tokens,
-                &generation.logprobs,
-                &generation.top_logprobs,
-                text,
-            )
-        } else {
-            "null".to_owned()
-        };
-        if !choices.is_empty() {
-            choices.push(',');
-        }
-        choices.push_str(&format!(
-            r#"{{"index":{},"message":{{"role":"assistant","content":{}}},"logprobs":{choice_logprobs},"finish_reason":{}}}"#,
-            index,
-            quote(text),
-            quote(reason)
-        ));
-        index += 1;
-    }
-    let body = format!(
-        r#"{{"id":{},"object":"chat.completion","created":{created},"model":{},"choices":[{choices}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
-        quote(&id),
-        quote(&served.model),
-        prompt_tokens + completion_tokens
-    );
-    respond(stream, 200, "OK", "application/json", &body)?;
-    if let Ok(mut metrics) = served.metrics.lock() {
-        metrics.tokens_generated(completion_tokens as u64);
-    }
-    Ok(200)
-}
-
-/// `POST /v1/completions`: the legacy text endpoint, with the same sampling, stop and streaming
-/// behaviour as chat.
-fn completions(
-    served: &Served,
-    stream: &mut dyn Transport,
-    request: &Request,
-    started: Instant,
-) -> std::io::Result<u16> {
-    let body = match std::str::from_utf8(&request.body) {
-        Ok(text) => text,
-        Err(_) => {
-            respond_error(stream, 400, "invalid_request", "body is not UTF-8")?;
-            return Ok(400);
-        }
-    };
-    let parsed = match Json::parse(body) {
-        Ok(value) => value,
-        Err(error) => {
-            respond_error(stream, 400, "invalid_request", &error)?;
-            return Ok(400);
-        }
-    };
-    if let Some(model) = parsed.get("model").and_then(Json::as_str)
-        && model != served.model
-    {
-        respond_error(
-            stream,
-            404,
-            "model_not_found",
-            &format!("no model named {model:?}"),
-        )?;
-        return Ok(404);
-    }
-    let Some(prompt) = parsed.get("prompt").and_then(Json::as_str) else {
-        respond_error(stream, 400, "invalid_request", "prompt must be a string")?;
-        return Ok(400);
-    };
-    let ids = match served.tokenizer.encode(prompt) {
-        Ok(ids) => ids,
-        Err(error) => {
-            respond_error(stream, 500, "internal_error", &error.to_string())?;
-            return Ok(500);
-        }
-    };
-    if ids.is_empty() {
-        respond_error(stream, 400, "invalid_request", "prompt must not be empty")?;
-        return Ok(400);
-    }
-    if ids.len() >= served.context_length {
-        respond_error(
-            stream,
-            422,
-            "context_too_long",
-            &format!(
-                "prompt is {} tokens but the context holds {}",
-                ids.len(),
-                served.context_length
-            ),
-        )?;
-        return Ok(422);
-    }
-
-    let remaining = (served.context_length - ids.len()) as u32;
-    let requested = parsed
-        .get("max_tokens")
-        .and_then(Json::as_u32)
-        .unwrap_or(256)
-        .max(1);
-    let max_tokens = requested.min(remaining);
-    let sampler = match sampler_of(&parsed) {
-        Ok(sampler) => sampler,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    let stops = match stop_sequences_of(&parsed) {
-        Ok(stops) => stops,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    let streaming = parsed
-        .get("stream")
-        .and_then(Json::as_bool)
-        .unwrap_or(false);
-    let include_usage = include_usage_of(&parsed);
-    let json_mode = match json_mode_of(&parsed) {
-        Ok(mode) => mode,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    if json_mode && streaming {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "response_format json_object needs stream: false",
-        )?;
-        return Ok(400);
-    }
-    let wants_logprobs = parsed
-        .get("logprobs")
-        .and_then(Json::as_bool)
-        .unwrap_or(false);
-    let top_n = parsed
-        .get("top_logprobs")
-        .and_then(Json::as_u32)
-        .unwrap_or(0) as usize;
-    if top_n > 5 {
-        respond_error(stream, 400, "invalid_request", "top_logprobs is at most 5")?;
-        return Ok(400);
-    }
-    if top_n > 0 && !wants_logprobs {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "top_logprobs needs logprobs: true",
-        )?;
-        return Ok(400);
-    }
-    if wants_logprobs && streaming {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "logprobs needs stream: false",
-        )?;
-        return Ok(400);
-    }
-
-    let id = format!("cmpl-{}", request_id());
-    let created = now_seconds();
-    let n = match choices_of(&parsed) {
-        Ok(n) => n,
-        Err(message) => {
-            respond_error(stream, 400, "invalid_request", &message)?;
-            return Ok(400);
-        }
-    };
-    if streaming && n > 1 {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "n greater than 1 needs stream: false",
-        )?;
-        return Ok(400);
-    }
-    let mut turns = match attach_turns(served, &ids, max_tokens, sampler, n, wants_logprobs, top_n)
-    {
-        Ok(turns) => turns,
-        Err((status, code, message)) => {
-            respond_error(stream, status, code, &message)?;
-            return Ok(status);
-        }
-    };
-
-    if streaming {
-        let (sequence, receiver) = turns.remove(0);
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-             Connection: close\r\n\r\n"
-        )?;
-        let mut seen: Vec<u32> = Vec::new();
-        let mut shown = String::new();
-        let mut first = true;
-        let mut disconnected = false;
-        let mut stopped = false;
-        let mut finished: Option<Generation> = None;
-        let mut failure: Option<String> = None;
-        for event in receiver {
-            let (token, _, _) = match event {
-                Event::Token {
-                    token,
-                    logprob,
-                    top_logprobs,
-                } => (token, logprob, top_logprobs),
-                Event::Finished(generation) => {
-                    finished = Some(*generation);
-                    break;
-                }
-                Event::Failed(message) => {
-                    failure = Some(message);
-                    break;
-                }
-            };
-            seen.push(token);
-            let Ok(text) = served.tokenizer.decode(&seen) else {
-                continue;
-            };
-            if !text.starts_with(shown.as_str()) {
-                continue;
-            }
-            let stop_at = stops.iter().filter_map(|stop| text.find(stop)).min();
-            let cut = match stop_at {
-                Some(at) => {
-                    stopped = true;
-                    at
-                }
-                None => emit_boundary(&text, shown.len(), &stops, false),
-            };
-            if cut > shown.len() {
-                let delta = &text[shown.len()..cut];
-                let frame = completion_chunk(&id, created, &served.model, Some(delta), None);
-                if sse(stream, &frame).is_err() {
-                    disconnected = true;
-                    break;
-                }
-                if first {
-                    first = false;
-                    if let Ok(mut metrics) = served.metrics.lock() {
-                        metrics.time_to_first_token(started.elapsed().as_secs_f64());
-                    }
-                }
-                shown.push_str(delta);
-                if let Ok(mut metrics) = served.metrics.lock() {
-                    metrics.tokens_generated(1);
-                }
-            }
-            if stopped {
-                break;
-            }
-        }
-        if (disconnected || stopped)
-            && let Ok(mut engine) = served.engine.lock()
-        {
-            let _ = engine.cancel(sequence);
-        }
-        served.router.unregister(sequence);
-        if let Ok(mut engine) = served.engine.lock() {
-            let _ = engine.release(sequence);
-        }
-        if disconnected {
-            let _ = stream.flush();
-            return Ok(200);
-        }
-        if let Some(message) = failure {
-            let _ = sse(stream, &format!(r#"{{"error":{}}}"#, quote(&message)));
-            let _ = sse(stream, "[DONE]");
-            let _ = stream.flush();
-            return Ok(200);
-        }
-        if stopped {
-            let frame = completion_chunk(&id, created, &served.model, None, Some("stop"));
-            let _ = sse(stream, &frame);
-            if include_usage {
-                let usage = usage_chunk(
-                    &id,
-                    created,
-                    &served.model,
-                    "text_completion",
-                    ids.len(),
-                    seen.len(),
-                );
-                let _ = sse(stream, &usage);
-            }
-            let _ = sse(stream, "[DONE]");
-            let _ = stream.flush();
-            return Ok(200);
-        }
-        let Some(finished) = finished else {
-            let _ = stream.flush();
-            return Ok(200);
-        };
-        if let Ok(text) = served.tokenizer.decode(&finished.tokens)
-            && text.starts_with(shown.as_str())
-            && text.len() > shown.len()
-        {
-            let _ = sse(
-                stream,
-                &completion_chunk(
-                    &id,
-                    created,
-                    &served.model,
-                    Some(&text[shown.len()..]),
-                    None,
-                ),
-            );
-        }
-        let reason = finish_reason(&finished.finish);
-        let frame = completion_chunk(&id, created, &served.model, None, Some(reason));
-        let _ = sse(stream, &frame);
-        if include_usage {
-            let usage = usage_chunk(
-                &id,
-                created,
-                &served.model,
-                "text_completion",
-                ids.len(),
-                finished.tokens.len(),
-            );
-            let _ = sse(stream, &usage);
-        }
-        let _ = sse(stream, "[DONE]");
-        let _ = stream.flush();
-        return Ok(200);
-    }
-
-    let prompt_tokens = ids.len();
-    let mut completion_tokens = 0usize;
-    let mut index = 0usize;
-    let mut choices = String::new();
-    while !turns.is_empty() {
-        let (sequence, receiver) = turns.remove(0);
-        let mut finished: Option<Generation> = None;
-        let mut failure: Option<String> = None;
-        for event in receiver {
-            match event {
-                Event::Token { .. } => {}
-                Event::Finished(generation) => {
-                    finished = Some(*generation);
-                    break;
-                }
-                Event::Failed(message) => {
-                    failure = Some(message);
-                    break;
-                }
-            }
-        }
-        release_sequence(served, sequence);
-        if let Some(message) = failure {
-            for (sequence, _) in turns.drain(..) {
-                release_sequence(served, sequence);
-            }
-            respond_error(stream, 500, "internal_error", &message)?;
-            return Ok(500);
-        }
-        let Some(generation) = finished else {
-            for (sequence, _) in turns.drain(..) {
-                release_sequence(served, sequence);
-            }
-            respond_error(
-                stream,
-                500,
-                "internal_error",
-                "the turn ended without a generation",
-            )?;
-            return Ok(500);
-        };
-        let text = served
-            .tokenizer
-            .decode(&generation.tokens)
-            .unwrap_or_default();
-        let (text, stopped) = without_stop(&text, &stops);
-        if json_mode && !is_json_object(text) {
-            for (sequence, _) in turns.drain(..) {
-                release_sequence(served, sequence);
-            }
-            respond_error(
-                stream,
-                422,
-                "invalid_json_output",
-                "model output is not a valid JSON object",
-            )?;
-            return Ok(422);
-        }
-        let reason = if stopped {
-            "stop"
-        } else {
-            finish_reason(&generation.finish)
-        };
-        completion_tokens += generation.tokens.len();
-        let choice_logprobs = if wants_logprobs {
-            logprobs_json(
-                &served.tokenizer,
-                &generation.tokens,
-                &generation.logprobs,
-                &generation.top_logprobs,
-                text,
-            )
-        } else {
-            "null".to_owned()
-        };
-        if !choices.is_empty() {
-            choices.push(',');
-        }
-        choices.push_str(&format!(
-            r#"{{"text":{},"index":{},"logprobs":{choice_logprobs},"finish_reason":{}}}"#,
-            quote(text),
-            index,
-            quote(reason)
-        ));
-        index += 1;
-    }
-    let body = format!(
-        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{choices}],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
-        quote(&id),
-        quote(&served.model),
-        prompt_tokens + completion_tokens
-    );
-    respond(stream, 200, "OK", "application/json", &body)?;
-    if let Ok(mut metrics) = served.metrics.lock() {
-        metrics.tokens_generated(completion_tokens as u64);
-    }
-    Ok(200)
-}
-
-fn messages_of(request: &Json) -> Result<Vec<ChatMessage>, String> {
-    let items = request
-        .get("messages")
-        .and_then(Json::as_array)
-        .ok_or_else(|| "messages must be an array".to_owned())?;
-    if items.is_empty() {
-        return Err("messages must not be empty".to_owned());
-    }
-    let mut messages = Vec::with_capacity(items.len());
-    for item in items {
-        let role = item
-            .get("role")
-            .and_then(Json::as_str)
-            .ok_or_else(|| "every message needs a role".to_owned())?;
-        let content = match item.get("content") {
-            Some(Json::String(text)) => text.clone(),
-            Some(Json::Array(parts)) => {
-                let mut joined = String::new();
-                for part in parts {
-                    if let Some(text) = part.get("text").and_then(Json::as_str) {
-                        joined.push_str(text);
-                    }
-                }
-                joined
-            }
-            _ => return Err("every message needs string content".to_owned()),
-        };
-        messages.push(match role {
-            "system" => ChatMessage::system(content),
-            "user" => ChatMessage::user(content),
-            "assistant" => ChatMessage::assistant(content),
-            other => return Err(format!("unsupported role {other:?}")),
-        });
-    }
-    Ok(messages)
-}
-
-/// Sampling knobs from the request. Unknown or out-of-range values fall back to the defaults;
-/// malformed `logit_bias` is an error because silently dropping a ban changes what is generated.
-/// Whether the request asks for JSON-only output.
-///
-/// Only `text` and `json_object` are understood; anything else is rejected rather than silently
-/// treated as plain text.
-fn json_mode_of(request: &Json) -> Result<bool, String> {
-    let Some(format) = request.get("response_format") else {
-        return Ok(false);
-    };
-    let kind = format.get("type").and_then(Json::as_str).unwrap_or("text");
-    match kind {
-        "text" => Ok(false),
-        "json_object" => Ok(true),
-        other => Err(format!("response_format type {other:?} is not supported")),
-    }
-}
-
-/// A JSON-mode reply must be one complete object, not just any JSON value.
-fn is_json_object(text: &str) -> bool {
-    matches!(Json::parse(text), Ok(Json::Object(_)))
-}
-
-fn sampler_of(request: &Json) -> Result<SamplerConfig, String> {
-    let mut sampler = SamplerConfig::default();
-    if let Some(value) = request.get("temperature").and_then(Json::as_f64) {
-        sampler.temperature = value.clamp(0.0, 2.0) as f32;
-    }
-    if let Some(value) = request.get("top_p").and_then(Json::as_f64)
-        && value > 0.0
-    {
-        sampler.top_p = (value.clamp(f32::MIN_POSITIVE as f64, 1.0)) as f32;
-    }
-    if let Some(value) = request.get("top_k").and_then(Json::as_u32) {
-        sampler.top_k = value as usize;
-    }
-    if let Some(value) = request.get("min_p").and_then(Json::as_f64) {
-        sampler.min_p = (value.clamp(0.0, 0.999_999)) as f32;
-    }
-    if let Some(value) = request.get("seed").and_then(Json::as_u32) {
-        sampler.seed = u64::from(value);
-    }
-    if let Some(value) = request.get("repetition_penalty").and_then(Json::as_f64)
-        && value > 0.0
-        && value.is_finite()
-    {
-        sampler.repetition_penalty = value as f32;
-    }
-    for (key, target) in [
-        ("presence_penalty", &mut sampler.presence_penalty),
-        ("frequency_penalty", &mut sampler.frequency_penalty),
-    ] {
-        if let Some(value) = request.get(key).and_then(Json::as_f64)
-            && value.is_finite()
-        {
-            *target = value.clamp(-2.0, 2.0) as f32;
-        }
-    }
-    if let Some(value) = request.get("logit_bias") {
-        let Json::Object(entries) = value else {
-            return Err("logit_bias must be an object mapping token ids to numbers".to_owned());
-        };
-        if entries.len() > MAX_LOGIT_BIAS {
-            return Err(format!(
-                "logit_bias accepts at most {MAX_LOGIT_BIAS} entries"
-            ));
-        }
-        for (slot, (key, value)) in entries.iter().enumerate() {
-            let id = key
-                .parse::<u32>()
-                .map_err(|_| format!("logit_bias key {key:?} is not a token id"))?;
-            let bias = value
-                .as_f64()
-                .ok_or_else(|| format!("logit_bias for {key:?} must be a number"))?;
-            if !bias.is_finite() {
-                return Err(format!("logit_bias for {key:?} must be finite"));
-            }
-            sampler.logit_bias[slot] = Some((id, bias.clamp(-100.0, 100.0) as f32));
-        }
-    }
-    Ok(sampler)
-}
-
-/// Stop sequences from a request: one string or an array of up to four, as OpenAI defines them.
-fn stop_sequences_of(request: &Json) -> Result<Vec<String>, String> {
-    let Some(value) = request.get("stop") else {
-        return Ok(Vec::new());
-    };
-    let mut stops = Vec::new();
-    match value {
-        Json::String(text) => {
-            if !text.is_empty() {
-                stops.push(text.clone());
-            }
-        }
-        Json::Array(items) => {
-            if items.len() > MAX_STOP_SEQUENCES {
-                return Err(format!("stop accepts at most {MAX_STOP_SEQUENCES} strings"));
-            }
-            for item in items {
-                match item {
-                    Json::String(text) if !text.is_empty() => stops.push(text.clone()),
-                    _ => return Err("stop must be a string or an array of strings".to_owned()),
-                }
-            }
-        }
-        _ => return Err("stop must be a string or an array of strings".to_owned()),
-    }
-    Ok(stops)
-}
-
-/// Generated text up to the earliest stop sequence, and whether one was found.
-fn without_stop<'a>(text: &'a str, stops: &[String]) -> (&'a str, bool) {
-    match stops.iter().filter_map(|stop| text.find(stop)).min() {
-        Some(at) => (&text[..at], true),
-        None => (text, false),
-    }
-}
-
-/// How much of `text` may be emitted without cutting a stop sequence in half.
-///
-/// Until the turn finishes, the last `longest stop - 1` bytes are held back: a stop sequence can
-/// arrive across token boundaries, so text that looks safe now may become its prefix next token.
-fn emit_boundary(text: &str, shown: usize, stops: &[String], finished: bool) -> usize {
-    if finished {
-        return text.len();
-    }
-    let hold = stops
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or(0)
-        .saturating_sub(1);
-    let mut cut = text.len().saturating_sub(hold).max(shown);
-    while cut > shown && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    cut
-}
-
-/// Attach a turn to the engine and return the receiver its tokens arrive on.
-/// A queued turn: its sequence id and the channel its tokens arrive on.
-type QueuedTurn = (u64, mpsc::Receiver<Event>);
-
-/// Release one turn's blocks and drop its route.
-fn release_sequence(served: &Served, sequence: u64) {
-    served.router.unregister(sequence);
-    if let Ok(mut engine) = served.engine.lock() {
-        let _ = engine.release(sequence);
-    }
-}
-
-/// Attach `n` turns for one request, releasing the ones already queued if a later admit fails.
-fn attach_turns(
-    served: &Served,
-    ids: &[u32],
-    max_tokens: u32,
-    sampler: SamplerConfig,
-    n: usize,
-    logprobs: bool,
-    top_n: usize,
-) -> Result<Vec<QueuedTurn>, (u16, &'static str, String)> {
-    let mut turns = Vec::with_capacity(n);
-    for choice in 0..n {
-        match attach_turn(
-            served,
-            ids,
-            max_tokens,
-            seed_for_choice(sampler, choice),
-            logprobs,
-            top_n,
-        ) {
-            Ok(turn) => turns.push(turn),
-            Err(error) => {
-                for (sequence, _) in turns.drain(..) {
-                    release_sequence(served, sequence);
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(turns)
-}
-
-/// Give each of the `n` choices its own seed.
-///
-/// Every turn restarts its sampler from the same configuration, so sharing the seed would make
-/// every choice draw the same tokens. The first choice keeps the requested seed, which keeps a
-/// single-choice request reproducible.
-fn seed_for_choice(mut sampler: SamplerConfig, choice: usize) -> SamplerConfig {
-    sampler.seed = sampler.seed.wrapping_add(choice as u64);
-    sampler
-}
-
-fn attach_turn(
-    served: &Served,
-    ids: &[u32],
-    max_tokens: u32,
-    sampler: SamplerConfig,
-    logprobs: bool,
-    top_n: usize,
-) -> Result<QueuedTurn, (u16, &'static str, String)> {
-    let (sender, receiver) = mpsc::channel();
-    let _admitting = served.router.admitting();
-    let sequence = {
-        // The lock is held only long enough to attach this request's sampler and queue its turn. The
-        // scheduler does the work, so other requests can join the same forward pass instead of
-        // queueing behind this one.
-        let mut engine = served
-            .engine
-            .lock()
-            .map_err(|_| (500, "internal_error", "engine lock was poisoned".to_owned()))?;
-        engine.set_sampler(sampler);
-        let sequence = engine.admit(ids, max_tokens).map_err(|error| {
-            let (status, code) = map_engine_error(&error);
-            (status, code, error.to_string())
-        })?;
-        engine.set_logprobs(sequence, logprobs).map_err(|error| {
-            let (status, code) = map_engine_error(&error);
-            (status, code, error.to_string())
-        })?;
-        engine.set_top_logprobs(sequence, top_n).map_err(|error| {
-            let (status, code) = map_engine_error(&error);
-            (status, code, error.to_string())
-        })?;
-        // The route goes in before the turn is queued: a step that starts the moment after
-        // `enqueue` must already have somewhere to send the first token.
-        served.router.register(sequence, sender);
-        if let Err(error) = engine.enqueue(sequence) {
-            served.router.unregister(sequence);
-            let _ = engine.release(sequence);
-            let (status, code) = map_engine_error(&error);
-            return Err((status, code, error.to_string()));
-        }
-        sequence
-    };
-    served.router.wake();
-    Ok((sequence, receiver))
-}
-
-/// Keeps the router's admit count honest on every path out of [`attach_turn`].
-struct AdmitGuard<'a> {
-    router: &'a Router,
-}
-
-impl Drop for AdmitGuard<'_> {
-    fn drop(&mut self) {
-        self.router.admitting.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// Whether the caller asked for the final usage chunk on a stream.
-fn include_usage_of(request: &Json) -> bool {
-    request
-        .get("stream_options")
-        .and_then(|options| options.get("include_usage"))
-        .and_then(Json::as_bool)
-        .unwrap_or(false)
-}
-
-/// `n` from the request, clamped to what one batch can hold.
-fn choices_of(request: &Json) -> Result<usize, String> {
-    let n = request.get("n").and_then(Json::as_u32).unwrap_or(1);
-    if n == 0 {
-        return Err("n must be at least 1".to_owned());
-    }
-    if n as usize > MAX_CHOICES {
-        return Err(format!("n is at most {MAX_CHOICES} on this server"));
-    }
-    Ok(n as usize)
-}
-
-fn finish_reason(finish: &vipera_runtime::FinishReason) -> &'static str {
-    match finish {
-        vipera_runtime::FinishReason::EndOfSequence => "stop",
-        vipera_runtime::FinishReason::Length => "length",
-        vipera_runtime::FinishReason::Cancelled => "cancelled",
-        vipera_runtime::FinishReason::Error => "error",
-    }
-}
-
-fn map_engine_error(error: &ViperaError) -> (u16, &'static str) {
-    match error.exit_code() {
-        2 => (400, "invalid_request"),
-        3 => (422, "context_too_long"),
-        _ => (500, "internal_error"),
-    }
-}
-
-fn chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    content: Option<&str>,
-    finish: Option<&str>,
-    logprob: Option<&str>,
-) -> String {
-    let delta = match content {
-        Some(text) => format!(r#"{{"role":"assistant","content":{}}}"#, quote(text)),
-        None => "{}".to_owned(),
-    };
-    let reason = match finish {
-        Some(reason) => quote(reason),
-        None => "null".to_owned(),
-    };
-    let logprobs = match logprob {
-        Some(entry) => format!(r#"{{"content":[{entry}]}}"#),
-        None => "null".to_owned(),
-    };
-    format!(
-        r#"{{"id":{},"object":"chat.completion.chunk","created":{created},"model":{},"choices":[{{"index":0,"delta":{delta},"logprobs":{logprobs},"finish_reason":{reason}}}]}}"#,
-        quote(id),
-        quote(model)
-    )
-}
-
-/// One streaming token's logprob entry, shaped like an entry of the non-streaming array.
-fn stream_logprob_json(
-    tokenizer: &Tokenizer,
-    delta: &str,
-    logprob: f32,
-    top: &[(u32, f32)],
-) -> String {
-    let mut alternatives = String::new();
-    for (id, probability) in top {
-        let Ok(token_text) = tokenizer.decode(&[*id]) else {
-            continue;
-        };
-        if !alternatives.is_empty() {
-            alternatives.push(',');
-        }
-        alternatives.push_str(&format!(
-            r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
-            quote(&token_text)
-        ));
-    }
-    format!(
-        r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
-        quote(delta)
-    )
-}
-
-/// OpenAI's `logprobs.content`: one entry per generated token, decoding each token as the delta
-/// from the text shown so far. Entries stop before any text past `visible`, so a stop sequence is
-/// not reported as a generated token.
-fn logprobs_json(
-    tokenizer: &Tokenizer,
-    tokens: &[u32],
-    logprobs: &[f32],
-    top: &[Vec<(u32, f32)>],
-    visible: &str,
-) -> String {
-    let mut entries = String::new();
-    let mut shown = String::new();
-    for (index, _) in tokens.iter().enumerate() {
-        let Ok(text) = tokenizer.decode(&tokens[..=index]) else {
-            continue;
-        };
-        if text.len() > visible.len() || !text.starts_with(shown.as_str()) {
-            break;
-        }
-        let delta = &text[shown.len()..];
-        let logprob = logprobs.get(index).copied().unwrap_or(f32::NAN);
-        let logprob = if logprob.is_finite() {
-            format!("{logprob}")
-        } else {
-            "null".to_owned()
-        };
-        let mut alternatives = String::new();
-        for (id, probability) in top.get(index).map(Vec::as_slice).unwrap_or(&[]) {
-            let Ok(token_text) = tokenizer.decode(&[*id]) else {
-                continue;
-            };
-            let probability = if probability.is_finite() {
-                format!("{probability}")
-            } else {
-                "null".to_owned()
-            };
-            if !alternatives.is_empty() {
-                alternatives.push(',');
-            }
-            alternatives.push_str(&format!(
-                r#"{{"token":{},"logprob":{probability},"bytes":null}}"#,
-                quote(&token_text)
-            ));
-        }
-        if !entries.is_empty() {
-            entries.push(',');
-        }
-        entries.push_str(&format!(
-            r#"{{"token":{},"logprob":{logprob},"bytes":null,"top_logprobs":[{alternatives}]}}"#,
-            quote(delta)
-        ));
-        shown = text;
-    }
-    format!(r#"{{"content":[{entries}]}}"#)
-}
-
-/// The extra chunk OpenAI clients expect when `stream_options.include_usage` is set: no choices,
-/// just the token counts for the whole stream.
-fn usage_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    object: &str,
-    prompt_tokens: usize,
-    completion_tokens: usize,
-) -> String {
-    format!(
-        r#"{{"id":{},"object":{},"created":{created},"model":{},"choices":[],"usage":{{"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},"total_tokens":{}}}}}"#,
-        quote(id),
-        quote(object),
-        quote(model),
-        prompt_tokens + completion_tokens
-    )
-}
-
-fn completion_chunk(
-    id: &str,
-    created: u64,
-    model: &str,
-    content: Option<&str>,
-    finish: Option<&str>,
-) -> String {
-    let text = match content {
-        Some(text) => quote(text),
-        None => quote(""),
-    };
-    let reason = match finish {
-        Some(reason) => quote(reason),
-        None => "null".to_owned(),
-    };
-    format!(
-        r#"{{"id":{},"object":"text_completion","created":{created},"model":{},"choices":[{{"text":{text},"index":0,"logprobs":null,"finish_reason":{reason}}}]}}"#,
-        quote(id),
-        quote(model)
-    )
-}
-
-fn sse(stream: &mut dyn Transport, data: &str) -> std::io::Result<()> {
-    stream.write_all(format!("data: {data}\n\n").as_bytes())?;
-    stream.flush()
-}
-
-fn respond(
-    stream: &mut dyn Transport,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{CORS_HEADERS}\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
-    stream.flush()
-}
-
-/// Answer a CORS preflight: no credentials, no body, and a day-long cache.
-fn respond_preflight(stream: &mut dyn Transport) -> std::io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 204 No Content\r\n{CORS_HEADERS}Access-Control-Max-Age: 86400\r\n\
-         Content-Length: 0\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.flush()
-}
-
-fn respond_error(
-    stream: &mut dyn Transport,
-    status: u16,
-    code: &str,
-    message: &str,
-) -> std::io::Result<u16> {
-    let kind = match status {
-        401 => "authentication_error",
-        404 => "invalid_request_error",
-        429 => "rate_limit_error",
-        500 | 503 => "server_error",
-        _ => "invalid_request_error",
-    };
-    let body = format!(
-        r#"{{"error":{{"message":{},"type":"{kind}","code":{}}}}}"#,
-        quote(message),
-        quote(code)
-    );
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        413 => "Payload Too Large",
-        422 => "Unprocessable Entity",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    respond(stream, status, reason, "application/json", &body)?;
-    Ok(status)
-}
-
-fn respond_error_retry(
-    stream: &mut dyn Transport,
-    status: u16,
-    code: &str,
-    message: &str,
-    retry_after: u64,
-) -> std::io::Result<u16> {
-    let kind = "rate_limit_error";
-    let body = format!(
-        r#"{{"error":{{"message":{},"type":"{kind}","code":{}}}}}"#,
-        quote(message),
-        quote(code)
-    );
-    let head = format!(
-        "HTTP/1.1 {status} Too Many Requests\r\nContent-Type: application/json\r\n{CORS_HEADERS}\
-         Content-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body.as_bytes())?;
-    stream.flush()?;
-    Ok(status)
-}
-
-struct Request {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
-
-    fn authorized(&self, expected: &str) -> bool {
-        match self.header("authorization") {
-            Some(value) => value
-                .strip_prefix("Bearer ")
-                .map(str::trim)
-                .is_some_and(|key| key == expected),
-            None => false,
-        }
-    }
-}
-
-/// Read one request. `Ok(None)` means the peer closed before sending a request line.
-fn read_request(stream: &mut dyn Transport) -> std::io::Result<Option<Request>> {
-    let mut buffer = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 8192];
-    let head_end = loop {
-        if let Some(position) = find(&buffer, b"\r\n\r\n") {
-            break position;
-        }
-        if buffer.len() > MAX_HEAD_BYTES {
-            respond_error(
-                stream,
-                400,
-                "invalid_request",
-                "request headers are too large",
-            )?;
-            return Ok(None);
-        }
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-    };
-
-    let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
-    let mut lines = head.split("\r\n");
-    let Some(line) = lines.next() else {
-        respond_error(stream, 400, "invalid_request", "malformed request line")?;
-        return Ok(None);
-    };
-    let mut parts = line.split(' ');
-    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
-        respond_error(stream, 400, "invalid_request", "malformed request line")?;
-        return Ok(None);
-    };
-    let mut headers = Vec::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_owned(), value.trim().to_owned()));
-        }
-    }
-
-    let mut request = Request {
-        method: method.to_owned(),
-        path: path.split('?').next().unwrap_or(path).to_owned(),
-        headers,
-        body: Vec::new(),
-    };
-
-    if request
-        .header("transfer-encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        respond_error(
-            stream,
-            400,
-            "invalid_request",
-            "chunked request bodies are not supported; send Content-Length",
-        )?;
-        return Ok(None);
-    }
-    let length = match request.header("content-length") {
-        Some(value) => match value.parse::<usize>() {
-            Ok(length) => length,
-            Err(_) => {
-                respond_error(stream, 400, "invalid_request", "bad Content-Length")?;
-                return Ok(None);
-            }
-        },
-        None => 0,
-    };
-    if length > MAX_BODY_BYTES {
-        respond_error(stream, 413, "invalid_request", "request body is too large")?;
-        return Ok(None);
-    }
-    if request
-        .header("expect")
-        .is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
-    {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
-        stream.flush()?;
-    }
-
-    let mut body = buffer[head_end + 4..].to_vec();
-    while body.len() < length {
-        let read = stream.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..read]);
-    }
-    body.truncate(length);
-    request.body = body;
-    Ok(Some(request))
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn request_id() -> String {
-    // Time in milliseconds plus a per-process counter: unique enough for logs, no dependency.
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0);
-    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    base32(millis << 12 | u128::from(counter & 0xfff))
-}
-
-static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn base32(mut value: u128) -> String {
-    const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
-    let mut out = Vec::new();
-    while value > 0 {
-        out.push(ALPHABET[(value % 32) as usize]);
-        value /= 32;
-    }
-    if out.is_empty() {
-        out.push(b'0');
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap_or_default()
-}
-
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
-}
-
 #[derive(Default)]
-struct Metrics {
+pub(crate) struct Metrics {
     requests: BTreeMap<(String, u16), u64>,
     tokens: u64,
     duration: Histogram,
@@ -2644,7 +1005,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn record(&mut self, endpoint: &str, status: u16, seconds: f64) {
+    pub(crate) fn record(&mut self, endpoint: &str, status: u16, seconds: f64) {
         *self
             .requests
             .entry((endpoint.to_owned(), status))
@@ -2652,11 +1013,11 @@ impl Metrics {
         self.duration.observe(seconds);
     }
 
-    fn time_to_first_token(&mut self, seconds: f64) {
+    pub(crate) fn time_to_first_token(&mut self, seconds: f64) {
         self.first_token.observe(seconds);
     }
 
-    fn tokens_generated(&mut self, count: u64) {
+    pub(crate) fn tokens_generated(&mut self, count: u64) {
         self.tokens += count;
     }
 
@@ -2812,29 +1173,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_decodes_padding_and_line_breaks() {
-        assert_eq!(base64_decode("aGk=").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(base64_decode("aGk").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(base64_decode("a\nG\r\nk").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(base64_decode("AQID").as_deref(), Some(&[1u8, 2, 3][..]));
-        assert_eq!(base64_decode(""), Some(Vec::new()));
-        assert_eq!(base64_decode("aGk*"), None, "a stray byte is not skipped");
-    }
-
-    #[test]
-    fn pem_blocks_carry_their_tags_in_order() {
-        let pem = b"-----BEGIN CERTIFICATE-----\naGk=\n-----END CERTIFICATE-----\n\
-                    -----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
-        let blocks = pem_blocks(pem);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].0, "CERTIFICATE");
-        assert_eq!(blocks[0].1, b"hi");
-        assert_eq!(blocks[1].0, "PRIVATE KEY");
-        assert_eq!(blocks[1].1, [1u8, 2, 3]);
-        assert!(pem_blocks(b"no blocks here").is_empty());
-    }
-
-    #[test]
     fn the_access_log_is_on_unless_it_is_turned_off() {
         assert!(access_log_enabled_for(None), "unset means on");
         for off in ["0", "false", "OFF", "no", " 0 "] {
@@ -2843,63 +1181,6 @@ mod tests {
         for on in ["1", "true", "yes", ""] {
             assert!(access_log_enabled_for(Some(on)), "{on:?} leaves it on");
         }
-    }
-    #[test]
-    fn rejects_roles_the_contract_does_not_define() {
-        let request = Json::parse(r#"{"messages":[{"role":"tool","content":"x"}]}"#).unwrap();
-        let error = messages_of(&request).expect_err("tool is not supported");
-        assert!(error.contains("unsupported role"), "{error}");
-    }
-
-    #[test]
-    fn accepts_content_parts_as_well_as_strings() {
-        let request = Json::parse(
-            r#"{"messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#,
-        )
-        .unwrap();
-        let messages = messages_of(&request).expect("valid");
-        assert_eq!(messages.len(), 1);
-    }
-
-    /// The certificate pair is read once at startup; a renewal is a file write after that.
-    #[test]
-    fn a_rotated_certificate_is_reloaded_without_a_restart() {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-        let dir = std::env::temp_dir().join(format!("vipera-tls-reload-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let cert = dir.join("chain.crt");
-        let key = dir.join("server.key");
-        std::fs::copy(fixtures.join("chain.crt"), &cert).expect("chain");
-        std::fs::copy(fixtures.join("server.key"), &key).expect("key");
-        let source = TlsSource::new(
-            cert.to_str().expect("utf-8 path"),
-            key.to_str().expect("utf-8 path"),
-        )
-        .expect("the fixture pair loads");
-
-        assert!(!source.refresh(), "nothing moved since startup");
-        let serving = source.config();
-
-        // A half-written renewal keeps the certificate that works: a broken file must not take
-        // the server down, and the bad stamp is remembered instead of retried every connection.
-        std::fs::write(&cert, b"not a certificate").expect("write");
-        assert!(!source.refresh());
-        assert!(Arc::ptr_eq(&serving, &source.config()));
-        assert!(!source.refresh(), "the bad stamp is remembered");
-
-        std::fs::write(
-            &cert,
-            std::fs::read(fixtures.join("server.crt")).expect("leaf"),
-        )
-        .expect("write");
-        assert!(
-            source.refresh(),
-            "a usable renewal replaces the configuration"
-        );
-        assert!(!Arc::ptr_eq(&serving, &source.config()));
-        assert!(!source.refresh(), "the new stamp is remembered");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2941,110 +1222,6 @@ mod tests {
     }
 
     #[test]
-    fn sampler_fields_are_clamped() {
-        let request = Json::parse(
-            r#"{"temperature":9,"top_p":2,"top_k":5,"min_p":-1,"seed":7,"repetition_penalty":1.2,"presence_penalty":5,"frequency_penalty":-5,"logit_bias":{"42":200,"7":-5}}"#,
-        )
-        .unwrap();
-        let sampler = sampler_of(&request).expect("valid request");
-        assert_eq!(sampler.logit_bias[0], Some((42, 100.0)));
-        assert_eq!(sampler.logit_bias[1], Some((7, -5.0)));
-        assert_eq!(sampler.logit_bias[2], None);
-        assert_eq!(sampler.presence_penalty, 2.0);
-        assert_eq!(sampler.frequency_penalty, -2.0);
-        assert_eq!(sampler.temperature, 2.0);
-        assert_eq!(sampler.top_p, 1.0);
-        assert_eq!(sampler.top_k, 5);
-        assert_eq!(sampler.min_p, 0.0);
-        assert_eq!(sampler.seed, 7);
-        assert!((sampler.repetition_penalty - 1.2).abs() < 1e-6);
-    }
-
-    #[test]
-    fn json_mode_understands_text_and_object() {
-        let object = Json::parse(r#"{"response_format":{"type":"json_object"}}"#).unwrap();
-        assert!(json_mode_of(&object).unwrap());
-        let text = Json::parse(r#"{"response_format":{"type":"text"}}"#).unwrap();
-        assert!(!json_mode_of(&text).unwrap());
-        assert!(!json_mode_of(&Json::parse("{}").unwrap()).unwrap());
-        let schema = Json::parse(r#"{"response_format":{"type":"json_schema"}}"#).unwrap();
-        assert!(json_mode_of(&schema).is_err());
-    }
-
-    #[test]
-    fn json_validation_requires_one_complete_object() {
-        assert!(is_json_object(r#"{"a":1}"#));
-        assert!(!is_json_object("[1]"));
-        assert!(!is_json_object(r#"{"a":1"#));
-        assert!(!is_json_object("Hi"));
-    }
-
-    #[test]
-    fn malformed_logit_bias_is_rejected() {
-        for body in [
-            r#"{"logit_bias":[1,2]}"#,
-            r#"{"logit_bias":{"x":1}}"#,
-            r#"{"logit_bias":{"7":"high"}}"#,
-        ] {
-            let request = Json::parse(body).unwrap();
-            assert!(sampler_of(&request).is_err(), "accepted {body}");
-        }
-    }
-
-    #[test]
-    fn choices_get_distinct_seeds() {
-        let base = SamplerConfig {
-            seed: 7,
-            ..SamplerConfig::default()
-        };
-        assert_eq!(seed_for_choice(base, 0).seed, 7);
-        assert_eq!(seed_for_choice(base, 3).seed, 10);
-        let last = SamplerConfig {
-            seed: u64::MAX,
-            ..base
-        };
-        assert_eq!(seed_for_choice(last, 1).seed, 0);
-    }
-
-    #[test]
-    fn stream_frames_parse_as_json() {
-        let frame = chunk("chatcmpl-1", 42, "qwen2", Some("hi \"there\""), None, None);
-        let parsed = Json::parse(&frame).expect("valid frame");
-        assert_eq!(
-            parsed
-                .get("choices")
-                .and_then(Json::as_array)
-                .and_then(|choices| choices[0].get("delta"))
-                .and_then(|delta| delta.get("content"))
-                .and_then(Json::as_str),
-            Some("hi \"there\"")
-        );
-        let final_frame = chunk("chatcmpl-1", 42, "qwen2", None, Some("stop"), None);
-        assert_eq!(
-            Json::parse(&final_frame)
-                .unwrap()
-                .get("choices")
-                .and_then(Json::as_array)
-                .and_then(|choices| choices[0].get("finish_reason"))
-                .and_then(Json::as_str),
-            Some("stop")
-        );
-    }
-
-    #[test]
-    fn bearer_tokens_are_compared_exactly() {
-        let request = Request {
-            method: "POST".to_owned(),
-            path: "/v1/chat/completions".to_owned(),
-            headers: vec![("Authorization".to_owned(), "Bearer secret".to_owned())],
-            body: Vec::new(),
-        };
-        assert!(request.authorized("secret"));
-        assert!(!request.authorized("secre"));
-        assert!(!request.authorized(""));
-    }
-
-    #[test]
     fn histograms_expose_the_prometheus_shape() {
         let mut histogram = Histogram::default();
         histogram.observe(0.2);
@@ -3053,113 +1230,5 @@ mod tests {
         assert!(out.contains("vipera_request_duration_seconds_bucket{le=\"0.25\"} 1"));
         assert!(out.contains("vipera_request_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(out.contains("vipera_request_duration_seconds_count 1"));
-    }
-
-    #[test]
-    fn n_defaults_to_one_and_is_capped_at_the_batch_size() {
-        assert_eq!(choices_of(&Json::parse("{}").unwrap()), Ok(1));
-        assert_eq!(choices_of(&Json::parse(r#"{"n":4}"#).unwrap()), Ok(4));
-        assert!(choices_of(&Json::parse(r#"{"n":0}"#).unwrap()).is_err());
-        assert!(choices_of(&Json::parse(r#"{"n":5}"#).unwrap()).is_err());
-    }
-
-    #[test]
-    fn stop_accepts_a_string_or_an_array() {
-        let request = Json::parse(r#"{"stop":"\n\n"}"#).unwrap();
-        assert_eq!(stop_sequences_of(&request).unwrap(), vec!["\n\n"]);
-        let request = Json::parse(r#"{"stop":["a","b"]}"#).unwrap();
-        assert_eq!(stop_sequences_of(&request).unwrap(), vec!["a", "b"]);
-        let request = Json::parse("{}").unwrap();
-        assert!(stop_sequences_of(&request).unwrap().is_empty());
-    }
-
-    #[test]
-    fn stop_rejects_more_than_four_sequences_or_a_bad_type() {
-        let request = Json::parse(r#"{"stop":["a","b","c","d","e"]}"#).unwrap();
-        assert!(stop_sequences_of(&request).is_err());
-        let request = Json::parse(r#"{"stop":7}"#).unwrap();
-        assert!(stop_sequences_of(&request).is_err());
-    }
-
-    #[test]
-    fn stop_cuts_at_the_earliest_match() {
-        let stops = vec!["STOP".to_owned(), "TOP".to_owned()];
-        assert_eq!(without_stop("abcSTOPdef", &stops), ("abc", true));
-        assert_eq!(without_stop("abcdef", &stops), ("abcdef", false));
-    }
-
-    #[test]
-    fn streaming_holds_back_a_partial_stop() {
-        let stops = vec!["world".to_owned()];
-        // Four trailing bytes could still become "world"; only "hello" is safe.
-        assert_eq!(emit_boundary("hello wor", 0, &stops, false), 5);
-        // A finished turn emits everything, because no stop occurred.
-        assert_eq!(emit_boundary("hello wor", 0, &stops, true), 9);
-        // The hold-back never splits a UTF-8 character.
-        assert_eq!(emit_boundary("aé", 0, &["xyz".to_owned()], false), 1);
-    }
-
-    #[test]
-    fn include_usage_requires_a_true_flag() {
-        let parse = |body: &str| include_usage_of(&Json::parse(body).unwrap());
-        assert!(parse(r#"{"stream_options":{"include_usage":true}}"#));
-        assert!(!parse(r#"{"stream_options":{"include_usage":false}}"#));
-        assert!(!parse(r#"{"stream_options":{}}"#));
-        assert!(!parse("{}"));
-        assert!(!parse(r#"{"stream_options":{"include_usage":"yes"}}"#));
-    }
-
-    #[test]
-    fn usage_chunk_has_no_choices_and_counts_tokens() {
-        let frame = usage_chunk("chatcmpl-1", 42, "qwen2", "chat.completion.chunk", 5, 3);
-        let parsed = Json::parse(&frame).expect("valid frame");
-        assert_eq!(
-            parsed
-                .get("choices")
-                .and_then(Json::as_array)
-                .map(<[Json]>::len),
-            Some(0)
-        );
-        let usage = parsed.get("usage").expect("usage present");
-        assert_eq!(usage.get("prompt_tokens").and_then(Json::as_u32), Some(5));
-        assert_eq!(
-            usage.get("completion_tokens").and_then(Json::as_u32),
-            Some(3)
-        );
-        assert_eq!(usage.get("total_tokens").and_then(Json::as_u32), Some(8));
-    }
-
-    #[test]
-    fn completion_frames_parse_as_json() {
-        let frame = completion_chunk("cmpl-1", 42, "qwen2", Some("hi"), None);
-        let parsed = Json::parse(&frame).expect("valid frame");
-        assert_eq!(
-            parsed.get("object").and_then(Json::as_str),
-            Some("text_completion")
-        );
-        assert_eq!(
-            parsed
-                .get("choices")
-                .and_then(Json::as_array)
-                .and_then(|choices| choices[0].get("text"))
-                .and_then(Json::as_str),
-            Some("hi")
-        );
-        let final_frame = completion_chunk("cmpl-1", 42, "qwen2", None, Some("stop"));
-        assert_eq!(
-            Json::parse(&final_frame)
-                .unwrap()
-                .get("choices")
-                .and_then(Json::as_array)
-                .and_then(|choices| choices[0].get("finish_reason"))
-                .and_then(Json::as_str),
-            Some("stop")
-        );
-    }
-
-    #[test]
-    fn error_bodies_use_the_contract_envelope() {
-        let error = map_engine_error(&ViperaError::infeasible("too big"));
-        assert_eq!(error, (422, "context_too_long"));
     }
 }

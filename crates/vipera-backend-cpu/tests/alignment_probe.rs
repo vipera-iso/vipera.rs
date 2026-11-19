@@ -1,10 +1,13 @@
 //! E1 from `docs/design/ADR-002-weight-mapping.md`: does page alignment alone move the Q4_K
 //! weight stream?
 //!
-//! Run with:
+//! `#[ignore]`d because a debug build cannot time a 200 MB matvec — the ratio is only meaningful in
+//! release, on the machine it is read on. The assertion it now carries is that the same bytes at a
+//! different address produce the same result, so a run that does happen proves something even when
+//! the printed number is discarded. Run it with `--nocapture` to see the ratio:
 //!
 //! ```text
-//! cargo test -p vipera-backend-cpu --release --test alignment_probe -- --ignored --nocapture
+//! cargo test -p vipera-backend-cpu --release --test alignment_probe -- --nocapture
 //! ```
 //!
 //! Two 200 MB Q4_K tensors, one from a plain `Vec` (what `std::fs::read` gives), one sliced at a
@@ -43,7 +46,7 @@ fn address_of(slice: &[u8]) -> usize {
 }
 
 #[test]
-#[ignore = "measurement, not a correctness check"]
+#[ignore = "measurement: a debug build cannot time a 200 MB matvec, run it with --release"]
 fn page_alignment_moves_the_q4k_stream_or_it_does_not() {
     let stride = row_bytes(GgmlType::Q4K, COLS).expect("Q4_K row");
     let rows = BYTES / stride;
@@ -91,6 +94,17 @@ fn page_alignment_moves_the_q4k_stream_or_it_does_not() {
             std::hint::black_box(&out);
         }
     }
+
+    // The same bytes must give the same answer wherever they sit: a difference here would mean the
+    // kernel reads outside its row, which is a correctness bug, not an alignment effect.
+    let mut plain_out = vec![0.0_f32; rows];
+    let mut aligned_out = vec![0.0_f32; rows];
+    matvec(GgmlType::Q4K, &plain, COLS, rows, &x, &mut plain_out).expect("matvec");
+    matvec(GgmlType::Q4K, aligned, COLS, rows, &x, &mut aligned_out).expect("matvec");
+    assert_eq!(
+        plain_out, aligned_out,
+        "the same weights at a different address must produce the same result"
+    );
 
     let gbps = |times: &[Duration]| {
         let best = times.iter().min().expect("a run");
