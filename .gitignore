@@ -25,6 +25,10 @@
 # Only the engine's own script is part of the repository; this home directory has others.
 /scripts/*
 !/scripts/parity-tokenize.sh
+# The logits reference the qwen3 conformance test compares against: the dumper and the wrapper that
+# builds it, so the reference is a run anyone can repeat.
+!/scripts/logits-dump.sh
+!/scripts/logits-dump.c
 !/specs/
 # Design notes for the engine itself live beside the specs. Only this directory is part of the
 # repository; the other trees under docs/ (graph dumps, scratch notes) are not.

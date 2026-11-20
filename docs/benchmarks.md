@@ -2531,10 +2531,13 @@ At 4k the 14B decode step saves 45 ms, the largest absolute saving of the three 
 the same ratio as the 7B because the step is bandwidth-bound for both. The 1024 prefill is a wash
 (46.4 s against 46.6 s, inside run-to-run noise at this size) and the 4096 one gains 5%.
 
-The qwen3 path was checked by loading the 14B file and generating greedily: coherent text from the
-first token. It is not held to llama.cpp's exact continuation — neither is the qwen2 path, which
-leaves llama.cpp's greedy text at the third token of the same prompt — the token-level parity
-checks under `scripts/` are the place that comparison lives.
+The qwen3 path is held to llama.cpp's logits rather than to its prose: `scripts/logits-dump.sh`
+runs one fixed token sequence through llama.cpp (no sampling, no chat template) and
+`crates/vipera-backend-cpu/tests/logits_reference.rs` runs the same ids through this backend. On the
+14B file the argmax is the same token (19846), the top eight are the same set, and the worst of the
+top sixteen moves 0.25 logits against a top of 22.6 — the rank flips start where neighbouring rows
+sit 0.05 apart, inside the accumulation noise of two different f32 orders. Coherent greedy text
+from the first token is a weaker signal than that and is not what the check rests on.
 
 ```bash
 cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch  -- --ignored --nocapture
