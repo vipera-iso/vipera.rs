@@ -2651,3 +2651,56 @@ saving grows with it; the matvecs do not change.
 cargo test -p vipera-backend-gpu --release --test attention_shared -- --ignored --nocapture
 cargo test -p vipera-backend-gpu --release --test layer_gpu the_split_arm -- --ignored --nocapture
 ```
+
+### Building a batched product's activations on the calling thread: 58 ms of a chunk — opt-in pool, 2026-11-20
+
+`matvec_pooled_batch` builds the owned activations of a product (copy, group sums, Q8 quantiser) on
+the calling thread, one entry after another, before it wakes any worker, so every worker is idle for
+that time. A prefill chunk makes 196 such products (per layer: q/k/v at width 1536, o at 1536,
+gate and up at 1536, down at 8960 — 168 products at 1536 and 28 at 8960), and the profile's Q4_K and
+Q6_K phases include it, because the stamp wraps the whole call. `bench_activation_prep`, 128
+entries, one thread, best of 5, two runs:
+
+| width | `OwnedActivation::new` | of which group sums | quantiser | copy |
+|---|---|---|---|---|
+| 1536 | 0.163–0.165 ms | 0.045–0.047 | 0.109 | 0.014–0.015 |
+| 8960 | 1.094–1.099 ms | 0.291–0.304 | 0.595–0.617 | 0.208–0.213 |
+
+That is 168 x 0.165 + 28 x 1.1 = **~58 ms per chunk** of calling-thread time with the workers waiting:
+5.5% of the 1045 ms 4k chunk and 8% of the 718 ms first chunk, at this sandbox's speed (a 1-vCPU
+AVX-512 Xeon, not the i5-11300H).
+
+`VIPERA_PARALLEL_PREP=1` (off by default) has the pool's workers build them: the calling thread copies
+the entries into buffers (a worker cannot borrow its stack), hands each participant a run of entries
+and keeps the last run, and each worker finishes its buffers in place (`OwnedActivation::from_buffer`).
+It applies from 16 entries up, so a decode step or a short draft never pays a wake-up for it. **The
+result is bit-identical**, entry for entry, to the serial build, because the same sums and the same
+quantiser run on the same values (`prepared_activations_are_bit_identical_to_the_serial_ones`: Q4_K,
+Q6_K and F32, batches of 1, 2, 7, 16, 32 and 33 entries, widths 32/96/1536, groups of zeros and of
+negative zeros, worker counts 0/3/7). A worker that is gone or panics does not hang or half-fill the
+batch: its run is built on the caller, or the call returns an error, as `fill_batch` does for rows.
+
+**What was and was not measured.** On this 1-vCPU host the pool cannot add parallelism, so
+`pool_prep_cost` only bounds the overhead: calling thread against pool 0.99x and 0.98x at one
+participant, 0.98x and 1.03x at four time-sliced ones (1536 and 8960 wide), i.e. no cost for taking
+the path. The gain is a parallel one and has to be measured on the rig: if eight participants split
+the 0.9 ms of work at 8960, the product's preparation falls from about 1.1 ms to about 0.2 (copy)
++ 0.11 + a wake-up, and from 0.165 to about 0.065 at 1536, which over 196 products is roughly 40 ms
+of a chunk, 4–6% — a projection, not a result. Prior polling and on-demand experiments in this file
+found wake-ups costing what they saved on this part, so it is off until it is measured:
+
+```bash
+for v in 0 1; do VIPERA_PARALLEL_PREP=$v VIPERA_PROFILE_STEP=1 <the 4k prefill run>; done
+cargo test -p vipera-backend-cpu --release --lib pool_prep_cost -- --ignored --nocapture
+```
+
+**What this entry also found, not changed.** The tiled kernels build their activation tile inside
+every call on every thread (`bench_tiled_q4k_vs_q6k_shapes`, B = 128, one thread, row count 0 so the
+call is the tile alone): 0.03–0.06 ms at width 1536 and 0.37–0.47 ms at 8960, for both Q4_K and Q6_K.
+A down projection gives each of eight threads 192 rows, about 2.4 ms of kernel work at the single-thread
+rate, so the duplicated tile is ~16% of that call and ~21 ms of CPU per thread per chunk in total.
+Sharing one tile across the participants is the next lever of this kind, and unlike the preparation it
+needs a barrier. And the two prefill kernels, single thread, 128 entries: gate/up 8960x1536 Q4_K
+77.3 GMAC/s against Q6_K 54.6 (1.42x), down 1536x8960 Q4_K 94.8 against Q6_K 83.8 (1.13x) — the
+Q6_K layers are only the FFN down and attention v, so the gap is worth about 16 ms of a chunk, not the
+whole of the Q6_K phase's 15%.

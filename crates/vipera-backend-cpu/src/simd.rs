@@ -3741,6 +3741,59 @@ mod tests {
         bench!(128, cold_rows, "cold");
     }
 
+    /// Q4_K against Q6_K through their tiled prefill kernels, one thread, B = 128, at the two shapes
+    /// a chunk multiplies: the FFN gate/up (8960 rows of 1536) and the FFN down (1536 rows of 8960).
+    /// Three row counts per shape separate what a call pays once (the activation tile, built over
+    /// the whole row width) from what each row pays.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_tiled_q4k_vs_q6k_shapes() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x96_9600_0000_4242);
+        for (label, rows, cols) in [
+            ("gate/up 8960x1536", 8_960_usize, 1_536_usize),
+            ("down 1536x8960", 1_536, 8_960),
+        ] {
+            let blocks = cols / 256;
+            let q4: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+            let q6: Vec<u8> = (0..rows).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+            let source: Vec<Vec<f32>> = (0..128)
+                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                .collect();
+            let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+            let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+            let xs: [&QuantizedX; 128] = std::array::from_fn(|e| &xs_vec[e]);
+            let sums: [&[f32]; 128] = std::array::from_fn(|e| sums_vec[e].as_slice());
+            for count in [0_usize, 32, 256, rows] {
+                for (format, data, stride) in
+                    [("q4k", &q4, blocks * 144), ("q6k", &q6, blocks * 210)]
+                {
+                    let mut out = vec![0.0_f32; 128 * count];
+                    let mut best = f64::INFINITY;
+                    for _ in 0..3 {
+                        let start = std::time::Instant::now();
+                        let ok = if format == "q4k" {
+                            try_q4k_matvec_tiled_range(data, stride, 0, count, &xs, &sums, &mut out)
+                        } else {
+                            try_q6k_matvec_tiled_range(data, stride, 0, count, &xs, &mut out)
+                        };
+                        assert!(ok, "{format} tiled kernel refused");
+                        best = best.min(start.elapsed().as_secs_f64());
+                    }
+                    std::hint::black_box(&out);
+                    let macs = (count * cols * 128) as f64;
+                    println!(
+                        "{label} {format} rows {count:>5}: {:>8.2} ms, {:>6.1} GMAC/s",
+                        best * 1e3,
+                        macs / best / 1e9
+                    );
+                }
+            }
+        }
+    }
+
     /// The output projection's shape: one activation against the vocabulary
     /// matrix, which is the largest single tensor read in a chunk and runs at
     /// B=1 because only the last position needs logits.
