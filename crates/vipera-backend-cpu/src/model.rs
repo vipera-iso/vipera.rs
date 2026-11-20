@@ -3412,6 +3412,189 @@ fn attend(
     )
 }
 
+/// Queries one block of a prompt chunk shares a K/V row with, in [`attend_rows_shared`].
+///
+/// Four keeps the per-block state (four sets of `heads x head_dim` accumulators, 24 KiB at twelve
+/// heads of 128) inside L1 while still dividing the row traffic by four. Eight doubles the win and
+/// spills the accumulators to L2, where the V pass pays for them again.
+const QBLOCK: usize = 4;
+
+/// Whether a chunk's attention shares each K/V row across a block of queries.
+///
+/// **Off unless `VIPERA_ATTN_QBLOCK` is set to `1`, `true`, `on` or `yes`.** Measured at 4k on the
+/// i5-11300H, `VIPERA_ATTN_QBLOCK=1` takes attention from 435-445 ms to 399-411 ms of a chunk, 7.7%,
+/// and a chunk from 1280 ms to 1261-1273 ms, which is inside this ledger's own 8-15% window spread:
+/// the sharing removes the row traffic and leaves the arithmetic, and attention is already bound by
+/// that (see the entry of 2026-11-20 in `docs/benchmarks.md`). Off by default because it regroups
+/// the softmax sums - within rounding (~1e-7) of the per-entry kernel, not bit-identical, the policy
+/// the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE` follow - and does not pay for itself end
+/// to end yet.
+fn attention_qblock_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_ATTN_QBLOCK").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+/// Whether every entry of a chunk reads the same KV blocks, which is what lets one traversal serve
+/// all of them.
+fn one_kv_for_all(kv: &[KvRead<'_>]) -> bool {
+    kv.iter().all(|view| {
+        std::ptr::eq(view.storage, kv[0].storage)
+            && std::ptr::eq(view.table, kv[0].table)
+            && view.tokens_per_block == kv[0].tokens_per_block
+            && view.bytes_per_token == kv[0].bytes_per_token
+            && view.layout == kv[0].layout
+    })
+}
+
+/// A block of a prompt chunk's attention, folded in one traversal of the history.
+///
+/// A chunk calls [`attend_entries`] once per layer with one query row per position, and every row
+/// walks the whole history: at 3.3k positions that is 128 passes over the same K and V rows per
+/// layer, 11 GB of reads for a 128-token chunk. The rows are the same rows for every query in the
+/// block and the positions are consecutive, so one walk feeds [`QBLOCK`] queries: each K row is
+/// scored against the block and each V row is folded into the block's accumulators before the next
+/// row replaces it in L1.
+///
+/// The queries of a block have different history lengths. Entry `slot` sees positions below
+/// `positions[first + slot]` only, so the rows past that are a prefix of the block it never folds —
+/// the same causal answer with the same values, but folded a block of [`GROUP_ROWS`] positions at a
+/// time ([`fold_chunk_block`], the kernel the position-chunked path already uses) rather than
+/// scored, then normalised row by row. That regrouping is within rounding (~1e-7), not
+/// bit-identical.
+///
+/// The first version of this kernel folded one position at a time and was **twice as slow** as the
+/// per-entry path (677 ms against 325 ms of a 3k chunk, measured 2026-11-20): it saved three
+/// quarters of the K/V reads and paid for them by touching every block accumulator once per
+/// position instead of once per sixteen, which the V fold dominates. The row blocking is what makes
+/// the sharing pay.
+fn attend_rows_shared(
+    q: &[f32],
+    kv: &[KvRead<'_>],
+    positions: &[usize],
+    layer: usize,
+    shape: AttnShape,
+    out: &mut [f32],
+    workers: usize,
+) -> Result<(), ViperaError> {
+    let entries = positions.len();
+    let heads = shape.heads;
+    let head_dim = shape.head_dim;
+    let kv_heads = shape.kv_heads;
+    let query = heads * head_dim;
+    let width = kv_heads * head_dim;
+    let layer_bytes = kv[0].layout.bytes_per_row(width);
+    let order = AttentionSwitches::from_env().order;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let blocks = entries.div_ceil(QBLOCK);
+    let workers = workers.min(blocks).max(1);
+
+    let block_rows = crate::simd::GROUP_ROWS;
+    let run = |first: usize, end: usize, slot_out: &mut [f32]| -> Result<(), ViperaError> {
+        let rows = end - first;
+        let mut m = vec![f32::NEG_INFINITY; rows * heads];
+        let mut d = vec![0.0_f32; rows * heads];
+        let mut o = vec![0.0_f32; rows * query];
+        let mut block_scores = vec![0.0_f32; heads * block_rows];
+        let mut key_bases = [0_usize; crate::simd::GROUP_ROWS];
+        let mut value_bases = [0_usize; crate::simd::GROUP_ROWS];
+        let history = positions[first..end].iter().copied().max().unwrap_or(0);
+        let storage = kv[0].storage;
+
+        // One walk of the history per block of positions, feeding every query of the block: the
+        // K and V rows are decoded and read once, and each query folds the same sixteen rows into
+        // its own running (max, sum, weighted V).
+        let mut start = 0;
+        while start < history {
+            let stop = (start + block_rows).min(history);
+            let mut pending = 0;
+            kv[0].for_each_row_range(
+                order,
+                layer,
+                layer_bytes,
+                start,
+                stop,
+                |_position, base| {
+                    key_bases[pending] = base;
+                    value_bases[pending] = kv[0].value_row(order, base, layer_bytes);
+                    pending += 1;
+                    Ok(())
+                },
+            )?;
+            for slot in 0..rows {
+                // The rows at or past this query's own position are its future: the block is a
+                // prefix of what it may see, so the allowed rows are a slice of the gathered ones.
+                let seen = positions[first + slot];
+                let allowed = (0..pending).take_while(|row| start + row < seen).count();
+                if allowed == 0 {
+                    continue;
+                }
+                let heads_slice = slot * heads..(slot + 1) * heads;
+                fold_chunk_block(
+                    storage,
+                    &key_bases[..allowed],
+                    &value_bases[..allowed],
+                    &q[(first + slot) * query..][..query],
+                    shape,
+                    &(0..heads),
+                    scale,
+                    &mut block_scores,
+                    &mut m[heads_slice.clone()],
+                    &mut d[heads_slice.clone()],
+                    &mut o[slot * query..][..query],
+                );
+            }
+            start = stop;
+        }
+
+        for slot in 0..rows {
+            for head in 0..heads {
+                let at = slot * heads + head;
+                let inverse = 1.0 / d[at];
+                let dst = &mut slot_out[slot * query + head * head_dim..][..head_dim];
+                for (out, value) in dst.iter_mut().zip(&o[at * head_dim..(at + 1) * head_dim]) {
+                    *out = *value * inverse;
+                }
+            }
+        }
+        Ok(())
+    };
+
+    if workers == 1 {
+        return run(0, entries, out);
+    }
+
+    let mut jobs: Vec<(usize, usize, &mut [f32])> = Vec::with_capacity(workers);
+    let mut cursor: &mut [f32] = out;
+    for part in 0..workers {
+        let first = blocks * part / workers;
+        let end = blocks * (part + 1) / workers;
+        let row_start = first * QBLOCK;
+        let row_end = (end * QBLOCK).min(entries);
+        let (slot, rest) = cursor.split_at_mut((row_end - row_start) * query);
+        cursor = rest;
+        jobs.push((row_start, row_end, slot));
+    }
+
+    let results: Vec<Result<(), ViperaError>> = thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .into_iter()
+            .map(|(first, end, slot)| scope.spawn(move || run(first, end, slot)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a qblock attention worker panicked"))
+            .collect()
+    });
+    results.into_iter().collect()
+}
+
 /// A chunk's worth of attention: one output row per entry, each with its own history length.
 ///
 /// The rows are independent, and so are the heads inside one row, so the work goes to
@@ -3442,6 +3625,22 @@ fn attend_entries(
     let switches = AttentionSwitches::from_env();
     let last = positions.iter().copied().max().unwrap_or(0);
     let lanes = entries.saturating_mul(shape.heads).saturating_mul(last);
+
+    // A prompt chunk asks the same history once per token, with consecutive positions and one KV
+    // view between them. One walk of the history over a block of queries reads every K/V row
+    // `QBLOCK` times fewer; the rows are then the traffic of the pass rather than its arithmetic.
+    if entries > 1
+        && kv[0].layout == KvLayout::F16
+        && one_kv_for_all(kv)
+        && !quant::exact_dot_requested()
+        && attention_window().is_none()
+        && attention_qblock_enabled()
+    {
+        let workers = quant::max_threads().min(entries.div_ceil(QBLOCK));
+        if workers > 1 {
+            return attend_rows_shared(q, kv, positions, layer, shape, out, workers);
+        }
+    }
     // Only the entries are split. Splitting a single entry's heads was measured too: at ctx 1024 a
     // decode step went from 45.3 to 48.7 ms, because every worker decodes the same KV rows again and
     // the workers cost more than the twelve heads they divide.
@@ -4522,6 +4721,75 @@ mod tests {
             }
             std::hint::black_box(out[0]);
         });
+    }
+
+    /// The row-sharing kernel against the per-entry one a chunk takes today: same answer within
+    /// rounding, at a history length that uses the streaming kernel and with a causal tail where
+    /// the queries of one block see different amounts of history.
+    #[test]
+    fn qblock_attention_matches_the_per_entry_kernel_within_rounding() {
+        let shape = AttnShape {
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+        let query = shape.heads * shape.head_dim;
+        let entries = 9usize;
+        let first = 260usize;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..(first + entries).div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            first + entries,
+        );
+        let bytes_per_token = 2 * 2 * KvLayout::F16.bytes_per_row(shape.kv_heads * shape.head_dim);
+        let kv = KvView {
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            bytes_per_token,
+            layout: KvLayout::F16,
+        };
+        let q: Vec<f32> = (0..entries * query)
+            .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.07)
+            .collect();
+        let positions: Vec<usize> = (0..entries).map(|slot| first + slot + 1).collect();
+
+        // One call per entry, as a chunk does it today.
+        let mut expected = vec![0.0_f32; entries * query];
+        for entry in 0..entries {
+            let read = KvRead::of(&kv);
+            let mut scratch = AttnScratch::default();
+            attend_entry(
+                AttentionCall {
+                    q: &q[entry * query..][..query],
+                    kv: &read,
+                    layer: 0,
+                    positions: positions[entry],
+                    shape,
+                    heads: 0..shape.heads,
+                    out: &mut expected[entry * query..][..query],
+                },
+                &mut scratch,
+            )
+            .expect("one entry");
+        }
+
+        let reads: Vec<KvRead<'_>> = (0..entries).map(|_| KvRead::of(&kv)).collect();
+        let mut shared = vec![0.0_f32; entries * query];
+        attend_rows_shared(&q, &reads, &positions, 0, shape, &mut shared, 1).expect("shared");
+
+        let worst = expected
+            .iter()
+            .zip(&shared)
+            .map(|(one, many)| (one - many).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 1e-5, "row sharing moved an output by {worst}");
     }
 
     fn order_for_test() -> RowOrder {

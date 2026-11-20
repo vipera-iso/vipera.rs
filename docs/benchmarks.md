@@ -2704,3 +2704,73 @@ needs a barrier. And the two prefill kernels, single thread, 128 entries: gate/u
 77.3 GMAC/s against Q6_K 54.6 (1.42x), down 1536x8960 Q4_K 94.8 against Q6_K 83.8 (1.13x) — the
 Q6_K layers are only the FFN down and attention v, so the gap is worth about 16 ms of a chunk, not the
 whole of the Q6_K phase's 15%.
+
+### A chunk's attention with one walk per four queries: 7.7% of the phase, off by default — 2026-11-20
+
+A prompt chunk calls `attend_entries` once per layer with one query row per position, and every row
+walks the whole history. At 4093 positions that is 128 passes over the same K and V rows per layer,
+~11 GB of reads for one 128-token chunk, against 37 GFLOP of dots and value multiply-adds that no
+sharing can remove. The rows are identical and the positions are consecutive, so
+`attend_rows_shared` walks the history once per block of four queries, and each query folds the same
+sixteen gathered rows with `fold_chunk_block`, the kernel the position-chunked path already uses.
+An entry sees positions below its own, so the rows past that are a prefix of the block it skips.
+
+i5-11300H, `VIPERA_THREADS=8`, Qwen2.5-1.5B Q4_K_M, f16 KV, 4093-token prompt, 32 chunks, one run
+per arm back to back, attention ms per chunk:
+
+| chunk | 26 | 27 | 28 | 29 | 30 | 31 | 32 |
+|---|---|---|---|---|---|---|---|
+| per entry (today) | 362.6 | 375.8 | 390.4 | 405.3 | 420.2 | 434.0 | 445.1 |
+| one walk per four | 336.3 | 349.6 | 360.8 | 373.5 | 386.5 | 398.2 | 410.6 |
+| | 7.3% | 7.0% | 7.6% | 7.8% | 8.0% | 8.2% | 7.7% |
+
+**The end-to-end number is not quoted as a win.** Chunk totals moved 1289.9 -> 1272.6 ms at the
+last chunk, ~1.3%, but the second arm's Q4_K rose 602 -> 615 ms with nothing about it changed: the
+box ran hotter, and that is larger than the delta. Attention at 34% of a 4k chunk bought back about
+2.7% of the chunk, inside this ledger's 8-15% window spread.
+
+**What the sharing can and cannot reach.** It removes the row traffic and leaves the arithmetic:
+every (query, position) pair still pays 12 dots and 12 value multiply-adds of 128 values each. That
+is why eight queries per block measures the same as four (304.9/317.3/331.1/326.3 ms at chunks
+24-27) and why the gain stops at 7-8% rather than approaching the 4x the traffic falls by. Attention
+here is bound by its own multiply-adds, not by memory.
+
+**What the first attempt got wrong, since it is the obvious shape.** Folding one position at a time
+kept four `heads x head_dim` accumulators hot and touched each of them once per position: 677.5 ms
+of chunk 24 against 324.6 for the per-entry kernel, twice as slow with three quarters of the rows
+gone. The V fold (`fold_chunk_block`, sixteen positions per call) is what makes the accumulator
+traffic stop mattering, so the row blocking is load-bearing and the query blocking is the 7%.
+
+Off by default (`VIPERA_ATTN_QBLOCK=1` turns it on) because it regroups the softmax sums - within
+rounding, ~1e-7, of the per-entry kernel, the same policy as the position-chunked kernel - and 2.7%
+of a chunk at 4k does not buy a change in a chunk's bits. What would keep it: a workload where
+attention is a much larger share (a longer context than this one, or the sliding window on, where
+attention is already split by position), or a machine whose f16 dot runs closer to peak than this
+one's, where the row traffic is a larger fraction of the phase.
+
+```bash
+VIPERA_ATTN_QBLOCK=0 VIPERA_PROFILE_STEP=1 <the 4k prefill run>   # per entry
+VIPERA_ATTN_QBLOCK=1 VIPERA_PROFILE_STEP=1 <the 4k prefill run>   # one walk per four
+cargo test -p vipera-backend-cpu --release --lib qblock_attention_matches -- --nocapture
+```
+
+The kernel is held to the per-entry one by `qblock_attention_matches_the_per_entry_kernel_within_rounding`
+(9 entries, 260+ positions, a causal tail where the queries of one block see different histories).
+
+**Where the prefill gap actually is, measured in the same run.** A 4k chunk is 1288 ms: Q4_K 47-50%
+(602 ms), Q6_K 14-15% (181 ms), attention 34%, the rest under 5%. 128 tokens in 1288 ms is 99 tok/s,
+against the 159-168 tok/s this ledger's llama.cpp rows record for `pp4096` on this rig: 0.59-0.62x.
+Even a free attention pass would leave 0.8x, so this kernel is not the prefill's problem.
+
+**What the remaining 0.62x is not.** "The ggml repacked GEMM is slower than the tiled Rust kernel"
+(2026-11-15) already answered the obvious reading: llama.cpp's Q4_K microkernel is *slower* per thread
+than this engine's, four cores are within a few percent of what they can deliver for it, and "any
+further prefill work has to reduce work or threads, not tighten the loop". So the gap is not a kernel
+to port and not a loop to widen. What is left, untested, is work: this chunk multiplies every weight
+once per token for 128 tokens, and llama.cpp's `pp4096` advantage has to come from doing less of it
+per token - chunking, residency, or a batched path this engine does not have. That is a design
+question, not a constant.
+
+**Axis, because the names collide.** K and V rows are already shared across a head group by default
+(`9abfa5e`, `a31d5ee`). This kernel shares them across *queries* instead - a different axis, which is
+why it is a second kernel and why its gain (7.7%) is smaller than the traffic it removes.
