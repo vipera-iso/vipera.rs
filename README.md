@@ -7,9 +7,10 @@
 
 **A CPU-first inference engine for GGUF models, written in Rust with no third-party crates in the
 engine itself.** It parses the file, plans memory, tokenizes, samples, generates, and serves an
-OpenAI-compatible chat endpoint. The one dependency in the workspace is `rustls`, for TLS termination
-in `vipera serve`, and it is recorded as `EXC-002` in [`CONSTRAINTS.md`](CONSTRAINTS.md) rather than
-quietly breaking the rule.
+OpenAI-compatible chat endpoint. The engine links nothing outside `std`; the workspace's two
+dependencies sit outside it and are recorded rather than quietly assumed: `rustls` for TLS in
+`vipera serve` (`EXC-002`) and `cudarc` for the CUDA backend (`EXC-006`), in
+[`CONSTRAINTS.md`](CONSTRAINTS.md).
 
 The engine is the Cargo workspace in this repository. The specification, plan and contracts live
 under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
@@ -126,7 +127,7 @@ trustworthy:
 ## Layout
 
 ```text
-Cargo.toml                    workspace: 9 library crates, 1 binary
+Cargo.toml                    workspace: 10 library crates, 1 binary
 crates/
   vipera-errors/              error type and exit-code mapping
   vipera-traits/              the interfaces a backend and an algorithm implement
@@ -136,6 +137,7 @@ crates/
   vipera-sampler/             RNG and sampling policies
   vipera-runtime/             pipeline, sequences, KV cache, engine
   vipera-backend-cpu/         quantized kernels, scalar reference, AVX2
+  vipera-backend-gpu/         CUDA backend behind the same `ForwardPass` (one device, f16 KV)
   vipera-server/              HTTP server and JSON, behind `vipera serve`
 bins/vipera/                  the `vipera` command (argument parsing only)
 scripts/                      parity checks against llama.cpp
@@ -160,7 +162,11 @@ docs/benchmarks/              the surveys the plan was written from
 
 ## Limitations
 
-- **GPU**: there is no CUDA, Metal or Vulkan backend. `verify` reports host memory only.
+- **GPU**: `vipera-backend-gpu` implements `ForwardPass` on one CUDA device with `f16` KV, and
+  `cargo test -p vipera-backend-gpu` holds it to the CPU backend through the runtime's KV buffer. No
+  Metal or Vulkan backend, no batched (prefill) kernel yet, no sliding window (a ring table is
+  refused), and the CLI has no `--backend cuda` yet, so a normal build still runs on the CPU. `verify`
+  reports host memory only.
 - **Prefill**: llama.cpp is faster at every prompt length measured here, from 9–22% at 128 tokens to
   52–61% at 4096; decode is level. Both are measured on the machine described above, not estimated.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
