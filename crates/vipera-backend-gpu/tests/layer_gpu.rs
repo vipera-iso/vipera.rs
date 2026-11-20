@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use vipera_backend_gpu::Device;
-use vipera_backend_gpu::layer::{GpuLayer, LayerShape, LayerWeights, Packed};
+use vipera_backend_gpu::layer::{GpuLayer, LayerShape, LayerWeights, Packed, force_split};
 use vipera_core::gguf::{GgmlType, GgufFile, Value};
 
 fn model_path() -> String {
@@ -215,5 +215,133 @@ fn one_layer_on_the_gpu() {
     assert!(
         out.iter().all(|value| value.is_finite()),
         "non-finite output"
+    );
+}
+
+/// The split arm changes which blocks do the work, not the arithmetic: the same layer, the same 700
+/// steps, both arms, held to rounding.
+///
+/// 700 positions is past the arm's threshold and past five chunks of history, so the combine pass
+/// folds a real multi-chunk softmax rather than a single trivial one.
+#[test]
+#[ignore = "needs a CUDA device and a model"]
+fn the_split_arm_preserves_a_real_layer() {
+    let device = match Device::open(0) {
+        Ok(device) => device,
+        Err(error) => {
+            eprintln!("skipped: {error}");
+            return;
+        }
+    };
+    let path = model_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let file = GgufFile::parse(&bytes).expect("gguf");
+    let arch = file
+        .metadata
+        .get("general.architecture")
+        .and_then(Value::as_str)
+        .unwrap_or("qwen2")
+        .to_owned();
+    let key = |name: &str| format!("{arch}.{name}");
+    let shape = LayerShape {
+        hidden: meta_usize(&file, &key("embedding_length"), 1536),
+        ffn: meta_usize(&file, &key("feed_forward_length"), 8960),
+        heads: meta_usize(&file, &key("attention.head_count"), 12),
+        kv_heads: meta_usize(&file, &key("attention.head_count_kv"), 2),
+        head_dim: meta_usize(&file, &key("embedding_length"), 1536)
+            / meta_usize(&file, &key("attention.head_count"), 12),
+        rope_base: meta_f32(&file, &key("rope.freq_base"), 1_000_000.0),
+        epsilon: meta_f32(&file, &key("attention.layer_norm_rms_epsilon"), 1e-6),
+        max_positions: 1024,
+    };
+    let attn_norm = f32s(&file, &bytes, "blk.0.attn_norm.weight");
+    let ffn_norm = f32s(&file, &bytes, "blk.0.ffn_norm.weight");
+    let has_bias = file
+        .tensors
+        .iter()
+        .any(|tensor| tensor.name == "blk.0.attn_q.bias");
+    let (bq, bk, bv) = if has_bias {
+        (
+            Some(f32s(&file, &bytes, "blk.0.attn_q.bias")),
+            Some(f32s(&file, &bytes, "blk.0.attn_k.bias")),
+            Some(f32s(&file, &bytes, "blk.0.attn_v.bias")),
+        )
+    } else {
+        (None, None, None)
+    };
+    let x: Vec<f32> = (0..shape.hidden)
+        .map(|i| ((i as f32 * 0.013).sin()) * 0.5)
+        .collect();
+
+    let positions = 700;
+    let timed = 20;
+    let mut arms: Vec<Vec<f32>> = Vec::new();
+    let mut times = Vec::new();
+    for split in [false, true] {
+        force_split(Some(split));
+        let matrices = [
+            quantized(&file, &bytes, "blk.0.attn_q.weight"),
+            quantized(&file, &bytes, "blk.0.attn_k.weight"),
+            quantized(&file, &bytes, "blk.0.attn_v.weight"),
+            quantized(&file, &bytes, "blk.0.attn_output.weight"),
+            quantized(&file, &bytes, "blk.0.ffn_gate.weight"),
+            quantized(&file, &bytes, "blk.0.ffn_up.weight"),
+            quantized(&file, &bytes, "blk.0.ffn_down.weight"),
+        ];
+        let mut layer = GpuLayer::upload(
+            &device,
+            shape,
+            LayerWeights {
+                attn_norm: &attn_norm,
+                ffn_norm: &ffn_norm,
+                matrices,
+                biases: [bq.as_deref(), bk.as_deref(), bv.as_deref()],
+            },
+        )
+        .expect("upload layer");
+        let mut out = Vec::new();
+        let mut elapsed = 0.0_f64;
+        for position in 0..positions {
+            let start = Instant::now();
+            out = layer.step(&device, &x, position).expect("step");
+            if position >= positions - timed {
+                elapsed += start.elapsed().as_secs_f64();
+            }
+        }
+        // Two launches (split + combine) mean the host does not observe the device finishing, so
+        // the arms are timed to the last synchronising read rather than per launch: this number is
+        // the layer, not the kernel, and it is taken once per arm rather than interleaved.
+        device.synchronize().unwrap();
+        times.push(elapsed / timed as f64 * 1e3);
+        arms.push(out);
+    }
+    force_split(None);
+
+    println!(
+        "layer step at {positions} positions: per-head {:.3} ms, split {:.3} ms ({:+.0}% time)",
+        times[0],
+        times[1],
+        (times[0] - times[1]) / times[0] * 100.0
+    );
+    let (per_head, split) = (&arms[0], &arms[1]);
+    let worst = per_head
+        .iter()
+        .zip(split)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    let largest = per_head.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+    println!(
+        "{positions} positions on one layer: worst |per-head - split| = {worst:.2e} on values up to {largest:.3}"
+    );
+    assert!(
+        split.iter().all(|value| value.is_finite()),
+        "the split arm produced non-finite output"
+    );
+    assert!(
+        worst < 1e-5 * largest.max(1.0),
+        "the split arm moved the layer by {worst:.2e}"
     );
 }

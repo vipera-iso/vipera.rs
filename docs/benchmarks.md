@@ -2599,3 +2599,55 @@ under a millisecond of that step.
 cargo test -p vipera-backend-gpu --release --test attention_shared -- --ignored --nocapture
 VIPERA_GPU_ATTN_SHARE=on cargo test -p vipera-backend-gpu --release --test model_gpu -- --ignored --nocapture
 ```
+
+### Split the history across blocks: the GPU attention kernel cut along positions — 2026-11-20
+
+The section above ended on a lead: the shared kernel's 4k time (3.36 ms) was not its bandwidth
+(0.3 ms of saving from the K rows it stopped re-reading), it was latency — eight blocks on a
+fourteen-SM card, and two `__syncthreads()` per position on a 4096-long loop. The fix is the one
+flash-decoding uses: cut the history, not the heads.
+
+`attention_split` runs one block per (KV head, chunk of 128 positions): it stages K rows in shared
+memory, scores the whole group against them, and writes an unnormalised partial — the chunk's max,
+its softmax denominator, and `sum(exp(score - max) * v)` per dimension. `attention_combine` folds
+the chunks with the online-softmax identity (one block per head, one thread per dimension). Scores
+stay in shared memory, so the shared kernel's global score scratch disappears. Chunk length was
+swept at 64/128/256/512: 64 and 128 tie at 4096 (1.92 ms), 512 loses at 2048 (1.19 against 1.00),
+so 128 is what ships.
+
+The arm is on by default from 512 positions up (`VIPERA_GPU_ATTN_SPLIT=off` pins the older arms;
+`force_split` does it per call). Parity holds where it did for the shared arm:
+`split_attention_matches_the_per_head_kernel` covers 1/7/255/256/257/511/512/513/1023/1024 positions
+— chunk edges, thread edges and the empty tail past 1020 — to 6e-8, and
+`the_split_arm_preserves_a_real_layer` runs a real Qwen2.5-1.5B block for 700 positions twice, once
+per arm: worst 1.43e-6 on values up to 4.7.
+
+Three arms, same rows, arms interleaved inside every round, 20 rounds after warming all three
+(GTX 1650; synthetic K/V so no quantizer is in front of the kernel):
+
+| shape | positions | per-head | shared | split |
+|---|---|---|---|---|
+| qwen3-14b, 40/8 heads | 512 | 0.537 ms | 0.509 (-5.4%) | **0.380 (-29.2%)** |
+| | 1024 | 1.061 ms | 1.006 (-5.2%) | **0.627 (-40.9%)** |
+| | 2048 | 2.116 ms | 2.006 (-5.2%) | **1.241 (-41.3%)** |
+| | 4096 | 3.549 ms | 3.275 (-7.7%) | **1.923 (-45.8%, 1.8x)** |
+| qwen2.5-1.5b, 12/2 heads | 512 | 0.332 ms | 0.412 (**+24.1%**) | **0.116 (-65.1%)** |
+| | 1024 | 0.884 ms | 0.885 (-0.1%) | **0.226 (-74.4%)** |
+| | 2048 | 1.753 ms | 1.763 (+0.6%) | **0.339 (-80.7%)** |
+| | 4096 | 3.504 ms | 3.546 (+1.2%) | **0.579 (-83.5%, 6.0x)** |
+
+The 1.5B row is the one that matters for this card, and it also corrects the section above: with two
+KV heads the shared arm is *not* worth taking at all — it is 2 blocks where the per-head kernel is
+12 — so the sharing that helped a 40/8 model is a loss on the model this machine actually serves.
+The split arm is not: at 4k it is 6x, because 2 KV heads × 32 chunks is 64 blocks instead of 2.
+
+End to end on one real Qwen2.5-1.5B layer (`the_split_arm_preserves_a_real_layer`, step 680–699 of a
+700-position history, per arm, not interleaved — the card throttles under a sustained loop, and this
+is the honest label rather than a claim of a paired number): **1.195 ms/step per-head against
+0.795 ms split, −34% of the layer step**. Attention is the part that grows with depth, so the
+saving grows with it; the matvecs do not change.
+
+```bash
+cargo test -p vipera-backend-gpu --release --test attention_shared -- --ignored --nocapture
+cargo test -p vipera-backend-gpu --release --test layer_gpu the_split_arm -- --ignored --nocapture
+```

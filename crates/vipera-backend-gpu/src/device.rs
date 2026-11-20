@@ -41,6 +41,8 @@ pub(crate) struct Ops {
     pub(crate) rope: Arc<CudaFunction>,
     pub(crate) attention_decode: Arc<CudaFunction>,
     pub(crate) attention_decode_shared: Arc<CudaFunction>,
+    pub(crate) attention_split: Arc<CudaFunction>,
+    pub(crate) attention_combine: Arc<CudaFunction>,
     pub(crate) swiglu: Arc<CudaFunction>,
     pub(crate) add_inplace: Arc<CudaFunction>,
     pub(crate) quantize_q8: Arc<CudaFunction>,
@@ -101,6 +103,8 @@ impl Device {
             rope: op("rope")?,
             attention_decode: op("attention_decode")?,
             attention_decode_shared: op("attention_decode_shared")?,
+            attention_split: op("attention_split")?,
+            attention_combine: op("attention_combine")?,
             swiglu: op("swiglu")?,
             add_inplace: op("add_inplace")?,
             quantize_q8: op("quantize_q8")?,
@@ -380,6 +384,113 @@ impl Device {
         // slot check, and `scores` is checked above for the group's full row.
         unsafe { launch.launch(config) }
             .map_err(|error| ViperaError::internal(format!("shared attention failed: {error}")))?;
+        Ok(())
+    }
+
+    /// Score and sum `positions` of history in `chunks` blocks per KV head, writing each chunk's
+    /// partial softmax to `partial`.
+    ///
+    /// `partial` holds `heads * (2 * chunks + chunks * head_dim)` floats: per head, the chunk maxima,
+    /// then the chunk denominators, then the chunk `sum(exp(score - max) * v)` rows. Follow it with
+    /// [`Self::attention_combine`] to produce the output row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_split(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k_cache: &DeviceBuffer<f32>,
+        v_cache: &DeviceBuffer<f32>,
+        partial: &mut DeviceBuffer<f32>,
+        positions: usize,
+        chunk: usize,
+        shape: crate::layer::LayerShape,
+        scale: f32,
+    ) -> Result<usize, ViperaError> {
+        if chunk == 0 {
+            return Err(ViperaError::invalid_argument("a chunk of zero positions"));
+        }
+        let group = shape.heads / shape.kv_heads.max(1);
+        if shape.kv_heads == 0
+            || !shape.heads.is_multiple_of(shape.kv_heads)
+            || !shape.head_dim.is_multiple_of(32)
+            || group * shape.head_dim > 1024
+        {
+            return Err(ViperaError::invalid_argument(
+                "the split path needs a whole-group block and whole warps per head",
+            ));
+        }
+        let chunks = positions.div_ceil(chunk);
+        if partial.len() < shape.heads * (2 * chunks + chunks * shape.head_dim) {
+            return Err(ViperaError::invalid_argument(format!(
+                "the partial buffer holds {} floats, {} chunks of {} heads need {}",
+                partial.len(),
+                chunks,
+                shape.heads,
+                shape.heads * (2 * chunks + chunks * shape.head_dim)
+            )));
+        }
+        let warps = shape.head_dim / 32;
+        let shared = (shape.head_dim + group * chunk + group * warps + 2 * group) * 4;
+        let config = LaunchConfig {
+            grid_dim: (shape.kv_heads as u32, chunks as u32, 1),
+            block_dim: ((group * shape.head_dim) as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let positions = positions as i32;
+        let chunk = chunk as i32;
+        let chunks = chunks as i32;
+        let heads = shape.heads as i32;
+        let kv_heads = shape.kv_heads as i32;
+        let head_dim = shape.head_dim as i32;
+        let mut launch = self.stream.launch_builder(&self.ops.attention_split);
+        launch.arg(&q.slice);
+        launch.arg(&k_cache.slice);
+        launch.arg(&v_cache.slice);
+        launch.arg(&mut partial.slice);
+        launch.arg(&positions);
+        launch.arg(&chunk);
+        launch.arg(&chunks);
+        launch.arg(&heads);
+        launch.arg(&kv_heads);
+        launch.arg(&head_dim);
+        launch.arg(&scale);
+        // SAFETY: one block per (KV head, chunk), `group * head_dim` threads; the cache holds
+        // `max_positions` rows of `kv_heads * head_dim`, `positions` is checked against the caller's
+        // slot check, the chunk count is derived from `positions`, and `partial` is checked above for
+        // the whole `[max; sum; acc]` layout.
+        unsafe { launch.launch(config) }
+            .map_err(|error| ViperaError::internal(format!("split attention failed: {error}")))?;
+        Ok(chunks as usize)
+    }
+
+    /// Fold the partials [`Self::attention_split`] wrote into `out`.
+    pub fn attention_combine(
+        &self,
+        partial: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        chunks: usize,
+        shape: crate::layer::LayerShape,
+    ) -> Result<(), ViperaError> {
+        if chunks == 0 {
+            return Err(ViperaError::invalid_argument("no chunks to combine"));
+        }
+        let config = LaunchConfig {
+            grid_dim: (shape.heads as u32, 1, 1),
+            block_dim: (shape.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let chunks = chunks as i32;
+        let heads = shape.heads as i32;
+        let head_dim = shape.head_dim as i32;
+        let mut launch = self.stream.launch_builder(&self.ops.attention_combine);
+        launch.arg(&partial.slice);
+        launch.arg(&mut out.slice);
+        launch.arg(&chunks);
+        launch.arg(&heads);
+        launch.arg(&head_dim);
+        // SAFETY: one block per head, `head_dim` threads, each thread owning one output dimension;
+        // `partial` is the buffer `attention_split` filled with the same chunk count and shape.
+        unsafe { launch.launch(config) }
+            .map_err(|error| ViperaError::internal(format!("attention combine failed: {error}")))?;
         Ok(())
     }
 
