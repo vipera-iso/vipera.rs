@@ -2547,3 +2547,55 @@ VIPERA_ATTN_WINDOW=2048 cargo test --release -p vipera-backend-cpu --lib decode_
 VIPERA_TEST_MODEL=~/.vipera/models/hermes4-14b-q4km.gguf \
   cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch -- --ignored --nocapture
 ```
+
+### The GPU attention kernel shares K rows across a head group too — opt-in, 2026-11-20
+
+The CPU sharing numbers above had no GPU counterpart: `vipera-backend-gpu` had one attention kernel,
+one block per query head, and every head of a group read the same `positions * head_dim` of K and V.
+At 4k positions on a 40-head/8-KV-head model that is ~168 MB of cache traffic per layer for ~33 MB
+of distinct rows, and a 4 MB L2 holds neither side of that.
+
+`attention_decode_shared` (in `layer.cu`) puts one block per *KV* head instead: the block's first
+`head_dim` threads stage the K row in shared memory, all five heads of the group score it from
+there, and the group's warps read each V row with the same index, so L1 serves one row where the
+per-head kernel read five. Each block owns `group * head_dim` = 640 threads. The softmax weights are
+the only thing that leaves the block — `group * positions` floats do not fit in shared memory at long
+contexts (80 KB at 4096) — so they go to a per-layer scratch buffer of `heads * max_positions` on
+the device. 80 KB of traffic against the MBs the shares save.
+
+The arm is behind `VIPERA_GPU_ATTN_SHARE=on` (or `layer::force_shared(Some(true))` for a paired run)
+and defaults off: every earlier GPU number was taken with the per-head kernel. Shapes without a
+group, without whole-warps-per-head, or with `group * head_dim` over 1024 keep the per-head kernel.
+
+Correctness: `shared_attention_matches_the_per_head_kernel` holds the two arms to 1e-5 of the output
+magnitude at 1, 7, 64 and 511 positions on Qwen3-14B's attention shape, and both against a CPU
+reference — worst difference 6e-8, which is rounding, not an arm.
+
+The A/B (`attention_arms_at_long_context`, arms interleaved inside every round, 20 rounds after
+three warm launches, GTX 1650, Qwen3-14B attention shape, synthetic rows so a GGUF quantizer is not
+in front of the kernel):
+
+| positions | per-head | shared | time change |
+|---|---|---|---|
+| 512 | 0.535 ms | 0.507 ms | -5.2% |
+| 1024 | 1.061 ms | 1.006 ms | -5.2% |
+| 2048 | 2.116 ms | 2.006 ms | -5.2% |
+| 4096 | 3.651 ms | 3.355 ms | -8.1% |
+
+Honest reading: this is the sharing working and it is not the win the traffic math promises. The K
+reads that go away are ~64 MB at 4096, which at this card's ~200 GB/s is ~0.3 ms — exactly what was
+measured. The rest of the 3.4 ms is not bandwidth: the per-position loop carries two
+`__syncthreads()` and the V pass is a serial dependent add, so the kernel runs at a fraction of the
+card's bandwidth and moving fewer bytes barely moves it. One block per KV head is also 8 blocks
+across 14 SMs, i.e. six idle. Making this pay needs the split-positions attention the decode path
+does not have yet (flash-decoding style: blocks over position chunks, then a combine pass), not a
+better sharing kernel.
+
+End to end the switch is invisible at the lengths this backend is exercised at: the 1.5B model's
+23.6 ms/token with `VIPERA_GPU_ATTN_SHARE=on` lands inside run-to-run noise, because attention is
+under a millisecond of that step.
+
+```bash
+cargo test -p vipera-backend-gpu --release --test attention_shared -- --ignored --nocapture
+VIPERA_GPU_ATTN_SHARE=on cargo test -p vipera-backend-gpu --release --test model_gpu -- --ignored --nocapture
+```

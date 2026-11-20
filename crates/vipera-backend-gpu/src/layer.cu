@@ -166,6 +166,131 @@ extern "C" __global__ void attention_decode(
     out[head * head_dim + tid] = acc;
 }
 
+// `attend_shared`: the same causal attention, with one block per *KV* head instead of per query
+// head, so the `group` query heads that share a K/V row walk the cache together.
+//
+// The per-head kernel above makes every query head in a group re-read the same `positions *
+// head_dim` of K and V; at 4k positions on a 40-head/8-KV-head model that is ~168 MB per layer of
+// cache traffic for ~33 MB of distinct rows, and the card's L2 cannot hold either. Here a block owns
+// one KV head: its first `head_dim` threads load the K row once into shared memory, every head in the
+// group scores it from there, and the V row is read by the group's warps with the same index, so the
+// L1 serves one row instead of `group` of them.
+//
+// Scores are the only thing that leaves the block, because `group * positions` floats do not fit in
+// shared memory at long contexts (80 KB at 4096 for a group of five). They go to a scratch buffer the
+// layer owns, one row per query head: 80 KB of traffic against the MBs the shares save.
+extern "C" __global__ void attention_decode_shared(
+    const float * __restrict__ q,
+    const float * __restrict__ k_cache,
+    const float * __restrict__ v_cache,
+    float * __restrict__ out,
+    float * __restrict__ scores,
+    int positions,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    float scale)
+{
+    // One slot per warp of every head in the group, plus the K row and the two per-head scalars.
+    const int group = heads / kv_heads;
+    const int warps = head_dim / 32;
+    extern __shared__ float shared[];
+    float *kh = shared;                              // [head_dim]
+    float *partials = kh + head_dim;                 // [group * warps]
+    float *head_max = partials + group * warps;      // [group]
+    float *head_sum = head_max + group;              // [group]
+
+    const int kv_head = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int local = tid / head_dim;                // which query head of the group
+    const int d = tid % head_dim;
+    const int warp = tid >> 5;
+    const int across = tid & 31;
+    const int head = kv_head * group + local;
+    const int kv_row = kv_heads * head_dim;
+    const float *qh = q + head * head_dim;
+    const size_t base = (size_t)kv_head * head_dim + d;
+    // One score row per query head: `heads * positions`, not `group * positions`, because every KV
+    // block writes its own group's rows.
+    float *mine = scores + (size_t)(kv_head * group + local) * positions;
+
+    for (int at = 0; at < positions; ++at) {
+        if (local == 0) {
+            kh[d] = k_cache[(size_t)at * kv_row + base];
+        }
+        __syncthreads();
+        float dot = qh[d] * kh[d];
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, off);
+        }
+        if (across == 0) {
+            partials[warp] = dot;
+        }
+        __syncthreads();
+        if (d == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < warps; ++w) {
+                total += partials[local * warps + w];
+            }
+            mine[at] = total * scale;
+        }
+        __syncthreads();   // the next iteration overwrites `kh`
+    }
+
+    // Softmax over the whole history, per head, across the head's `head_dim` threads.
+    float largest = __int_as_float(0xff800000);
+    for (int at = d; at < positions; at += head_dim) {
+        largest = fmaxf(largest, mine[at]);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        largest = fmaxf(largest, __shfl_down_sync(0xffffffffu, largest, off));
+    }
+    if (across == 0) {
+        partials[warp] = largest;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float top = __int_as_float(0xff800000);
+        for (int w = 0; w < warps; ++w) {
+            top = fmaxf(top, partials[local * warps + w]);
+        }
+        head_max[local] = top;
+    }
+    __syncthreads();
+    const float top = head_max[local];
+
+    float sum = 0.0f;
+    for (int at = d; at < positions; at += head_dim) {
+        const float weight = expf(mine[at] - top);
+        mine[at] = weight;
+        sum += weight;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    }
+    if (across == 0) {
+        partials[warp] = sum;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) {
+            total += partials[local * warps + w];
+        }
+        head_sum[local] = 1.0f / total;
+    }
+    __syncthreads();
+    const float inverse = head_sum[local];
+
+    // Every head of the group indexes the same V row, so the rows the block reads once are the rows
+    // the whole group multiplies by: that is the traffic this kernel exists to remove.
+    float acc = 0.0f;
+    for (int at = 0; at < positions; ++at) {
+        acc += mine[at] * inverse * v_cache[(size_t)at * kv_row + base];
+    }
+    out[head * head_dim + d] = acc;
+}
+
 // `swiglu`: out = silu(gate) * up.
 extern "C" __global__ void swiglu(
     const float * __restrict__ gate,

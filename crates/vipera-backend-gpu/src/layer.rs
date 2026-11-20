@@ -8,6 +8,8 @@
 //! What it is not: batched, paged, or wired into `ForwardPass`. K/V live in one flat per-layer cache
 //! sized to `max_positions`, which is what a comparison against the CPU needs and nothing more.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use vipera_errors::ViperaError;
 
 use crate::device::{Device, DeviceBuffer};
@@ -17,6 +19,65 @@ use crate::q6k::Q6kMatrix;
 use crate::q8::Q8Device;
 
 pub(crate) const SOURCE: &str = include_str!("layer.cu");
+
+/// Environment switch for the shared-attention arm, for the one measurement that wants both arms in
+/// one process. `on`/`1`/`true` shares, anything else keeps the per-head kernel.
+pub const SHARE_ENV: &str = "VIPERA_GPU_ATTN_SHARE";
+
+/// `2` means "not forced"; `0` and `1` are the arms [`force_shared`] pins.
+const UNSET: u8 = 2;
+static SHARE: AtomicU8 = AtomicU8::new(UNSET);
+
+/// Pin the attention arm for the next steps, or hand control back to the environment with `None`.
+///
+/// Both arms are the same arithmetic over the same rows, so a measurement can time them in one
+/// process — which is the only way two timings here are comparable, since the clock on this card
+/// moves with the load before it.
+pub fn force_shared(arm: Option<bool>) {
+    SHARE.store(
+        match arm {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => UNSET,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a step should use the shared-group attention kernel.
+///
+/// Off unless asked for: the per-head kernel is the one every earlier number was taken with, and a
+/// switch that defaults on turns a measurement into a change of behaviour.
+pub fn shared_enabled() -> bool {
+    match SHARE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => matches!(
+            std::env::var(SHARE_ENV).as_deref(),
+            Ok("1" | "on" | "true" | "yes")
+        ),
+    }
+}
+
+/// Whether a shape can take the shared kernel at all: a group of more than one head, a block that
+/// fits, and a head width of whole warps (the reduction is a warp shuffle per head).
+fn shares(shape: LayerShape) -> bool {
+    let group = shape.heads / shape.kv_heads.max(1);
+    shape.kv_heads > 0
+        && shape.heads.is_multiple_of(shape.kv_heads)
+        && group > 1
+        && shape.head_dim.is_multiple_of(32)
+        && group * shape.head_dim <= 1024
+}
+
+/// Floats the shared kernel needs for its softmax weights, zero when the shape cannot use it.
+fn score_scratch(shape: LayerShape) -> usize {
+    if shares(shape) {
+        shape.heads * shape.max_positions
+    } else {
+        0
+    }
+}
 
 /// f16 by bit pattern, for the tensors the file stores as halves.
 pub fn f16(h: u16) -> f32 {
@@ -174,6 +235,9 @@ pub struct GpuLayer {
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     attn: DeviceBuffer<f32>,
+    /// Softmax weights, one row per query head, between the two halves of the shared kernel:
+    /// `heads * max_positions` floats.
+    attn_scores: DeviceBuffer<f32>,
     projection: DeviceBuffer<f32>,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
@@ -213,6 +277,7 @@ impl GpuLayer {
             k: device.alloc(kv)?,
             v: device.alloc(kv)?,
             attn: device.alloc(query)?,
+            attn_scores: device.alloc(score_scratch(shape).max(1))?,
             projection: device.alloc(shape.hidden)?,
             gate: device.alloc(shape.ffn)?,
             up: device.alloc(shape.ffn)?,
@@ -281,6 +346,7 @@ impl GpuLayer {
             k: device.alloc(kv)?,
             v: device.alloc(kv)?,
             attn: device.alloc(query)?,
+            attn_scores: device.alloc(score_scratch(shape).max(1))?,
             projection: device.alloc(shape.hidden)?,
             gate: device.alloc(shape.ffn)?,
             up: device.alloc(shape.ffn)?,
@@ -374,15 +440,28 @@ impl GpuLayer {
         )?;
 
         let scale = 1.0 / (shape.head_dim as f32).sqrt();
-        device.attention(
-            &self.q,
-            &self.k_cache,
-            &self.v_cache,
-            &mut self.attn,
-            position + 1,
-            shape,
-            scale,
-        )?;
+        if shared_enabled() && shares(shape) {
+            device.attention_shared(
+                &self.q,
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.attn,
+                &mut self.attn_scores,
+                position + 1,
+                shape,
+                scale,
+            )?;
+        } else {
+            device.attention(
+                &self.q,
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.attn,
+                position + 1,
+                shape,
+                scale,
+            )?;
+        }
         self.wo
             .project(device, &self.attn, &mut self.q8, &mut self.projection)?;
         device.add_inplace(&mut self.residual, &self.projection, shape.hidden)?;

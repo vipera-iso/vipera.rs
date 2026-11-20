@@ -40,6 +40,7 @@ pub(crate) struct Ops {
     pub(crate) rmsnorm: Arc<CudaFunction>,
     pub(crate) rope: Arc<CudaFunction>,
     pub(crate) attention_decode: Arc<CudaFunction>,
+    pub(crate) attention_decode_shared: Arc<CudaFunction>,
     pub(crate) swiglu: Arc<CudaFunction>,
     pub(crate) add_inplace: Arc<CudaFunction>,
     pub(crate) quantize_q8: Arc<CudaFunction>,
@@ -47,6 +48,14 @@ pub(crate) struct Ops {
 }
 
 impl Device {
+    /// Wait for the work queued on the stream, so a measurement times the kernels rather than the
+    /// launches.
+    pub fn synchronize(&self) -> Result<(), ViperaError> {
+        self.stream
+            .synchronize()
+            .map_err(|error| ViperaError::internal(format!("synchronize failed: {error}")))
+    }
+
     /// Open device `ordinal` (0 is the only one this backend picks) and compile the kernels.
     ///
     /// Returns an error rather than panicking when the driver is missing, so a build with the GPU
@@ -91,6 +100,7 @@ impl Device {
             rmsnorm: op("rmsnorm")?,
             rope: op("rope")?,
             attention_decode: op("attention_decode")?,
+            attention_decode_shared: op("attention_decode_shared")?,
             swiglu: op("swiglu")?,
             add_inplace: op("add_inplace")?,
             quantize_q8: op("quantize_q8")?,
@@ -295,6 +305,81 @@ impl Device {
         // `kv_heads*head_dim` and `positions` is checked against it by the caller's slot check.
         unsafe { launch.launch(config) }
             .map_err(|error| ViperaError::internal(format!("attention launch failed: {error}")))?;
+        Ok(())
+    }
+
+    /// Causal grouped-query attention with one block per KV head: the `group` query heads that share
+    /// its rows score each K row once from shared memory and read each V row once.
+    ///
+    /// `scores` is scratch of at least `heads * positions` floats; it holds the softmax weights
+    /// between the two halves of the kernel, because a group's score rows do not fit in shared
+    /// memory at long contexts. Callers pick this path for KV-shared models where
+    /// `group * head_dim` fits a block and `head_dim` is a whole number of warps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_shared(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k_cache: &DeviceBuffer<f32>,
+        v_cache: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        scores: &mut DeviceBuffer<f32>,
+        positions: usize,
+        shape: crate::layer::LayerShape,
+        scale: f32,
+    ) -> Result<(), ViperaError> {
+        let group = shape.heads / shape.kv_heads.max(1);
+        if shape.kv_heads == 0 || !shape.heads.is_multiple_of(shape.kv_heads) {
+            return Err(ViperaError::invalid_argument(
+                "the query heads do not divide into the KV heads",
+            ));
+        }
+        if !shape.head_dim.is_multiple_of(32) {
+            return Err(ViperaError::invalid_argument(
+                "the shared path needs a head width that is a whole number of warps",
+            ));
+        }
+        if group * shape.head_dim > 1024 {
+            return Err(ViperaError::invalid_argument(format!(
+                "{} threads would be one block; the limit is 1024",
+                group * shape.head_dim
+            )));
+        }
+        if scores.len() < shape.heads * positions {
+            return Err(ViperaError::invalid_argument(format!(
+                "the score scratch holds {} floats, the heads need {}",
+                scores.len(),
+                shape.heads * positions
+            )));
+        }
+        let warps = shape.head_dim / 32;
+        let shared = (shape.head_dim + group * warps + 2 * group) * 4;
+        let config = LaunchConfig {
+            grid_dim: (shape.kv_heads as u32, 1, 1),
+            block_dim: ((group * shape.head_dim) as u32, 1, 1),
+            shared_mem_bytes: shared as u32,
+        };
+        let positions = positions as i32;
+        let heads = shape.heads as i32;
+        let kv_heads = shape.kv_heads as i32;
+        let head_dim = shape.head_dim as i32;
+        let mut launch = self
+            .stream
+            .launch_builder(&self.ops.attention_decode_shared);
+        launch.arg(&q.slice);
+        launch.arg(&k_cache.slice);
+        launch.arg(&v_cache.slice);
+        launch.arg(&mut out.slice);
+        launch.arg(&mut scores.slice);
+        launch.arg(&positions);
+        launch.arg(&heads);
+        launch.arg(&kv_heads);
+        launch.arg(&head_dim);
+        launch.arg(&scale);
+        // SAFETY: one block per KV head, `group * head_dim` threads; the cache holds
+        // `max_positions` rows of `kv_heads * head_dim`, `positions` is checked against the caller's
+        // slot check, and `scores` is checked above for the group's full row.
+        unsafe { launch.launch(config) }
+            .map_err(|error| ViperaError::internal(format!("shared attention failed: {error}")))?;
         Ok(())
     }
 
