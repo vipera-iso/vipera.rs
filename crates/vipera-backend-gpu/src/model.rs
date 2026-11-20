@@ -134,7 +134,24 @@ fn meta_f32(file: &GgufFile, key: &str, fallback: f32) -> f32 {
 
 impl GpuModel {
     /// Read a GGUF file and copy the tensors the device path knows onto the card.
+    ///
+    /// Sized for the 512 positions the measurements use; [`Self::load_with_positions`] is what a
+    /// runtime that plans a context asks for.
     pub fn load(device: Device, path: &Path) -> Result<Self, ViperaError> {
+        Self::load_with_positions(device, path, 512)
+    }
+
+    /// The same load with a KV cache sized to `positions`.
+    pub fn load_with_positions(
+        device: Device,
+        path: &Path,
+        positions: usize,
+    ) -> Result<Self, ViperaError> {
+        if positions == 0 {
+            return Err(ViperaError::invalid_argument(
+                "the device KV cache needs at least one position",
+            ));
+        }
         let bytes = std::fs::read(path)?;
         let file = GgufFile::parse(&bytes)?;
         let arch = file
@@ -154,7 +171,7 @@ impl GpuModel {
             head_dim: hidden / heads.max(1),
             rope_base: meta_f32(&file, &key("rope.freq_base"), 1_000_000.0),
             epsilon: meta_f32(&file, &key("attention.layer_norm_rms_epsilon"), 1e-6),
-            max_positions: 512,
+            max_positions: positions,
         };
         let layers = meta_usize(&file, &key("block_count"), 28);
         let vocab = meta_usize(&file, "tokenizer.ggml.tokens", 0);
@@ -249,6 +266,83 @@ impl GpuModel {
     /// Layers loaded.
     pub fn depth(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Positions the device KV cache holds.
+    pub fn kv_positions(&self) -> usize {
+        self.shape.max_positions
+    }
+
+    /// Values in one K or V row, `kv_heads * head_dim`.
+    pub fn kv_width(&self) -> usize {
+        self.shape.kv_width()
+    }
+
+    /// Copy `count` rows from layer `layer`'s caches into two host vectors.
+    ///
+    /// This is the write-back half of the paged seam: the runtime's buffer is what a prefix-cache
+    /// copy moves, so every row a step computed has to reach it.
+    pub fn download_kv(
+        &self,
+        layer: usize,
+        first: usize,
+        count: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), ViperaError> {
+        let width = self.shape.kv_width();
+        let rows = self
+            .layers
+            .get(layer)
+            .ok_or_else(|| ViperaError::internal(format!("no layer {layer}")))?;
+        if first
+            .checked_add(count)
+            .is_none_or(|end| end > self.kv_positions())
+        {
+            return Err(ViperaError::invalid_argument(format!(
+                "rows {first}..{} are past the cache of {}",
+                first + count,
+                self.kv_positions()
+            )));
+        }
+        let mut k = vec![0f32; count * width];
+        let mut v = vec![0f32; count * width];
+        self.device
+            .download_at(rows.k_cache(), first * width, &mut k)?;
+        self.device
+            .download_at(rows.v_cache(), first * width, &mut v)?;
+        Ok((k, v))
+    }
+
+    /// Copy host rows into layer `layer`'s caches, starting at position `first`.
+    pub fn upload_kv(
+        &mut self,
+        layer: usize,
+        first: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> Result<(), ViperaError> {
+        let width = self.shape.kv_width();
+        let positions = self.shape.max_positions;
+        if k.len() != v.len() || !k.len().is_multiple_of(width) {
+            return Err(ViperaError::invalid_argument(
+                "KV rows must be two equal vectors of whole rows",
+            ));
+        }
+        if first
+            .checked_add(k.len() / width)
+            .is_none_or(|end| end > positions)
+        {
+            return Err(ViperaError::invalid_argument(format!(
+                "{} rows at {first} are past the cache of {positions}",
+                k.len() / width,
+            )));
+        }
+        let rows = self
+            .layers
+            .get_mut(layer)
+            .ok_or_else(|| ViperaError::internal(format!("no layer {layer}")))?;
+        let (k_cache, v_cache) = rows.kv_caches_mut();
+        self.device.upload_at(k, k_cache, first * width)?;
+        self.device.upload_at(v, v_cache, first * width)
     }
 
     /// Run `token` at `position` and return its logits.

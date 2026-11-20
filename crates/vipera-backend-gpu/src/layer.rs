@@ -434,6 +434,21 @@ impl GpuLayer {
         self.shape
     }
 
+    /// The layer's K and V caches, which the paged backend mirrors into the runtime's buffer.
+    pub fn kv_caches_mut(&mut self) -> (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>) {
+        (&mut self.k_cache, &mut self.v_cache)
+    }
+
+    /// The layer's K cache, for a read-only copy back to the host.
+    pub fn k_cache(&self) -> &DeviceBuffer<f32> {
+        &self.k_cache
+    }
+
+    /// The layer's V cache.
+    pub fn v_cache(&self) -> &DeviceBuffer<f32> {
+        &self.v_cache
+    }
+
     /// Bytes of Q4_K weights held on the device.
     pub fn weight_bytes(&self) -> usize {
         [

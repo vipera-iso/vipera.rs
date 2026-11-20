@@ -178,6 +178,53 @@ impl Device {
             .map_err(|error| ViperaError::internal(format!("copy to the device failed: {error}")))
     }
 
+    /// Copy a host row into the middle of a device buffer.
+    ///
+    /// The backend's KV cache is one allocation per layer, and a step writes one position into it;
+    /// copying the whole buffer up would move the history for a row's worth of new data.
+    pub fn upload_at<T: cudarc::driver::DeviceRepr>(
+        &self,
+        host: &[T],
+        dst: &mut DeviceBuffer<T>,
+        offset: usize,
+    ) -> Result<(), ViperaError> {
+        if offset
+            .checked_add(host.len())
+            .is_none_or(|end| end > dst.len())
+        {
+            return Err(ViperaError::invalid_argument(format!(
+                "copy of {} values at {offset} into {} slots",
+                host.len(),
+                dst.len()
+            )));
+        }
+        self.stream
+            .memcpy_htod(host, &mut dst.slice.slice_mut(offset..offset + host.len()))
+            .map_err(|error| ViperaError::internal(format!("copy to the device failed: {error}")))
+    }
+
+    /// Copy part of a device buffer back to the host.
+    pub fn download_at<T: cudarc::driver::DeviceRepr>(
+        &self,
+        src: &DeviceBuffer<T>,
+        offset: usize,
+        out: &mut [T],
+    ) -> Result<(), ViperaError> {
+        if offset
+            .checked_add(out.len())
+            .is_none_or(|end| end > src.len())
+        {
+            return Err(ViperaError::invalid_argument(format!(
+                "copy of {} values at {offset} out of {} slots",
+                out.len(),
+                src.len()
+            )));
+        }
+        self.stream
+            .memcpy_dtoh(&src.slice.slice(offset..offset + out.len()), out)
+            .map_err(|error| ViperaError::internal(format!("copy to the host failed: {error}")))
+    }
+
     /// Copy one device buffer into another of the same length.
     pub fn copy_buffer(
         &self,
