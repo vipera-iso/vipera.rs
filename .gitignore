@@ -25,6 +25,8 @@
 # Only the engine's own script is part of the repository; this home directory has others.
 /scripts/*
 !/scripts/parity-tokenize.sh
+# The gate: the stages CI runs are the stages a human runs, so the script has to travel with the code.
+!/scripts/gate.sh
 # The logits reference the qwen3 conformance test compares against: the dumper and the wrapper that
 # builds it, so the reference is a run anyone can repeat.
 !/scripts/logits-dump.sh

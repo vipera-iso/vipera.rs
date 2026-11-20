@@ -113,12 +113,25 @@ mypy src/vipera --ignore-missing-imports --no-error-summary
 python3 -m pytest tests/ -q
 
 # vipera.rs (Rust workspace) — both baselines are zero and must stay zero
-cargo fmt --check
-cargo clippy --workspace --all-targets --locked --features acme
+scripts/gate.sh              # every stage, in order
+scripts/gate.sh lint         # one stage
+scripts/gate.sh --list       # fmt lint build test features measure gpu
+```
+
+The Rust side has one executable form, `scripts/gate.sh`. CI runs it one stage per job and nothing
+else, so a stage that is green on a laptop and a stage that is green on CI are the same command; the
+stages are `fmt`, `lint`, `build`, `test`, `features`, `measure` and `gpu`, and the `ci` job fails
+unless every one of them passed. The commands behind the stages, which are the bar itself:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked --features acme -- -D warnings
+cargo build --workspace --release --locked
 cargo test --workspace --locked
 cargo test -p vipera-server --features acme --locked
 # The two measurement tests that assert (EXC-004). Release because a debug build cannot time them.
 cargo test -p vipera-backend-cpu --release --locked --test prefix_cache --test alignment_probe -- --ignored
+cargo test -p vipera-backend-gpu --locked
 ```
 
 The commands above are the canonical definition of "green". If `CONSTRAINTS.md` and a wrapper script disagree, this file wins.
