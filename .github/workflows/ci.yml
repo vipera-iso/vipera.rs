@@ -52,7 +52,7 @@ jobs:
       # both: a restore can only be a restore for the same pair. Per stage, because each stage builds
       # a different feature set, with a shared fallback for a cold stage.
       - name: Cache cargo and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
