@@ -2,9 +2,8 @@
 
 Last reviewed: 2026-11-06 · Owner: repo maintainer · Applies to: every human and every agent that edits this repo.
 
-This file is the written bar for `vipera-opt` (Python, repo root) and for the `vipera.rs` Phase 1 work specified in
-`specs/001-vipera-rs-engine/`. It exists because the agent writes far more code than anyone reads line by line, so
-"good enough" has to be written down and checked, not remembered.
+This file is the written bar for the `vipera.rs` engine in this workspace. It exists because the agent writes far
+more code than anyone reads line by line, so "good enough" has to be written down and checked, not remembered.
 
 **Do not weaken this file to make a change pass.** Tightening is silent; loosening needs a row in Exceptions.
 
@@ -21,8 +20,8 @@ These five are review-checked on every change. No tooling required, no exception
 
 ## Rules for the agent — what "code linh tinh" means here
 
-1. **Work from a written intent.** Every change traces to a spec requirement (`FR-xxx`), a constitution principle, or an
-   explicit instruction in the conversation. If it traces to none of those, stop and ask instead of inventing scope.
+1. **Work from the request.** The conversation is the brief. A change does not need a spec requirement or a
+   constitution principle behind it; if the request is ambiguous, pick the smallest defensible reading and say which.
 2. **No unrequested features.** No extra flags, endpoints, config keys, abstractions, or "while I'm here" additions. A new
    file needs a reason the task stated; a new dependency needs explicit approval.
 3. **No drive-by refactors.** Do not reformat, rename, reorder imports in, or "clean up" files the task did not name.
@@ -38,9 +37,8 @@ These five are review-checked on every change. No tooling required, no exception
 8. **Evidence before claims.** Run the exact check and quote its result. If a check could not run, say "not run" and why.
    Never describe compiled-but-unverified behavior as tested.
 9. **One concern per change.** A bug fix contains no feature; a feature contains no refactor; a refactor changes no behavior.
-10. **Respect the non-goals.** For `vipera-opt` these are binding (`constitution` Principle V): no quantization, pruning,
-    distillation, speculative decoding, multi-tenant serving, UI, or cloud orchestration. For `vipera.rs`, Phase 2+ items
-    in `plan.md` stay out of Phase 1.
+10. **Design notes are context, not a gate.** `specs/` and `docs/design/` say how an area got here and are worth reading
+    before changing it; they do not authorise or forbid work. Ask the user, not the document, when the two disagree.
 
 ## Enforced with numbers
 
@@ -104,14 +102,13 @@ An exception needs an owner and an expiry; without both it is a removal, not an 
 ## How to run the checks
 
 ```bash
-# vipera-opt (Python, repo root)
+# vipera-opt (Python, the `src/` and `tests/` trees)
 ruff check src/vipera tests
 mypy src/vipera --ignore-missing-imports --no-error-summary
-pip install -e ".[dev]"        # once, provides pytest
 python3 -m pytest tests/ -q
 
 # vipera.rs (Rust workspace) — both baselines are zero and must stay zero
-cd vipera.rs
+cargo fmt --check
 cargo clippy --workspace --all-targets --locked --features acme
 cargo test --workspace --locked
 cargo test -p vipera-server --features acme --locked
