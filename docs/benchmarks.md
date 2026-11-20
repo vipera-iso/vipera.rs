@@ -2719,10 +2719,23 @@ assumed: eight independent `vpdpbusd` chains on registers, no loads, nothing to 
 | `q4k_matvec_tiled_range`, down 1536x8960 | 107.0 - 114.9 |
 | `q6k_matvec_tiled_range`, same shapes | 66 - 83 |
 
+**Units.** This file also quotes the same kernel in GFLOPS; 1 GMAC is 2 FLOP, so 198.6 GFLOPS is 99.3
+GMAC/s and the two are the same measurement, not a 2x regression. The two GFLOPS figures already in
+this file for this kernel (198.6 in "The repacked 8x8 Q4_K GEMM would not help", 153.7 in "The ggml
+repacked GEMM is slower...") are 23% apart for the same shape, thread count and batch because they
+were taken in different windows on a laptop that drifts; the ceiling here is quoted as a range for
+the same reason.
+
 Two things follow. The weight broadcast the kernel issues per multiply-add costs 4-6% of the ceiling,
 so it is not the loss it looks like in the source. And the kernel runs at **42%** of what one thread
-can do - about 350 GMAC/s is left on the table - and it is not a memory problem: a 98 KB working set
-(`rows 32`, everything in L2) measures 90.8 GMAC/s, the same as the 13.7 MB one.
+can do, which is not a memory problem: a 98 KB working set (`rows 32`, everything in L2) measures 90.8
+GMAC/s, the same as the 13.7 MB one.
+
+**This is a single-thread ceiling, and it is not the pass's ceiling.** "Where the '27% of kernel rate'
+went" (2026-11-15) measured 66 GFLOPS/thread with four cores busy - 33 GMAC/s - because the second
+hyperthread of a core buys nothing here. So the 42% is the gap between one thread alone and one
+thread's instruction ceiling; it is not 350 GMAC/s the prefill could have, and the five configurations
+below are what trying to take it looked like.
 
 **The instruction count predicted a 2x that the machine does not deliver.** Counting the loop by
 hand: per row per sub-block per tile half, 8 weight fetches, 8 broadcasts, 8 `vpdpbusd`, a `dx` load, a
@@ -2745,8 +2758,12 @@ under a real dependency-mixing loop plus spills in the band, neither of which th
 told about from the outside.
 
 **What the number does say** is that a 2x is not available from reordering what is already there: five
-configurations, one at the shipped point, all within 30% of each other and none above it. `perf` is not
-installable in this container, so the step after this is a profiler, not another constant.
+configurations, one at the shipped point, all within 30% of each other and none above it. That is the
+same verdict the 2026-11-15 entries reached from the other end ("tile split, cache blocking and more
+threads are all closed", "any further prefill work has to reduce work or threads, not tighten the
+loop") - this entry reaches it from the kernel side and adds the number those entries were missing.
+`perf` is not installable in this container, so the step after this is a profiler, not another
+constant.
 
 **What reaching the ceiling needs.** Not another constant. The epilogue and the window buffer are
 paid per row per sub-block per half, so the loop has to fold more of them away: carry the sum across
