@@ -2760,4 +2760,17 @@ The kernel is held to the per-entry one by `qblock_attention_matches_the_per_ent
 **Where the prefill gap actually is, measured in the same run.** A 4k chunk is 1288 ms: Q4_K 47-50%
 (602 ms), Q6_K 14-15% (181 ms), attention 34%, the rest under 5%. 128 tokens in 1288 ms is 99 tok/s,
 against the 159-168 tok/s this ledger's llama.cpp rows record for `pp4096` on this rig: 0.59-0.62x.
-Even a free attention pass would leave 0.8x. The quantized GEMM is the lever, not this kernel.
+Even a free attention pass would leave 0.8x, so this kernel is not the prefill's problem.
+
+**What the remaining 0.62x is not.** "The ggml repacked GEMM is slower than the tiled Rust kernel"
+(2026-11-15) already answered the obvious reading: llama.cpp's Q4_K microkernel is *slower* per thread
+than this engine's, four cores are within a few percent of what they can deliver for it, and "any
+further prefill work has to reduce work or threads, not tighten the loop". So the gap is not a kernel
+to port and not a loop to widen. What is left, untested, is work: this chunk multiplies every weight
+once per token for 128 tokens, and llama.cpp's `pp4096` advantage has to come from doing less of it
+per token - chunking, residency, or a batched path this engine does not have. That is a design
+question, not a constant.
+
+**Axis, because the names collide.** K and V rows are already shared across a head group by default
+(`9abfa5e`, `a31d5ee`). This kernel shares them across *queries* instead - a different axis, which is
+why it is a second kernel and why its gain (7.7%) is smaller than the traffic it removes.
