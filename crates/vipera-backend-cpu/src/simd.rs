@@ -2159,6 +2159,61 @@ pub fn vnni512_available() -> bool {
     })
 }
 
+/// Eight independent `vpdpbusd` chains on registers: the instruction-mix
+/// ceiling of the machine, measured rather than assumed. Test-only.
+#[cfg(test)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dpbusd_ceiling(iters: u64) -> i64 {
+    // SAFETY: the caller checked `vnni512_available`, and both operands are
+    // built here rather than loaded.
+    unsafe {
+        let mut acc = [_mm512_set1_epi32(0); 8];
+        let weights = _mm512_set1_epi32(0x0f0f_0f0f);
+        let codes = _mm512_set1_epi32(0x0101_0101);
+        for _ in 0..iters {
+            for slot in acc.iter_mut() {
+                *slot = _mm512_dpbusd_epi32(*slot, weights, codes);
+            }
+        }
+        let mut total = 0_i64;
+        for slot in acc {
+            let lanes: [i32; 16] = std::mem::transmute(slot);
+            total += lanes.iter().map(|&lane| i64::from(lane)).sum::<i64>();
+        }
+        std::hint::black_box(total)
+    }
+}
+
+/// The same eight chains, but each multiply-add needs its weight broadcast
+/// first - the shape [`q4k_matvec_tiled_range`] actually issues, where the
+/// four-byte weight word is all the row loop can give the multiply-add.
+/// Test-only.
+#[cfg(test)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn broadcast_ceiling(iters: u64) -> i64 {
+    // SAFETY: the caller checked `vnni512_available`; the weight words come
+    // from an array built here, never from outside.
+    unsafe {
+        let words: [u32; 64] = std::array::from_fn(|w| 0x0f0f_0f0f_u32 ^ w as u32);
+        let mut acc = [_mm512_set1_epi32(0); 8];
+        let codes = _mm512_set1_epi32(0x0101_0101);
+        let mut w = 0_usize;
+        for _ in 0..iters {
+            for slot in acc.iter_mut() {
+                let word = words[w & 63];
+                *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word as i32), codes);
+                w = w.wrapping_add(1);
+            }
+        }
+        let mut total = 0_i64;
+        for slot in acc {
+            let lanes: [i32; 16] = std::mem::transmute(slot);
+            total += lanes.iter().map(|&lane| i64::from(lane)).sum::<i64>();
+        }
+        std::hint::black_box(total)
+    }
+}
+
 /// Safe entry point for [`q4k_matvec_tiled_range`]: checks the CPU and the
 /// activation lengths itself, so callers outside this module can use it
 /// without `unsafe`.
@@ -3792,6 +3847,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The ceiling the tiled kernel is measured against: `vpdpbusd` back to
+    /// back on registers, eight independent accumulators so the dependency
+    /// chain is never the limit. No matvec on this CPU can beat this number,
+    /// and the gap to it is what the loop around the multiply-adds costs.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_dpbusd_ceiling() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let total = unsafe { dpbusd_ceiling(20_000_000) };
+            let secs = start.elapsed().as_secs_f64();
+            std::hint::black_box(total);
+            best = best.min(secs);
+        }
+        println!(
+            "vpdpbusd ceiling, one thread: {:.1} GMAC/s",
+            20_000_000.0 * 8.0 * 64.0 / best / 1e9
+        );
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let total = unsafe { broadcast_ceiling(20_000_000) };
+            let secs = start.elapsed().as_secs_f64();
+            std::hint::black_box(total);
+            best = best.min(secs);
+        }
+        println!(
+            "vpdpbusd ceiling with a weight broadcast per op: {:.1} GMAC/s",
+            20_000_000.0 * 8.0 * 64.0 / best / 1e9
+        );
     }
 
     /// The output projection's shape: one activation against the vocabulary

@@ -2704,3 +2704,62 @@ needs a barrier. And the two prefill kernels, single thread, 128 entries: gate/u
 77.3 GMAC/s against Q6_K 54.6 (1.42x), down 1536x8960 Q4_K 94.8 against Q6_K 83.8 (1.13x) — the
 Q6_K layers are only the FFN down and attention v, so the gap is worth about 16 ms of a chunk, not the
 whole of the Q6_K phase's 15%.
+
+### The q4k tiled kernel is at 42% of a measured ceiling, and the ceiling is not the multiply-add — 2026-11-20
+
+The tiled kernel is the prefill: q4k is 47-50% of a 4k chunk and q6k another 14-15%. Before tuning it
+again, the question is what it is being measured against, so the ceiling was measured rather than
+assumed: eight independent `vpdpbusd` chains on registers, no loads, nothing to interfere.
+
+| loop | GMAC/s, one thread |
+|---|---|
+| `vpdpbusd` back to back, 8 accumulators | 258.8 - 264.4 |
+| the same, with a weight broadcast from memory per op | 242.4 - 253.1 |
+| `q4k_matvec_tiled_range`, gate/up 8960x1536 | 94.4 - 97.9 |
+| `q4k_matvec_tiled_range`, down 1536x8960 | 107.0 - 114.9 |
+| `q6k_matvec_tiled_range`, same shapes | 66 - 83 |
+
+Two things follow. The weight broadcast the kernel issues per multiply-add costs 4-6% of the ceiling,
+so it is not the loss it looks like in the source. And the kernel runs at **42%** of what one thread
+can do - about 350 GMAC/s is left on the table - and it is not a memory problem: a 98 KB working set
+(`rows 32`, everything in L2) measures 90.8 GMAC/s, the same as the 13.7 MB one.
+
+**The instruction count predicted a 2x that the machine does not deliver.** Counting the loop by
+hand: per row per sub-block per tile half, 8 weight fetches, 8 broadcasts, 8 `vpdpbusd`, a `dx` load, a
+`sum` load, two scale broadcasts, three float multiply-adds, and the load-add-store into the window
+buffer - ~4.3 uops per multiply-add against a multiply-add port that issues one per cycle. That
+predicts working the fetch stream in half would be worth 20-25%, so it was tried:
+
+| change | gate/up | down | verdict |
+|---|---|---|---|
+| `BAND` 8, one fetch per multiply-add (shipped) | 94.4 - 97.9 | 107.0 - 114.9 | baseline |
+| two tile halves share one weight fetch, `BAND` 4 | 95.4 | 111.8 | neutral, reverted |
+| the same, `BAND` 2 | 64.1 - 75.5 | 72.3 - 75.7 | worse |
+| `BAND` 12 | 66.5 - 73.5 | 74.8 - 78.0 | worse |
+| `BAND` 16 | 69.5 - 75.1 | 75.7 - 77.8 | worse |
+
+Sharing a weight fetch between two halves is worth nothing, and both moving the band either way
+loses: `BAND` 8 is a local optimum in both directions. So the fetch stream is not the limiter, and the
+uop accounting above is missing something - the likeliest candidates are the sustained AVX-512 clock
+under a real dependency-mixing loop plus spills in the band, neither of which this kernel can be
+told about from the outside.
+
+**What the number does say** is that a 2x is not available from reordering what is already there: five
+configurations, one at the shipped point, all within 30% of each other and none above it. `perf` is not
+installable in this container, so the step after this is a profiler, not another constant.
+
+**What reaching the ceiling needs.** Not another constant. The epilogue and the window buffer are
+paid per row per sub-block per half, so the loop has to fold more of them away: carry the sum across
+blocks in registers, and stage the epilogue so its float work is paid once per row per block instead
+of once per sub-block. That is a microkernel restructure with a new accumulator layout, not an edit;
+it is also what the ggml repack GEMM does, and this ledger already records that the ggml repack build
+measured *slower* than this kernel at these shapes (2026-11-15), so the restructure would have to be
+measured against this bench at every step, not assumed to win.
+
+There is no performance change in this entry. `bench_dpbusd_ceiling` and
+`bench_tiled_q4k_vs_q6k_shapes` are what the next attempt has to beat.
+
+```bash
+cargo test -p vipera-backend-cpu --release --lib bench_dpbusd_ceiling -- --ignored --nocapture
+cargo test -p vipera-backend-cpu --release --lib bench_tiled_q4k_vs_q6k_shapes -- --ignored --nocapture
+```
