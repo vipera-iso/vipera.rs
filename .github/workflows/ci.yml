@@ -1,11 +1,16 @@
 name: ci
 
-# The gate this repository actually holds: format, lint, test, in that order, on every push and pull
-# request.
+# One gate, run per stage, in parallel. The stages themselves live in `scripts/gate.sh`, so the
+# command CI runs and the command a human runs are the same command; this file only decides where
+# they run, what they may reuse, and how a red build is reported.
+#
+# Adding a check means adding a stage to the script and a name to the matrix. It does not mean
+# writing a second command here.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,53 +19,63 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  # The integration tests skip themselves with a printed reason when no model is present; this keeps
+  # that reason visible in the job log instead of buried in a captured harness.
+  RUST_BACKTRACE: "1"
+
 jobs:
   gate:
+    name: gate / ${{ matrix.stage }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      # The integration tests skip themselves with a printed reason when no model is present; this
-      # keeps that reason visible in the job log instead of buried in a captured test harness.
-      RUST_BACKTRACE: 1
+    timeout-minutes: 25
+    strategy:
+      # Every stage reports, so one red does not hide the other six.
+      fail-fast: false
+      matrix:
+        stage: [fmt, lint, build, test, features, measure, gpu]
     steps:
       - uses: actions/checkout@v7
 
       - name: Toolchain components
         run: rustup component add rustfmt clippy
 
-      - name: Format
-        run: cargo fmt --all --check
+      - name: Toolchain
+        # The pin is `rust-toolchain.toml`; print what it resolved to, so a green report carries the
+        # compiler it ran on rather than "stable, at the time".
+        run: |
+          rustc --version --verbose
+          cargo --version
 
-      - name: Lint
-        # `acme` is off by default, so it is named here: code the default build never compiles is
-        # code the gate never checks.
-        run: cargo clippy --workspace --all-targets --locked --features acme -- -D warnings
+      # The pinned toolchain decides the build and `Cargo.lock` decides the graph, so the key carries
+      # both: a restore can only be a restore for the same pair. Per stage, because each stage builds
+      # a different feature set, with a shared fallback for a cold stage.
+      - name: Cache cargo and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.stage }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.stage }}-
+            ${{ runner.os }}-cargo-
 
-      - name: Test
-        run: cargo test --workspace --locked
+      - name: ${{ matrix.stage }}
+        run: ./scripts/gate.sh ${{ matrix.stage }}
 
-      - name: Test the ACME feature
-        run: cargo test -p vipera-server --features acme --locked
-
-      - name: Test the release-mode measurements
-        # These assert, so they belong in the gate; they are `#[ignore]`d only because a debug build
-        # cannot prefill or time them. Without a model they print the reason and pass.
-        run: cargo test -p vipera-backend-cpu --release --locked --test prefix_cache --test alignment_probe -- --ignored
-
-  gpu-seam:
-    # The CUDA seam: the paged KV layout, the `ForwardPass` implementation, and the parity harness
-    # that runs the device against the CPU backend through the runtime's own KV buffer.
-    #
-    # GitHub-hosted runners have no CUDA device, so `forward_pass_parity` prints its skip reason
-    # here and passes; what this job gates unconditionally is that the crate and its tests compile
-    # and that the host-side layout arithmetic is right. On a GPU runner set `VIPERA_REQUIRE_GPU: 1`
-    # (and point `VIPERA_TEST_MODEL` at a model) and the same test fails instead of skipping.
+  ci:
+    # The one check to require in branch protection, and the one place that says which stage was red.
+    # The matrix reports each stage; this fails unless all of them passed.
+    name: ci
+    if: always()
+    needs: [gate]
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    env:
-      RUST_BACKTRACE: 1
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-
-      - name: The CUDA seam
-        run: cargo test -p vipera-backend-gpu --locked -- --nocapture
+      - name: Every stage passed
+        run: |
+          echo "gate: ${{ needs.gate.result }}"
+          test "${{ needs.gate.result }}" = success
