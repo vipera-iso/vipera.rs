@@ -2467,3 +2467,240 @@ The prefill figures are steady because eight busy threads hold the clock up.
 **Repeatable measurement:** `scripts/bench-4k.sh` runs a 4k prompt twice per attention-switch arm and
 prints prefill, the attention share of it, decode, and llama-bench's own numbers when
 `LLAMA_BENCH=/path/to/llama-bench` is set.
+
+### The sliding-window kernels share K/V rows too — 2026-11-19
+
+`VIPERA_ATTN_GQA_SHARE` only reached the full-history kernels. A run with `VIPERA_ATTN_WINDOW` set —
+the one configuration where decode cost stops growing with depth, and so the one where decode
+attention matters most — went through `attention_window_heads` and
+`attention_window_chunked_heads`, which had no shared arm and read each K and V row once per query
+head. Both take the switch now. The two-pass window kernel scores each kept K row against a key
+head's whole group in one `simd::dot_f16_group` call and folds the kept V rows sixteen at a time
+through `fold_value_block` (`positions` became `stride`, with the score slot passed explicitly, so
+the kept positions stay numbered `[0, kept)` across the gap the dropped middle leaves). The chunked
+window kernel, which is what a decode step runs, folds each chunk through `fold_chunk_block`, the
+same block online-softmax the full-history KV-chunk kernel uses.
+
+Both remain within rounding of their per-head arms rather than bit-identical, and `q8_0` rows, the
+sequential `VIPERA_EXACT_DOT=1` path and groups over 16 heads keep the per-head kernels bit for bit:
+`shared_window_matches_the_per_head_kernel_within_rounding` holds them to 1e-5 across group sizes
+1/3/6/7, head ranges that cut a group, kept-position counts of 12/19/20/21/44 that straddle the
+sixteen-row blocks, and 2/3/4 workers, and checks the `q8_0` arm for equality.
+
+The end-to-end A/B the section above describes is runnable again — `decode_gqa_share_switch` and
+`prefill_gqa_share_switch` force the switch per call (`force_share`) instead of reading the
+environment, so one process times both arms. Qwen2.5-1.5B Q4_K_M, i5-11300H, 8 threads, arms
+interleaved, decode with the KV chunk and four workers on in both arms:
+
+| | per-head | shared |
+|---|---|---|
+| decode, ctx 1024 | 39.15 ms/step | 37.47 ms/step (-4.3%, slower in 18/60 rounds) |
+| decode, ctx 4096 | 51.21 ms/step | 43.07 ms/step (-15.9%, slower in 1/60) |
+| decode, ctx 4096, `VIPERA_ATTN_WINDOW=2048` | 42.40 ms/step | 39.31 ms/step (-7.3%) |
+| prefill 1024, best of 3 | 164.8 tok/s | 171.4 tok/s (+4.0%) |
+| prefill 4096, best of 2 | 112.4 tok/s | 125.7 tok/s (+11.8%) |
+
+The `VIPERA_ATTN_WINDOW=2048` row is the chunked window kernel (ctx 4096 is past the window plus
+sinks); the ctx 1024 row of that run is still the full-history kernel, since the window only applies
+once the history outgrows it. That is the end-to-end gain for the window path specifically: 3.1 ms
+of a 42.4 ms step.
+
+The same pairs on Qwen2.5-7B Q4_K_M, where the step is bandwidth-bound and attention is a smaller
+share, so the ratio shrinks with the model:
+
+| | per-head | shared |
+|---|---|---|
+| decode, ctx 1024 | 136.26 ms/step | 132.20 ms/step (-3.0%) |
+| decode, ctx 4096 | 166.22 ms/step | 147.76 ms/step (-11.1%, slower in 0/60 rounds) |
+| prefill 1024, best of 3 | 42.7 tok/s | 43.1 tok/s (+1.0%) |
+| prefill 4096, best of 2 | 32.2 tok/s | 34.5 tok/s (+6.5%) |
+
+The 14B GGUF on this machine is Hermes 4 14B, which is `qwen3`. The CPU backend reads that layout
+too now — `qwen3` blocks differ from `qwen2` by per-head q/k RMSNorm before RoPE, no attention
+biases, and a head width that comes from `attention.key_length` — so the same pair was taken on it
+(Hermes 4 14B Q4_K_M, 40 layers, 40 heads / 8 KV heads, head width 128, 40k context):
+
+| | per-head | shared |
+|---|---|---|
+| decode, ctx 1024 | 254.29 ms/step | 246.79 ms/step (-3.0%, slower in 13/60 rounds) |
+| decode, ctx 4096 | 320.07 ms/step | 274.72 ms/step (-14.2%, slower in 0/60 rounds) |
+| prefill 1024, best of 3 | 22.0 tok/s | 22.0 tok/s (+0.3% time) |
+| prefill 4096, best of 2 | 15.9 tok/s | 16.7 tok/s (-5.2% time) |
+
+At 4k the 14B decode step saves 45 ms, the largest absolute saving of the three models, and it is
+the same ratio as the 7B because the step is bandwidth-bound for both. The 1024 prefill is a wash
+(46.4 s against 46.6 s, inside run-to-run noise at this size) and the 4096 one gains 5%.
+
+The qwen3 path is held to llama.cpp's logits rather than to its prose: `scripts/logits-dump.sh`
+runs one fixed token sequence through llama.cpp (no sampling, no chat template) and
+`crates/vipera-backend-cpu/tests/logits_reference.rs` runs the same ids through this backend. On the
+14B file the argmax is the same token (19846), the top eight are the same set, and the worst of the
+top sixteen moves 0.25 logits against a top of 22.6 — the rank flips start where neighbouring rows
+sit 0.05 apart, inside the accumulation noise of two different f32 orders. Coherent greedy text
+from the first token is a weaker signal than that and is not what the check rests on.
+
+```bash
+cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch  -- --ignored --nocapture
+cargo test --release -p vipera-backend-cpu --lib prefill_gqa_share_switch -- --ignored --nocapture
+VIPERA_ATTN_WINDOW=2048 cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch -- --ignored --nocapture
+# the 14B rows: point the measurement at the qwen3 file
+VIPERA_TEST_MODEL=~/.vipera/models/hermes4-14b-q4km.gguf \
+  cargo test --release -p vipera-backend-cpu --lib decode_gqa_share_switch -- --ignored --nocapture
+```
+
+### The GPU attention kernel shares K rows across a head group too — opt-in, 2026-11-20
+
+The CPU sharing numbers above had no GPU counterpart: `vipera-backend-gpu` had one attention kernel,
+one block per query head, and every head of a group read the same `positions * head_dim` of K and V.
+At 4k positions on a 40-head/8-KV-head model that is ~168 MB of cache traffic per layer for ~33 MB
+of distinct rows, and a 4 MB L2 holds neither side of that.
+
+`attention_decode_shared` (in `layer.cu`) puts one block per *KV* head instead: the block's first
+`head_dim` threads stage the K row in shared memory, all five heads of the group score it from
+there, and the group's warps read each V row with the same index, so L1 serves one row where the
+per-head kernel read five. Each block owns `group * head_dim` = 640 threads. The softmax weights are
+the only thing that leaves the block — `group * positions` floats do not fit in shared memory at long
+contexts (80 KB at 4096) — so they go to a per-layer scratch buffer of `heads * max_positions` on
+the device. 80 KB of traffic against the MBs the shares save.
+
+The arm is behind `VIPERA_GPU_ATTN_SHARE=on` (or `layer::force_shared(Some(true))` for a paired run)
+and defaults off: every earlier GPU number was taken with the per-head kernel. Shapes without a
+group, without whole-warps-per-head, or with `group * head_dim` over 1024 keep the per-head kernel.
+
+Correctness: `shared_attention_matches_the_per_head_kernel` holds the two arms to 1e-5 of the output
+magnitude at 1, 7, 64 and 511 positions on Qwen3-14B's attention shape, and both against a CPU
+reference — worst difference 6e-8, which is rounding, not an arm.
+
+The A/B (`attention_arms_at_long_context`, arms interleaved inside every round, 20 rounds after
+three warm launches, GTX 1650, Qwen3-14B attention shape, synthetic rows so a GGUF quantizer is not
+in front of the kernel):
+
+| positions | per-head | shared | time change |
+|---|---|---|---|
+| 512 | 0.535 ms | 0.507 ms | -5.2% |
+| 1024 | 1.061 ms | 1.006 ms | -5.2% |
+| 2048 | 2.116 ms | 2.006 ms | -5.2% |
+| 4096 | 3.651 ms | 3.355 ms | -8.1% |
+
+Honest reading: this is the sharing working and it is not the win the traffic math promises. The K
+reads that go away are ~64 MB at 4096, which at this card's ~200 GB/s is ~0.3 ms — exactly what was
+measured. The rest of the 3.4 ms is not bandwidth: the per-position loop carries two
+`__syncthreads()` and the V pass is a serial dependent add, so the kernel runs at a fraction of the
+card's bandwidth and moving fewer bytes barely moves it. One block per KV head is also 8 blocks
+across 14 SMs, i.e. six idle. Making this pay needs the split-positions attention the decode path
+does not have yet (flash-decoding style: blocks over position chunks, then a combine pass), not a
+better sharing kernel.
+
+End to end the switch is invisible at the lengths this backend is exercised at: the 1.5B model's
+23.6 ms/token with `VIPERA_GPU_ATTN_SHARE=on` lands inside run-to-run noise, because attention is
+under a millisecond of that step.
+
+```bash
+cargo test -p vipera-backend-gpu --release --test attention_shared -- --ignored --nocapture
+VIPERA_GPU_ATTN_SHARE=on cargo test -p vipera-backend-gpu --release --test model_gpu -- --ignored --nocapture
+```
+
+### Split the history across blocks: the GPU attention kernel cut along positions — 2026-11-20
+
+The section above ended on a lead: the shared kernel's 4k time (3.36 ms) was not its bandwidth
+(0.3 ms of saving from the K rows it stopped re-reading), it was latency — eight blocks on a
+fourteen-SM card, and two `__syncthreads()` per position on a 4096-long loop. The fix is the one
+flash-decoding uses: cut the history, not the heads.
+
+`attention_split` runs one block per (KV head, chunk of 128 positions): it stages K rows in shared
+memory, scores the whole group against them, and writes an unnormalised partial — the chunk's max,
+its softmax denominator, and `sum(exp(score - max) * v)` per dimension. `attention_combine` folds
+the chunks with the online-softmax identity (one block per head, one thread per dimension). Scores
+stay in shared memory, so the shared kernel's global score scratch disappears. Chunk length was
+swept at 64/128/256/512: 64 and 128 tie at 4096 (1.92 ms), 512 loses at 2048 (1.19 against 1.00),
+so 128 is what ships.
+
+The arm is on by default from 512 positions up (`VIPERA_GPU_ATTN_SPLIT=off` pins the older arms;
+`force_split` does it per call). Parity holds where it did for the shared arm:
+`split_attention_matches_the_per_head_kernel` covers 1/7/255/256/257/511/512/513/1023/1024 positions
+— chunk edges, thread edges and the empty tail past 1020 — to 6e-8, and
+`the_split_arm_preserves_a_real_layer` runs a real Qwen2.5-1.5B block for 700 positions twice, once
+per arm: worst 1.43e-6 on values up to 4.7.
+
+Three arms, same rows, arms interleaved inside every round, 20 rounds after warming all three
+(GTX 1650; synthetic K/V so no quantizer is in front of the kernel):
+
+| shape | positions | per-head | shared | split |
+|---|---|---|---|---|
+| qwen3-14b, 40/8 heads | 512 | 0.537 ms | 0.509 (-5.4%) | **0.380 (-29.2%)** |
+| | 1024 | 1.061 ms | 1.006 (-5.2%) | **0.627 (-40.9%)** |
+| | 2048 | 2.116 ms | 2.006 (-5.2%) | **1.241 (-41.3%)** |
+| | 4096 | 3.549 ms | 3.275 (-7.7%) | **1.923 (-45.8%, 1.8x)** |
+| qwen2.5-1.5b, 12/2 heads | 512 | 0.332 ms | 0.412 (**+24.1%**) | **0.116 (-65.1%)** |
+| | 1024 | 0.884 ms | 0.885 (-0.1%) | **0.226 (-74.4%)** |
+| | 2048 | 1.753 ms | 1.763 (+0.6%) | **0.339 (-80.7%)** |
+| | 4096 | 3.504 ms | 3.546 (+1.2%) | **0.579 (-83.5%, 6.0x)** |
+
+The 1.5B row is the one that matters for this card, and it also corrects the section above: with two
+KV heads the shared arm is *not* worth taking at all — it is 2 blocks where the per-head kernel is
+12 — so the sharing that helped a 40/8 model is a loss on the model this machine actually serves.
+The split arm is not: at 4k it is 6x, because 2 KV heads × 32 chunks is 64 blocks instead of 2.
+
+End to end on one real Qwen2.5-1.5B layer (`the_split_arm_preserves_a_real_layer`, step 680–699 of a
+700-position history, per arm, not interleaved — the card throttles under a sustained loop, and this
+is the honest label rather than a claim of a paired number): **1.195 ms/step per-head against
+0.795 ms split, −34% of the layer step**. Attention is the part that grows with depth, so the
+saving grows with it; the matvecs do not change.
+
+```bash
+cargo test -p vipera-backend-gpu --release --test attention_shared -- --ignored --nocapture
+cargo test -p vipera-backend-gpu --release --test layer_gpu the_split_arm -- --ignored --nocapture
+```
+
+### Building a batched product's activations on the calling thread: 58 ms of a chunk — opt-in pool, 2026-11-20
+
+`matvec_pooled_batch` builds the owned activations of a product (copy, group sums, Q8 quantiser) on
+the calling thread, one entry after another, before it wakes any worker, so every worker is idle for
+that time. A prefill chunk makes 196 such products (per layer: q/k/v at width 1536, o at 1536,
+gate and up at 1536, down at 8960 — 168 products at 1536 and 28 at 8960), and the profile's Q4_K and
+Q6_K phases include it, because the stamp wraps the whole call. `bench_activation_prep`, 128
+entries, one thread, best of 5, two runs:
+
+| width | `OwnedActivation::new` | of which group sums | quantiser | copy |
+|---|---|---|---|---|
+| 1536 | 0.163–0.165 ms | 0.045–0.047 | 0.109 | 0.014–0.015 |
+| 8960 | 1.094–1.099 ms | 0.291–0.304 | 0.595–0.617 | 0.208–0.213 |
+
+That is 168 x 0.165 + 28 x 1.1 = **~58 ms per chunk** of calling-thread time with the workers waiting:
+5.5% of the 1045 ms 4k chunk and 8% of the 718 ms first chunk, at this sandbox's speed (a 1-vCPU
+AVX-512 Xeon, not the i5-11300H).
+
+`VIPERA_PARALLEL_PREP=1` (off by default) has the pool's workers build them: the calling thread copies
+the entries into buffers (a worker cannot borrow its stack), hands each participant a run of entries
+and keeps the last run, and each worker finishes its buffers in place (`OwnedActivation::from_buffer`).
+It applies from 16 entries up, so a decode step or a short draft never pays a wake-up for it. **The
+result is bit-identical**, entry for entry, to the serial build, because the same sums and the same
+quantiser run on the same values (`prepared_activations_are_bit_identical_to_the_serial_ones`: Q4_K,
+Q6_K and F32, batches of 1, 2, 7, 16, 32 and 33 entries, widths 32/96/1536, groups of zeros and of
+negative zeros, worker counts 0/3/7). A worker that is gone or panics does not hang or half-fill the
+batch: its run is built on the caller, or the call returns an error, as `fill_batch` does for rows.
+
+**What was and was not measured.** On this 1-vCPU host the pool cannot add parallelism, so
+`pool_prep_cost` only bounds the overhead: calling thread against pool 0.99x and 0.98x at one
+participant, 0.98x and 1.03x at four time-sliced ones (1536 and 8960 wide), i.e. no cost for taking
+the path. The gain is a parallel one and has to be measured on the rig: if eight participants split
+the 0.9 ms of work at 8960, the product's preparation falls from about 1.1 ms to about 0.2 (copy)
++ 0.11 + a wake-up, and from 0.165 to about 0.065 at 1536, which over 196 products is roughly 40 ms
+of a chunk, 4–6% — a projection, not a result. Prior polling and on-demand experiments in this file
+found wake-ups costing what they saved on this part, so it is off until it is measured:
+
+```bash
+for v in 0 1; do VIPERA_PARALLEL_PREP=$v VIPERA_PROFILE_STEP=1 <the 4k prefill run>; done
+cargo test -p vipera-backend-cpu --release --lib pool_prep_cost -- --ignored --nocapture
+```
+
+**What this entry also found, not changed.** The tiled kernels build their activation tile inside
+every call on every thread (`bench_tiled_q4k_vs_q6k_shapes`, B = 128, one thread, row count 0 so the
+call is the tile alone): 0.03–0.06 ms at width 1536 and 0.37–0.47 ms at 8960, for both Q4_K and Q6_K.
+A down projection gives each of eight threads 192 rows, about 2.4 ms of kernel work at the single-thread
+rate, so the duplicated tile is ~16% of that call and ~21 ms of CPU per thread per chunk in total.
+Sharing one tile across the participants is the next lever of this kind, and unlike the preparation it
+needs a barrier. And the two prefill kernels, single thread, 128 entries: gate/up 8960x1536 Q4_K
+77.3 GMAC/s against Q6_K 54.6 (1.42x), down 1536x8960 Q4_K 94.8 against Q6_K 83.8 (1.13x) — the
+Q6_K layers are only the FFN down and attention v, so the gap is worth about 16 ms of a chunk, not the
+whole of the Q6_K phase's 15%.

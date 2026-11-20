@@ -46,3 +46,21 @@ jobs:
         # These assert, so they belong in the gate; they are `#[ignore]`d only because a debug build
         # cannot prefill or time them. Without a model they print the reason and pass.
         run: cargo test -p vipera-backend-cpu --release --locked --test prefix_cache --test alignment_probe -- --ignored
+
+  gpu-seam:
+    # The CUDA seam: the paged KV layout, the `ForwardPass` implementation, and the parity harness
+    # that runs the device against the CPU backend through the runtime's own KV buffer.
+    #
+    # GitHub-hosted runners have no CUDA device, so `forward_pass_parity` prints its skip reason
+    # here and passes; what this job gates unconditionally is that the crate and its tests compile
+    # and that the host-side layout arithmetic is right. On a GPU runner set `VIPERA_REQUIRE_GPU: 1`
+    # (and point `VIPERA_TEST_MODEL` at a model) and the same test fails instead of skipping.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The CUDA seam
+        run: cargo test -p vipera-backend-gpu --locked -- --nocapture

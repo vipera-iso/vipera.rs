@@ -48,7 +48,7 @@ is expected to be green at every commit, so a local run alone does not prove the
 
 ## Checkpoints
 
-When a piece of work reaches a stopping point, record it in
-`specs/001-vipera-rs-engine/checkpoints/YYYY-MM-DD-<name>.md`: what changed, the branch and commit,
-the gate output as it actually came back, and what is still open. Keep it short — it is the handoff
-to the next session, not a changelog.
+When a piece of work reaches a stopping point, a short note under
+`specs/001-vipera-rs-engine/checkpoints/YYYY-MM-DD-<name>.md` — what changed, the branch and commit,
+the gate output as it actually came back, and what is still open — is welcome but optional. Nothing
+in the workflow depends on it.

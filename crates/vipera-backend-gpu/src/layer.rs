@@ -8,6 +8,8 @@
 //! What it is not: batched, paged, or wired into `ForwardPass`. K/V live in one flat per-layer cache
 //! sized to `max_positions`, which is what a comparison against the CPU needs and nothing more.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use vipera_errors::ViperaError;
 
 use crate::device::{Device, DeviceBuffer};
@@ -17,6 +19,135 @@ use crate::q6k::Q6kMatrix;
 use crate::q8::Q8Device;
 
 pub(crate) const SOURCE: &str = include_str!("layer.cu");
+
+/// Environment switch for the shared-attention arm, for the one measurement that wants both arms in
+/// one process. `on`/`1`/`true` shares, anything else keeps the per-head kernel.
+pub const SHARE_ENV: &str = "VIPERA_GPU_ATTN_SHARE";
+
+/// `2` means "not forced"; `0` and `1` are the arms [`force_shared`] pins.
+const UNSET: u8 = 2;
+static SHARE: AtomicU8 = AtomicU8::new(UNSET);
+
+/// Pin the attention arm for the next steps, or hand control back to the environment with `None`.
+///
+/// Both arms are the same arithmetic over the same rows, so a measurement can time them in one
+/// process — which is the only way two timings here are comparable, since the clock on this card
+/// moves with the load before it.
+pub fn force_shared(arm: Option<bool>) {
+    SHARE.store(
+        match arm {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => UNSET,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a step should use the shared-group attention kernel.
+///
+/// Off unless asked for: the per-head kernel is the one every earlier number was taken with, and a
+/// switch that defaults on turns a measurement into a change of behaviour.
+pub fn shared_enabled() -> bool {
+    match SHARE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => matches!(
+            std::env::var(SHARE_ENV).as_deref(),
+            Ok("1" | "on" | "true" | "yes")
+        ),
+    }
+}
+
+/// Environment switch for the split arm. The split kernel is the default past
+/// [`SPLIT_MIN`] positions because it is the same arithmetic at 3.4x the block count; `off`/`0`
+/// pins the older arms for a measurement.
+pub const SPLIT_ENV: &str = "VIPERA_GPU_ATTN_SPLIT";
+
+/// Unset leaves the split arm on (see [`split_enabled`]); `0`/`1` pin it.
+static SPLIT: AtomicU8 = AtomicU8::new(UNSET);
+
+/// Pin the split arm for the next steps (`None` hands control back to the environment).
+pub fn force_split(arm: Option<bool>) {
+    SPLIT.store(
+        match arm {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => UNSET,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a step should cut the history into chunks instead of walking it in one block.
+///
+/// On by default. Unlike the shared-group arm this is not a different accounting of the same reads
+/// — it is the same reads with eight times the blocks and no per-position `__syncthreads()` on a
+/// 4096-long critical path, and it is held to the per-head arm within rounding by
+/// `attention_split_matches_the_per_head_kernel`.
+pub fn split_enabled() -> bool {
+    match SPLIT.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => !matches!(
+            std::env::var(SPLIT_ENV).as_deref(),
+            Ok("0" | "off" | "false" | "no")
+        ),
+    }
+}
+
+/// Positions per block in the split kernel.
+pub(crate) const SPLIT_CHUNK: usize = 128;
+
+/// Shortest history worth a second launch (the combine pass costs a few microseconds).
+pub(crate) const SPLIT_MIN: usize = 512;
+
+/// Whether a shape can take the shared kernel at all: a group of more than one head, a block that
+/// fits, and a head width of whole warps (the reduction is a warp shuffle per head).
+fn shares(shape: LayerShape) -> bool {
+    let group = shape.heads / shape.kv_heads.max(1);
+    shape.kv_heads > 0
+        && shape.heads.is_multiple_of(shape.kv_heads)
+        && group > 1
+        && shape.head_dim.is_multiple_of(32)
+        && group * shape.head_dim <= 1024
+}
+
+/// Floats the shared kernel needs for its softmax weights, zero when the shape cannot use it.
+fn score_scratch(shape: LayerShape) -> usize {
+    if shares(shape) {
+        shape.heads * shape.max_positions
+    } else {
+        0
+    }
+}
+
+/// Chunks the split kernel uses at this shape's longest history.
+fn split_chunks(shape: LayerShape) -> usize {
+    if shares(shape) {
+        shape.max_positions.div_ceil(SPLIT_CHUNK)
+    } else {
+        0
+    }
+}
+
+/// Whether a step of `positions` positions takes the split arm.
+///
+/// A shape the shared kernel cannot take (no group, odd head width, oversized block) has no split
+/// arm either: it is the same block shape, only cut along the history.
+fn uses_split(shape: LayerShape, positions: usize) -> bool {
+    split_enabled() && shares(shape) && positions >= SPLIT_MIN
+}
+
+/// Floats the split kernel needs: per head, each chunk's max, denominator and V row.
+fn partial_scratch(shape: LayerShape) -> usize {
+    let chunks = split_chunks(shape);
+    if chunks == 0 {
+        0
+    } else {
+        shape.heads * (2 * chunks + chunks * shape.head_dim)
+    }
+}
 
 /// f16 by bit pattern, for the tensors the file stores as halves.
 pub fn f16(h: u16) -> f32 {
@@ -174,6 +305,11 @@ pub struct GpuLayer {
     k: DeviceBuffer<f32>,
     v: DeviceBuffer<f32>,
     attn: DeviceBuffer<f32>,
+    /// Softmax weights, one row per query head, between the two halves of the shared kernel:
+    /// `heads * max_positions` floats.
+    attn_scores: DeviceBuffer<f32>,
+    /// Per-chunk partial softmax of the split kernel: `heads * (2 * chunks + chunks * head_dim)`.
+    attn_partial: DeviceBuffer<f32>,
     projection: DeviceBuffer<f32>,
     gate: DeviceBuffer<f32>,
     up: DeviceBuffer<f32>,
@@ -213,6 +349,8 @@ impl GpuLayer {
             k: device.alloc(kv)?,
             v: device.alloc(kv)?,
             attn: device.alloc(query)?,
+            attn_scores: device.alloc(score_scratch(shape).max(1))?,
+            attn_partial: device.alloc(partial_scratch(shape).max(1))?,
             projection: device.alloc(shape.hidden)?,
             gate: device.alloc(shape.ffn)?,
             up: device.alloc(shape.ffn)?,
@@ -281,6 +419,8 @@ impl GpuLayer {
             k: device.alloc(kv)?,
             v: device.alloc(kv)?,
             attn: device.alloc(query)?,
+            attn_scores: device.alloc(score_scratch(shape).max(1))?,
+            attn_partial: device.alloc(partial_scratch(shape).max(1))?,
             projection: device.alloc(shape.hidden)?,
             gate: device.alloc(shape.ffn)?,
             up: device.alloc(shape.ffn)?,
@@ -292,6 +432,21 @@ impl GpuLayer {
     /// The shape this layer was built for.
     pub fn shape(&self) -> LayerShape {
         self.shape
+    }
+
+    /// The layer's K and V caches, which the paged backend mirrors into the runtime's buffer.
+    pub fn kv_caches_mut(&mut self) -> (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>) {
+        (&mut self.k_cache, &mut self.v_cache)
+    }
+
+    /// The layer's K cache, for a read-only copy back to the host.
+    pub fn k_cache(&self) -> &DeviceBuffer<f32> {
+        &self.k_cache
+    }
+
+    /// The layer's V cache.
+    pub fn v_cache(&self) -> &DeviceBuffer<f32> {
+        &self.v_cache
     }
 
     /// Bytes of Q4_K weights held on the device.
@@ -374,15 +529,40 @@ impl GpuLayer {
         )?;
 
         let scale = 1.0 / (shape.head_dim as f32).sqrt();
-        device.attention(
-            &self.q,
-            &self.k_cache,
-            &self.v_cache,
-            &mut self.attn,
-            position + 1,
-            shape,
-            scale,
-        )?;
+        if !shared_enabled() && uses_split(shape, position + 1) {
+            let chunks = device.attention_split(
+                &self.q,
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.attn_partial,
+                position + 1,
+                SPLIT_CHUNK,
+                shape,
+                scale,
+            )?;
+            device.attention_combine(&self.attn_partial, &mut self.attn, chunks, shape)?;
+        } else if shared_enabled() && shares(shape) {
+            device.attention_shared(
+                &self.q,
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.attn,
+                &mut self.attn_scores,
+                position + 1,
+                shape,
+                scale,
+            )?;
+        } else {
+            device.attention(
+                &self.q,
+                &self.k_cache,
+                &self.v_cache,
+                &mut self.attn,
+                position + 1,
+                shape,
+                scale,
+            )?;
+        }
         self.wo
             .project(device, &self.attn, &mut self.q8, &mut self.projection)?;
         device.add_inplace(&mut self.residual, &self.projection, shape.hidden)?;
@@ -426,5 +606,66 @@ impl GpuLayer {
     /// Whether the model's QKV projections carry biases.
     pub fn has_biases(&self) -> bool {
         self.bq.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qwen3_14b(max_positions: usize) -> LayerShape {
+        LayerShape {
+            hidden: 5120,
+            ffn: 17408,
+            heads: 40,
+            kv_heads: 8,
+            head_dim: 128,
+            rope_base: 1.0e6,
+            epsilon: 1e-6,
+            max_positions,
+        }
+    }
+
+    #[test]
+    fn the_split_arm_needs_a_group_and_whole_warps() {
+        assert!(shares(qwen3_14b(4096)));
+        // One KV head for every query head: there is nothing to share, and the split block would be
+        // one head's width.
+        let ungrouped = LayerShape {
+            kv_heads: 40,
+            ..qwen3_14b(4096)
+        };
+        assert!(!shares(ungrouped));
+        // A group of five heads at head width 96 is 480 threads of three warps each: fine. At 100 it
+        // is not a whole number of warps, and the shuffle reduction would read across heads.
+        let ragged = LayerShape {
+            head_dim: 100,
+            ..qwen3_14b(4096)
+        };
+        assert!(!shares(ragged));
+    }
+
+    #[test]
+    fn the_split_arm_starts_at_its_threshold() {
+        let shape = qwen3_14b(4096);
+        force_split(Some(false));
+        assert!(!uses_split(shape, SPLIT_MIN));
+        force_split(Some(true));
+        assert!(!uses_split(shape, SPLIT_MIN - 1));
+        assert!(uses_split(shape, SPLIT_MIN));
+        force_split(None);
+    }
+
+    #[test]
+    fn the_scratch_fits_the_shape() {
+        let shape = qwen3_14b(1024);
+        let chunks = 1024_usize.div_ceil(SPLIT_CHUNK);
+        assert_eq!(split_chunks(shape), chunks);
+        assert_eq!(
+            partial_scratch(shape),
+            shape.heads * (2 * chunks + chunks * shape.head_dim)
+        );
+        // The shared kernel's score rows are per head, not per group: every KV block writes its own.
+        assert_eq!(score_scratch(shape), shape.heads * shape.max_positions);
     }
 }

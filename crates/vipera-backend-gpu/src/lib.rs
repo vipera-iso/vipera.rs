@@ -1,11 +1,14 @@
-//! A CUDA backend for vipera, starting with the one kernel that matters: a Q4_K matvec.
+//! A CUDA backend for vipera: the whole bounded model on one device, behind the runtime's
+//! `ForwardPass`.
 //!
-//! Scope, stated plainly: one device (ordinal 0), one kernel (float activations against Q4_K
-//! weights), no batching, no attention, and no wiring into the runtime's `ForwardPass` yet. What it
-//! does have is the piece the tiered weight bus was waiting for — device memory that a layer can be
-//! copied into, and a kernel that computes on it — plus a parity test against the CPU reference.
+//! Scope, stated plainly: one device (ordinal 0), the Qwen2/Llama block the CPU backend runs, Q4_K
+//! and Q6_K weights, `f16` KV, and one sequence at a time. [`GpuBackend`] is the trait implementation:
+//! it computes a step on the card and keeps the runtime's paged KV buffer truthful, so a prefix-cache
+//! block the runtime moves is meaningful to either backend. Prefill is sequential — one position per
+//! weight read — until the batched kernel is wired through the layer, and a ring cache (sliding
+//! window) is refused by name because the device attention kernels walk positions densely.
 //!
-//! The kernel is compiled by NVRTC at open time, so no `.ptx` is checked in and the architecture is
+//! The kernels are compiled by NVRTC at open time, so no `.ptx` is checked in and the architecture is
 //! the device's own (`compute_75` on the reference GTX 1650).
 //!
 //! Why this is a separate crate: `cudarc` is the only third-party dependency in the workspace that
@@ -14,13 +17,16 @@
 
 #![warn(missing_docs)]
 
+pub mod backend;
 pub mod device;
 pub mod layer;
 pub mod model;
+mod paged;
 pub mod pool;
 pub mod q4k;
 pub mod q6k;
 pub mod q8;
 
+pub use backend::GpuBackend;
 pub use device::{Device, DeviceBuffer};
 pub use model::GpuModel;

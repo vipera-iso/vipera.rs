@@ -516,6 +516,23 @@ impl OwnedActivation {
         }
     }
 
+    /// [`OwnedActivation::new`] over a buffer that already holds `x` in its first `values` slots,
+    /// finished in place: the group sums are appended and the quantiser reads the same values, so
+    /// the result is `new(ty, &buffer[..values])` bit for bit without a second copy of `x`.
+    pub(crate) fn from_buffer(ty: GgmlType, mut buffer: Vec<f32>, values: usize) -> Self {
+        buffer.truncate(values);
+        let groups = values / 32;
+        let sums: Vec<f32> = x_sums_iter(&buffer).collect();
+        buffer.extend_from_slice(&sums);
+        let q = quantizes(ty).then(|| QuantizedX::new(&buffer[..values]));
+        Self {
+            x: buffer,
+            sums_off: values,
+            sums_len: groups,
+            q,
+        }
+    }
+
     /// The activation `x`, as the batched kernels read it.
     pub(crate) fn x(&self) -> &[f32] {
         &self.x[..self.sums_off]
@@ -854,15 +871,39 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     {
         return crate::tiled::matvec_tiled_batch(ty, data, stride, cols, rows, activations, out);
     }
-    let owned: std::sync::Arc<[OwnedActivation; B]> =
-        std::sync::Arc::new(std::array::from_fn(|entry| {
-            OwnedActivation::new(ty, activations[entry])
-        }));
     let threads = thread_budget(
         rows.saturating_mul(B),
         rows.saturating_mul(cols).saturating_mul(B),
     );
+    let owned: std::sync::Arc<[OwnedActivation; B]> =
+        if B >= PARALLEL_PREP_MIN_BATCH && threads > 1 && parallel_prep_enabled() {
+            pool.prepare(ty, activations, threads)?
+        } else {
+            std::sync::Arc::new(std::array::from_fn(|entry| {
+                OwnedActivation::new(ty, activations[entry])
+            }))
+        };
     pool.fill_batch(ty, data, stride, threads, &owned, out)
+}
+
+/// Entries a batched product needs before its activations are built by the pool instead of by the
+/// calling thread: a decode step or a short draft is one to a handful of entries and a wake-up per
+/// product would cost more than the work it spreads.
+const PARALLEL_PREP_MIN_BATCH: usize = 16;
+
+/// Whether a batched product's activations are prepared by the pool's workers.
+///
+/// Off unless `VIPERA_PARALLEL_PREP` is set to something other than `0`, `false`, `off` or `no`.
+/// The result is bit-identical either way; only who does the work changes, and a wake-up that
+/// costs more than it saves on a given machine is the reason it is a switch. Read once.
+fn parallel_prep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_PARALLEL_PREP").is_ok_and(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+    })
 }
 
 /// Multiply-adds below this stay on the calling thread: a spawn costs more than the work saves.
@@ -1692,5 +1733,54 @@ mod tests {
         }
         let values = dequantize(GgmlType::F32, &data, 3, 2).expect("dequantize");
         assert_eq!(values, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// What building the owned activations of one batched product costs on the calling thread, per
+    /// part, at the two widths a prefill chunk multiplies (1536 and 8960) with 128 entries. It is a
+    /// measurement, not a check, so it is `#[ignore]`d.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_activation_prep() {
+        let mut seed = 0x1234_5678_9abc_def1_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        for cols in [1536_usize, 8960] {
+            let xs: Vec<Vec<f32>> = (0..128)
+                .map(|_| (0..cols).map(|_| next()).collect())
+                .collect();
+            let time = |label: &str, run: &dyn Fn()| {
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let started = std::time::Instant::now();
+                    run();
+                    best = best.min(started.elapsed().as_secs_f64() * 1e3);
+                }
+                println!("cols {cols:>5}, 128 entries, {label:<22} {best:>7.3} ms");
+            };
+            time("OwnedActivation (Q4K)", &|| {
+                for x in &xs {
+                    std::hint::black_box(OwnedActivation::new(GgmlType::Q4K, x));
+                }
+            });
+            time("  x_sums alone", &|| {
+                for x in &xs {
+                    std::hint::black_box(x_sums(x));
+                }
+            });
+            time("  QuantizedX alone", &|| {
+                for x in &xs {
+                    std::hint::black_box(QuantizedX::new(x));
+                }
+            });
+            time("  copy alone", &|| {
+                for x in &xs {
+                    std::hint::black_box(x.to_vec());
+                }
+            });
+        }
     }
 }

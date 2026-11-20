@@ -1093,6 +1093,7 @@ dependencies = [
  "vipera-backend-cpu",
  "vipera-core",
  "vipera-errors",
+ "vipera-runtime",
 ]
 
 [[package]]

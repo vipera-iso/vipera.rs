@@ -166,6 +166,306 @@ extern "C" __global__ void attention_decode(
     out[head * head_dim + tid] = acc;
 }
 
+// `attend_shared`: the same causal attention, with one block per *KV* head instead of per query
+// head, so the `group` query heads that share a K/V row walk the cache together.
+//
+// The per-head kernel above makes every query head in a group re-read the same `positions *
+// head_dim` of K and V; at 4k positions on a 40-head/8-KV-head model that is ~168 MB per layer of
+// cache traffic for ~33 MB of distinct rows, and the card's L2 cannot hold either. Here a block owns
+// one KV head: its first `head_dim` threads load the K row once into shared memory, every head in the
+// group scores it from there, and the V row is read by the group's warps with the same index, so the
+// L1 serves one row instead of `group` of them.
+//
+// Scores are the only thing that leaves the block, because `group * positions` floats do not fit in
+// shared memory at long contexts (80 KB at 4096 for a group of five). They go to a scratch buffer the
+// layer owns, one row per query head: 80 KB of traffic against the MBs the shares save.
+extern "C" __global__ void attention_decode_shared(
+    const float * __restrict__ q,
+    const float * __restrict__ k_cache,
+    const float * __restrict__ v_cache,
+    float * __restrict__ out,
+    float * __restrict__ scores,
+    int positions,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    float scale)
+{
+    // One slot per warp of every head in the group, plus the K row and the two per-head scalars.
+    const int group = heads / kv_heads;
+    const int warps = head_dim / 32;
+    extern __shared__ float shared[];
+    float *kh = shared;                              // [head_dim]
+    float *partials = kh + head_dim;                 // [group * warps]
+    float *head_max = partials + group * warps;      // [group]
+    float *head_sum = head_max + group;              // [group]
+
+    const int kv_head = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int local = tid / head_dim;                // which query head of the group
+    const int d = tid % head_dim;
+    const int warp = tid >> 5;
+    const int across = tid & 31;
+    const int head = kv_head * group + local;
+    const int kv_row = kv_heads * head_dim;
+    const float *qh = q + head * head_dim;
+    const size_t base = (size_t)kv_head * head_dim + d;
+    // One score row per query head: `heads * positions`, not `group * positions`, because every KV
+    // block writes its own group's rows.
+    float *mine = scores + (size_t)(kv_head * group + local) * positions;
+
+    for (int at = 0; at < positions; ++at) {
+        if (local == 0) {
+            kh[d] = k_cache[(size_t)at * kv_row + base];
+        }
+        __syncthreads();
+        float dot = qh[d] * kh[d];
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, off);
+        }
+        if (across == 0) {
+            partials[warp] = dot;
+        }
+        __syncthreads();
+        if (d == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < warps; ++w) {
+                total += partials[local * warps + w];
+            }
+            mine[at] = total * scale;
+        }
+        __syncthreads();   // the next iteration overwrites `kh`
+    }
+
+    // Softmax over the whole history, per head, across the head's `head_dim` threads.
+    float largest = __int_as_float(0xff800000);
+    for (int at = d; at < positions; at += head_dim) {
+        largest = fmaxf(largest, mine[at]);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        largest = fmaxf(largest, __shfl_down_sync(0xffffffffu, largest, off));
+    }
+    if (across == 0) {
+        partials[warp] = largest;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float top = __int_as_float(0xff800000);
+        for (int w = 0; w < warps; ++w) {
+            top = fmaxf(top, partials[local * warps + w]);
+        }
+        head_max[local] = top;
+    }
+    __syncthreads();
+    const float top = head_max[local];
+
+    float sum = 0.0f;
+    for (int at = d; at < positions; at += head_dim) {
+        const float weight = expf(mine[at] - top);
+        mine[at] = weight;
+        sum += weight;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    }
+    if (across == 0) {
+        partials[warp] = sum;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) {
+            total += partials[local * warps + w];
+        }
+        head_sum[local] = 1.0f / total;
+    }
+    __syncthreads();
+    const float inverse = head_sum[local];
+
+    // Every head of the group indexes the same V row, so the rows the block reads once are the rows
+    // the whole group multiplies by: that is the traffic this kernel exists to remove.
+    float acc = 0.0f;
+    for (int at = 0; at < positions; ++at) {
+        acc += mine[at] * inverse * v_cache[(size_t)at * kv_row + base];
+    }
+    out[head * head_dim + d] = acc;
+}
+
+// `attend_split`: the same causal attention, cut along the history instead of along the heads.
+//
+// One block per (KV head, chunk of positions). The shared kernel above removes duplicate cache
+// reads but still runs one block per KV head: eight blocks on a fourteen-SM card, six SMs idle, and
+// the per-position loop's twice-per-position `__syncthreads()` on the critical path. At 4096
+// positions that measured 3.36 ms where the traffic saved accounts for 0.3 ms — the rest is
+// latency, so the lever is more blocks, not fewer bytes.
+//
+// Each block owns `chunk` positions of one KV head: it stages K rows in shared memory, scores the
+// group's heads against them, and writes an unnormalised partial — the chunk's max, its softmax
+// denominator, and `sum(exp(score - max) * v)` per dimension. `attend_combine` folds the chunks with
+// the online-softmax identity. Scores stay in shared memory here (a chunk is `positions / chunks`
+// long, not the whole history), so the global score scratch the shared kernel needs is gone.
+extern "C" __global__ void attention_split(
+    const float * __restrict__ q,
+    const float * __restrict__ k_cache,
+    const float * __restrict__ v_cache,
+    float * __restrict__ partial,
+    int positions,
+    int chunk,
+    int chunks,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    float scale)
+{
+    const int group = heads / kv_heads;
+    const int warps = head_dim / 32;
+    extern __shared__ float shared[];
+    float *kh = shared;                                 // [head_dim]
+    float *scores = kh + head_dim;                      // [group * chunk]
+    float *partials = scores + group * chunk;           // [group * warps]
+    float *head_max = partials + group * warps;         // [group]
+    float *head_sum = head_max + group;                 // [group]
+
+    const int kv_head = blockIdx.x;
+    const int c = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int local = tid / head_dim;
+    const int d = tid % head_dim;
+    const int warp = tid >> 5;
+    const int across = tid & 31;
+    const int head = kv_head * group + local;
+    const int kv_row = kv_heads * head_dim;
+    const float *qh = q + head * head_dim;
+    const size_t base = (size_t)kv_head * head_dim + d;
+    float *ph = partial + (size_t)head * (2 * chunks + (size_t)chunks * head_dim);
+
+    const int start = c * chunk;
+    const int stop = min(start + chunk, positions);
+    const int span = stop - start;
+    float *mine = scores + local * chunk;
+
+    if (span <= 0) {
+        // Past the end: an empty chunk contributes nothing, not a stale value.
+        if (d == 0) {
+            ph[c] = __int_as_float(0xff800000);
+            ph[chunks + c] = 0.0f;
+        }
+        ph[2 * chunks + (size_t)c * head_dim + d] = 0.0f;
+        return;
+    }
+
+    for (int i = 0; i < span; ++i) {
+        const int at = start + i;
+        if (local == 0) {
+            kh[d] = k_cache[(size_t)at * kv_row + base];
+        }
+        __syncthreads();
+        float dot = qh[d] * kh[d];
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_down_sync(0xffffffffu, dot, off);
+        }
+        if (across == 0) {
+            partials[warp] = dot;
+        }
+        __syncthreads();
+        if (d == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < warps; ++w) {
+                total += partials[local * warps + w];
+            }
+            mine[i] = total * scale;
+        }
+        __syncthreads();   // the next iteration overwrites `kh`
+    }
+
+    // The chunk's own softmax, per head.
+    float largest = __int_as_float(0xff800000);
+    for (int i = d; i < span; i += head_dim) {
+        largest = fmaxf(largest, mine[i]);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        largest = fmaxf(largest, __shfl_down_sync(0xffffffffu, largest, off));
+    }
+    if (across == 0) {
+        partials[warp] = largest;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float top = __int_as_float(0xff800000);
+        for (int w = 0; w < warps; ++w) {
+            top = fmaxf(top, partials[local * warps + w]);
+        }
+        head_max[local] = top;
+    }
+    __syncthreads();
+    const float top = head_max[local];
+
+    float sum = 0.0f;
+    for (int i = d; i < span; i += head_dim) {
+        const float weight = expf(mine[i] - top);
+        mine[i] = weight;
+        sum += weight;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    }
+    if (across == 0) {
+        partials[warp] = sum;
+    }
+    __syncthreads();
+    if (d == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps; ++w) {
+            total += partials[local * warps + w];
+        }
+        head_sum[local] = total;
+    }
+    __syncthreads();
+
+    // Unnormalised: the combine pass rescales by the global max and denominator.
+    float acc = 0.0f;
+    for (int i = 0; i < span; ++i) {
+        acc += mine[i] * v_cache[(size_t)(start + i) * kv_row + base];
+    }
+    ph[2 * chunks + (size_t)c * head_dim + d] = acc;
+    if (d == 0) {
+        ph[c] = top;
+        ph[chunks + c] = head_sum[local];
+    }
+}
+
+// `attend_combine`: fold `chunks` partials into the output row.
+//
+// `partial[head]` holds `[max; sum; acc per dimension]`, so chunk `c`'s weight in the global softmax
+// is `sum_c * exp(max_c - max)` over the sum of those, and its unnormalised V sum gets the same
+// factor. One block per head; every thread owns a dimension and walks the (short, ~16-entry) chunk
+// list.
+extern "C" __global__ void attention_combine(
+    const float * __restrict__ partial,
+    float * __restrict__ out,
+    int chunks,
+    int heads,
+    int head_dim)
+{
+    const int head = blockIdx.x;
+    const int d = threadIdx.x;
+    const float *ph = partial + (size_t)head * (2 * chunks + (size_t)chunks * head_dim);
+
+    float top = __int_as_float(0xff800000);
+    for (int c = 0; c < chunks; ++c) {
+        top = fmaxf(top, ph[c]);
+    }
+    float total = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        total += ph[chunks + c] * expf(ph[c] - top);
+    }
+    float acc = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        acc += ph[2 * chunks + (size_t)c * head_dim + d] * expf(ph[c] - top);
+    }
+    out[head * head_dim + d] = acc / total;
+}
+
 // `swiglu`: out = silu(gate) * up.
 extern "C" __global__ void swiglu(
     const float * __restrict__ gate,

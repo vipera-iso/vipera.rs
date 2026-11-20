@@ -9,6 +9,9 @@ description = "CUDA backend for vipera: device allocation and the first Q4_K mat
 [dependencies]
 vipera-core.workspace = true
 vipera-errors.workspace = true
+# The `ForwardPass` contract and the paged KV geometry: what makes this a backend rather than a
+# second engine. In-workspace path dependency, no new third-party crate.
+vipera-runtime.workspace = true
 # CUDA driver + NVRTC. `fallback-dynamic-loading` dlopens `libcuda`, so a machine without a driver
 # still builds and reports the reason instead of failing to link (EXC-006).
 cudarc = { version = "0.19", default-features = false, features = [
@@ -25,6 +28,10 @@ cudarc = { version = "0.19", default-features = false, features = [
 # The parity test holds the kernel to the CPU's dequantizer; the CPU crate is not a runtime
 # dependency of the GPU one.
 vipera-backend-cpu.workspace = true
+# The seam test names `ForwardPass`, `ForwardContext` and `ViperaError` directly, as the runtime
+# does.
+vipera-runtime.workspace = true
+vipera-errors.workspace = true
 
 # Every call into the CUDA driver is `unsafe`; the whole crate is the FFI boundary, and
 # `device.rs` documents the contract each wrapper upholds.
