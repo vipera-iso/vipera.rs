@@ -576,11 +576,16 @@ impl<'a, const B: usize> BatchActivation<'a, B> {
     }
 
     /// The activations themselves.
+    ///
+    /// The scalar and NEON kernels read the f32 form directly, so only the x86 batch kernels (and
+    /// the pool tests that compare prepared activations) need these accessors.
+    #[cfg(any(target_arch = "x86_64", test))]
     pub(crate) fn x(&self) -> &[&'a [f32]; B] {
         &self.x
     }
 
     /// The 32-value sums of each activation.
+    #[cfg(any(target_arch = "x86_64", test))]
     pub(crate) fn sums(&self) -> &[&'a [f32]; B] {
         &self.sums
     }
