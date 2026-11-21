@@ -4259,11 +4259,12 @@ fn rope(vector: &mut [f32], position: usize, heads: usize, head_dim: usize, base
 
 /// Whether the chunk path folds the norms and the SwiGLU multiply into the activation preparation.
 ///
-/// Off unless `VIPERA_PREP_FUSION` is set to something other than `0`, `false`, `off` or `no`.
-/// A chunk spends 12 ms on the two norms and 30 ms on the SwiGLU multiply on the calling thread,
-/// between products that leave every worker idle; folding them into the copy a [`PrepJob`] already
-/// makes moves that work onto the workers. The result is bit-identical either way — the transforms
-/// are elementwise and read nothing but their own inputs. Read once.
+/// On by default: a chunk spends ~12 ms on the two norms and ~30 ms on the SwiGLU multiply on the
+/// calling thread, between products that leave every worker idle; folding them into the copy a
+/// [`PrepJob`] already makes moves that work onto the workers. The result is bit-identical either
+/// way — the transforms are elementwise and read nothing but their own inputs. Set
+/// `VIPERA_PREP_FUSION` to `0`, `false`, `off` or `no` to keep the transforms on the calling
+/// thread. Read once.
 fn prep_fusion_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var("VIPERA_PREP_FUSION") {
@@ -4271,7 +4272,7 @@ fn prep_fusion_enabled() -> bool {
             let value = value.trim().to_ascii_lowercase();
             !matches!(value.as_str(), "0" | "false" | "off" | "no")
         }
-        Err(_) => false,
+        Err(_) => true,
     })
 }
 

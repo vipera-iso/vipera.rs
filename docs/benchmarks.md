@@ -3026,7 +3026,8 @@ Change: `parallel_prep_enabled()` now defaults to on; set `VIPERA_PARALLEL_PREP=
 
 ## Folding the norms and the SwiGLU multiply into the preparation job — 2026-11-21
 
-Behind `VIPERA_PREP_FUSION=1`. The chunk path used to do three passes on the calling thread between
+On by default (set `VIPERA_PREP_FUSION=0`/`false`/`off`/`no` to keep the transforms on the calling
+thread). The chunk path used to do three passes on the calling thread between
 products: `attn_norm` and `ffn_norm` (14.0-14.8 ms a chunk) and `silu_mul` (30-37 ms). Both are
 elementwise and read nothing but their own inputs, and a batched product already copies each
 activation into a worker's buffer — so the transform, the group sums and the quantiser now run in
@@ -3058,5 +3059,5 @@ Bit-identity: `cmp` on a 32-token `--temperature 0 --seed 1` run is clean betwee
 `a_fused_activation_matches_the_transform_built_serially` (values, sums and quantised activations,
 both transforms, two entries) pin the two pieces the fusion moved.
 
-Still off by default: it was measured on one box, and pair 2 shows how much a shared machine can eat
-of it.
+Default flipped after the same-box measurement above; pair 2 shows how much a shared machine can eat
+of it, so keep `VIPERA_PREP_FUSION=0` handy if a box regresses.
