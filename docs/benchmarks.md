@@ -2881,3 +2881,43 @@ What would change the verdict: a batch wider than 128 (the tile grows linearly w
 not), a machine with more cores than this 4C/8T part (the copies scale with threads), or a shape whose
 `cols` is large enough for the 0.17-0.21 ms tile to matter against its row count. Until one of those
 holds, the tile stays rebuilt per thread.
+
+## Where a prefill chunk's last 8% goes — 2026-11-21
+
+`VIPERA_PROFILE_STEP` named five phases and lumped everything else into `rest`. On a 128-token chunk
+that remainder was 6% (41 ms) with no way to say what it was, so the profiler now splits it into
+`proj` (the bias adds and per-head Q/K norms after the projections), `rope`, `kv_write` and `elem`
+(the residual adds and the gated FFN product). Same run, same rig as the entry above
+(i5-11300H, 8 threads, `qwen2.5-1.5b-instruct-q4_k_m.gguf`, ~128-token chunk):
+
+| phase | ms/chunk | share |
+|---|---|---|
+| q4k | 442-508 | 65-66% |
+| q6k | 137-160 | 20-21% |
+| attention | 39-61 | 5-8% |
+| **elem** | **28-33** | **4%** |
+| norm | 12-14 | 2% |
+| rope | 3.9-4.5 | 0.6% |
+| kv_write | 3.1-3.6 | 0.5% |
+| proj | 1.7-2.0 | 0.3% |
+| rest | 0.9-1.1 | 0.1% |
+
+The bucket is now empty, which is the point: the phases that were hiding in it are all on the calling
+thread, one element at a time, and together they are **56 ms, 7.4% of the chunk**. Decode, same build:
+`elem` 1.25 ms, `norm` 0.59, `rope` 0.18, `kv_write` 0.16 of a 36 ms step — the same work, 32x smaller,
+and not worth touching there.
+
+**`silu_mul` alone does not clear the gate.** It is already the AVX2 eight-lane kernel (bit-identical to
+the scalar, `silu_mul_matches_the_scalar_one_bit_for_bit`), so what is left is that it runs on one
+thread: 32M `exp`+divide per chunk of a 762 ms chunk. Spread over eight scoped threads at the call site
+it goes 32.4 -> 19.1 ms, i.e. **2.0% of the chunk including the ~3 ms of thread startup** the crude
+version pays 56 times a chunk. Under the gate, so nothing was kept; the crude arm was reverted.
+
+What the numbers do support is the mechanism, not the one kernel: 7.4% of a chunk is serial
+elementwise work that the pool spends idle for. Moving `elem`, `norm` and `rope` onto the crew that
+already exists costs one job per worker per phase (280 messages a chunk, ~0.3 ms) instead of 56 thread
+starts, and 3x on 56 ms is **~4.5% of a chunk** with the chunk unchanged otherwise. That is the next
+prefill lever; the tile-sharing idea closed in the entry above stays closed.
+
+Two things this measurement does not change: q4k at 720 GFLOPS and q6k at 755 against the 776 the
+kernel scored on its own are still the wall, and `rest` was never the problem — it was the label.
