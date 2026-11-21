@@ -3061,3 +3061,41 @@ both transforms, two entries) pin the two pieces the fusion moved.
 
 Default flipped after the same-box measurement above; pair 2 shows how much a shared machine can eat
 of it, so keep `VIPERA_PREP_FUSION=0` handy if a box regresses.
+
+## The 4-query attention walk is worth 4-6% of a chunk — 2026-11-21
+
+Behind `VIPERA_ATTN_GEMM=1` (alias of `VIPERA_ATTN_QBLOCK`). **This is not a new kernel**: the
+4-query shared walk of `attend_rows_shared` with `QBLOCK=4` is already in the tree, and has been
+since the position-chunked work. What it never had was a measurement at chunk depth, or a default:
+the 2026-11-20 entry measured it at 4k, where it took attention from 435-445 ms to 399-411 ms of a
+chunk and a chunk from 1280 to 1261-1273 ms — inside the window spread, so it stayed off.
+
+Measured here at the depth a chat prompt actually runs (128-token chunks, ctx 1024, history 128 /
+256 / 384) it is not marginal. Interleaved (on, off) x3, on `main` as it stands after #55-#57
+(`VIPERA_PARALLEL_PREP` and `VIPERA_PREP_FUSION` both on):
+
+| pair | chunk 1 | chunk 2 | chunk 3 |
+|---|---:|---:|---:|
+| 1 | 649.03 vs 681.21 (-4.7%) | 672.79 vs 713.98 (-5.8%) | 599.35 vs 626.94 (-4.4%) |
+| 2 | 649.09 vs 672.05 (-3.4%) | 668.80 vs 707.59 (-5.5%) | 596.88 vs 622.45 (-4.1%) |
+| 3 | 653.01 vs 668.51 (-2.3%) | 672.92 vs 706.39 (-4.7%) | 597.46 vs 621.25 (-3.8%) |
+
+Median: chunk 1 **-3.4%**, chunk 2 **-5.5%**, chunk 3 **-4.1%**; 9 of 9 pairs negative. Attention
+itself, medians: 22.8 / 35.6 / 38.6 ms against 42.4 / 69.1 / 59.8 ms — **-46% / -48% / -36%**.
+
+Rate, counting the full 128-query x history matrix (the causal mask makes the kernel do about half
+of it): 66.5 -> **124 GFLOPS** at depth 128, 81.7 -> **158** at 256, 141.4 -> **219** at 384. The
+384-deep chunk is the one the earlier entry timed at ~150, so the kernel is now ~1.55x that, and
+attention's share of a chunk falls from 6.2-10.4% to 3.5-6.4% — what remains is 23-39 ms that a
+perfect kernel would have to keep finding, which is why there is no second kernel in this phase.
+
+An earlier run of the same A/B, before #57 flipped the prep fusion on, read -4.6 / -5.7 / -4.0%: the
+arms are within a point of each other, which is what the ledger's noise window predicts.
+
+Parity: `cmp` is clean between the arms on a 32-token `--temperature 0 --seed 1` run at these
+depths. That is evidence, not a guarantee: the walk regroups the softmax sums and is documented as
+within rounding (~1e-7), not bit-identical, which is why it ships behind a switch rather than on by
+default, same policy as the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE`.
+
+Still off by default: it changes the summation order, and that is a numeric-policy decision, not a
+speed one.
