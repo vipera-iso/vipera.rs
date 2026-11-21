@@ -20,6 +20,16 @@ pub(crate) use crate::scalar::{
     dot_f16_f32_heads_exact, dot_f16_group, exp_sum_shifted, silu_mul,
 };
 
+/// Whether an in-place `f16` row and a row decoded to `f32` produce the same bits.
+///
+/// They do not here yet. [`dot_f32`] adds into four accumulators and [`axpy_f32`] fuses its
+/// multiply and add, while the `f16` kernels above are the scalar reference: one running sum, one
+/// unfused multiply-add. The in-place path decides which of the two a row takes, so turning it on
+/// would make two attention entry points disagree in the last bits instead of agreeing, which is
+/// what the bit-identity test in `model` holds them to. It stays off until the `f16` kernels get
+/// the same shape as the `f32` ones.
+pub(crate) const IN_PLACE_KV_BIT_EXACT: bool = false;
+
 /// Widen little-endian `f16` values into `f32`, stopping at whichever slice is shorter.
 pub(crate) fn half_to_float(source: &[u8], values: &mut [f32]) {
     crate::scalar::half_to_float(source, values);
