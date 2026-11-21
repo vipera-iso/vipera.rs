@@ -6,6 +6,9 @@
 //! honouring the switch (or that changes the `f32` arithmetic) fails at the prompt level, not only in
 //! the kernel tests.
 //!
+//! `VIPERA_FAST_SOFTMAX` is pinned off: it swaps libm's `expf` for a polynomial that is not
+//! bit-identical, so a default change there would move the fixture without touching Q4_K.
+//!
 //! Skipped — with the reason printed — when there is no model, or when the fixture was recorded on a
 //! different model file.
 //!
@@ -75,6 +78,10 @@ fn q4k_f32_reproduces_the_recorded_prompt_continuation() {
             "--json",
         ])
         .env("VIPERA_Q4K_F32", "1")
+        // The polynomial exponent is a separate switch that is not bit-identical to libm's `expf`,
+        // so leaving it at its default would let an attention change move this fixture. Pinned
+        // off, the continuation is the Q4_K f32-activation arithmetic this test is about.
+        .env("VIPERA_FAST_SOFTMAX", "0")
         .output()
         .expect("run vipera generate");
     assert!(

@@ -2774,3 +2774,110 @@ question, not a constant.
 **Axis, because the names collide.** K and V rows are already shared across a head group by default
 (`9abfa5e`, `a31d5ee`). This kernel shares them across *queries* instead - a different axis, which is
 why it is a second kernel and why its gain (7.7%) is smaller than the traffic it removes.
+## Four-row decode restructure — 2026-11-21 (rejected: 1.17x slower on re-measure)
+
+Hypothesis: four consecutive Q4_K/Q6_K rows in one loop body give four independent DRAM streams and
+load the activation bytes once per group, so decode should rise from 29 GB/s toward 38.
+
+Method: one binary, `VIPERA_ROW_KERNEL=0` (one-row) against `=1` (four-row, switch on the new
+`fill_four_rows`), arms alternating direction across rounds so neither arm always runs on the warmer
+cache. Per run: median of the first ten decode steps, `VIPERA_THREADS=8`, fixed prompt,
+`--temperature 0`, `VIPERA_PROFILE_STEP=1`. Absolute step time moved 33.8 → 38 ms between sessions
+(the machine is never quiet here), so only the ratio is meaningful.
+
+The first pass over this patch reported the arms as level (1.009x). Re-measured after rebuilding the
+same source, with the order reversed in half the rounds, it does not reproduce:
+
+| arm | median step (4 rounds) | q4k | q6k | vs one-row |
+|---|---|---|---|---|
+| one-row | 36.93 / 38.27 / 39.35 / 39.46 ms | 24.0–25.2 ms | 12.4–13.9 ms | 1.000 |
+| four-row | 43.55 / 44.37 / 44.52 / 44.68 ms | 25.5–26.4 ms | 17.3–18.1 ms | **1.17x slower** |
+
+The regression is concentrated in Q6_K (+34%), which is the kernel the codegen gate already showed
+spilling: 27 stores and 17 loads of `ymm` through `%rsp` per call. Q4_K pays about 6%. The token
+stream is still identical — 64 greedy tokens, `sha256` equal on both arms — so this is a speed
+result, not a correctness one.
+
+Codegen, `tools`-free check on the monomorphized sections:
+
+- `q4k_dot_4rows_vnni`: 848 instructions, 3756 B, **zmm 0, zero vector traffic through `%rsp`**,
+  32 `vpdpbusd` (8 × 4 rows), 36 `vfmadd`, 43 branches (8 inlined `f16_to_f32` × 5 + 3 loop).
+- `q6k_dot_4rows_q8`: 765 instructions, 3303 B, zmm 0, `vpmaddubsw` 20, but **27 stores / 17 loads of
+  `ymm` through `%rsp`**. `q6k_dot_4rows_q8` is `target_feature("avx2")`, i.e. 16 vector registers;
+  four rows of (accumulator + `qh` + temps) do not fit. Zeroing that needs an `avx512vl` variant
+  (32 registers) or two rows at a time, both of which change what is being measured.
+- Replacing the twelve per-block scalar `f16_to_f32` calls with `vcvtph2ps` (bit-identical: the
+  exhaustive 65536-pattern test already proves the two agree) cut branches to 2 and 3, but introduced
+  17/6 and 23/13 stack traffic and measured 2.4% slower. Reverted.
+
+Verdict: **row blocking loses on this loop**, and the earlier neutral label was measurement noise on
+this machine. The four-row kernels and the `VIPERA_ROW_KERNEL` switch are removed from the tree; the
+one-row loop stays the only decode kernel. The stack traffic above is the mechanism, not a mystery:
+four rows do not fit in the 16 vector registers an `avx2` function gets, so the Q6_K arm loads and
+stores its accumulators every run.
+
+Lesson for the next hypothesis: `q4_k` is 61% of decode and streams at ~30 GB/s against a 43 GB/s
+read ceiling, so the gap is not per-row scheduling. It is either the byte stream itself (layout and
+prefetch distance, both already measured negative) or the balance of `q6_k`'s 36% — measure before
+writing another loop.
+
+## Parallel activation prep on the rig — 2026-11-21 (neutral, stays opt-in)
+
+Hypothesis from the 2026-11-20 entry above: building a product's activations on the pool's workers
+should recover part of the ~58 ms per 4k chunk that `matvec_pooled_batch` spends preparing them on the
+calling thread, worth 4–6% of a chunk once the workers are real.
+
+Method: the switch already existed (`VIPERA_PARALLEL_PREP`, default off). Same release binary, same
+model and prompt set, `VIPERA_THREADS=8`, `prefill_vs_decode` from `win_vs_llama`; arms run back to
+back in alternating order because the machine's absolute rate moved 157 → 180 tok/s between windows.
+Threshold fixed before measuring: **pp512 ≥3% faster, with pp128 not regressing**.
+
+| arm | pp512 (tok/s) | pp128 (tok/s) | decode ctx 32 (ms/step) |
+|---|---|---|---|
+| off | 172.1 / 174.9 / 170.1 (median 172.1) | 180.2 / 183.8 / 175.3 | 29.5–29.9 |
+| on | 180.3 / 176.4 / 176.6 / 173.8 (median 176.5) | 188.8 / 184.1 / 182.3 / 179.2 | 29.8–30.4 |
+
+Paired in measurement order: +4.8%, +2.5%, +1.0%, +2.2% → median **+2.4%** on pp512. pp128 is level
+(+4.8%, +2.2%, −0.8%, +2.2%, median +2.2%) and decode does not move. That is below the 3% gate and the
+projection was optimistic; the switch stays off by default and no default changes.
+
+Reading: the work is real but small on this part. 196 products x 0.165 ms at 1536 is 32 ms of a
+1.0 s chunk, and only the preparation moves — the copy still runs on the caller for 16+ entries, and
+the workers' wake-up is paid per product. The 8960-wide `down` products (1.1 ms each) are where the
+remaining gain would be, but they are 28 of 196 calls and a fifth of the prep time, so the ceiling is
+of the same order as the noise.
+
+## Sharing the prefill activation tile across threads — 2026-11-21 (closed by measurement: 1.3% ceiling)
+
+Hypothesis from the entry above: `fill_rows_batch` hands every worker its own row range, and each one
+enters `q4k_matvec_tiled_range`, which builds the batch-wide activation tile (`act`/`dxs`/`sumt`, 192 KB
+at B=128 and 1536 wide, 1.1 MB at 8960) before it touches a weight byte. Eight threads therefore build
+the same tile eight times per product. Building it once on the caller and lending it to the workers
+would remove seven of those eight copies without needing a barrier, since the tile is read-only.
+
+Measured before writing that plumbing, because the ceiling is what decides whether it is worth it.
+`bench_tiled_q4k_vs_q6k_shapes`, B=128, release, one thread, `rows 0` so the call is the tile alone
+(best of three, 2026-11-21):
+
+| shape | q4k tile | q6k tile |
+|---|---|---|
+| 8960x1536 (gate/up) | 0.03 ms | 0.03 ms |
+| 1536x8960 (down) | 0.17 ms | 0.21 ms |
+
+A Qwen2.5-1.5B layer is q, k, o, gate/up at 1536 wide on Q4_K (4 x 0.03), v at 1536 wide on Q6_K
+(0.03) and down at 8960 wide on Q6_K (0.21): **0.33 ms per thread per layer, ~9 ms per 128-token chunk
+per thread**. That chunk takes ~0.73 s at the 176 tok/s pp512 measured in the entry above, so removing
+seven copies of the tile is worth **~1.3% of a chunk at most**, and less in practice: the remaining copy
+is built on the calling thread while the workers wait for their jobs, and the workers' own share is
+only 9 ms of a ~90 ms slice each.
+
+That is below the 3% gate this session pre-registered for prefill work, and below the 2-5% spread this
+box shows between identical arms (see the parallel-prep table), so no implementation is recorded: an
+unmeasurable change cannot be reported as a win, and the plumbing (a borrowed tile through `Job`'s
+lifetimes in `pool.rs`) is not free. The 2026-11-15 sweep already said the same thing from the other
+side — B=32 beats B=128 by ~8% because the tile is a reuse/latency trade, not a residency cliff.
+
+What would change the verdict: a batch wider than 128 (the tile grows linearly with B, the chunk does
+not), a machine with more cores than this 4C/8T part (the copies scale with threads), or a shape whose
+`cols` is large enough for the 0.17-0.21 ms tile to matter against its row count. Until one of those
+holds, the tile stays rebuilt per thread.
