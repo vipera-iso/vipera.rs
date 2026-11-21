@@ -3518,23 +3518,26 @@ const QBLOCK: usize = 4;
 
 /// Whether a chunk's attention shares each K/V row across a block of queries.
 ///
-/// **Off unless `VIPERA_ATTN_QBLOCK` is set to `1`, `true`, `on` or `yes`.** Measured at 4k on the
-/// i5-11300H, `VIPERA_ATTN_QBLOCK=1` takes attention from 435-445 ms to 399-411 ms of a chunk, 7.7%,
-/// and a chunk from 1280 ms to 1261-1273 ms, which is inside this ledger's own 8-15% window spread:
-/// the sharing removes the row traffic and leaves the arithmetic, and attention is already bound by
-/// that (see the entry of 2026-11-20 in `docs/benchmarks.md`). Off by default because it regroups
-/// the softmax sums - within rounding (~1e-7) of the per-entry kernel, not bit-identical, the policy
-/// the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE` follow - and does not pay for itself end
-/// to end yet.
+/// **Off unless `VIPERA_ATTN_GEMM` or `VIPERA_ATTN_QBLOCK` is set to `1`, `true`, `on` or `yes`.**
+/// Measured at 4k on the i5-11300H, `VIPERA_ATTN_QBLOCK=1` took attention from 435-445 ms to
+/// 399-411 ms of a chunk, 7.7%, and a chunk from 1280 ms to 1261-1273 ms, which was inside that
+/// ledger's own 8-15% window spread: the sharing removes the row traffic and leaves the
+/// arithmetic, and attention is already bound by that. Off by default because it regroups the
+/// softmax sums - within rounding (~1e-7) of the per-entry kernel, not bit-identical, the policy
+/// the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE` follow.
 fn attention_qblock_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("VIPERA_ATTN_QBLOCK").is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
+        ["VIPERA_ATTN_GEMM", "VIPERA_ATTN_QBLOCK"]
+            .iter()
+            .any(|name| {
+                std::env::var(name).is_ok_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "yes"
+                    )
+                })
+            })
     })
 }
 
