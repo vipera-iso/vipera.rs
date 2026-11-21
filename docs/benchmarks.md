@@ -2921,3 +2921,10 @@ prefill lever; the tile-sharing idea closed in the entry above stays closed.
 
 Two things this measurement does not change: q4k at 720 GFLOPS and q6k at 755 against the 776 the
 kernel scored on its own are still the wall, and `rest` was never the problem — it was the label.
+
+End to end, this costs nothing: the same build, 510 tokens in four full chunks, the chunk sum is
+2.85 / 2.90 / 2.98 s, i.e. **171.8 / 176.6 / 179.8 tok/s pp512 (median 176.6)** against the 172.1 /
+176.5 of the 2026-11-16 entry, and profiler on and off are the same wall clock (3.63 s for the whole
+process, both arms). `scripts/bench-4k.sh` at `PROMPT=512` prints 134.8 for this prompt, which is the
+script's arithmetic and not the engine: 52 sentences tokenise to 520, so there is a fifth chunk of 8
+tokens that still costs 606 ms, and the script divides the sum of all five by 512.
