@@ -26,7 +26,7 @@ use std::thread::Scope;
 use vipera_core::gguf::GgmlType;
 use vipera_errors::ViperaError;
 
-use crate::quant::{self, BatchActivation, OwnedActivation};
+use crate::quant::{self, BatchActivation, Fusion, OwnedActivation};
 
 /// A run of entries to turn into owned activations. Each buffer holds the entry's values followed
 /// by room for its group sums, so a worker finishes it in place instead of copying it again.
@@ -35,6 +35,9 @@ struct PrepJob {
     first_entry: usize,
     values: usize,
     buffers: Vec<Vec<f32>>,
+    /// The transform the caller would otherwise run on its own thread (the feed-forward norm, the
+    /// SwiGLU multiply). Applied to each buffer here, before the sums and the quantiser.
+    fusion: Fusion,
 }
 
 /// What a worker is asked to do.
@@ -103,6 +106,7 @@ impl<'d, const B: usize> Pool<'d, B> {
         &self,
         ty: GgmlType,
         activations: &[&[f32]; B],
+        fusion: &Fusion,
         threads: usize,
     ) -> Result<Arc<[OwnedActivation; B]>, ViperaError> {
         let participants = threads.min(self.workers.len()).min(B).max(1);
@@ -135,6 +139,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                 first_entry,
                 values,
                 buffers: run,
+                fusion: fusion.clone(),
             };
             let rejected = match self.workers.get(chunk) {
                 Some(sender) => match sender.send(Task::Prep(job)) {
@@ -158,6 +163,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                 first_entry,
                 values,
                 buffers: run,
+                fusion: fusion.clone(),
             };
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish_prep(job)))
                 .map_err(|_| ViperaError::internal("activation preparation panicked"))?;
@@ -323,9 +329,19 @@ fn copy_back<const B: usize>(
 
 /// Turn a run of buffers into owned activations, in order.
 fn finish_prep(job: PrepJob) -> Vec<OwnedActivation> {
-    job.buffers
+    let PrepJob {
+        ty,
+        first_entry,
+        values,
+        buffers,
+        fusion,
+    } = job;
+    buffers
         .into_iter()
-        .map(|buffer| OwnedActivation::from_buffer(job.ty, buffer, job.values))
+        .enumerate()
+        .map(|(offset, buffer)| {
+            OwnedActivation::from_buffer_fused(ty, buffer, values, &fusion, first_entry + offset)
+        })
         .collect()
 }
 
@@ -449,7 +465,9 @@ mod tests {
                     let views: [&[f32]; B] = std::array::from_fn(|entry| inputs[entry].as_slice());
                     std::thread::scope(|scope| {
                         let pool = Pool::<B>::new(scope, workers);
-                        let prepared = pool.prepare(ty, &views, threads).expect("prepare");
+                        let prepared = pool
+                            .prepare(ty, &views, &Fusion::None, threads)
+                            .expect("prepare");
                         for entry in 0..B {
                             let serial = OwnedActivation::new(ty, views[entry]);
                             assert_same_activations(
@@ -501,7 +519,7 @@ mod tests {
                             std::hint::black_box(serial);
                         } else {
                             let pooled = pool
-                                .prepare(GgmlType::Q4K, &views, participants)
+                                .prepare(GgmlType::Q4K, &views, &Fusion::None, participants)
                                 .expect("prepare");
                             std::hint::black_box(pooled);
                         }

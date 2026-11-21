@@ -18,7 +18,7 @@ use vipera_errors::ViperaError;
 use vipera_runtime::{BatchContext, BatchEntry, ForwardContext, ForwardPass};
 
 use crate::pool::Pool;
-use crate::quant::{self, f16_to_f32, f32_to_f16};
+use crate::quant::{self, Fusion, f16_to_f32, f32_to_f16};
 
 /// The most sequences one batched step computes at once.
 ///
@@ -242,18 +242,17 @@ impl Tensor {
         pool: &Pool<'d, B>,
         file: &'d [u8],
         activations: &[&[f32]; B],
+        fusion: &Fusion,
         out: &mut [f32],
     ) -> Result<(), ViperaError> {
         let at = crate::profile::stamp();
-        let result = quant::matvec_pooled_batch(
-            pool,
-            self.ty,
-            self.data(file),
-            self.cols,
-            self.rows,
-            activations,
-            out,
-        );
+        let matrix = quant::Matrix {
+            ty: self.ty,
+            cols: self.cols,
+            rows: self.rows,
+        };
+        let result =
+            quant::matvec_pooled_batch(pool, matrix, self.data(file), activations, fusion, out);
         if let Some(at) = at {
             crate::profile::record_shape(
                 shape_name(self.ty),
@@ -330,7 +329,9 @@ struct BatchScratch {
     k: Vec<f32>,
     v: Vec<f32>,
     attn: Vec<f32>,
-    gate: Vec<f32>,
+    /// Shared rather than borrowed: a fused product hands its worker the gate rows, and a job
+    /// travels with the pool's lifetime, which is longer than this scratch's borrow.
+    gate: std::sync::Arc<[f32]>,
     up: Vec<f32>,
     /// The last entry's logits: the only row a prefill chunk or a single decode step asks for.
     logits: Vec<f32>,
@@ -353,7 +354,7 @@ impl BatchScratch {
             k: vec![0.0; MAX_BATCH * kv],
             v: vec![0.0; MAX_BATCH * kv],
             attn: vec![0.0; MAX_BATCH * config.hidden],
-            gate: vec![0.0; MAX_BATCH * config.ffn],
+            gate: vec![0.0; MAX_BATCH * config.ffn].into(),
             up: vec![0.0; MAX_BATCH * config.ffn],
             logits: vec![0.0; config.vocab],
             logits_each: Vec::new(),
@@ -974,29 +975,52 @@ impl CpuBackend {
             for (index, layer) in layers.iter().enumerate() {
                 weights.advance(index);
                 let at = crate::profile::stamp();
-                for entry in 0..B {
-                    rms_norm(
-                        &batch.x[entry * hidden..][..hidden],
-                        &layer.attn_norm,
-                        epsilon,
-                        &mut batch.h[entry * hidden..][..hidden],
-                    );
+                let fused = prep_fusion_enabled();
+                if !fused {
+                    for entry in 0..B {
+                        rms_norm(
+                            &batch.x[entry * hidden..][..hidden],
+                            &layer.attn_norm,
+                            epsilon,
+                            &mut batch.h[entry * hidden..][..hidden],
+                        );
+                    }
                 }
                 crate::profile::note(crate::profile::Phase::Norm, at);
-                let activations = rows::<B>(&batch.h, hidden);
-                layer
-                    .wq
-                    .matvec_batch::<B>(&pool, file, &activations, &mut batch.q[..B * query])?;
+                let norm = if fused {
+                    Fusion::Norm {
+                        weight: std::sync::Arc::from(&layer.attn_norm[..]),
+                        epsilon,
+                    }
+                } else {
+                    Fusion::None
+                };
+                // With the norm fused the projections read the residual stream itself: each of them
+                // runs the norm inside the copy its prep already makes.
+                let activations = if fused {
+                    rows::<B>(&batch.x, hidden)
+                } else {
+                    rows::<B>(&batch.h, hidden)
+                };
+                layer.wq.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &activations,
+                    &norm,
+                    &mut batch.q[..B * query],
+                )?;
                 layer.wk.matvec_batch::<B>(
                     &pool,
                     file,
                     &activations,
+                    &norm,
                     &mut batch.k[..B * kv_width],
                 )?;
                 layer.wv.matvec_batch::<B>(
                     &pool,
                     file,
                     &activations,
+                    &norm,
                     &mut batch.v[..B * kv_width],
                 )?;
                 let per_head_norm = !layer.q_norm.is_empty();
@@ -1090,6 +1114,7 @@ impl CpuBackend {
                     &pool,
                     file,
                     &rows::<B>(&batch.attn, hidden),
+                    &Fusion::None,
                     &mut batch.h[..B * hidden],
                 )?;
                 let at = crate::profile::stamp();
@@ -1102,32 +1127,65 @@ impl CpuBackend {
                 crate::profile::note(crate::profile::Phase::Elem, at);
 
                 let at = crate::profile::stamp();
-                for entry in 0..B {
-                    rms_norm(
-                        &batch.x[entry * hidden..][..hidden],
-                        &layer.ffn_norm,
-                        epsilon,
-                        &mut batch.h[entry * hidden..][..hidden],
-                    );
+                if !fused {
+                    for entry in 0..B {
+                        rms_norm(
+                            &batch.x[entry * hidden..][..hidden],
+                            &layer.ffn_norm,
+                            epsilon,
+                            &mut batch.h[entry * hidden..][..hidden],
+                        );
+                    }
                 }
                 crate::profile::note(crate::profile::Phase::Norm, at);
-                let activations = rows::<B>(&batch.h, hidden);
+                let norm = if fused {
+                    Fusion::Norm {
+                        weight: std::sync::Arc::from(&layer.ffn_norm[..]),
+                        epsilon,
+                    }
+                } else {
+                    Fusion::None
+                };
+                let activations = if fused {
+                    rows::<B>(&batch.x, hidden)
+                } else {
+                    rows::<B>(&batch.h, hidden)
+                };
+                let gate = std::sync::Arc::get_mut(&mut batch.gate).ok_or_else(|| {
+                    ViperaError::internal(
+                        "the gate buffer is still shared while a product writes it",
+                    )
+                })?;
                 layer.wg.matvec_batch::<B>(
                     &pool,
                     file,
                     &activations,
-                    &mut batch.gate[..B * ffn],
+                    &norm,
+                    &mut gate[..B * ffn],
                 )?;
-                layer
-                    .wu
-                    .matvec_batch::<B>(&pool, file, &activations, &mut batch.up[..B * ffn])?;
+                layer.wu.matvec_batch::<B>(
+                    &pool,
+                    file,
+                    &activations,
+                    &norm,
+                    &mut batch.up[..B * ffn],
+                )?;
                 let at = crate::profile::stamp();
-                silu_mul(&mut batch.up[..B * ffn], &batch.gate[..B * ffn]);
+                let silu = if fused {
+                    Fusion::Silu {
+                        gate: std::sync::Arc::clone(&batch.gate),
+                        width: ffn,
+                    }
+                } else {
+                    silu_mul(&mut batch.up[..B * ffn], &batch.gate[..B * ffn]);
+                    Fusion::None
+                };
                 crate::profile::note(crate::profile::Phase::Elem, at);
                 layer.wd.matvec_batch::<B>(
                     &pool,
                     file,
                     &rows::<B>(&batch.up, ffn),
+                    &silu,
                     &mut batch.h[..B * hidden],
                 )?;
                 let at = crate::profile::stamp();
@@ -1174,6 +1232,7 @@ impl CpuBackend {
                     &pool,
                     file,
                     &rows::<B>(&batch.h, hidden),
+                    &Fusion::None,
                     &mut batch.logits_each[..B * vocab],
                 )?;
             }
@@ -4198,11 +4257,42 @@ fn rope(vector: &mut [f32], position: usize, heads: usize, head_dim: usize, base
     )
 }
 
+/// Whether the chunk path folds the norms and the SwiGLU multiply into the activation preparation.
+///
+/// Off unless `VIPERA_PREP_FUSION` is set to something other than `0`, `false`, `off` or `no`.
+/// A chunk spends 12 ms on the two norms and 30 ms on the SwiGLU multiply on the calling thread,
+/// between products that leave every worker idle; folding them into the copy a [`PrepJob`] already
+/// makes moves that work onto the workers. The result is bit-identical either way — the transforms
+/// are elementwise and read nothing but their own inputs. Read once.
+fn prep_fusion_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VIPERA_PREP_FUSION") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => false,
+    })
+}
+
 fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, out: &mut [f32]) {
     let mean = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
     let inverse = 1.0 / (mean + epsilon).sqrt();
     for ((value, weight), input) in out.iter_mut().zip(weight).zip(input) {
         *value = input * inverse * weight;
+    }
+}
+
+/// [`rms_norm`] over a buffer that already holds the input, in place.
+///
+/// The arithmetic is `rms_norm`'s, element for element, so a caller that can hand a pool worker its
+/// own buffer gets the same bits as the pass on the calling thread (`rms_norm_in_place_is_rms_norm`
+/// checks that). It exists because a worker cannot borrow a separate output slice.
+pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], epsilon: f32) {
+    let mean = values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32;
+    let inverse = 1.0 / (mean + epsilon).sqrt();
+    for (value, weight) in values.iter_mut().zip(weight) {
+        *value = *value * inverse * weight;
     }
 }
 
@@ -4374,6 +4464,29 @@ mod tests {
         let expected = 1.0 / (12.5_f32).sqrt();
         assert!((out[0] - 3.0 * expected).abs() < 1e-6);
         assert!((out[1] - 4.0 * expected).abs() < 1e-6);
+    }
+
+    /// The in-place kernel a fused product runs on a worker is `rms_norm`'s arithmetic, bit for
+    /// bit, so folding the norm into the activation copy cannot move a token.
+    #[test]
+    fn rms_norm_in_place_is_rms_norm() {
+        let weight: Vec<f32> = (0..1536)
+            .map(|at| ((at % 37) as f32 - 18.0) / 23.0)
+            .collect();
+        let input: Vec<f32> = (0..1536)
+            .map(|at| ((at * 7919 % 1013) as f32 - 500.0) / 97.0)
+            .collect();
+        let mut expected = vec![0.0_f32; input.len()];
+        rms_norm(&input, &weight, 1e-6, &mut expected);
+        let mut in_place = input.clone();
+        rms_norm_in_place(&mut in_place, &weight, 1e-6);
+        for (at, (expected, got)) in expected.iter().zip(&in_place).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                got.to_bits(),
+                "value {at}: {expected} vs {got}"
+            );
+        }
     }
 
     /// qwen3's per-head norms must be `rms_norm` on each head's own vector, with the same weight
