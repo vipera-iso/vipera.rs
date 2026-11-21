@@ -2846,3 +2846,38 @@ Reading: the work is real but small on this part. 196 products x 0.165 ms at 153
 the workers' wake-up is paid per product. The 8960-wide `down` products (1.1 ms each) are where the
 remaining gain would be, but they are 28 of 196 calls and a fifth of the prep time, so the ceiling is
 of the same order as the noise.
+
+## Sharing the prefill activation tile across threads — 2026-11-21 (closed by measurement: 1.3% ceiling)
+
+Hypothesis from the entry above: `fill_rows_batch` hands every worker its own row range, and each one
+enters `q4k_matvec_tiled_range`, which builds the batch-wide activation tile (`act`/`dxs`/`sumt`, 192 KB
+at B=128 and 1536 wide, 1.1 MB at 8960) before it touches a weight byte. Eight threads therefore build
+the same tile eight times per product. Building it once on the caller and lending it to the workers
+would remove seven of those eight copies without needing a barrier, since the tile is read-only.
+
+Measured before writing that plumbing, because the ceiling is what decides whether it is worth it.
+`bench_tiled_q4k_vs_q6k_shapes`, B=128, release, one thread, `rows 0` so the call is the tile alone
+(best of three, 2026-11-21):
+
+| shape | q4k tile | q6k tile |
+|---|---|---|
+| 8960x1536 (gate/up) | 0.03 ms | 0.03 ms |
+| 1536x8960 (down) | 0.17 ms | 0.21 ms |
+
+A Qwen2.5-1.5B layer is q, k, o, gate/up at 1536 wide on Q4_K (4 x 0.03), v at 1536 wide on Q6_K
+(0.03) and down at 8960 wide on Q6_K (0.21): **0.33 ms per thread per layer, ~9 ms per 128-token chunk
+per thread**. That chunk takes ~0.73 s at the 176 tok/s pp512 measured in the entry above, so removing
+seven copies of the tile is worth **~1.3% of a chunk at most**, and less in practice: the remaining copy
+is built on the calling thread while the workers wait for their jobs, and the workers' own share is
+only 9 ms of a ~90 ms slice each.
+
+That is below the 3% gate this session pre-registered for prefill work, and below the 2-5% spread this
+box shows between identical arms (see the parallel-prep table), so no implementation is recorded: an
+unmeasurable change cannot be reported as a win, and the plumbing (a borrowed tile through `Job`'s
+lifetimes in `pool.rs`) is not free. The 2026-11-15 sweep already said the same thing from the other
+side — B=32 beats B=128 by ~8% because the tile is a reuse/latency trade, not a residency cliff.
+
+What would change the verdict: a batch wider than 128 (the tile grows linearly with B, the chunk does
+not), a machine with more cores than this 4C/8T part (the copies scale with threads), or a shape whose
+`cols` is large enough for the 0.17-0.21 ms tile to matter against its row count. Until one of those
+holds, the tile stays rebuilt per thread.
