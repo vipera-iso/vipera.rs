@@ -898,16 +898,17 @@ const PARALLEL_PREP_MIN_BATCH: usize = 16;
 
 /// Whether a batched product's activations are prepared by the pool's workers.
 ///
-/// Off unless `VIPERA_PARALLEL_PREP` is set to something other than `0`, `false`, `off` or `no`.
-/// The result is bit-identical either way; only who does the work changes, and a wake-up that
-/// costs more than it saves on a given machine is the reason it is a switch. Read once.
+/// On by default: the workers build the batched activations instead of leaving them to the calling
+/// thread. Set `VIPERA_PARALLEL_PREP=0` (or `false`/`off`/`no`) to fall back to the serial build;
+/// the result is bit-identical either way, only who does the work changes. Read once.
 fn parallel_prep_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("VIPERA_PARALLEL_PREP").is_ok_and(|value| {
+    *ON.get_or_init(|| match std::env::var("VIPERA_PARALLEL_PREP") {
+        Ok(value) => {
             let value = value.trim().to_ascii_lowercase();
-            !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        }
+        Err(_) => true,
     })
 }
 
