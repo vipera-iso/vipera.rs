@@ -2921,3 +2921,85 @@ prefill lever; the tile-sharing idea closed in the entry above stays closed.
 
 Two things this measurement does not change: q4k at 720 GFLOPS and q6k at 755 against the 776 the
 kernel scored on its own are still the wall, and `rest` was never the problem — it was the label.
+
+End to end, this costs nothing: the same build, 510 tokens in four full chunks, the chunk sum is
+2.85 / 2.90 / 2.98 s, i.e. **171.8 / 176.6 / 179.8 tok/s pp512 (median 176.6)** against the 172.1 /
+176.5 of the 2026-11-16 entry, and profiler on and off are the same wall clock (3.63 s for the whole
+process, both arms). `scripts/bench-4k.sh` at `PROMPT=512` prints 134.8 for this prompt, which is the
+script's arithmetic and not the engine: 52 sentences tokenise to 520, so there is a fifth chunk of 8
+tokens that still costs 606 ms, and the script divides the sum of all five by 512.
+
+### The crew the numbers pointed at does not survive the borrow checker — 2026-11-21
+
+The obvious reading of 7.4% serial is "hand those phases to the pool, it is idle anyway". Written that
+way it does not compile, and the reason is structural rather than a mistake in the write-up: a thread
+that is started once per pass is reached through a channel, and a channel has one message type, so the
+borrows inside that type get one lifetime — the pass's. `&mut batch.h` handed to such a channel has to
+stay borrowed for the whole pass, and then the `matvec_batch` calls that follow cannot touch `batch.h`
+at all (E0502/E0499 on the first phase that is followed by a product, `model.rs:981-997` for the norm
+and `:1160` for the residual add). Starting the crew per call instead is what the 2.0% arm already
+measured: it borrows fine and does not pay.
+
+`pool.rs` says the same thing in its own doc comment, from the other direction — "handing a worker
+`&mut [f32]` would make that borrow last as long as the pool, and the caller could not touch its own
+output buffer afterwards" — and that is why the pool's matvec results come back as owned vectors over
+a channel. Elementwise output is too big to copy: silu's 4.6 MB per layer, 28 layers, is ~14 ms a chunk
+at the measured copy bandwidth, which is more than half of the 32 ms it would save.
+
+So the crew arm is recorded as **not implementable in this workspace's safe Rust**, not as a win that
+was skipped, and `elem`, `norm` and `rope` stay on the calling thread. The one route that needs no copy
+is folding the transform into the preparation job that already copies each activation into a worker
+buffer — but that path only runs behind `VIPERA_PARALLEL_PREP` (off by default, and the norm would be
+recomputed once per product that shares it, three times for the attention projections), so it is a
+different hypothesis with its own measurement before it, not this one carrying the same 4.5% ceiling.
+
+## Ledger sweep on 2026-11-21: what still matches, what does not — 2026-11-21
+
+Every phase this file records for a 128-token chunk, re-measured in one sitting on the same box, same
+model, 8 threads. The box was shared (load average 3.5, a browser and the agent itself on 8 threads),
+which is worth ~3% here — that is the size of the drift below, not a regression:
+
+| phase | recorded | today | verdict |
+|---|---|---|---|
+| chunk total | 762-776 ms | 773-792 ms | +2% box load |
+| q4k | 442-508 | 515-533 | +5%, top of the band |
+| q6k | 137-160 | 154-159 | inside |
+| attention | 39-61 | 38.6-41.4 (chunk 1), 55-73 (deeper) | inside |
+| elem | 28-33 | 33.9-36.2 | +8%, still 4-5% |
+| norm | 12-14 | 14.0-14.5 | top of the band |
+| proj | 1.7-2.0 | 1.84-2.44 | top of the band |
+| rope | 3.9-4.5 | 4.29-4.65 | inside |
+| kv_write | 3.1-3.6 | 3.08-3.83 | inside |
+| rest | 0.9-1.1 | 0.96-1.30 | inside |
+
+Decode is the one entry that does not reproduce: the profile prints 82-92 ms for the first two steps,
+while the wall clock says 18 steps on top of a 470-token prefill average **42 ms/step**, and the first
+steps carry the page faults of a 1.1 GB mapping. The 36.4-38.4 ms recorded earlier came from a quieter
+box and a second or third step; the number to compare against is the wall clock, and today it is 42.
+
+### `VIPERA_PARALLEL_PREP=1` is worth 3.8% and is still off by default
+
+Interleaved pairs (off, on), chunk 1, medians of three: **781.4 -> 751.8 ms, -3.8%**, and the same
+direction in 3 of 3 pairs and in chunks 2 and 3 (813.6 -> 782.8, 709.4 -> 685.0). Prep runs 196 times a
+chunk, and the pool is idle for each of them: what the switch buys is exactly the 0.16 ms (width 1536)
+and 1.1 ms (width 8960) the calling thread spends turning activations into owned quantised ones.
+
+Decode is untouched by it (`PARALLEL_PREP_MIN_BATCH` is 16, a decode step has 1 to 8 entries), and it
+is bit-identical — `prepared_activations_are_bit_identical_to_the_serial_ones` checks the split, not
+just the total. So the switch is a default waiting to be flipped on evidence from more than one box,
+not a new kernel; it is also the only place the norm/silu fusion of the entry above could live.
+
+### The other two levers, bounded
+
+**Attention is the one with room left.** Its share of a chunk is 5% at depth 128 and 8% at depth ~380,
+and the two switches already in the tree account for 8-17% of that (both off: 42.3 / 72.2 / 66.2 ms;
+defaults: 40.1 / 64.9 / 55.1 ms). What is left is not bandwidth: the K/V a chunk of 128 queries reads
+at depth 380 is 28 layers x 380 tokens x 1 KB = 10.6 MB, i.e. 0.27 ms of the 55. The arithmetic is
+~8.4 GFLOP (QK^T and AV, 12 heads x 128 queries x ~380 keys x 128 dims x 2), so the kernel runs at
+**~150 GFLOPS, a fifth of the 720 the Q4_K matvec reaches**. A tile-resident micro-GEMM with the
+softmax fused would have to beat 150 by 2.5x to be worth the gate; that is ~4% of a chunk at the top
+end and needs a new kernel, not a switch.
+
+**`proj` has none.** 1.84-2.44 ms a chunk is **0.3%**: the bias adds and the per-head Q/K norms after
+the projections are already vectorised, and even deleting them entirely would not clear the 3% gate.
+NO-GO without writing anything, and the same holds for `rope` (0.6%) and `kv_write` (0.5%).
