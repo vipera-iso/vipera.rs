@@ -2928,3 +2928,27 @@ End to end, this costs nothing: the same build, 510 tokens in four full chunks, 
 process, both arms). `scripts/bench-4k.sh` at `PROMPT=512` prints 134.8 for this prompt, which is the
 script's arithmetic and not the engine: 52 sentences tokenise to 520, so there is a fifth chunk of 8
 tokens that still costs 606 ms, and the script divides the sum of all five by 512.
+
+### The crew the numbers pointed at does not survive the borrow checker — 2026-11-21
+
+The obvious reading of 7.4% serial is "hand those phases to the pool, it is idle anyway". Written that
+way it does not compile, and the reason is structural rather than a mistake in the write-up: a thread
+that is started once per pass is reached through a channel, and a channel has one message type, so the
+borrows inside that type get one lifetime — the pass's. `&mut batch.h` handed to such a channel has to
+stay borrowed for the whole pass, and then the `matvec_batch` calls that follow cannot touch `batch.h`
+at all (E0502/E0499 on the first phase that is followed by a product, `model.rs:981-997` for the norm
+and `:1160` for the residual add). Starting the crew per call instead is what the 2.0% arm already
+measured: it borrows fine and does not pay.
+
+`pool.rs` says the same thing in its own doc comment, from the other direction — "handing a worker
+`&mut [f32]` would make that borrow last as long as the pool, and the caller could not touch its own
+output buffer afterwards" — and that is why the pool's matvec results come back as owned vectors over
+a channel. Elementwise output is too big to copy: silu's 4.6 MB per layer, 28 layers, is ~14 ms a chunk
+at the measured copy bandwidth, which is more than half of the 32 ms it would save.
+
+So the crew arm is recorded as **not implementable in this workspace's safe Rust**, not as a win that
+was skipped, and `elem`, `norm` and `rope` stay on the calling thread. The one route that needs no copy
+is folding the transform into the preparation job that already copies each activation into a worker
+buffer — but that path only runs behind `VIPERA_PARALLEL_PREP` (off by default, and the norm would be
+recomputed once per product that shares it, three times for the attention projections), so it is a
+different hypothesis with its own measurement before it, not this one carrying the same 4.5% ceiling.
