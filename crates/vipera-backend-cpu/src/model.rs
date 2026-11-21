@@ -616,12 +616,15 @@ impl CpuBackend {
 
                 for (index, layer) in layers.iter().enumerate() {
                     weights.advance(index);
+                    let at = crate::profile::stamp();
                     rms_norm(x, &layer.attn_norm, config.rms_eps, h);
+                    crate::profile::note(crate::profile::Phase::Norm, at);
                     layer.wq.matvec(&pool, file, h, q)?;
-                    add_assign(q, &layer.bq);
                     layer.wk.matvec(&pool, file, h, k)?;
-                    add_assign(k, &layer.bk);
                     layer.wv.matvec(&pool, file, h, v)?;
+                    let at = crate::profile::stamp();
+                    add_assign(q, &layer.bq);
+                    add_assign(k, &layer.bk);
                     add_assign(v, &layer.bv);
                     if !layer.q_norm.is_empty() {
                         per_head_rms_norm(
@@ -639,7 +642,9 @@ impl CpuBackend {
                             shape.head_dim,
                         );
                     }
+                    crate::profile::note(crate::profile::Phase::Proj, at);
 
+                    let at = crate::profile::stamp();
                     rope(q, position, shape.heads, shape.head_dim, config.rope_base);
                     rope(
                         k,
@@ -648,21 +653,30 @@ impl CpuBackend {
                         shape.head_dim,
                         config.rope_base,
                     );
+                    crate::profile::note(crate::profile::Phase::Rope, at);
+                    let at = crate::profile::stamp();
                     kv.write(position, index, shape, k, v)?;
+                    crate::profile::note(crate::profile::Phase::KvWrite, at);
 
                     let at = crate::profile::stamp();
                     attend(q, &kv, index, position + 1, shape, attn_scratch, attn)?;
                     crate::profile::note(crate::profile::Phase::Attention, at);
 
                     layer.wo.matvec(&pool, file, attn, h)?;
+                    let at = crate::profile::stamp();
                     add_assign(x, h);
+                    crate::profile::note(crate::profile::Phase::Elem, at);
 
                     rms_norm(x, &layer.ffn_norm, config.rms_eps, h);
                     layer.wg.matvec(&pool, file, h, gate)?;
                     layer.wu.matvec(&pool, file, h, up)?;
+                    let at = crate::profile::stamp();
                     silu_mul(up, gate);
+                    crate::profile::note(crate::profile::Phase::Elem, at);
                     layer.wd.matvec(&pool, file, up, h)?;
+                    let at = crate::profile::stamp();
                     add_assign(x, h);
+                    crate::profile::note(crate::profile::Phase::Elem, at);
                 }
             }
 
@@ -986,6 +1000,7 @@ impl CpuBackend {
                     &mut batch.v[..B * kv_width],
                 )?;
                 let per_head_norm = !layer.q_norm.is_empty();
+                let at = crate::profile::stamp();
                 for entry in 0..B {
                     add_assign(&mut batch.q[entry * query..][..query], &layer.bq);
                     add_assign(&mut batch.k[entry * kv_width..][..kv_width], &layer.bk);
@@ -1007,9 +1022,11 @@ impl CpuBackend {
                         );
                     }
                 }
+                crate::profile::note(crate::profile::Phase::Proj, at);
 
                 for entry in 0..B {
                     let position = positions[entry];
+                    let at = crate::profile::stamp();
                     rope_with(
                         &mut batch.q[entry * query..][..query],
                         &rope_angles[entry],
@@ -1022,6 +1039,8 @@ impl CpuBackend {
                         shape.kv_heads,
                         shape.head_dim,
                     );
+                    crate::profile::note(crate::profile::Phase::Rope, at);
+                    let at = crate::profile::stamp();
                     let context = &contexts[entry];
                     let mut view = KvView {
                         storage: kv,
@@ -1037,6 +1056,7 @@ impl CpuBackend {
                         &batch.k[entry * kv_width..][..kv_width],
                         &batch.v[entry * kv_width..][..kv_width],
                     )?;
+                    crate::profile::note(crate::profile::Phase::KvWrite, at);
                 }
 
                 // Every row of the chunk is in the cache now, so the whole chunk's attention is one
@@ -1072,12 +1092,14 @@ impl CpuBackend {
                     &rows::<B>(&batch.attn, hidden),
                     &mut batch.h[..B * hidden],
                 )?;
+                let at = crate::profile::stamp();
                 for entry in 0..B {
                     add_assign(
                         &mut batch.x[entry * hidden..][..hidden],
                         &batch.h[entry * hidden..][..hidden],
                     );
                 }
+                crate::profile::note(crate::profile::Phase::Elem, at);
 
                 let at = crate::profile::stamp();
                 for entry in 0..B {
@@ -1099,19 +1121,23 @@ impl CpuBackend {
                 layer
                     .wu
                     .matvec_batch::<B>(&pool, file, &activations, &mut batch.up[..B * ffn])?;
+                let at = crate::profile::stamp();
                 silu_mul(&mut batch.up[..B * ffn], &batch.gate[..B * ffn]);
+                crate::profile::note(crate::profile::Phase::Elem, at);
                 layer.wd.matvec_batch::<B>(
                     &pool,
                     file,
                     &rows::<B>(&batch.up, ffn),
                     &mut batch.h[..B * hidden],
                 )?;
+                let at = crate::profile::stamp();
                 for entry in 0..B {
                     add_assign(
                         &mut batch.x[entry * hidden..][..hidden],
                         &batch.h[entry * hidden..][..hidden],
                     );
                 }
+                crate::profile::note(crate::profile::Phase::Elem, at);
             }
 
             if need_logits && only_last {

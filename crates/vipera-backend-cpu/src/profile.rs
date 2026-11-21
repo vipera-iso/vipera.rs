@@ -26,10 +26,23 @@ pub enum Phase {
     Attention,
     /// RMS normalisation, including the rotary embeddings applied next to it.
     Norm,
+    /// The bias adds after the attention projections and the per-head Q/K normalisation beside
+    /// them, which the projections do not cover.
+    Proj,
+    /// The rotary embedding applied to Q and K.
+    Rope,
+    /// Encoding K and V into the cache and storing them, once per position per layer.
+    KvWrite,
+    /// The elementwise passes between the products: the residual adds and the gated FFN product.
+    Elem,
 }
 
 /// The counters, one per [`Phase`].
-static COUNTERS: [AtomicU64; 5] = [
+static COUNTERS: [AtomicU64; 9] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -43,7 +56,11 @@ static TOTAL: AtomicU64 = AtomicU64::new(0);
 static STEPS: AtomicU64 = AtomicU64::new(0);
 /// The same two counters for prompt chunks, which are counted apart from decode steps: a chunk
 /// computes several positions per weight read, so mixing them into one average describes neither.
-static PREFILL_COUNTERS: [AtomicU64; 5] = [
+static PREFILL_COUNTERS: [AtomicU64; 9] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -210,7 +227,7 @@ pub fn finish_pass(start: Option<Instant>) {
     let Some(start) = start else { return };
     let total = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let prefill = IN_CHUNK.with(|flag| flag.get());
-    let (counters, total_at, steps_at): (&[AtomicU64; 5], &AtomicU64, &AtomicU64) = if prefill {
+    let (counters, total_at, steps_at): (&[AtomicU64; 9], &AtomicU64, &AtomicU64) = if prefill {
         (&PREFILL_COUNTERS, &PREFILL_TOTAL, &PREFILL_STEPS)
     } else {
         (&COUNTERS, &TOTAL, &STEPS)
@@ -219,7 +236,17 @@ pub fn finish_pass(start: Option<Instant>) {
     let steps = steps_at.fetch_add(1, Ordering::Relaxed) + 1;
     let average = total_at.load(Ordering::Relaxed) / steps;
     let kind = if prefill { "chunk" } else { "decode" };
-    let names = ["q4k", "q6k", "other_dot", "attention", "norm"];
+    let names = [
+        "q4k",
+        "q6k",
+        "other_dot",
+        "attention",
+        "norm",
+        "proj",
+        "rope",
+        "kv_write",
+        "elem",
+    ];
     let mut line = format!("PROFILE {kind} {steps} {:.2} ms:", average as f64 / 1e6);
     let mut claimed = 0;
     for (index, name) in names.iter().enumerate() {
