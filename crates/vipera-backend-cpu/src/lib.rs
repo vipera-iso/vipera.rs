@@ -34,6 +34,10 @@ pub(crate) mod simd;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) mod simd {
     pub(crate) use crate::scalar::*;
+
+    /// The `f16` and `f32` kernels are the same scalar code here, so an in-place row is the
+    /// decoded row's bits.
+    pub(crate) const IN_PLACE_KV_BIT_EXACT: bool = true;
 }
 pub(crate) mod tiled;
 

@@ -2116,7 +2116,10 @@ fn attention_streaming_heads(
     // instead of decoding it into `row` first: same bits (the conversion is exact and the dot tree
     // is the same one), no 2 MB of row buffer per layer per pass. `VIPERA_INPLACE_KV=0` keeps the
     // decoded arm for an A/B in one binary.
-    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let in_place = in_place_kv_enabled()
+        && crate::simd::IN_PLACE_KV_BIT_EXACT
+        && kv.layout == KvLayout::F16
+        && !sequential;
     let shared = share && in_place && group <= MAX_SHARED_GROUP;
     let count = heads.end - heads.start;
     scores.clear();
@@ -2412,7 +2415,10 @@ fn attention_window_heads(
     if count == 0 || positions == 0 {
         return Ok(());
     }
-    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let in_place = in_place_kv_enabled()
+        && crate::simd::IN_PLACE_KV_BIT_EXACT
+        && kv.layout == KvLayout::F16
+        && !sequential;
     let shared = share && in_place && group <= MAX_SHARED_GROUP;
     let sinks_end = sinks.min(positions);
     let window_start = positions.saturating_sub(window).max(sinks_end);
@@ -2808,7 +2814,10 @@ fn attention_kv_chunked_heads(
     let layer_bytes = kv.layout.bytes_per_row(width);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sequential = quant::exact_dot_requested();
-    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let in_place = in_place_kv_enabled()
+        && crate::simd::IN_PLACE_KV_BIT_EXACT
+        && kv.layout == KvLayout::F16
+        && !sequential;
     let shared = share && in_place && group <= MAX_SHARED_GROUP;
 
     #[derive(Clone)]
@@ -3060,7 +3069,10 @@ fn attention_window_chunked_heads(
     let layer_bytes = kv.layout.bytes_per_row(width);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sequential = quant::exact_dot_requested();
-    let in_place = in_place_kv_enabled() && kv.layout == KvLayout::F16 && !sequential;
+    let in_place = in_place_kv_enabled()
+        && crate::simd::IN_PLACE_KV_BIT_EXACT
+        && kv.layout == KvLayout::F16
+        && !sequential;
     let shared = share && in_place && group <= MAX_SHARED_GROUP;
     let count = heads.end - heads.start;
     let kept: usize = ranges

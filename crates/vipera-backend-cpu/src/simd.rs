@@ -486,6 +486,12 @@ unsafe fn half_to_float_f16c(source: &[u8], values: &mut [f32], length: usize) {
 ///
 /// Safe to call: it detects AVX2 itself and falls back to the scalar loop, and it reads only whole
 /// blocks, finishing any tail one value at a time.
+///
+/// Whether an in-place `f16` row and a row decoded to `f32` produce the same bits: every `f16`
+/// kernel here mirrors this file's reduction tree, so they do. See `simd_aarch64` for the
+/// architecture where they do not yet.
+pub(crate) const IN_PLACE_KV_BIT_EXACT: bool = true;
+
 pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let length = a.len().min(b.len());
     if !available() || length < 16 {
