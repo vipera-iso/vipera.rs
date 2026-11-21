@@ -1,5 +1,5 @@
 {
-  "note": "Recorded from `vipera generate --temperature 0` with VIPERA_Q4K_F32=1 on the model below (i5-11300H, release build, 2026-11-17). It pins the Q4_K f32-activation continuation the README describes; the default i8-activation path diverges from it at token 2 on this prompt, so the test fails if the switch stops being honoured. Re-record it when the Q4_K arithmetic changes.",
+  "note": "Recorded from `vipera generate --temperature 0` with VIPERA_Q4K_F32=1 and VIPERA_FAST_SOFTMAX=0 on the model below (i5-11300H, release build, 2026-11-17, re-confirmed 2026-11-21). It pins the Q4_K f32-activation continuation the README describes; the default i8-activation path diverges from it at token 2 on this prompt, so the test fails if the switch stops being honoured. The exponent switch is pinned off because its polynomial is not bit-identical to libm's `expf` — 9abfa5e turned it on by default and moved this continuation without any Q4_K change. Re-record it when the Q4_K arithmetic changes.",
   "model": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
   "prompt": "The quick brown fox jumps over the lazy dog.",
   "max_new": 24,
