@@ -7,6 +7,7 @@
 //! else is refused by name rather than dequantized approximately: a wrong scale convention produces
 //! fluent-looking nonsense, which is harder to notice than an error.
 
+use std::sync::Arc;
 use std::thread;
 
 use vipera_core::gguf::GgmlType;
@@ -501,6 +502,8 @@ pub(crate) struct OwnedActivation {
 }
 
 impl OwnedActivation {
+    /// Kept for the tests that compare a fused activation against the plain build.
+    #[cfg(test)]
     pub(crate) fn new(ty: GgmlType, x: &[f32]) -> Self {
         let groups = x.len() / 32;
         // `x` and its group sums share one buffer: one allocation instead of two.
@@ -519,8 +522,20 @@ impl OwnedActivation {
     /// [`OwnedActivation::new`] over a buffer that already holds `x` in its first `values` slots,
     /// finished in place: the group sums are appended and the quantiser reads the same values, so
     /// the result is `new(ty, &buffer[..values])` bit for bit without a second copy of `x`.
-    pub(crate) fn from_buffer(ty: GgmlType, mut buffer: Vec<f32>, values: usize) -> Self {
+    ///
+    /// `fusion` is applied to those values first. That is the whole point of the transform living
+    /// in this module: the buffer was just filled from the caller's activation, and a worker that
+    /// already holds it can transform, sum and quantise without the caller running the transform
+    /// pass on its own thread.
+    pub(crate) fn from_buffer_fused(
+        ty: GgmlType,
+        mut buffer: Vec<f32>,
+        values: usize,
+        fusion: &Fusion,
+        entry: usize,
+    ) -> Self {
         buffer.truncate(values);
+        fusion.apply(entry, &mut buffer);
         let groups = values / 32;
         let sums: Vec<f32> = x_sums_iter(&buffer).collect();
         buffer.extend_from_slice(&sums);
@@ -546,6 +561,49 @@ impl OwnedActivation {
     /// `x` rounded to `i8`, when this activation was built for Q4_K.
     pub(crate) fn quantized(&self) -> Option<&QuantizedX> {
         self.q.as_ref()
+    }
+}
+
+/// A transform a batched product applies to each activation before it is summed and quantised.
+///
+/// It lives here rather than in the model because the only place it can run for free is the copy
+/// into a worker's buffer: a chunk spends 12 ms on the feed-forward norm and 30 ms on the SwiGLU
+/// multiply on the calling thread, between products that leave every worker idle. Both transforms
+/// are elementwise and read nothing but their own inputs, so a worker computing them produces the
+/// same bits the caller's pass produced.
+///
+/// The inputs a transform needs are owned (`Arc`), because a job travels to a worker with the
+/// pool's data lifetime and the caller's scratch buffers are shorter-lived than that.
+#[derive(Clone)]
+pub(crate) enum Fusion {
+    /// Nothing; the activation is copied as given.
+    None,
+    /// `rms_norm(x, weight, epsilon)`, in place.
+    Norm { weight: Arc<[f32]>, epsilon: f32 },
+    /// `x * silu(gate[entry])`, the SwiGLU multiply, entry `entry` of a `B`-entry batch.
+    Silu { gate: Arc<[f32]>, width: usize },
+}
+
+impl Fusion {
+    /// Apply the transform to entry `entry`'s values.
+    fn apply(&self, entry: usize, values: &mut [f32]) {
+        match self {
+            Fusion::None => {}
+            Fusion::Norm { weight, epsilon } => {
+                crate::model::rms_norm_in_place(values, weight, *epsilon);
+            }
+            Fusion::Silu { gate, width } => {
+                if let Some(gate) = gate.get(entry * width..(entry + 1) * width) {
+                    crate::simd::silu_mul(values, gate);
+                }
+            }
+        }
+    }
+
+    /// Whether this transform does nothing, in which case the paths that do not copy an activation
+    /// (the tiled product) still apply.
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, Fusion::None)
     }
 }
 
@@ -819,7 +877,19 @@ pub(crate) fn matvec_pooled<'d>(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
-    matvec_pooled_batch(pool, ty, data, cols, rows, &[x], out)
+    let matrix = Matrix { ty, cols, rows };
+    matvec_pooled_batch(pool, matrix, data, &[x], &Fusion::None, out)
+}
+
+/// The layout of one weight matrix: everything a product needs to know about the bytes it reads.
+///
+/// Grouped as a unit because a batched product would otherwise take `ty`, `cols` and `rows` beside
+/// the data they describe, which is one argument past what a call to read.
+#[derive(Clone, Copy)]
+pub(crate) struct Matrix {
+    pub(crate) ty: GgmlType,
+    pub(crate) cols: usize,
+    pub(crate) rows: usize,
 }
 
 /// [`matvec_pooled`] for `B` activations, reading each row once for all of them.
@@ -836,13 +906,13 @@ pub(crate) fn matvec_pooled<'d>(
 /// across 32 rows); `Q8_0`/`Q6_K` stay on the pooled kernel.
 pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     pool: &crate::pool::Pool<'d, B>,
-    ty: GgmlType,
+    matrix: Matrix,
     data: &'d [u8],
-    cols: usize,
-    rows: usize,
     activations: &[&[f32]; B],
+    fusion: &Fusion,
     out: &mut [f32],
 ) -> Result<(), ViperaError> {
+    let Matrix { ty, cols, rows } = matrix;
     let stride = row_bytes(ty, cols)?;
     for (entry, x) in activations.iter().enumerate() {
         if x.len() != cols {
@@ -870,7 +940,8 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     }
     // The float tile is a diagnostic and stays behind `VIPERA_TILED=1`: the integer prefill
     // path below is the default, and it should not change how the few float tensors sum.
-    if crate::tiled::scalar_tiled_enabled()
+    if fusion.is_none()
+        && crate::tiled::scalar_tiled_enabled()
         && crate::tiled::tiled_serves::<B>()
         && matches!(ty, GgmlType::F32 | GgmlType::F16)
     {
@@ -882,10 +953,13 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     );
     let owned: std::sync::Arc<[OwnedActivation; B]> =
         if B >= PARALLEL_PREP_MIN_BATCH && threads > 1 && parallel_prep_enabled() {
-            pool.prepare(ty, activations, threads)?
+            pool.prepare(ty, activations, fusion, threads)?
         } else {
             std::sync::Arc::new(std::array::from_fn(|entry| {
-                OwnedActivation::new(ty, activations[entry])
+                let x = activations[entry];
+                let mut buffer = Vec::with_capacity(x.len() + x.len() / 32);
+                buffer.extend_from_slice(x);
+                OwnedActivation::from_buffer_fused(ty, buffer, cols, fusion, entry)
             }))
         };
     pool.fill_batch(ty, data, stride, threads, &owned, out)
@@ -1189,6 +1263,63 @@ mod tests {
         assert_eq!(out[32], 31.0);
         assert_eq!(out[64], 16.0, "group 3 uses the high nibble of ql[0]");
         assert_eq!(out[96], 16.0);
+    }
+
+    /// A fused activation has to be the plain build of the transformed values, bit for bit: the
+    /// transform moves to a worker, not the arithmetic.
+    #[test]
+    fn a_fused_activation_matches_the_transform_built_serially() {
+        let width = 64;
+        let weight: Vec<f32> = (0..width)
+            .map(|at| ((at % 13) as f32 - 6.0) / 7.0)
+            .collect();
+        let gate_values: Vec<f32> = (0..2 * width)
+            .map(|at| ((at * 37 % 41) as f32 - 20.0) / 11.0)
+            .collect();
+        for entry in 0..2 {
+            let x: Vec<f32> = (0..width)
+                .map(|at| ((at * 7919 % 61) as f32 - 30.0) / 13.0)
+                .collect();
+            for fusion in [
+                Fusion::Norm {
+                    weight: weight.clone().into(),
+                    epsilon: 1e-6,
+                },
+                Fusion::Silu {
+                    gate: gate_values.clone().into(),
+                    width,
+                },
+            ] {
+                let mut buffer = Vec::with_capacity(x.len() + x.len() / 32);
+                buffer.extend_from_slice(&x);
+                let fused = OwnedActivation::from_buffer_fused(
+                    GgmlType::Q4K,
+                    buffer,
+                    width,
+                    &fusion,
+                    entry,
+                );
+                let mut expected = x.clone();
+                match &fusion {
+                    Fusion::Norm { weight, epsilon } => {
+                        crate::model::rms_norm_in_place(&mut expected, weight, *epsilon);
+                    }
+                    Fusion::Silu { gate, width } => {
+                        let gate = &gate[entry * width..(entry + 1) * width];
+                        crate::simd::silu_mul(&mut expected, gate);
+                    }
+                    Fusion::None => unreachable!(),
+                }
+                let plain = OwnedActivation::new(GgmlType::Q4K, &expected);
+                assert_eq!(fused.x(), plain.x(), "entry {entry} values");
+                assert_eq!(fused.sums(), plain.sums(), "entry {entry} sums");
+                assert_eq!(
+                    fused.quantized().map(|q| &q.q),
+                    plain.quantized().map(|q| &q.q),
+                    "entry {entry} quantized activations"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1626,11 +1757,12 @@ mod tests {
             thread::scope(|scope| {
                 let pool = crate::pool::Pool::new(scope, thread_budget(rows, rows * cols * B));
                 // One warm-up call: the first pass also faults in the allocation.
-                matvec_pooled_batch(&pool, ty, data, cols, rows, activations, &mut out)
+                let matrix = Matrix { ty, cols, rows };
+                matvec_pooled_batch(&pool, matrix, data, activations, &Fusion::None, &mut out)
                     .expect("shapes are consistent");
                 let started = std::time::Instant::now();
                 for _ in 0..iterations {
-                    matvec_pooled_batch(&pool, ty, data, cols, rows, activations, &mut out)
+                    matvec_pooled_batch(&pool, matrix, data, activations, &Fusion::None, &mut out)
                         .expect("shapes are consistent");
                 }
                 started.elapsed().as_secs_f64() / f64::from(iterations)

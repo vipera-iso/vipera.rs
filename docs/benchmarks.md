@@ -3023,3 +3023,40 @@ is unchanged by construction; decode profile steps 2-4 stayed in the same noise 
 Change: `parallel_prep_enabled()` now defaults to on; set `VIPERA_PARALLEL_PREP=0` (or
 `false`/`off`/`no`) to restore the serial activation build. Result is bit-identical either way;
 `prepared_activations_are_bit_identical_to_the_serial_ones` covers the split.
+
+## Folding the norms and the SwiGLU multiply into the preparation job — 2026-11-21
+
+Behind `VIPERA_PREP_FUSION=1`. The chunk path used to do three passes on the calling thread between
+products: `attn_norm` and `ffn_norm` (14.0-14.8 ms a chunk) and `silu_mul` (30-37 ms). Both are
+elementwise and read nothing but their own inputs, and a batched product already copies each
+activation into a worker's buffer — so the transform, the group sums and the quantiser now run in
+that copy, on the pool, while the caller would otherwise sit on a serial pass. The norm weight
+travels as an `Arc<[f32]>`, the gate rows as a shared `Arc<[f32]>` (a job travels with the pool's
+lifetime, and the caller's scratch is shorter-lived than that).
+
+Ceiling measured first, by making both passes no-ops in a throwaway build: chunk 654.5 / 674.5 /
+670.6 ms against 693.1 / 733.8 / 696.8 ms, i.e. `elem` 34 -> 3.8 ms and `norm` 15.2 -> 3.0 ms. That
+is ~6% of a chunk, which is what made this worth writing rather than a 1.9% norm-only fusion.
+
+Interleaved (on, off) x3, chunk totals:
+
+| pair | chunk 1 | chunk 2 | chunk 3 |
+|---|---:|---:|---:|
+| 1 | 727.48 vs 770.83 (-5.6%) | 761.74 vs 799.06 (-4.7%) | 673.56 vs 706.59 (-4.7%) |
+| 2 | 745.03 vs 752.31 (-1.0%) | 780.94 vs 783.62 (-0.3%) | 689.79 vs 695.78 (-0.9%) |
+| 3 | 738.62 vs 776.93 (-4.9%) | 765.11 vs 839.45 (-8.9%) | 676.65 vs 740.17 (-8.6%) |
+
+Median pair delta **-4.7%**; chunk 1 medians 738.62 vs 770.83 ms, **-4.2%**. The spread is the box,
+not the arm: pair 2 ran while the machine was busiest. What the profile says moved is exact — `norm`
+14.7 -> 0.01 ms and `elem` 37.0 -> 4.9 ms, with the same 40 ms reappearing inside `q4k`/`q6k`, because
+the prep the workers now do is charged to the product that owns it. The win is the caller's idle
+window, not less total work, so it is bounded by how much of those 45 ms was serial on a saturated
+pool.
+
+Bit-identity: `cmp` on a 32-token `--temperature 0 --seed 1` run is clean between the arms, and
+`rms_norm_in_place_is_rms_norm` (bits, 1536 values) plus
+`a_fused_activation_matches_the_transform_built_serially` (values, sums and quantised activations,
+both transforms, two entries) pin the two pieces the fusion moved.
+
+Still off by default: it was measured on one box, and pair 2 shows how much a shared machine can eat
+of it.
