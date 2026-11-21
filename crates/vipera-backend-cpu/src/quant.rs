@@ -577,15 +577,15 @@ impl<'a, const B: usize> BatchActivation<'a, B> {
 
     /// The activations themselves.
     ///
-    /// The scalar and NEON kernels read the f32 form directly, so only the x86 batch kernels (and
-    /// the pool tests that compare prepared activations) need these accessors.
-    #[cfg(any(target_arch = "x86_64", test))]
+    /// The scalar and NEON kernels read the f32 form directly, so only the x86 batch kernels need
+    /// these accessors; the aarch64 build would otherwise carry two dead methods.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn x(&self) -> &[&'a [f32]; B] {
         &self.x
     }
 
     /// The 32-value sums of each activation.
-    #[cfg(any(target_arch = "x86_64", test))]
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn sums(&self) -> &[&'a [f32]; B] {
         &self.sums
     }
@@ -1280,6 +1280,9 @@ mod tests {
     ///
     /// Ignored by default:
     /// `cargo test -p vipera-backend-cpu --release --lib -- --ignored --nocapture a_512_bit_decode_row`
+    // The kernel it measures is the AVX-512 VNNI one, so the test only exists where that module
+    // does; on aarch64 the row kernel it would compare against is the only kernel there is.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore = "measurement, not a correctness check"]
     fn a_512_bit_decode_row_is_measured_against_the_row_kernel() {
