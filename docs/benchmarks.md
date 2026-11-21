@@ -3003,3 +3003,23 @@ end and needs a new kernel, not a switch.
 **`proj` has none.** 1.84-2.44 ms a chunk is **0.3%**: the bias adds and the per-head Q/K norms after
 the projections are already vectorised, and even deleting them entirely would not clear the 3% gate.
 NO-GO without writing anything, and the same holds for `rope` (0.6%) and `kv_write` (0.5%).
+
+## `VIPERA_PARALLEL_PREP` on by default — 2026-11-21
+
+Same box (i5-11300H, 8 threads, `Qwen2.5-1.5B-Instruct-Q4_K_M`), same prompt as the phase-split
+ledger (24× "the quick brown fox...", 128-token chunks, ctx 1024, seed 1, `--max-tokens 20`,
+`VIPERA_PROFILE_STEP=1`). Interleaved (on, off) × 3, median of chunk totals:
+
+| chunk | on (default) | off (`VIPERA_PARALLEL_PREP=0`) | delta |
+|---|---:|---:|---:|
+| 1 | 721.77 ms | 774.13 ms | -6.76% |
+| 2 | 757.23 ms | 797.40 ms | -5.04% |
+| 3 | 664.77 ms | 695.73 ms | -4.45% |
+
+Direction held in 3/3 pairs for every chunk. Decode (batch 1-8, below `PARALLEL_PREP_MIN_BATCH=16`)
+is unchanged by construction; decode profile steps 2-4 stayed in the same noise band (on median
+~97.6/105.3/89.6 ms vs off ~94.7/107.2/88.8 ms).
+
+Change: `parallel_prep_enabled()` now defaults to on; set `VIPERA_PARALLEL_PREP=0` (or
+`false`/`off`/`no`) to restore the serial activation build. Result is bit-identical either way;
+`prepared_activations_are_bit_identical_to_the_serial_ones` covers the split.
