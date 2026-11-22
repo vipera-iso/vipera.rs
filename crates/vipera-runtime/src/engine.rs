@@ -155,6 +155,10 @@ struct Turn {
     /// stop. A long draft costs more positions in the verify pass, so it is only paid for while it
     /// is being accepted.
     draft_cap: usize,
+    /// Consecutive verify passes that accepted nothing. Once a turn has missed this many times in a
+    /// row the drafts are not finding the context's own continuation, and each further pass costs
+    /// more than the plain token it returns, so speculation stops for the rest of the turn.
+    spec_misses: u8,
     timings: StageTimings,
 }
 
@@ -169,6 +173,10 @@ impl fmt::Debug for Turn {
             .finish_non_exhaustive()
     }
 }
+
+/// Zero-accept verify passes in a row before a turn stops speculating. Five is past the point where
+/// `draft_cap` has already shrunk to 2, so a turn that still accepts nothing is not repeating.
+const SPEC_MISS_LIMIT: u8 = 5;
 
 /// Whether speculative decoding runs, given what the host asked for in [`EngineConfig`].
 ///
@@ -657,6 +665,7 @@ impl<F: ForwardPass> Engine<F> {
             top_n,
             speculative,
             draft_cap: 4,
+            spec_misses: 0,
             timings: StageTimings::new(),
         });
         Ok(())
@@ -893,6 +902,13 @@ impl<F: ForwardPass> Engine<F> {
     /// that matches the draft is kept, and the model's own pick after it becomes the next
     /// unprocessed token. The greedy stream is unchanged, which is what makes this safe to measure.
     fn step_speculative(&mut self, id: u64, report: &mut StepReport) -> Result<(), ViperaError> {
+        if self
+            .turns
+            .get(&id)
+            .is_some_and(|turn| turn.spec_misses >= SPEC_MISS_LIMIT)
+        {
+            return self.sample(id, report);
+        }
         let Engine {
             kv,
             forward,
@@ -1000,8 +1016,12 @@ impl<F: ForwardPass> Engine<F> {
         if !draft.is_empty() {
             if accepted == draft.len() {
                 turn.draft_cap = (turn.draft_cap + 1).min(8);
+                turn.spec_misses = 0;
             } else if accepted == 0 {
                 turn.draft_cap = 2;
+                turn.spec_misses = turn.spec_misses.saturating_add(1);
+            } else {
+                turn.spec_misses = 0;
             }
         }
 
