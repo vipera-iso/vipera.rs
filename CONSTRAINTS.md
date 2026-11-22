@@ -16,6 +16,9 @@ These five are review-checked on every change. No tooling required, no exception
   functions that return a hardcoded value where the caller expects a computed one.
 - **No skipped or deleted tests** without the reason in the same change (`@pytest.mark.skip`, `xfail`, removed assertions).
 - **No secrets in source**: API keys, tokens, connection strings. Report the location, never the value.
+- **A performance change names the skills it loaded**: its PR body carries a `## Skills` section naming the
+  phases it used (`vipera-perf-loop` §2, where phases 1, 3 and 6 are mandatory). The `skills` CI job is red
+  without that section, so this is checked by a machine and not by memory.
 - **This file is not edited in the same change that was failing a rule.**
 
 ## Rules for the agent — what "code linh tinh" means here
@@ -119,7 +122,9 @@ scripts/gate.sh --list       # fmt lint build test features measure gpu
 ```
 
 The Rust side has one executable form, `scripts/gate.sh`. CI runs it one stage per job and nothing
-else, so a stage that is green on a laptop and a stage that is green on CI are the same command; the
+else — apart from the `skills` job, which reads the PR body and therefore has no local form, because
+the body exists only in the event — so a stage that is green on a laptop and a stage that is green on
+CI are the same command; the
 stages are `fmt`, `lint`, `build`, `test`, `features`, `measure` and `gpu`, and the `ci` job fails
 unless every one of them passed. The commands behind the stages, which are the bar itself:
 

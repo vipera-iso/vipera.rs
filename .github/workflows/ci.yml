@@ -66,16 +66,48 @@ jobs:
       - name: ${{ matrix.stage }}
         run: ./scripts/gate.sh ${{ matrix.stage }}
 
+  skills:
+    # A perf change must name the skills it loaded, per phase (`vipera-perf-loop` §2). A line in a
+    # chat transcript is not evidence anyone can check later; the PR body is, and GitHub hands it to
+    # the runner. Body text is only available from the event, so this cannot be a `gate.sh` stage.
+    name: skills
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: PR body names the skills it loaded
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if printf '%s' "$BODY" | grep -qiE '^##[[:space:]]+skills[[:space:]]*$'; then
+            echo "found a '## Skills' section"
+            exit 0
+          fi
+          echo "::error::this PR body has no '## Skills' section (vipera-perf-loop §2)."
+          echo "Add one line naming the phases it used, for example:"
+          echo '  `1 optimizer` · `3 ponytail` · `6 green-push`'
+          echo "Phases 1, 3 and 6 are mandatory; say so in the section if one does not apply."
+          exit 1
+
   ci:
     # The one check to require in branch protection, and the one place that says which stage was red.
     # The matrix reports each stage; this fails unless all of them passed.
     name: ci
     if: always()
-    needs: [gate]
+    needs: [gate, skills]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Every stage passed
         run: |
           echo "gate: ${{ needs.gate.result }}"
+          echo "skills: ${{ needs.skills.result }}"
           test "${{ needs.gate.result }}" = success
+          # `skills` is skipped on a push to main, where there is no PR body to read.
+          case "${{ needs.skills.result }}" in
+            success | skipped) ;;
+            *)
+              echo "::error::the skills job did not pass"
+              exit 1
+              ;;
+          esac
