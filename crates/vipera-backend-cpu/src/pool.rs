@@ -561,6 +561,131 @@ mod tests {
         check::<16>(0, 1);
     }
 
+    /// One Q4_K block with `d = 1`, `dmin = 0`, scale 1 and minimum 0 in every sub-block, and
+    /// nibbles `0x21`: the pattern the quantiser tests use, so the kernel does its real arithmetic
+    /// at representative magnitudes instead of multiplying zeros.
+    fn q4k_block() -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[4..8].fill(1);
+        block[12..16].fill(1);
+        block[16..144].fill(0x21);
+        block
+    }
+
+    /// Where a prefill product's wall clock goes at `B = 128`: the activation prepare (with and
+    /// without the shared tile it also fills), the row fill on its own, and the call as the model
+    /// makes it. Written because `ffn_down` (1536 rows x 8960 cols) streams 1 GB/s while
+    /// `ffn_gate` (8960 x 1536) streams 3.3 GB/s at the same block count, and the kernel alone is
+    /// equally fast on both shapes.
+    ///
+    /// ```text
+    /// VIPERA_THREADS=8 cargo test -p vipera-backend-cpu --release --lib prefill_product_breakdown -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn prefill_product_breakdown() {
+        const B: usize = 128;
+        let participants = quant::max_threads();
+        for &(rows, blocks) in &[(8960usize, 6usize), (1536, 35)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let block_bytes = q4k_block();
+            let matrix: Vec<u8> = (0..rows * blocks)
+                .flat_map(|_| block_bytes.clone())
+                .collect();
+            let inputs: Vec<Vec<f32>> = (0..B)
+                .map(|entry| pseudo_random(11 + entry as u64, cols))
+                .collect();
+            let views: [&[f32]; B] = std::array::from_fn(|entry| inputs[entry].as_slice());
+            let gate: Arc<[f32]> = Arc::from(pseudo_random(7, B * cols));
+            let silu = Fusion::Silu {
+                gate: Arc::clone(&gate),
+                width: cols,
+            };
+            let matrix_info = quant::Matrix {
+                ty: vipera_core::gguf::GgmlType::Q4K,
+                cols,
+                rows,
+            };
+            let mut out = vec![0.0_f32; B * rows];
+            std::thread::scope(|scope| {
+                let pool = Pool::<B>::new(scope, participants.saturating_sub(1).max(1));
+                // whole call, prepare with tile, prepare without tile, row fill alone
+                let mut best = [f64::INFINITY; 4];
+                for _ in 0..10 {
+                    for (arm, slot) in best.iter_mut().enumerate() {
+                        let started = std::time::Instant::now();
+                        match arm {
+                            0 => {
+                                quant::matvec_pooled_batch(
+                                    &pool,
+                                    matrix_info,
+                                    &matrix,
+                                    &views,
+                                    &silu,
+                                    &mut out,
+                                )
+                                .expect("product");
+                                std::hint::black_box(&out);
+                            }
+                            1 | 2 => {
+                                let tile =
+                                    (arm == 1).then(|| pool.take_tile(blocks, B.div_ceil(16)));
+                                let owned = pool
+                                    .prepare(
+                                        vipera_core::gguf::GgmlType::Q4K,
+                                        &views,
+                                        &silu,
+                                        participants,
+                                        tile.clone(),
+                                    )
+                                    .expect("prepare");
+                                std::hint::black_box(&owned);
+                                if let Some(tile) = tile {
+                                    pool.recycle_tile(tile);
+                                }
+                            }
+                            _ => {
+                                let owned: Arc<[OwnedActivation; B]> =
+                                    Arc::new(std::array::from_fn(|entry| {
+                                        OwnedActivation::new(
+                                            vipera_core::gguf::GgmlType::Q4K,
+                                            views[entry],
+                                        )
+                                    }));
+                                let tile = pool.take_tile(blocks, B.div_ceil(16));
+                                pool.fill_batch(
+                                    vipera_core::gguf::GgmlType::Q4K,
+                                    &matrix,
+                                    stride,
+                                    participants,
+                                    &owned,
+                                    &mut out,
+                                    Some(tile.clone()),
+                                )
+                                .expect("fill");
+                                std::hint::black_box(&out);
+                                pool.recycle_tile(tile);
+                            }
+                        }
+                        *slot = slot.min(started.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                let bytes = (rows * stride) as f64;
+                println!(
+                    "{rows:>5}x{cols:<5} {participants}T: whole {:>6.2} ms ({:>4.1} GB/s) | prep+tile {:>5.2} | prep {:>5.2} | fill {:>5.2} (prep {:.0}% of fill)",
+                    best[0],
+                    bytes / (best[0] * 1e6),
+                    best[1],
+                    best[2],
+                    best[3],
+                    100.0 * (best[0] - best[3]) / best[3]
+                );
+            });
+        }
+    }
+
     /// What building a batched product's activations costs on the calling thread against the pool,
     /// at the two widths a prefill chunk multiplies, 128 entries. The pool's gain is parallel, so
     /// it only shows on a machine with the cores for it. It is a measurement, not a check, so it

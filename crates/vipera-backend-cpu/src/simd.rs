@@ -3957,6 +3957,104 @@ mod tests {
         }
     }
 
+    /// Measurement, not a check: what a 148-byte repacked Q4_K block buys over GGUF's 144.
+    ///
+    /// The 12 packed scale bytes become 8 scales + 8 mins as plain `u8` (still 6-bit values), so a
+    /// block's dequant reads them with two 8-byte loads instead of calling `q4k_scale_min` eight
+    /// times. The code bytes stay packed, so the nibble split and both f16 conversions are in both
+    /// arms; this isolates the scale header. +2.8% bytes is the only repack a decode-bound model can
+    /// afford, so if this arm does not move, no 4.5 bpw repack will.
+    #[test]
+    #[ignore]
+    fn bench_repacked_q4k_scale_header() {
+        const N: usize = 1 << 16;
+        const ROUNDS: usize = 20;
+
+        let mut fill = 0x9e37_79b9_7f4a_7c15u64;
+        let mut gguf = vec![0u8; N * 144];
+        for byte in gguf.iter_mut() {
+            fill ^= fill << 13;
+            fill ^= fill >> 7;
+            fill ^= fill << 17;
+            *byte = (fill >> 24) as u8;
+        }
+        // Random bytes make NaN/Inf f16 scales, whose payloads need not sum alike; pin both
+        // scale factors to 1.0 so the two arms differ only in how the header bytes are read.
+        for i in 0..N {
+            gguf[i * 144..i * 144 + 4].copy_from_slice(&[0x00, 0x3c, 0x00, 0x3c]);
+        }
+        let mut packed = vec![0u8; N * 148];
+        for i in 0..N {
+            let src = &gguf[i * 144..][..144];
+            let dst = &mut packed[i * 148..][..148];
+            dst[..4].copy_from_slice(&src[..4]);
+            for j in 0..8 {
+                let (scale, min) = crate::quant::q4k_scale_min(&src[4..16], j);
+                dst[4 + j] = scale;
+                dst[12 + j] = min;
+            }
+            dst[20..].copy_from_slice(&src[16..]);
+        }
+
+        fn run(buf: &[u8], stride: usize, wide_header: bool) -> (u128, u32) {
+            let mut checksum = 0u32;
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                for i in 0..N {
+                    let b = &buf[i * stride..][..stride];
+                    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                    let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                    let mut acc = 0.0f32;
+                    if wide_header {
+                        let scales = u64::from_le_bytes(b[4..12].try_into().unwrap());
+                        let mins = u64::from_le_bytes(b[12..20].try_into().unwrap());
+                        for j in 0..8 {
+                            let scale = ((scales >> (j * 8)) & 0xff) as f32;
+                            let min = ((mins >> (j * 8)) & 0xff) as f32;
+                            acc += d * scale + dmin * min;
+                        }
+                        for code in &b[20..] {
+                            acc += f32::from(code & 0x0f);
+                        }
+                    } else {
+                        for j in 0..8 {
+                            let (scale, min) = crate::quant::q4k_scale_min(&b[4..16], j);
+                            acc += d * f32::from(scale) + dmin * f32::from(min);
+                        }
+                        for code in &b[16..] {
+                            acc += f32::from(code & 0x0f);
+                        }
+                    }
+                    checksum = checksum.wrapping_add(acc.to_bits());
+                }
+            }
+            (start.elapsed().as_nanos(), checksum)
+        }
+
+        let (mut gguf_ns, mut gguf_sum) = (0u128, 0u32);
+        let (mut packed_ns, mut packed_sum) = (0u128, 0u32);
+        for _ in 0..3 {
+            let (ns, sum) = run(&gguf, 144, false);
+            gguf_ns += ns;
+            gguf_sum = sum;
+            let (ns, sum) = run(&packed, 148, true);
+            packed_ns += ns;
+            packed_sum = sum;
+        }
+        assert_eq!(
+            gguf_sum, packed_sum,
+            "the two layouts must dequant identically"
+        );
+        let blocks = (N * ROUNDS * 3) as f64;
+        let gguf_ns_block = gguf_ns as f64 / blocks;
+        let packed_ns_block = packed_ns as f64 / blocks;
+        println!(
+            "dequant per block: GGUF 144B {gguf_ns_block:.2} ns, repacked 148B \
+             {packed_ns_block:.2} ns ({:.1}% of the GGUF cost)",
+            packed_ns_block / gguf_ns_block * 100.0
+        );
+    }
+
     #[test]
     #[ignore = "measurement, not a correctness check"]
     fn bench_tiled_vs_row_single_thread() {
