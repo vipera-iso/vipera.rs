@@ -2007,7 +2007,8 @@ output, not just the last bit of an intermediate. It is therefore behind a switc
 with the numbers recorded here; flipping the default needs an ADR and a quality comparison (fixed
 prompts, and preferably perplexity against the exact path), not a benchmark row. `q4k_tiled_range_matches_batch_vnni`
 still passes on the fused arm — tolerance parity with the row kernel is unchanged, which is why this
-is a policy decision rather than a correctness bug.
+is a policy decision rather than a correctness bug. The decision to keep it opt-in, and the quality
+measurements behind that decision, are in `docs/design/ADR-003-fused-prefill-epilogue.md`.
 
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 

@@ -3820,6 +3820,65 @@ mod tests {
         }
     }
 
+    /// Measurement only: how far the tiled kernel sits from the row kernel, so a change to the
+    /// epilogue can be judged by whether it moves toward the reference or away from it.
+    ///
+    /// The row kernel is not ground truth for the dot — both pick a different summation order — but
+    /// it is the kernel every decode path uses, so distance from it is the quantity a prefill's
+    /// activations are consumed with.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn q4k_tiled_error_against_row_kernel() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x51ed_270b_3ac9_e1f7);
+        let rows = 48usize;
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 144;
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut got = vec![0.0_f32; 16 * rows];
+        // SAFETY: whole blocks, VNNI-512 checked above.
+        unsafe { q4k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &sums, &mut got, None) };
+        let mut worst_abs = 0.0_f32;
+        let mut worst_rel = 0.0_f32;
+        let mut sum_rel = 0.0_f64;
+        let mut count = 0usize;
+        let mut totals = [0.0_f32; 16];
+        for row in 0..rows {
+            let row_bytes = &data[row * stride..(row + 1) * stride];
+            // SAFETY: whole blocks, VNNI checked above.
+            unsafe { q4k_dot_batch_vnni(row_bytes, &xs, &sums, &mut totals) };
+            for entry in 0..16 {
+                let want = totals[entry];
+                let got = got[entry * rows + row];
+                let abs = (got - want).abs();
+                let rel = abs / want.abs().max(f32::MIN_POSITIVE);
+                worst_abs = worst_abs.max(abs);
+                worst_rel = worst_rel.max(rel);
+                sum_rel += f64::from(rel);
+                count += 1;
+            }
+        }
+        println!(
+            "{}: max abs {worst_abs:.3e}, max rel {worst_rel:.3e}, mean rel {:.3e} over {count} values",
+            if tiled_fma_enabled() {
+                "fused epilogue"
+            } else {
+                "multiply-then-add"
+            },
+            sum_rel / count as f64
+        );
+    }
+
     /// Measurement only: what allocating and zeroing one product tile costs, so the remaining
     /// ceiling gap can be attributed before a reuse path is written.
     #[test]
