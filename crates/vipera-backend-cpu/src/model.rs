@@ -845,6 +845,7 @@ impl CpuBackend {
             } else {
                 (rest.len() & !7).min(MAX_BATCH)
             };
+            crate::profile::note_batch_width(width);
             let is_last_piece = rest.len() == width;
             let piece_need_logits = need_logits && (!only_last || is_last_piece);
             let piece_only_last = only_last && is_last_piece;

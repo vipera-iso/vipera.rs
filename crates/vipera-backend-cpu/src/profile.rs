@@ -50,6 +50,52 @@ static COUNTERS: [AtomicU64; 9] = [
     AtomicU64::new(0),
 ];
 
+/// How often each batch width was dispatched, indexed by width.
+///
+/// A generic kernel is monomorphised per width, and the widths are not interchangeable: the same
+/// function can pass a codegen gate at one width and fail it at another. Without this counter the
+/// only way to know which one a benchmark exercises is to guess from token counts, which is how a
+/// session ends up optimising a kernel that never runs. Empty unless `VIPERA_PROFILE_WIDTHS` is
+/// set, so the cost when it is off is one relaxed load of a `OnceLock`.
+static WIDTH_COUNTS: [AtomicU64; 129] = [const { AtomicU64::new(0) }; 129];
+
+/// Whether dispatch widths are being counted.
+fn widths_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VIPERA_PROFILE_WIDTHS").is_ok_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
+/// Add one dispatched batch width to its count.
+pub fn note_batch_width(width: usize) {
+    if !widths_enabled() {
+        return;
+    }
+    if let Some(slot) = WIDTH_COUNTS.get(width) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Print the widths dispatched since the last pass and start again.
+fn print_widths() {
+    let mut line = String::from("PROFILE widths");
+    let mut any = false;
+    for (width, count) in WIDTH_COUNTS.iter().enumerate() {
+        let count = count.swap(0, Ordering::Relaxed);
+        if count > 0 {
+            line.push_str(&format!(" {width}:{count}"));
+            any = true;
+        }
+    }
+    if any {
+        eprintln!("{line}");
+    }
+}
+
 /// Whole-pass time, so the phases can be reported as a share of it.
 static TOTAL: AtomicU64 = AtomicU64::new(0);
 /// How many passes have been timed, and therefore how many lines were printed.
@@ -224,6 +270,9 @@ fn print_shapes(steps: u64, prefill: bool) {
 /// The numbers are averages over every pass of that kind timed so far, which keeps a single noisy
 /// step from being read as the answer. Prompt chunks and decode steps are counted apart.
 pub fn finish_pass(start: Option<Instant>) {
+    if widths_enabled() {
+        print_widths();
+    }
     let Some(start) = start else { return };
     let total = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
     let prefill = IN_CHUNK.with(|flag| flag.get());
