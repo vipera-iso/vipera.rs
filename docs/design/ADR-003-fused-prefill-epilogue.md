@@ -71,7 +71,27 @@ Ví dụ cùng prompt tiếng Việt: arm default mở đầu "Prefill và decod
 đầu "Từ khóa: prefill, decode, phần cứng…". Cả hai đều là output hợp lý của một model 1.5B; phép đo
 này **không** nói cái nào tốt hơn, chỉ nói rằng chúng khác nhau — và khác ngay từ token đầu.
 
-### 2.3 Khoảng cách tới row kernel
+### 2.3 Perplexity trên văn bản cố định
+
+Đo bằng `vipera score` (lệnh mới trong commit cùng ngày: log-likelihood của một văn bản cố định,
+chia chunk 64 token qua đúng đường prefill nên kernel tiled — và FMA — có mặt trong phép đo). Năm
+văn bản cắt từ `docs/benchmarks.md` và `docs/design/*.md`, mỗi lượt chạy hai lần cho mỗi arm và cả
+hai arm đều tái lập từng chữ số:
+
+| văn bản | token | mean NLL off | mean NLL fused | Δ |
+|---|---:|---:|---:|---:|
+| popcount, rays | 986 | 2.826631 | 2.823378 | **−0.00325** |
+| gate/up shapes | 1697 | 3.084673 | 3.083967 | **−0.00071** |
+| ggml bind | 2444 | 2.637364 | 2.639467 | **+0.00210** |
+| ADR-001 mở đầu | 1492 | 3.324126 | 3.324727 | **+0.00060** |
+| ADR-003 mục 2 | 1494 | 3.581916 | 3.582051 | **+0.00014** |
+
+Trung bình **−0.000224 nats/token**, tức **−0.007%**; hai văn bản tốt lên, ba xấu đi, và không văn
+bản nào lệch quá 0.003 nats (0.1%). Perplexity đổi 16.888 → 16.834 trên văn bản đầu. Ở độ phân giải
+này phép đo **không** phân biệt được hai arm — nó loại bỏ khả năng "fused làm tệ đi rõ rệt", không
+chứng minh hai arm cho cùng phân bố.
+
+### 2.4 Khoảng cách tới row kernel
 
 Row kernel (`q4k_dot_batch_vnni`) là kernel mà decode dùng cho mọi ma trận Q4_K, nên "gần nó hơn"
 là tiêu chí trung tính còn đo được trong repo. Test `q4k_tiled_error_against_row_kernel` (48 row,
@@ -97,6 +117,12 @@ bình **giảm** — đúng như lý thuyết: một lần làm tròn thay vì h
   chiếm 18% chunk; đo riêng.
 
 ## 4. Options
+
+Cập nhật sau khi có phép đo perplexity (mục 2.3): cả hai phép đo độc lập — sai số so với row
+kernel và NLL trên văn bản — đều nói fused không tệ hơn, nên **B trở thành lựa chọn có cơ sở**. Những
+gì còn giữ default ở A là hành vi: 6/9 prompt ra văn bản khác, và perplexity không nhìn thấy điều đó.
+Lật hay không là quyết định của owner, và ADR giữ nguyên trạng thái opt-in cho tới khi có quyết định
+đó — không phải vì thiếu số đo nữa.
 
 | # | Cách | Được | Mất | Policy |
 |---|---|---|---|---|
@@ -144,7 +170,7 @@ tiêu thụ.
 | 2 | kernel GFLOPS | không chậm hơn ở cả hai shape | đạt: +8.6% / +12% |
 | 3 | sai số so với row kernel | mean rel không tăng | đạt: 3.250e-7 vs 3.542e-7 |
 | 4 | tất định | mỗi arm tự khớp qua nhiều lần chạy | đạt |
-| 5 | **chất lượng theo tác vụ** | **chưa có** — cần một bộ prompt có đáp án hoặc perplexity trên văn bản cố định, và tiêu chí "không tệ hơn" viết trước khi đo | **chặn** |
+| 5 | **chất lượng theo tác vụ** | perplexity trên văn bản cố định, "không tệ hơn" | đo rồi: −0.007% trung bình, 2 tốt / 3 xấu, dưới ngưỡng phân giải (`vipera score`, mục 2.3) |
 | 6 | chi phí hành vi | ghi rõ trong changelog rằng output prefill đổi | chưa làm |
 
 Rollback: xoá một nhánh `if` hoặc để switch về default off; không đụng layout, không đụng kernel
@@ -170,8 +196,8 @@ row, không đụng `SharedTile`.
 
 ## 11. Open questions
 
-1. Bộ đo chất lượng theo tác vụ nào là đủ rẻ để chạy trong CI (perplexity trên một file văn bản cố
-   định cần một lệnh `score` chưa có trong CLI)?
+1. `vipera score` đã có; bao nhiêu văn bản và độ dài nào là đủ để tiêu chí 5 có ý nghĩa (một file
+   ~1000 token cho ±0.1% NLL, nhưng không thấy được khác biệt hành vi)?
 2. Có nên gộp luôn phần Q6_K nếu nó cho cùng tỉ lệ, để chỉ có một switch cho "epilogue fused"?
 3. Owner và ngày hết hạn của cam kết "default off" — nếu 6 tháng nữa không ai đo, giữ nguyên hay
    xoá switch để khỏi mang code chết?

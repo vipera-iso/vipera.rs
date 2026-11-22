@@ -2041,6 +2041,31 @@ entry** — with B=16 there is exactly one half, so the transposed form would se
 the batch size that has the least work to hide it. Not ported: the ceiling is below the gate and the
 restructure would slow the common case.
 
+### `vipera score`, and what the fused epilogue costs in perplexity — 2026-11-22
+
+A prefill kernel that changes rounding cannot be judged by tokens alone when two builds disagree:
+the question is whether the text becomes less likely, and that needs a number. `vipera score
+<model.gguf> (--text|--text-file) [--ctx N] [--json]` prints the log-likelihood, mean NLL and
+perplexity this build assigns to a fixed text. It sends the text through the prefill path in chunks
+of 64 tokens and reads every position's row with `ForwardPass::logits_range`, so nothing is sampled
+and the prefill kernel is what is measured. Two runs of the same arm produce the same digits.
+
+Five texts cut from these docs, both arms, mean NLL per token:
+
+| text | tokens | default | fused epilogue | Δ |
+|---|---:|---:|---:|---:|
+| popcount / rays | 986 | 2.826631 | 2.823378 | −0.00325 |
+| gate and up shapes | 1697 | 3.084673 | 3.083967 | −0.00071 |
+| the ggml bind | 2444 | 2.637364 | 2.639467 | +0.00210 |
+| ADR-001 opening | 1492 | 3.324126 | 3.324727 | +0.00060 |
+| ADR-003 §2 | 1494 | 3.581916 | 3.582051 | +0.00014 |
+
+Mean **−0.000224 nats/token (−0.007%)**, two texts better and three worse, none off by more than
+0.003 nats. At this resolution the measurement cannot separate the arms, which rules out "the fused
+form makes text clearly less likely" and does not prove the two are interchangeable. Together with
+the row-kernel error in §2.4 of ADR-003, it is the evidence that keeps that ADR's opt-in default a
+policy choice about changed output rather than about arithmetic quality.
+
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 
 The engine already ships prompt-lookup (`VIPERA_SPECULATIVE`), so this was a measurement, not a new
