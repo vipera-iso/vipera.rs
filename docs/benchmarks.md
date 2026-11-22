@@ -3576,3 +3576,59 @@ same 520-token prompt, chunk 4:
 Medians: q4k **-4.8%**, q6k 118.27 vs 128.67 (**-8.1%**), chunk **-4.9%**, direction 5/5. Both
 sides drift up across the pairs as the box loads, which if anything understates the gain in the
 last pairs, and every pair is read within itself. The change holds on a quiet box.
+
+## llama.cpp `e574a17` rerun, same machine — 2026-11-23
+
+Re-ran the upstream reference on this box because the README prefill line was questioned. Not a
+paired interleaved vipera↔llama.cpp session; llama.cpp and vipera were measured separately, minutes
+apart, on a `powersave` governor (CPU scaling 74%, i5-11300H, 4c/8t). Use the 2026-11-15 paired table
+for the comparison the README quotes; this entry is a fresh reference point for the current box.
+
+Machine/model:
+
+- CPU: 11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz, 4 cores / 8 threads, governor `powersave`
+- Model: `~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf` (Q4_K_M, 1.04 GiB)
+- llama.cpp: `/home/user/llama-latest/build/bin/llama-bench`, `e574a17` (build 466)
+
+llama.cpp commands and results (`-ngl 0 -t 8 -r 3`):
+
+```bash
+M=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
+B=/home/user/llama-latest/build/bin/llama-bench
+$B -m $M -p 128,512,1024,4096 -n 0 -t 8 -r 3 -ngl 0
+$B -m $M -p 0 -n 128 -t 8 -r 3 -ngl 0
+$B -m $M -p 0 -n 128 -d 4096 -t 8 -r 3 -ngl 0
+```
+
+| test | llama.cpp e574a17 |
+|---|---:|
+| pp128 | 230.74 ± 4.49 t/s |
+| pp512 | 229.72 ± 2.23 t/s |
+| pp1024 | 212.73 ± 1.96 t/s |
+| pp4096 | 166.18 ± 1.90 t/s |
+| tg128 | 36.57 ± 0.36 t/s |
+| tg128 @ d4096 | 23.99 ± 0.58 t/s |
+
+Vipera (current tree, `perf/prefill-attention-scores` head before this doc commit), measured by the
+existing ignored harness, not interleaved with llama-bench:
+
+```bash
+VIPERA_THREADS=8 VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  cargo test --release -p vipera-backend-cpu --test win_vs_llama -- --ignored --nocapture prefill_vs_decode
+VIPERA_THREADS=8 VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  cargo test --release -p vipera-backend-cpu --test win_vs_llama -- --ignored --nocapture prefill_long_prompt
+```
+
+| test | vipera (win_vs_llama harness) |
+|---|---:|
+| pp64 | 206.6 tok/s (309.8 ms) |
+| pp128 | 215.6 tok/s (593.7 ms) |
+| pp512 | 204.0 tok/s (2509.4 ms) |
+| pp1024 | 190.7 tok/s (5368.5 ms) |
+| pp4096 | 132.8 tok/s (30850.8 ms) |
+| decode ctx32 | 34.9 tok/s (28.7 ms/step) |
+
+Read: llama.cpp e574a17 prefill is still ahead on this snapshot (pp128 230.7 vs 215.6; pp512 229.7 vs
+204.0; pp4096 166.2 vs 132.8). Decode is close (tg128 36.6 vs ctx32 34.9 tok/s, different depth).
+The vipera numbers are higher than the 2026-11-15 paired README table; treat as box/variance until
+reproduced with the paired interleaved protocol. No README table was changed.
