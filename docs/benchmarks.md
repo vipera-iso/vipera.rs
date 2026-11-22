@@ -1948,10 +1948,36 @@ Counting the loads per row per 256-column block: 64 activation loads (shared by 
 half is innermost and one broadcast feeds all 8 halves — just moves the cost: 512 weight broadcasts
 become 512 activation loads. Reusing *both* dimensions needs `rows × halves` accumulators, and
 `B = 128` means 8 halves: 4 rows × 8 halves is 32 `zmm` before `facc`, `codes` and the broadcast, i.e.
-more than the ISA has. The largest variant that fits is 2 rows × 4 halves (16 registers), which
-cuts loads per row from 576 to 384 (−33%) at the price of two half-passes over the window. That is
-the next experiment, not something measured yet; expected ~10% of a chunk, and it must stay
-bit-identical (the per-`(row, half)` `g` and `s` orders are unchanged by it, so it should).
+more than the ISA has. So the largest variant that fits is 2 rows × 4 halves (16 registers), which
+cuts the loads per row from 576 to 384.
+
+That variant was then written, proven and measured, and it buys nothing. It lived behind
+`VIPERA_Q4K_ROW2`, and `the_two_row_path_is_bit_identical_to_the_eight_row_one` pinned it byte for
+byte on four shapes, including an odd row count and a partial 32-row window — every `(row, half)`
+keeps its `s`-then-`g` order and its single `buf` add, so the switch was all the fallback needed:
+
+| arm | 8960×1536, 1T | 1536×8960, 1T | chunk 4, 5 interleaved pairs |
+|---|---:|---:|---:|
+| eight rows by one half (default) | 151.7 / 152.6 GFLOPS | 175.6 / 176.9 GFLOPS | median 800.59 ms |
+| two rows by four halves | 152.3 / 150.3 GFLOPS | 169.9 / 168.7 GFLOPS | median 786.81 ms (−1.7%, 4 of 5 pairs) |
+
+−1.7% is under the 3% gate and the change is ~100 dense lines, so it was removed rather than kept
+behind the switch. The useful part is what the two arms say together: **cutting a third of the loads
+changes nothing**, so the load ports were never the binding constraint. What the
+`VIPERA_PROBE_NO_WEIGHT` arm was buying is the hoist — with the broadcast replaced by a constant the
+compiler keeps one `set1` per group instead of eight, one per row, and the loop gets shorter, which
+is not the same thing as sparing the load ports.
+
+The first version of the variant, with a runtime half index into `acc[row][half]`, came out **21%
+slower** (121 against 153 GFLOPS): a dynamically indexed array of `__m512` is a stack slot, so every
+`dpbusd` reloaded its accumulator. Writing the four halves out by hand is what brought it to parity,
+and it is the reason an inner loop like this should never index its accumulators at run time.
+
+Clean baseline for the rows above, same binary and model, commit `35f265f`: chunk 4 median
+**800.59 ms** (5 runs, load 1.85), q4k 70%, q6k 18%, attention 10%; per-shape table from a
+2953-token prompt at `B=128`: gate+up 8.07 ms/call, Q6_K down 11.46, Q4_K down 8.91, wo 1.95. Twenty
+minutes earlier, with no code change, the same command gave 985–1043 ms — that is the machine, and
+the reason every row above is a ratio.
 
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 
