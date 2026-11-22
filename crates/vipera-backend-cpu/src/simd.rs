@@ -3879,6 +3879,112 @@ mod tests {
         );
     }
 
+    use std::arch::x86_64::{
+        _mm512_shuffle_i32x4, _mm512_storeu_si512, _mm512_unpackhi_epi32, _mm512_unpackhi_epi64,
+        _mm512_unpacklo_epi32, _mm512_unpacklo_epi64,
+    };
+
+    /// Transpose a 16 x 16 square of 32-bit words held in sixteen ZMM registers: word `k` of input
+    /// row `i` becomes word `i` of output row `k`.
+    ///
+    /// Pure data movement, so the result is bit-for-bit what a word-by-word copy produces.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    #[inline]
+    fn transpose_16x16(r: [__m512i; 16]) -> [__m512i; 16] {
+        let mut pairs = [_mm512_setzero_si512(); 16];
+        for i in 0..8 {
+            pairs[2 * i] = _mm512_unpacklo_epi32(r[2 * i], r[2 * i + 1]);
+            pairs[2 * i + 1] = _mm512_unpackhi_epi32(r[2 * i], r[2 * i + 1]);
+        }
+        let mut quads = [[_mm512_setzero_si512(); 4]; 4];
+        for g in 0..4 {
+            quads[g][0] = _mm512_unpacklo_epi64(pairs[4 * g], pairs[4 * g + 2]);
+            quads[g][1] = _mm512_unpackhi_epi64(pairs[4 * g], pairs[4 * g + 2]);
+            quads[g][2] = _mm512_unpacklo_epi64(pairs[4 * g + 1], pairs[4 * g + 3]);
+            quads[g][3] = _mm512_unpackhi_epi64(pairs[4 * g + 1], pairs[4 * g + 3]);
+        }
+        let mut out = [_mm512_setzero_si512(); 16];
+        for m in 0..4 {
+            let lo01 = _mm512_shuffle_i32x4::<0x88>(quads[0][m], quads[1][m]);
+            let hi01 = _mm512_shuffle_i32x4::<0xDD>(quads[0][m], quads[1][m]);
+            let lo23 = _mm512_shuffle_i32x4::<0x88>(quads[2][m], quads[3][m]);
+            let hi23 = _mm512_shuffle_i32x4::<0xDD>(quads[2][m], quads[3][m]);
+            out[m] = _mm512_shuffle_i32x4::<0x88>(lo01, lo23);
+            out[4 + m] = _mm512_shuffle_i32x4::<0x88>(hi01, hi23);
+            out[8 + m] = _mm512_shuffle_i32x4::<0xDD>(lo01, lo23);
+            out[12 + m] = _mm512_shuffle_i32x4::<0xDD>(hi01, hi23);
+        }
+        out
+    }
+
+    /// Measurement only: `SharedTile::fill_entries` against the 16x16 transpose the tiled kernel's
+    /// owned path uses, on the same data and single-threaded, with the bytes compared.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn shared_tile_fill_vs_transpose() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x7a11_0000_0000_0001);
+        let blocks = 35usize;
+        let entries = 128usize;
+        let halves = entries / 16;
+        let source: Vec<Vec<i8>> = (0..entries)
+            .map(|_| {
+                (0..blocks * 256)
+                    .map(|_| (rng.unit() * 15.0) as i8)
+                    .collect()
+            })
+            .collect();
+        let q: Vec<&[i8]> = source.iter().map(|x| x.as_slice()).collect();
+        let len = blocks * halves * 64 * 16 * 4;
+
+        let tile = SharedTile::new(blocks, halves);
+        let start = std::time::Instant::now();
+        for _ in 0..16 {
+            tile.fill_entries(0, &q);
+        }
+        let copy = start.elapsed().as_secs_f64() / 16.0;
+        let want = tile.bytes().to_vec();
+
+        let mut got = vec![0_i8; len];
+        let start = std::time::Instant::now();
+        for _ in 0..16 {
+            // SAFETY: AVX-512 checked above; every store is inside `got` and every load inside `q`.
+            unsafe {
+                for b in 0..blocks {
+                    for half in 0..halves {
+                        let base = (b * halves + half) * 64 * 16 * 4;
+                        for chunk in 0..4 {
+                            let mut rows = [_mm512_setzero_si512(); 16];
+                            for (col, row) in rows.iter_mut().enumerate() {
+                                *row = _mm512_loadu_si512(
+                                    q[half * 16 + col].as_ptr().add(b * 256 + chunk * 64)
+                                        as *const __m512i,
+                                );
+                            }
+                            for (k, value) in transpose_16x16(rows).into_iter().enumerate() {
+                                _mm512_storeu_si512(
+                                    got.as_mut_ptr().add(base + (chunk * 16 + k) * 64)
+                                        as *mut __m512i,
+                                    value,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let transposed = start.elapsed().as_secs_f64() / 16.0;
+        assert_eq!(want, got, "the transpose wrote different bytes");
+        println!(
+            "fill_entries {:.3} ms, transpose {:.3} ms ({}x, {blocks} blocks x {entries} entries)",
+            copy * 1e3,
+            transposed * 1e3,
+            copy / transposed
+        );
+    }
+
     /// Measurement only: what allocating and zeroing one product tile costs, so the remaining
     /// ceiling gap can be attributed before a reuse path is written.
     #[test]

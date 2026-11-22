@@ -2010,6 +2010,37 @@ still passes on the fused arm — tolerance parity with the row kernel is unchan
 is a policy decision rather than a correctness bug. The decision to keep it opt-in, and the quality
 measurements behind that decision, are in `docs/design/ADR-003-fused-prefill-epilogue.md`.
 
+### Q6_K's epilogue is worth a sixth as much, and the fill has nothing to give — 2026-11-22
+
+The Q4_K fold has an obvious symmetric form in `q6k_matvec_tiled_range`, and the kernel does get
+faster; the chunk does not follow, because Q6_K is 18% of a chunk and only part of that is epilogue.
+
+| arm | Q6_K tiled, 8960x1536, B=128, 1T (`bench_q6k_tiled`) | chunk 4, 5 interleaved pairs |
+|---|---:|---:|
+| multiply-then-add (default) | 22.92 / 23.14 / 22.36 ms/pass | median 665.85 ms |
+| fused epilogue | 21.38 / 21.40 / 21.24 ms/pass (**-6.7%**, 3/3) | median 660.96 ms (**-0.73%**, 4/5) |
+
+-0.73% is under the 3% gate, and the change costs the same bits the Q4_K one does, so the arm was
+removed and only the measurement kept. Q4_K's epilogue is six ops of a `dpbusd`-and-scale loop over
+625 MB of weights; Q6_K's is five ops over a block that also unpacks 2 bits per value from a second
+array, and its four `dpbusd` per 16 values already amortise the epilogue across more work.
+
+One measurement trap came out of this: reading the switch with `std::env::var_os` once per row
+instead of once per call made the *same* kernel 20× slower (22 ms → 398 ms per pass), and because
+that cost lands on both arms, only the paired ratio looked sane. Hoist an env read out of every loop
+that repeats it, and treat a 20× outlier as a bug in the harness before reading anything into it.
+
+**The activation-tile fill has no headroom either.** `SharedTile::fill_entries` writes 4 bytes per
+(group, entry); the 16×16 transpose does the same bytes in 64-byte stores. Single-threaded, 35
+blocks × 128 entries: **0.29-0.33 ms copying against 0.24 ms transposing** (1.2-1.4×, bytes compared
+identical, `shared_tile_fill_vs_transpose`). That looks like a win until it is put in context: prep
+plus tile build is **0.24 ms of a 4.95 ms product** with 8 threads (`prefill_product_breakdown`), so
+faster fill can move a *product* by well under 1%, and a chunk only by that share of its products.
+Worse, the transpose needs all 16 entries of a half in one task, and the fill is parallelised **per
+entry** — with B=16 there is exactly one half, so the transposed form would serialise the fill for
+the batch size that has the least work to hide it. Not ported: the ceiling is below the gate and the
+restructure would slow the common case.
+
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 
 The engine already ships prompt-lookup (`VIPERA_SPECULATIVE`), so this was a measurement, not a new
