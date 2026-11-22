@@ -2092,6 +2092,17 @@ from 3% to 10% while it stayed still. A fourfold cut in row traffic buying only 
 time also says the walk is no longer purely memory-bound once rows are shared — that part is measured,
 the explanation is not.
 
+At depth it gets **worse, not better**, which is the opposite of what the 30% share suggests. Chunk 24
+of the 2953-token prompt (~2.4k positions), three pairs: attention 254.07 ms to 236.43 ms (**−6.9%**),
+chunk 854.45 ms to 847.02 ms (**−0.87%**). Four times less row traffic buys a seventh of what it buys
+at 370 positions, so at depth the per-row arithmetic — scores, `exp`, the weighted sum — is what the
+kernel is spending its time on, not the reads. That is measured as two points, not as a curve.
+
+`docs/design/ADR-004-attn-qblock-default.md` takes the decision from here: the switch stays opt-in,
+because the same five-text `score` run puts mean NLL **up 0.086% with all five texts worse**
+(+0.003184, +0.000206, +0.001230, +0.003898, +0.004763 nats/token), and the win is smallest exactly
+where a chunk costs the most.
+
 It is still not bit-identical (it regroups the softmax sums, as the position-chunked kernel and
 `VIPERA_ATTN_GQA_SHARE` already do by default), and this time the change is visible: `vipera score`
 puts mean NLL at **+0.11%** (2.826631 to 2.829815) on the 986-token text and **+0.05%** on the
