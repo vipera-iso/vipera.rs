@@ -22,7 +22,8 @@ fn kept_window() -> Option<(u64, u64)> {
 }
 use vipera_errors::ViperaError;
 use vipera_runtime::{
-    DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, KvCache, KvConfig, Stage, peak_resident_bytes,
+    DEFAULT_TOKENS_PER_BLOCK, Engine, EngineConfig, ForwardContext, ForwardPass, KvCache, KvConfig,
+    Stage, peak_resident_bytes,
 };
 use vipera_sampler::{Sampler, SamplerConfig};
 use vipera_server::serve;
@@ -36,6 +37,8 @@ USAGE:
     vipera model-info <model.gguf> [--json]
     vipera plan <model.gguf> [--ctx N] [--kv-type f16|q8_0|q4_0] [--json]
     vipera profile [--json]
+    vipera score <model.gguf> [--text TEXT]... [--text-file PATH]... [--ctx N]
+                 [--kv-type f16|q8_0] [--json]
     vipera tokenize <model.gguf> [--text TEXT | --text-file PATH | --ids IDS]
                    [--system TEXT] [--user TEXT] [--assistant TEXT] [--no-generation-prompt] [--json]
     vipera sample [--logits CSV | --logits-file PATH] [--model MODEL] [--count N] [--seed N]
@@ -53,6 +56,7 @@ COMMANDS:
     model-info    Print the model's architecture, quantization, and tensor summary
     plan          Predict device and host memory for a placement without loading the model
     profile       Print the detected hardware profile and its stable fingerprint
+    score         Log-likelihood and perplexity of a fixed text under this build
     tokenize      Tokenize text or a rendered chat with the model's own vocabulary
     sample        Sample token ids from logits with a fixed seed and print the result
     verify        Load a model and compare measured memory with the plan's prediction
@@ -90,6 +94,7 @@ fn run(args: Vec<String>) -> Result<u8, ViperaError> {
         }
         "plan" => plan_command(&args[1..]),
         "profile" => profile_command(&args[1..]),
+        "score" => score_command(&args[1..]),
         "tokenize" => tokenize_command(&args[1..]),
         "sample" => sample_command(&args[1..]),
         "verify" => verify_command(&args[1..]),
@@ -755,6 +760,227 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
     Ok(0)
 }
 
+/// Tokens the scorer sends per backend call, and therefore logit vectors it holds at once.
+///
+/// One position's row is the whole vocabulary — 152k floats for this model — so a whole document
+/// scored in one call would keep a row per token alive at the same time.
+const SCORE_CHUNK: usize = 64;
+
+/// `ln P(index)` from one row of logits, in `f64` after subtracting the row's largest value.
+///
+/// The subtraction is what keeps the exponential in range; it cancels exactly in the ratio, so the
+/// result is the same number, computed without the overflow. An index outside the row scores
+/// `-infinity` rather than panicking, which is what a vocabulary mismatch should look like.
+fn log_probability(row: &[f32], index: u32) -> f64 {
+    let Some(&chosen) = row.get(index as usize) else {
+        return f64::NEG_INFINITY;
+    };
+    let largest = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let total: f64 = row
+        .iter()
+        .map(|value| (f64::from(*value) - largest).exp())
+        .sum();
+    (f64::from(chosen) - largest) - total.ln()
+}
+
+/// `vipera score <model.gguf> (--text TEXT | --text-file PATH)`: the log-likelihood this build gives
+/// a fixed text, so two builds that produce different tokens can be compared by perplexity instead
+/// of by reading their outputs.
+///
+/// Each token from the second on is scored against the logits the model produced from the tokens
+/// before it, so the text is its own continuation and nothing is sampled. The forward pass is the
+/// same one prefill uses — the text is sent in chunks of [`SCORE_CHUNK`] and each chunk's rows are
+/// read through [`ForwardPass::logits_range`] — so a change to a prefill kernel shows up here.
+fn score_command(args: &[String]) -> Result<u8, ViperaError> {
+    let mut json = false;
+    // Every text is scored on its own KV cache, so a corpus is a loop and not a wider batch.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    let mut ctx: Option<u64> = None;
+    let mut kv_type = KvCacheType::F16;
+    let mut path: Option<&str> = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--text" => {
+                let value = next_value(args, index, "--text")?;
+                texts.push(("<text>".to_owned(), value.to_owned()));
+                index += 1;
+            }
+            "--text-file" => {
+                let file = next_value(args, index, "--text-file")?.to_owned();
+                let source = std::fs::read_to_string(&file)?;
+                texts.push((file, source));
+                index += 1;
+            }
+            "--ctx" => {
+                ctx = Some(parse_number("--ctx", next_value(args, index, "--ctx")?)?);
+                index += 1;
+            }
+            "--kv-type" => {
+                kv_type = KvCacheType::parse(next_value(args, index, "--kv-type")?)?;
+                index += 1;
+            }
+            flag if flag.starts_with('-') => {
+                return Err(ViperaError::usage(format!(
+                    "unknown flag \"{flag}\" for score"
+                )));
+            }
+            other => {
+                if path.is_some() {
+                    return Err(ViperaError::usage(format!(
+                        "unexpected extra argument \"{other}\""
+                    )));
+                }
+                path = Some(other);
+            }
+        }
+        index += 1;
+    }
+
+    let path = path.ok_or_else(|| ViperaError::usage("score needs a model path"))?;
+    if texts.is_empty() {
+        texts.push(("<stdin>".to_owned(), read_stdin()?));
+    }
+
+    let bytes = std::fs::read(resolve_model_path(path)?)?;
+    let file = GgufFile::parse(&bytes)?;
+    let tokenizer = Tokenizer::from_gguf(&file)?;
+    let mut backend = CpuBackend::from_bytes(bytes, &file)?;
+    let model = backend.config();
+
+    let bytes_per_token = model.kv_bytes_per_token_for(kv_type).ok_or_else(|| {
+        ViperaError::unsupported(format!(
+            "this model cannot store its KV cache as {}",
+            kv_type.as_str()
+        ))
+    })?;
+    let context_limit = file.describe().context_limit.unwrap_or(2048);
+    let context_length = ctx.unwrap_or(context_limit.min(4096));
+
+    let started = Instant::now();
+    let mut totals: Vec<(String, f64, usize)> = Vec::with_capacity(texts.len());
+    for (label, source) in &texts {
+        let ids = tokenizer.encode(source)?;
+        if ids.len() < 2 {
+            return Err(ViperaError::usage(format!(
+                "{label}: needs at least two tokens, since the first has nothing before it to be \
+                 scored against"
+            )));
+        }
+        if ids.len() as u64 > context_length {
+            return Err(ViperaError::unsupported(format!(
+                "{label}: {} tokens, longer than the {context_length} this run reserves; pass a \
+                 larger --ctx",
+                ids.len()
+            )));
+        }
+        let (log_likelihood, scored) =
+            score_ids(&mut backend, &ids, context_length, bytes_per_token)?;
+        totals.push((label.clone(), log_likelihood, scored));
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+
+    // Token-weighted, not the mean of the per-text means: a twelve-token sentence must not weigh as
+    // much as a fifteen-hundred-token document.
+    let tokens: usize = totals.iter().map(|(_, _, scored)| scored).sum();
+    let log_likelihood: f64 = totals.iter().map(|(_, total, _)| total).sum();
+    let mean_nll = -log_likelihood / tokens as f64;
+
+    if json {
+        let entries: Vec<String> = totals
+            .iter()
+            .map(|(label, total, scored)| {
+                let mean = -total / *scored as f64;
+                format!(
+                    "    {{\"label\": {}, \"tokens\": {scored}, \"log_likelihood\": {total:.6}, \
+                     \"mean_nll\": {mean:.6}, \"perplexity\": {:.6}}}",
+                    quote(label),
+                    mean.exp()
+                )
+            })
+            .collect();
+        emit(&format!(
+            "{{\n  \"texts\": [\n{}\n  ],\n  \"tokens\": {tokens},\n  \"log_likelihood\": \
+             {log_likelihood:.6},\n  \"mean_nll\": {mean_nll:.6},\n  \"bits_per_token\": {:.6},\n  \
+             \"perplexity\": {:.6},\n  \"seconds\": {elapsed:.3}\n}}\n",
+            entries.join(",\n"),
+            mean_nll / std::f64::consts::LN_2,
+            mean_nll.exp()
+        ))?;
+    } else {
+        for (label, total, scored) in &totals {
+            let mean = -total / *scored as f64;
+            emit(&format!(
+                "{label}: {scored} tokens, {total:.4} nats, mean nll {mean:.4}, perplexity {:.4}\n",
+                mean.exp()
+            ))?;
+        }
+        emit(&format!(
+            "all texts: {tokens} tokens, {log_likelihood:.4} nats, mean nll {mean_nll:.4} \
+             nats/token ({:.4} bits/token), perplexity {:.4}\n",
+            mean_nll / std::f64::consts::LN_2,
+            mean_nll.exp()
+        ))?;
+    }
+    Ok(0)
+}
+
+/// The log-likelihood this backend gives `ids`, summed over every token after the first.
+///
+/// A fresh KV cache per text keeps the texts independent: a corpus is several documents, not one
+/// long one, and sharing the cache would score each text against everything that came before it.
+fn score_ids(
+    backend: &mut CpuBackend,
+    ids: &[u32],
+    context_length: u64,
+    bytes_per_token: u64,
+) -> Result<(f64, usize), ViperaError> {
+    // No window: scoring reads every position the text has, so a ring would only add bookkeeping.
+    let mut kv = KvCache::new(KvConfig::for_run(
+        bytes_per_token,
+        DEFAULT_TOKENS_PER_BLOCK,
+        context_length,
+        None,
+        1,
+    )?)?;
+    kv.reserve(0, ids.len() as u64)?;
+    let tokens_per_block = kv.config().tokens_per_block;
+    let block_table: Vec<u32> = kv
+        .table(0)
+        .ok_or_else(|| ViperaError::internal("score reserved no block table"))?
+        .to_vec();
+    let storage = kv.storage_mut();
+
+    let mut log_likelihood = 0.0_f64;
+    let mut scored = 0usize;
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + SCORE_CHUNK).min(ids.len());
+        let mut context = ForwardContext {
+            tokens: &ids[..end],
+            new_tokens: &ids[start..end],
+            first_position: start as u32,
+            block_table: &block_table,
+            kv: storage,
+            tokens_per_block,
+            bytes_per_token,
+        };
+        let rows = backend.logits_range(&mut context)?;
+        for (offset, row) in rows.iter().enumerate() {
+            let next = start + offset + 1;
+            if next >= ids.len() {
+                break;
+            }
+            log_likelihood += log_probability(row, ids[next]);
+            scored += 1;
+        }
+        start = end;
+    }
+    Ok((log_likelihood, scored))
+}
+
 /// Print whatever part of `text` has not been printed, assuming the printed text is its prefix.
 ///
 /// Decoding a growing prefix can only extend it, but a partial multi-byte character can decode as a
@@ -1369,6 +1595,33 @@ mod tests {
                 driver_version: Some("560.35".to_owned()),
             }],
         }
+    }
+
+    #[test]
+    fn a_log_probability_is_a_negative_number_that_sums_to_one() {
+        use super::log_probability;
+        // Three logits, so the softmax is checkable by hand: e^0 / (e^0 + e^0 + e^0).
+        let row = [0.0_f32, 0.0, 0.0];
+        let each = log_probability(&row, 0);
+        assert!((each + 3.0_f64.ln()).abs() < 1e-12, "{each}");
+        let total: f64 = (0..3).map(|index| log_probability(&row, index).exp()).sum();
+        assert!((total - 1.0).abs() < 1e-12, "{total}");
+
+        // Large logits must not overflow the exponential: without subtracting the row's maximum
+        // this is `exp(1000)`, which is infinity, and every probability would be NaN.
+        let huge = [1_000.0_f32, 1_000.0];
+        let each = log_probability(&huge, 0);
+        assert!((each + std::f64::consts::LN_2).abs() < 1e-12, "{each}");
+
+        // A logit far below the maximum keeps its own probability, not a saturated one.
+        let split = [1_000.0_f32, 0.0, -1_000.0];
+        let best = log_probability(&split, 0);
+        assert!(best <= 0.0 && best > -1e-12, "{best}");
+        let runner_up = log_probability(&split, 1);
+        assert!((runner_up + 1_000.0).abs() < 1e-3, "{runner_up}");
+
+        // An index outside the row is not a panic.
+        assert_eq!(log_probability(&row, 3), f64::NEG_INFINITY);
     }
 
     #[test]

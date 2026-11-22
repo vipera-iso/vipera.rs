@@ -1878,6 +1878,264 @@ hold with more than one thread. Fixing that (one reduction order for batched and
 the prerequisite for revisiting a draft model, which is the version that would actually pay: this
 n-gram drafter is out of ideas after 32k tokens of context.
 
+### `ffn_down` is 27% of a chunk because it is 29% of the MACs — 2026-11-22
+
+The backlog carried "down 1536×8960 costs 26% more per call than the same MAC" and a guessed chunk
+ceiling of 2.2%. The probe below is right and the reading of it was wrong, in a way worth recording
+because it sent an afternoon after a deficit that does not exist.
+
+Skipping the down product entirely (throwaway probe, `VIPERA_SKIP_DOWN`) takes chunk 4 of a 524-token
+prompt from **994 ms to 762 ms (−23%)**, and q6k from 176 ms to 21 ms; 3/3 pairs. That number stands.
+What it means is not "down is slow": per layer `ffn_down` is 1536×8960 of ~46.8M MACs, i.e. **29% of
+the arithmetic**, and it costs **27.6%** of the chunk. The share and the arithmetic agree.
+
+The table that first appeared here reported gate at "7.2 GB/s" and down at "1.0 GB/s" for the same
+tensor bytes. That was the `bytes/call` column multiplied by the thread count for the gate row and
+not for the down rows — the b128 `GB/s` column of the `SHAPE` table divides by a whole-pass total, so
+it is ~0 and means nothing. Per shape, 16 chunk passes of a 2953-token prompt, 8 threads:
+
+| shape | calls/pass | ms/pass | ms/call | bytes/call | GB/s | GFLOPS |
+|---|---:|---:|---:|---:|---:|---:|
+| Q4_K 8960×1536 (gate+up) | 896 | 438.25 | 7.826 | 7.74 MB | 0.99 | 450 |
+| Q6_K 1536×8960 (down, half the layers) | 224 | 156.08 | 11.149 | 11.29 MB | 1.01 | 316 |
+| Q4_K 1536×8960 (down, other half) | 224 | 119.71 | 8.551 | 7.74 MB | 0.91 | 412 |
+| Q4_K 1536×1536 (wo) | 896 | 102.54 | 1.831 | 1.33 MB | 0.73 | 330 |
+| Q4_K 256×1536 (q/k/v slices) | 672 | 28.80 | 0.686 | 221 KB | 0.32 | 147 |
+| Q6_K 151936×1536 (output, b1) | 16 | 8.46 | 8.462 | 191.4 MB | 22.6 | — |
+
+Read per MAC, gate is 0.569 ns, Q4_K down 0.621 (9% worse), Q6_K down 0.810 (42% worse but 46% more
+bytes, so per byte at parity). Nothing here is a 7x deficit, and the 22.6 GB/s of the output
+projection is not a target the FFN can be held to: at `B=1` that product is one read of 191 MB and
+bandwidth-bound, while a `B=128` chunk product is 3.5 GFLOP against 7.7 MB and compute-bound.
+
+Three measurements close the question rather than the theory:
+
+- `q4k_tiled_batch128_throughput`, single thread, same bytes and same block count: 8960×1536 is
+  24.2 ms (145 GFLOPS) and 1536×8960 is 21.6 ms (163 GFLOPS). The down orientation is the faster one.
+- `prefill_product_breakdown` (`pool.rs`), whole product at 1/4/8 threads: 23.4 / 8.7 / 7.8 ms for
+the gate shape and 23.4 / 8.8 / 7.8 ms for down. Four threads equal eight — this box has four
+physical cores and a `B=128` FFN product is ALU-bound, so no bandwidth argument applies.
+- Skipping the Q6_K six-bit unpack entirely (throwaway probe, `VIPERA_Q6K_NO_UNPACK`) changes that
+  product by **0.01 ms** (11.149 → 11.159). The scalar unpack is free; vectorising it would buy
+  nothing, and the 42%-per-MAC gap is bytes, not unpack instructions.
+
+So the lever left is the instruction sequence itself, for every `B=128` product at once: 145 GFLOPS
+single-threaded against a zdpbusd issue roof of ~224 GFLOPS (one 64-MAC instruction per two cycles at
+3.5 GHz) is 64% of roof. That is IDEA-007, not a down fix.
+
+### The tiled kernel pays a load per `dpbusd`, and 32 registers is the wall — 2026-11-22
+
+IDEA-007 says the `B=128` tiled kernel sits at 64% of its `dpbusd` issue roof and guesses the gap is
+the float epilogue. Three throwaway probes (all removed) split that gap instead, on
+`q4k_tiled_batch128_throughput`, single thread, 8960×1536 and 1536×8960:
+
+| probe | 8960×1536 | 1536×8960 |
+|---|---:|---:|
+| baseline | 25.7 ms / 137.1 GFLOPS | 22.6 ms / 155.6 GFLOPS |
+| weight broadcast replaced by a constant | 19.9 / 177.4 (+29%) | 14.5 / 243.0 (+56%) |
+| float epilogue replaced by one `add` (`cvt` kept) | 19.4 / 181.9 (+33%) | 16.0 / 220.5 (+42%) |
+| both | 12.8 / 274.4 (+100%) | 10.0 / 353.3 (+127%) |
+| same words read from a buffer written once, outside the loop | 23.2 / 151.9 (+11%) | 20.9 / 168.3 (+8%) |
+
+So the kernel is not `dpbusd`-bound at all: dropping the per-row weight broadcast and dropping the
+required `scale·dx` / `min·sum` arithmetic each buy ~a third, and together they double it. The last
+row separates the two reasons the broadcast is expensive: a store-forwarding stall (the unpack writes
+32-byte chunks and the dot reads 4-byte words out of them) is only ~10%; the other ~28% is load-port
+pressure, because there is **one broadcast load per `dpbusd`**.
+
+Counting the loads per row per 256-column block: 64 activation loads (shared by the band's 8 rows) +
+512 weight broadcasts = 576 loads for 512 `dpbusd`. The obvious restructure — swap the loops so the
+half is innermost and one broadcast feeds all 8 halves — just moves the cost: 512 weight broadcasts
+become 512 activation loads. Reusing *both* dimensions needs `rows × halves` accumulators, and
+`B = 128` means 8 halves: 4 rows × 8 halves is 32 `zmm` before `facc`, `codes` and the broadcast, i.e.
+more than the ISA has. So the largest variant that fits is 2 rows × 4 halves (16 registers), which
+cuts the loads per row from 576 to 384.
+
+That variant was then written, proven and measured, and it buys nothing. It lived behind
+`VIPERA_Q4K_ROW2`, and `the_two_row_path_is_bit_identical_to_the_eight_row_one` pinned it byte for
+byte on four shapes, including an odd row count and a partial 32-row window — every `(row, half)`
+keeps its `s`-then-`g` order and its single `buf` add, so the switch was all the fallback needed:
+
+| arm | 8960×1536, 1T | 1536×8960, 1T | chunk 4, 5 interleaved pairs |
+|---|---:|---:|---:|
+| eight rows by one half (default) | 151.7 / 152.6 GFLOPS | 175.6 / 176.9 GFLOPS | median 800.59 ms |
+| two rows by four halves | 152.3 / 150.3 GFLOPS | 169.9 / 168.7 GFLOPS | median 786.81 ms (−1.7%, 4 of 5 pairs) |
+
+−1.7% is under the 3% gate and the change is ~100 dense lines, so it was removed rather than kept
+behind the switch. Nine interleaved pairs on a quieter box (load 1.04) then failed to reproduce it
+at all: 791.65 ms median off against 792.87 ms on, +0.15%, five of nine pairs either way, median
+paired difference +0.89 ms. The 1.7% was noise, which is what a five-pair result just above the
+machine's run-to-run spread will sometimes be — the reason the gate asks for ratios and repeats, not
+for one good afternoon.
+
+Scale folded into the activation scales would have cut one multiply out of the epilogue without
+changing the loop, but it cannot be bit-identical: `(cvt·scale)·dx` and `cvt·(dx·scale)` round
+twice in a different order. It also saves nothing — `dxs` depends on the block and the half, so
+building `dx·scale` costs exactly the multiply it removes. The useful part is what the two arms say together: **cutting a third of the loads
+changes nothing**, so the load ports were never the binding constraint. What the
+`VIPERA_PROBE_NO_WEIGHT` arm was buying is the hoist — with the broadcast replaced by a constant the
+compiler keeps one `set1` per group instead of eight, one per row, and the loop gets shorter, which
+is not the same thing as sparing the load ports.
+
+The first version of the variant, with a runtime half index into `acc[row][half]`, came out **21%
+slower** (121 against 153 GFLOPS): a dynamically indexed array of `__m512` is a stack slot, so every
+`dpbusd` reloaded its accumulator. Writing the four halves out by hand is what brought it to parity,
+and it is the reason an inner loop like this should never index its accumulators at run time.
+
+Clean baseline for the rows above, same binary and model, commit `35f265f`: chunk 4 median
+**800.59 ms** (5 runs, load 1.85), q4k 70%, q6k 18%, attention 10%; per-shape table from a
+2953-token prompt at `B=128`: gate+up 8.07 ms/call, Q6_K down 11.46, Q4_K down 8.91, wo 1.95. Twenty
+minutes earlier, with no code change, the same command gave 985–1043 ms — that is the machine, and
+the reason every row above is a ratio.
+
+### The epilogue is worth 5% of a chunk, at the cost of the arithmetic — 2026-11-22
+
+The probes above put the tiled kernel's epilogue at +33% (8960×1536) and +42% (1536×8960) when it
+is removed entirely, and that arithmetic is required: `sum over s of (cvt(acc_s)·scale_s·dx_s -
+sum_s·min_s)`. The patch under discussion folds it into four vector ops instead of six,
+`fma(cvt(acc)·dxv, scale, facc)` then `fnmadd(sumv, min, ..)`, and it delivers:
+
+| arm | 8960×1536, 1T | 1536×8960, 1T | chunk 4, 5 interleaved pairs |
+|---|---:|---:|---:|
+| multiply-then-add (default) | 153.4 / 149.5 GFLOPS | 165.2 / 173.2 GFLOPS | median 785.16 ms |
+| fused epilogue (`VIPERA_Q4K_FMA_EPI=1`) | 165.1 / 167.4 (+8.6%) | 193.4 / 189.3 (+12%) | median 746.04 ms (−5.0%, 5 of 5 pairs) |
+
+That is the largest measured chunk gain since the tiled kernel landed, and it is **not** a perf
+change: the fused form rounds once where the two multiplies round twice. Sixteen greedy tokens from
+the 524-token prompt come out different between the arms (49 vs 69 bytes of text), so this moves
+output, not just the last bit of an intermediate. It is therefore behind a switch that defaults off,
+with the numbers recorded here; flipping the default needs an ADR and a quality comparison (fixed
+prompts, and preferably perplexity against the exact path), not a benchmark row. `q4k_tiled_range_matches_batch_vnni`
+still passes on the fused arm — tolerance parity with the row kernel is unchanged, which is why this
+is a policy decision rather than a correctness bug. The decision to keep it opt-in, and the quality
+measurements behind that decision, are in `docs/design/ADR-003-fused-prefill-epilogue.md`.
+
+### Q6_K's epilogue is worth a sixth as much, and the fill has nothing to give — 2026-11-22
+
+The Q4_K fold has an obvious symmetric form in `q6k_matvec_tiled_range`, and the kernel does get
+faster; the chunk does not follow, because Q6_K is 18% of a chunk and only part of that is epilogue.
+
+| arm | Q6_K tiled, 8960x1536, B=128, 1T (`bench_q6k_tiled`) | chunk 4, 5 interleaved pairs |
+|---|---:|---:|
+| multiply-then-add (default) | 22.92 / 23.14 / 22.36 ms/pass | median 665.85 ms |
+| fused epilogue | 21.38 / 21.40 / 21.24 ms/pass (**-6.7%**, 3/3) | median 660.96 ms (**-0.73%**, 4/5) |
+
+-0.73% is under the 3% gate, and the change costs the same bits the Q4_K one does, so the arm was
+removed and only the measurement kept. Q4_K's epilogue is six ops of a `dpbusd`-and-scale loop over
+625 MB of weights; Q6_K's is five ops over a block that also unpacks 2 bits per value from a second
+array, and its four `dpbusd` per 16 values already amortise the epilogue across more work.
+
+One measurement trap came out of this: reading the switch with `std::env::var_os` once per row
+instead of once per call made the *same* kernel 20× slower (22 ms → 398 ms per pass), and because
+that cost lands on both arms, only the paired ratio looked sane. Hoist an env read out of every loop
+that repeats it, and treat a 20× outlier as a bug in the harness before reading anything into it.
+
+**The activation-tile fill has no headroom either.** `SharedTile::fill_entries` writes 4 bytes per
+(group, entry); the 16×16 transpose does the same bytes in 64-byte stores. Single-threaded, 35
+blocks × 128 entries: **0.29-0.33 ms copying against 0.24 ms transposing** (1.2-1.4×, bytes compared
+identical, `shared_tile_fill_vs_transpose`). That looks like a win until it is put in context: prep
+plus tile build is **0.24 ms of a 4.95 ms product** with 8 threads (`prefill_product_breakdown`), so
+faster fill can move a *product* by well under 1%, and a chunk only by that share of its products.
+Worse, the transpose needs all 16 entries of a half in one task, and the fill is parallelised **per
+entry** — with B=16 there is exactly one half, so the transposed form would serialise the fill for
+the batch size that has the least work to hide it. Not ported: the ceiling is below the gate and the
+restructure would slow the common case.
+
+### `vipera score`, and what the fused epilogue costs in perplexity — 2026-11-22
+
+A prefill kernel that changes rounding cannot be judged by tokens alone when two builds disagree:
+the question is whether the text becomes less likely, and that needs a number. `vipera score
+<model.gguf> [--text TEXT]... [--text-file PATH]... [--ctx N] [--json]` prints the log-likelihood,
+mean NLL and perplexity this build assigns to each text and then to the corpus as a whole. Every flag
+may be repeated and each text gets its own KV cache, so a corpus is several independent documents;
+the summary is token-weighted, not the mean of the per-text means. It sends each text through the
+prefill path in chunks of 64 tokens and reads every position's row with `ForwardPass::logits_range`,
+so nothing is sampled and the prefill kernel is what is measured. Two runs of the same arm produce
+the same digits.
+
+Five texts cut from these docs, both arms, mean NLL per token:
+
+| text | tokens | default | fused epilogue | Δ |
+|---|---:|---:|---:|---:|
+| popcount / rays | 986 | 2.826631 | 2.823378 | −0.00325 |
+| gate and up shapes | 1697 | 3.084673 | 3.083967 | −0.00071 |
+| the ggml bind | 2444 | 2.637364 | 2.639467 | +0.00210 |
+| ADR-001 opening | 1492 | 3.324126 | 3.324727 | +0.00060 |
+| ADR-003 §2 | 1494 | 3.581916 | 3.582051 | +0.00014 |
+
+Mean **−0.000224 nats/token (−0.007%)**, two texts better and three worse, none off by more than
+0.003 nats. At this resolution the measurement cannot separate the arms, which rules out "the fused
+form makes text clearly less likely" and does not prove the two are interchangeable. Together with
+the row-kernel error in §2.4 of ADR-003, it is the evidence that keeps that ADR's opt-in default a
+policy choice about changed output rather than about arithmetic quality.
+
+### Attention is 10% of a short chunk and 30% of a deep one, and one switch is now over the gate — 2026-11-22
+
+Attention used to be 3% of a prefill chunk. The dots got faster and attention did not, so it is now
+**10%** of chunk 4 of the 524-token prompt (median 66.25 ms of 649.71) and **29-30%** at 2.9k tokens
+(245-257 ms of 828-858) — it grows with the history, which nothing else in a chunk does.
+
+The cost is the history walk per query row: a chunk of ~105 positions calls attention once per layer
+with one row per position, and every row reads every K and V row. At ~370 positions that is
+105 rows × 28 layers × 2 KV heads × 370 positions × 128 values × 2 bytes × 2 (K and V) ≈ **1.1 GB** of
+KV reads for the chunk, against 0.9 GB of weights — at 66 ms that is ~17 GB/s, so it is neither at
+the memory ceiling (42.8 GB/s) nor at the arithmetic one.
+
+`VIPERA_ATTN_QBLOCK=1` is the existing answer to exactly that: one history walk feeds four queries,
+cutting the row traffic fourfold. It is implemented, tested and off by default with the note that it
+"does not pay for itself end to end yet". Five interleaved pairs, chunk 4:
+
+| arm | attention | chunk 4 |
+|---|---:|---:|
+| default | 66.25 ms median (64.19-69.42) | 649.71 ms median |
+| `VIPERA_ATTN_QBLOCK=1` | 47.77 ms median (47.21-49.27), **-27.9%** | 629.16 ms median, **-3.2%**, 5/5 pairs |
+
+So it is over the 3% gate now, and the reason is not that the kernel changed: the slice it cuts grew
+from 3% to 10% while it stayed still. A fourfold cut in row traffic buying only 28% of the attention
+time also says the walk is no longer purely memory-bound once rows are shared — that part is measured,
+the explanation is not.
+
+At depth it gets **worse, not better**, which is the opposite of what the 30% share suggests. Chunk 24
+of the 2953-token prompt (~2.4k positions), three pairs: attention 254.07 ms to 236.43 ms (**−6.9%**),
+chunk 854.45 ms to 847.02 ms (**−0.87%**). Four times less row traffic buys a seventh of what it buys
+at 370 positions, so at depth the per-row arithmetic — scores, `exp`, the weighted sum — is what the
+kernel is spending its time on, not the reads. That is measured as two points, not as a curve.
+
+`docs/design/ADR-004-attn-qblock-default.md` takes the decision from here: the switch stays opt-in,
+because the same five-text `score` run puts mean NLL **up 0.086% with all five texts worse**
+(+0.003184, +0.000206, +0.001230, +0.003898, +0.004763 nats/token), and the win is smallest exactly
+where a chunk costs the most.
+
+It is still not bit-identical (it regroups the softmax sums, as the position-chunked kernel and
+`VIPERA_ATTN_GQA_SHARE` already do by default), and this time the change is visible: `vipera score`
+puts mean NLL at **+0.11%** (2.826631 to 2.829815) on the 986-token text and **+0.05%** on the
+2444-token one, both in the direction of *less* likely text, and 16 greedy tokens from the 524-token
+prompt come out different. That is a decision with a cost on both sides — 3.2% of a chunk against a
+small likelihood regression — so the default is unchanged here and the numbers are waiting for an
+owner's call.
+
+### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
+
+The engine already ships prompt-lookup (`VIPERA_SPECULATIVE`), so this was a measurement, not a new
+feature. 8 threads, `--ctx 1024`, 48 greedy tokens, seed 1; the token ids came out identical in
+every pair:
+
+| prompt | plain tok/s | speculative tok/s | ratio |
+|---|---:|---:|---:|
+| 520-token chat prompt | 11.34 | 13.52 | 1.19x |
+| copy-heavy ("repeat this line three times") | 27.11 | 33.86 | 1.25x |
+| poem, no repetition | 29.02 | 27.67 | 0.95x |
+
+So the 32k result above is not the whole story: at short context the verify pass is cheap and repeats
+pay. The poem case is the cost of a draft that exists and is wrong — a lost 5%.
+
+`SPEC_MISS_LIMIT` in `vipera-runtime` now counts consecutive zero-accept verify passes and, at five
+(`draft_cap` has already shrunk to 2 by then), falls back to plain decoding for the rest of the turn.
+Re-run on a loaded box (load average 17, all three prompts 5x slower, so read ratios only): poem
+**3.74 plain vs 3.72 speculative** (neutral), chat 1.86 vs 2.83 and copy 3.43 vs 5.35 (still ahead),
+token ids unchanged. The 32k caveat — the verify pass is not bit-identical at 8 threads, and the
+drafter has nothing to find that deep — still stands.
+
 ### The window kernel paid per-head call overhead, and the weight stream is not bit-limited — 2026-11-18
 
 With the ring cache in place, a 32k step with a 2048 window profiles as: **q4k 19.2 ms (48%), q6k
@@ -3099,3 +3357,222 @@ default, same policy as the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE`.
 
 Still off by default: it changes the summation order, and that is a numeric-policy decision, not a
 speed one.
+## Re-measuring the query-blocked attention kernel at depth ~380 — 2026-11-22
+
+Premise check for "a tile-resident micro-GEMM with the softmax fused". That kernel already exists:
+`attend_rows_shared` behind `VIPERA_ATTN_QBLOCK`, QBLOCK = 4, which scores a block of queries against
+each K row once and folds the block's V rows with `fold_chunk_block` (block online softmax). The open
+question was only whether a wider tile could beat the ~150 GFLOPS attention reaches.
+
+The box was shared while this ran (load average 3.0; chunk totals ~1020 ms against the 617 ms quiet
+window at the top of this session's B0), so only same-run ratios are quoted. i5-11300H,
+`taskset -c 2-7`, `VIPERA_THREADS=6`, Qwen2.5-1.5B Q4_K_M f16 KV, 520-token prompt, one run per arm
+interleaved, 5 pairs, medians:
+
+| chunk | attention off | attention on | delta | total off | total on | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| 3 (positions 256-383) | 89.96 ms | 59.72 ms | -33.6% | 1013.46 ms | 1025.50 ms | +1.2% |
+| 4 (positions 384-511) | 95.77 ms | 72.32 ms | -24.5% | 1022.07 ms | 1034.57 ms | +1.2% |
+
+Attention falls by a quarter and the chunk does not move: Q4_K is ~70% of the chunk and its
+drift between arms is larger than the ~23 ms saved. This reproduces the 2026-11-20 4k result at
+shallower depth (7.7% of attention, ~1-3% of a chunk, inside noise).
+
+Roofline for the wider kernel: for the 6-head group, `score_block_single` issues 96 FMAs (8 lanes)
+plus 16 f16 conversions per key row, ~6.9 MAC/instruction against AVX2's 8, so the dot already runs
+at ~85% of the f32 FMA peak. Attention's 150 GFLOPS is ~76% of that peak (~198 GFLOPS on 4 cores at
+3.1 GHz); a wider micro-GEMM has at most ~1.3x on the arithmetic, ~1% of a chunk at this depth, and
+cannot reach the 2.5x the 4k entry said would be needed. **NO-GO**; `VIPERA_ATTN_QBLOCK` stays off
+(regroups the softmax sums, does not pay end to end).
+
+## Prefill with 128-token chunks: where the 617 ms goes — 2026-11-22
+
+A 2050-token prompt (205 × the quick brown fox, ctx 4096, `--max-tokens 1`, `VIPERA_THREADS=8`,
+`VIPERA_PROFILE_STEP=1`) gives 16 full chunks plus a 2-token tail, so the per-shape table prints.
+The box was shared (chunk 16 at 995 ms against the 617 ms quiet chunks at the top of this file), so
+quote the shares and the same-run ratios, not the absolute times.
+
+Phase split, first and last full chunks:
+
+| chunk | total | q4k | q6k | attention |
+|---|---:|---:|---:|---:|
+| 1 (depth 128) | 813.8 ms | 584.7 (72%) | 160.7 (20%) | 50.8 (6%) |
+| 16 (depth 2048) | 994.6 ms | 602.3 (61%) | 163.0 (16%) | 211.6 (21%) |
+
+Per-shape table, 16 chunk passes, b128 (ms per pass and per call):
+
+| shape | calls/pass | ms/pass | ms/call |
+|---|---:|---:|---:|
+| Q4_K 8960×1536 (gate+up) | 56 | 370.6 | 6.618 |
+| Q6_K 1536×8960 (down, 14 layers) | 14 | 146.0 | 10.430 |
+| Q4_K 1536×8960 (down, 14 layers) | 14 | 116.7 | 8.337 |
+| Q4_K 1536×1536 (wq, wo) | 56 | 88.9 | 1.587 |
+| Q4_K 256×1536 (wk and 14 layer v) | 42 | 26.0 | 0.618 |
+| Q6_K 256×1536 (14 layer v) | 14 | 9.3 | 0.667 |
+| Q6_K 151936×1536 b1 (output) | 1 | 7.6 | 7.611 (25.2 GB/s) |
+
+The quiet-baseline q4k phase is 117 GMAC a chunk (32.6M MAC per layer-token × 28 × 128) in 441 ms,
+i.e. **530 GFLOPS**. The kernel's single-thread microbench is 77.3 GMAC/s (155 GFLOPS) on the gate/up
+shape, so four physical cores are worth ~620 GFLOPS and SMT adds the rest: at depth 2048, 8 threads
+run a chunk in 914.8/920.0 ms against 1142.4/1166.0 at 4 threads (1.25x), so the thread count is not
+the lever. In situ the product is at ~85% of the microbench ceiling; the named remainder is the
+tiled kernel's activation tile, built once per call on every participant (~0.03-0.06 ms at width
+1536, 0.37-0.47 ms at 8960, ~21 ms of CPU per thread per chunk ≈ 3% of a chunk), and sharing it
+needs a barrier.
+
+## One activation tile per product instead of one per participant — 2026-11-22
+
+Built as predicted above: the tiled Q4_K/Q6_K kernels used to build the same activation tile on every
+row participant (0.03-0.06 ms per call at width 1536, 0.37-0.47 ms at 8960). The activation-prep
+workers now fill one `SharedTile` for the product, each worker filling the entries its run owns, and
+`Pool::prepare`'s existing join is the happens-before the row workers need — no extra barrier.
+`VIPERA_SHARED_TILE=0` restores the per-participant build; both paths write the same bytes.
+
+Ceiling first, by making the build loop a no-op in a throwaway build: a 2048-token prefill's chunk 16
+fell 759.2 -> 712.2 ms with q4k 452.6 -> 425.3 and q6k 125.7 -> 109.0, i.e. ~44 ms of a 770 ms chunk
+(5.7%).
+
+Measured change, 5 interleaved pairs (shared on, off), 520-token prompt, chunk 4, i5-11300H,
+`VIPERA_THREADS=8`, `--max-tokens 1`:
+
+| pair | q4k on | q4k off | q6k on | q6k off | total on | total off |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 448.51 | 463.67 | 117.36 | 128.59 | 645.34 | 670.87 |
+| 2 | 451.67 | 467.36 | 122.53 | 132.10 | 656.14 | 680.14 |
+| 3 | 458.03 | 476.79 | 120.30 | 130.23 | 659.68 | 687.51 |
+| 4 | 457.96 | 475.79 | 120.89 | 130.99 | 660.24 | 689.48 |
+| 5 | 463.57 | 477.50 | 119.05 | 131.19 | 665.78 | 692.30 |
+| median | 457.96 | 475.79 | 120.30 | 130.99 | 659.68 | 687.51 |
+
+Medians: q4k **-3.8%**, q6k **-8.2%**, chunk **-4.0%**, and the direction held in 5/5 pairs. That is
+about 28 ms of a 660 ms chunk, three quarters of the 44 ms ceiling.
+
+The rest is not the per-call allocation, which was the next candidate. `shared_tile_allocation_cost`
+(ignored measurement test) times `SharedTile::new`: **16.4 us** for the 35x8 down tile and **2.4 us**
+for the 6x8 width-1536 tile. A chunk makes 28 down and ~112 smaller tiles, so the whole chunk's
+tile allocations are ~0.7 ms, 0.1% of it. A reuse path (taking the buffer back out of the `Arc` and
+caching it on the pool) would not clear the 3% gate. It was written anyway, on request, and measured:
+five interleaved pairs with `VIPERA_TILE_REUSE=1` against `=0` (shared tile on both), same prompt and
+chunk, gave chunk medians **661.79 vs 664.49 ms (-0.4%)** and q4k 456.12 vs 460.58, with the
+direction in 3 of 5 pairs. That is the 0.7 ms the allocation measured, inside the noise; the free
+list (`Pool::take_tile`/`recycle_tile`, buffer kept across products, `SharedTile` carrying a `len`
+prefix) stays because it was asked for, with the switch to turn it off. The two runs of the ceiling
+probe just landed on different box loads (759 ms against the 605-634 ms quiet baseline), which is
+where the apparent 16 ms gap came from.
+
+Result is bit-identical: `a_shared_activation_tile_is_bit_identical_to_a_local_one` fills a tile in
+two disjoint runs and compares the kernel's output with the local build byte for byte. Whole crate:
+85 lib tests pass, `cargo clippy -p vipera-backend-cpu --all-targets -- -D warnings` clean,
+`cargo fmt --all --check` clean. The box was shared (chunk 4 at ~660 ms against the 617 ms quiet
+chunks earlier), so the ratios are the result.
+
+**Two hypotheses closed by this run.** `VIPERA_ATTN_QBLOCK` at depth 2048 cuts attention
+186.3→174.5 and 189.0→174.4 ms (−6.4% and −7.7%), chunk 914.2→902.6 and 916.0→898.8 ms (−1.3% and
+−1.9%): the −25% seen at depth ~380 does not hold at depth, and the chunk win is under the 3% gate,
+so it stays off. The 8-token tail is not expensive: a fresh 8-token chunk is 128.2 ms total (q4k
+94.3) at 8 threads, and 415.4 ms at one thread. The 552 ms the 520-token B0 run showed for its
+8-token fifth chunk was the shared box and depth, not the batch width. No code change at that point; prefill is at
+~85% of its measured kernel ceiling, and the only lever left in the tree was the tile-sharing barrier,
+which the shared-tile entry above then built.
+
+## Quiet-box 128-token chunk baseline — 2026-11-22
+
+The box was measured first: 4.3% CPU busy over 3 s, load average 0.35, 94.8% idle, governor
+`powersave`, some cores at 3.9 GHz. Three runs of the 520-token prompt (52 × the quick brown fox,
+chunk 1 = 128 tokens), `VIPERA_THREADS=8`, `--max-tokens 1`, `--ctx 1024`, seed 1. This is the
+current default, i.e. with the shared activation tile on.
+
+| chunk | total | q4k | q6k | attention | elem | proj | rope | kv_write | rest |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 (depth 128) | 605.63 | 440.34 (73%) | 114.28 (19%) | 39.68 (7%) | 3.34 | 1.71 | 4.26 | 3.36 | 1.16 |
+| 2 (depth 256) | 625.58 | 436.38 (70%) | 112.59 (18%) | 62.80 (10%) | 3.40 | 1.73 | 4.31 | 3.41 | 1.04 |
+| 3 (depth 384) | 628.00 | 438.60 (70%) | 114.33 (18%) | 60.96 (10%) | 3.38 | 1.84 | 4.40 | 3.48 | 1.00 |
+| 4 (depth 512) | 633.73 | 439.77 (69%) | 114.87 (18%) | 65.05 (10%) | 3.36 | 1.77 | 4.40 | 3.48 | 0.99 |
+
+Medians of the three runs; the spread was 598.5-640.4 on chunk 1 and 627.6-653.0 on chunk 4 (the
+last run was 3-6% slow on every phase, governor ramp rather than one kernel). `norm` is 0.00
+because `VIPERA_PREP_FUSION` folds it into the preparation job.
+
+Against the 617.5 / 657.2 / 661.2 / 667.4 ms recorded at the start of this session (same prompt,
+same thread count, quiet box, per-participant tiles), the current build is 1.9% / 4.8% / 5.0% / 5.1%
+cheaper, which is the shared tile plus the usual run-to-run spread. Use the table above as the
+quiet reference for the next prefill change; the earlier numbers belong to the old tile path.
+
+## Idea sweep: ROW_WIN, and what the unpack is worth — 2026-11-22
+
+Two cheap questions from `references/idea-sources.md` (skill), both answered before writing a kernel.
+The box was loaded (chunk 4 at ~780 ms), so only the pairs are read.
+
+**ROW_WIN 32 -> 64 (IDEA-004), five interleaved pairs of two binaries:** chunk medians
+**783.08 -> 782.35 ms (-0.09%)**, q4k 540.22 -> 542.43 (**+0.4%**) — neutral to slightly worse, so the
+window stays at 32.
+
+**The ceiling of the whole Q4_K dequant/unpack (IDEA-001/002).** A throwaway build skipped the
+per-row unpack loop (f16 scales, `q4k_scale_min`, nibble split into `wq`); the kernel then ran on a
+zero weight tile, so the output is wrong and only wall-clock is read:
+
+| pair | q4k base | q4k no-unpack | chunk base | chunk no-unpack |
+|---|---:|---:|---:|---:|
+| 1 | 453.70 | 428.10 | 656.47 | 627.10 |
+| 2 | 464.07 | 437.76 | 671.95 | 642.99 |
+| 3 | 484.12 | 428.78 | 700.29 | 627.32 |
+| 4 | 510.06 | 483.36 | 737.76 | 704.16 |
+| 5 | 479.91 | 438.65 | 694.41 | 644.67 |
+
+Medians: q4k **-8.8%**, chunk **-7.4%**. That is the most a repacked Q4_K layout (IDEA-001) can win
+before its own kernel changes, and it clears the 3% gate (~6% of a chunk). A VBMI-only rewrite of the
+nibble split (IDEA-002) would have to take about half of that unpack to reach the gate, so it is below
+IDEA-001 and only worth a microbench first. The probe was removed; no code from this entry ships.
+
+**The nibble split measured alone.** A second throwaway build skipped only the `and`/shift/`wq`
+stores and kept the scales and f16 work: q4k median **432.05 -> 425.42 ms (-1.5%)**, chunk
+**627.74 -> 615.72 ms (-1.9%)**, 5/5 pairs. So a `vpermb` rewrite of the split can reach at most
+~1% of a chunk (IDEA-002: closed).
+
+**A 4.5 bpw repacked scale header does not help.** `simd::tests::bench_repacked_q4k_scale_header`
+keeps the codes packed and replaces the 12 scale bytes with 8 scales + 8 mins as `u8` (148 B per
+block, +2.8% bytes), then dequantizes 65k blocks both ways with the same f16 work and asserts the
+results identical: GGUF **115.86 ns** per block, repacked **131.95 ns (114%)**. `q4k_scale_min`'s
+bit extraction is cheaper than two u64 loads on the critical path, so the remaining ~7% of q4k is
+not the header. What is left is the `wq` round trip (write 256 B per 144 B block, read it back) and
+the inner loop's per-group `set1_epi32`; removing those means a GEMM that consumes packed 4-bit
+codes directly (the llama.cpp 8x8 shape), not a header tweak.
+
+**Zeroing the scratch is free.** Skipping `wq.fill(0)`, the two `scales`/`mins` loops and the
+`dvec`/`dminvec` fills: q4k median 435.81 -> 436.28 ms (+0.1%), chunk 3/5 pairs worse — neutral. The
+memset overlaps the `dpbusd` chain, so there is nothing there either.
+
+**IDEA-001 closes.** The three probes divide the 8.8%: nibble split (its `and`/shift, the 128 code
+bytes it loads, and the `wq` stores) 1.5%, packed scale header below zero, memset zero. What is left
+is the 12-byte scale read, `q4k_scale_min`, the two f16 conversions and the sixteen `scale_f`/`min_f`
+products — required arithmetic that a 4.5 bpw layout cannot remove. Precomputing those products
+costs +33% weight bytes as f32 (a decode regression) or f16 precision (breaks bit-identity with the
+GGUF path). No 4.5 bpw repack clears the 3% gate, so the kernel is not built; the gate bench stays as
+the record of why.
+
+**Down-projection orientation (IDEA-005), from the per-shape table:** `1536x8960` Q4_K costs 8.337 ms
+per call against 6.618 ms for `8960x1536` at the same MACs, 26% more; bringing it level is worth
+~2.2% of a chunk. No mechanism yet (the 5040-byte row stride and the 35-block walk are the suspects),
+so it stays a diagnosis until a targeted measurement, not a kernel change.
+
+**Speculative decode (IDEA-003)** was not built: it is a feature with its own quality gate (greedy
+hash plus acceptance rate), not a kernel, and it needs a branch of its own.
+
+### The shared tile, re-measured on the quiet box
+
+The −4.0% above came from a box at load average ~3; this repeats the A/B on the quiet box
+(6.3% CPU busy at the start, load 1.32, rising to 4.28 by the end). Five interleaved pairs, the
+same 520-token prompt, chunk 4:
+
+| pair | chunk on | chunk off | q4k on | q4k off |
+|---|---:|---:|---:|---:|
+| 1 | 625.87 | 665.82 | 433.05 | 459.65 |
+| 2 | 634.38 | 675.07 | 440.71 | 464.75 |
+| 3 | 644.74 | 678.23 | 445.74 | 469.87 |
+| 4 | 656.55 | 679.75 | 456.23 | 468.37 |
+| 5 | 660.56 | 687.28 | 457.99 | 476.72 |
+| median | 644.74 | 678.23 | 445.74 | 468.37 |
+
+Medians: q4k **-4.8%**, q6k 118.27 vs 128.67 (**-8.1%**), chunk **-4.9%**, direction 5/5. Both
+sides drift up across the pairs as the box loads, which if anything understates the gain in the
+last pairs, and every pair is read within itself. The change holds on a quiet box.

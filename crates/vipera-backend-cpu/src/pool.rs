@@ -27,6 +27,7 @@ use vipera_core::gguf::GgmlType;
 use vipera_errors::ViperaError;
 
 use crate::quant::{self, BatchActivation, Fusion, OwnedActivation};
+use crate::simd::SharedTile;
 
 /// A run of entries to turn into owned activations. Each buffer holds the entry's values followed
 /// by room for its group sums, so a worker finishes it in place instead of copying it again.
@@ -38,6 +39,8 @@ struct PrepJob {
     /// The transform the caller would otherwise run on its own thread (the feed-forward norm, the
     /// SwiGLU multiply). Applied to each buffer here, before the sums and the quantiser.
     fusion: Fusion,
+    /// The product-wide Q4_K activation tile this run also fills, when the caller prepared one.
+    tile: Option<Arc<SharedTile>>,
 }
 
 /// What a worker is asked to do.
@@ -61,6 +64,8 @@ struct Job<'d, const B: usize> {
     first_row: usize,
     count: usize,
     activations: Arc<[OwnedActivation; B]>,
+    /// The Q4_K activation tile built by the prep workers and shared by every participant.
+    tile: Option<Arc<SharedTile>>,
 }
 
 /// Workers started for one pass, each with its own job queue.
@@ -70,6 +75,10 @@ pub(crate) struct Pool<'d, const B: usize> {
     workers: Vec<Sender<Task<'d, B>>>,
     replies: Receiver<(usize, Vec<f32>)>,
     prepared: Receiver<PrepReply>,
+    /// Activation-tile buffers handed back after their product, so a chunk's ~196 products do not
+    /// allocate a megabyte each. A chunk alternates two sizes (width 1536 and 8960), and a buffer
+    /// that has served the larger one keeps its capacity for both.
+    tiles: std::sync::Mutex<Vec<Vec<i8>>>,
 }
 
 impl<'d, const B: usize> Pool<'d, B> {
@@ -92,6 +101,33 @@ impl<'d, const B: usize> Pool<'d, B> {
             workers,
             replies,
             prepared,
+            tiles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take a tile buffer for this product, or allocate one when the free list is empty.
+    pub(crate) fn take_tile(&self, blocks: usize, halves: usize) -> Arc<SharedTile> {
+        let buffer = self
+            .tiles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop();
+        Arc::new(match buffer {
+            Some(buffer) => SharedTile::from_buffer(buffer, blocks, halves),
+            None => SharedTile::new(blocks, halves),
+        })
+    }
+
+    /// Return a tile's buffer to the free list, if this was the last reference to it.
+    pub(crate) fn recycle_tile(&self, tile: Arc<SharedTile>) {
+        let Ok(tile) = Arc::try_unwrap(tile) else {
+            return;
+        };
+        let buffer = tile.into_buffer();
+        let mut free = self.tiles.lock().unwrap_or_else(|error| error.into_inner());
+        // Two shapes per chunk; a handful of buffers covers them without holding memory forever.
+        if free.len() < 4 {
+            free.push(buffer);
         }
     }
 
@@ -108,6 +144,7 @@ impl<'d, const B: usize> Pool<'d, B> {
         activations: &[&[f32]; B],
         fusion: &Fusion,
         threads: usize,
+        tile: Option<Arc<SharedTile>>,
     ) -> Result<Arc<[OwnedActivation; B]>, ViperaError> {
         let participants = threads.min(self.workers.len()).min(B).max(1);
         let values = activations.first().map_or(0, |x| x.len());
@@ -140,6 +177,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                 values,
                 buffers: run,
                 fusion: fusion.clone(),
+                tile: tile.clone(),
             };
             let rejected = match self.workers.get(chunk) {
                 Some(sender) => match sender.send(Task::Prep(job)) {
@@ -164,6 +202,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                 values,
                 buffers: run,
                 fusion: fusion.clone(),
+                tile: tile.clone(),
             };
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish_prep(job)))
                 .map_err(|_| ViperaError::internal("activation preparation panicked"))?;
@@ -204,6 +243,7 @@ impl<'d, const B: usize> Pool<'d, B> {
     /// A worker that has gone away is not fatal: the chunk it would have taken is computed on this
     /// thread instead, so a panic in one job degrades to the serial path rather than hanging on a
     /// reply that will never come.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fill_batch(
         &self,
         ty: GgmlType,
@@ -212,6 +252,7 @@ impl<'d, const B: usize> Pool<'d, B> {
         threads: usize,
         activations: &Arc<[OwnedActivation; B]>,
         out: &mut [f32],
+        tile: Option<Arc<SharedTile>>,
     ) -> Result<(), ViperaError> {
         if B == 0 {
             return Err(ViperaError::invalid_argument(
@@ -228,7 +269,7 @@ impl<'d, const B: usize> Pool<'d, B> {
         let threads = threads.min(self.workers.len()).max(1);
         if threads == 1 {
             let activation = BatchActivation::new(activations);
-            quant::fill_rows_batch(ty, data, stride, 0, &activation, out);
+            quant::fill_rows_batch(ty, data, stride, 0, &activation, out, tile.as_deref());
             return Ok(());
         }
 
@@ -247,6 +288,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                 first_row,
                 count,
                 activations: Arc::clone(activations),
+                tile: tile.clone(),
             };
             match self
                 .workers
@@ -258,7 +300,15 @@ impl<'d, const B: usize> Pool<'d, B> {
                 _ => {
                     let activation = BatchActivation::new(activations);
                     let mut values = vec![0.0_f32; count * B];
-                    quant::fill_rows_batch(ty, data, stride, first_row, &activation, &mut values);
+                    quant::fill_rows_batch(
+                        ty,
+                        data,
+                        stride,
+                        first_row,
+                        &activation,
+                        &mut values,
+                        tile.as_deref(),
+                    );
                     copy_back::<B>(out, rows, first_row, &values)?;
                 }
             }
@@ -272,7 +322,15 @@ impl<'d, const B: usize> Pool<'d, B> {
             // The caller's chunk has to fail the same way a worker's does: a shape mismatch is a
             // panic in the kernel, and the contract is an error, not an unwind through the engine.
             let computed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                quant::fill_rows_batch(ty, data, stride, first_row, &activation, &mut values);
+                quant::fill_rows_batch(
+                    ty,
+                    data,
+                    stride,
+                    first_row,
+                    &activation,
+                    &mut values,
+                    tile.as_deref(),
+                );
             }));
             if computed.is_err() {
                 return Err(ViperaError::internal(
@@ -335,14 +393,27 @@ fn finish_prep(job: PrepJob) -> Vec<OwnedActivation> {
         values,
         buffers,
         fusion,
+        tile,
     } = job;
-    buffers
+    let built: Vec<OwnedActivation> = buffers
         .into_iter()
         .enumerate()
         .map(|(offset, buffer)| {
             OwnedActivation::from_buffer_fused(ty, buffer, values, &fusion, first_entry + offset)
         })
-        .collect()
+        .collect();
+    // This participant's entries of the product-wide tile. Ranges are disjoint by construction
+    // (`prepare` splits the batch into runs), and the row workers only read after every reply is in.
+    if let Some(tile) = &tile {
+        let q: Vec<&[i8]> = built
+            .iter()
+            .filter_map(|activation| activation.quantized().map(|x| x.q.as_slice()))
+            .collect();
+        if q.len() == built.len() {
+            tile.fill_entries(first_entry, &q);
+        }
+    }
+    built
 }
 
 /// Take jobs until the queue closes, answering each with the rows it produced.
@@ -377,6 +448,7 @@ fn run_worker<'d, const B: usize>(
                 job.first_row,
                 &activation,
                 &mut values,
+                job.tile.as_deref(),
             );
         }))
         .is_err();
@@ -414,6 +486,7 @@ mod tests {
                 2,
                 &activations,
                 &mut out,
+                None,
             );
             assert!(result.is_err(), "expected internal error, got {result:?}");
         });
@@ -466,7 +539,7 @@ mod tests {
                     std::thread::scope(|scope| {
                         let pool = Pool::<B>::new(scope, workers);
                         let prepared = pool
-                            .prepare(ty, &views, &Fusion::None, threads)
+                            .prepare(ty, &views, &Fusion::None, threads, None)
                             .expect("prepare");
                         for entry in 0..B {
                             let serial = OwnedActivation::new(ty, views[entry]);
@@ -486,6 +559,131 @@ mod tests {
         check::<32>(3, 4);
         check::<33>(7, 8);
         check::<16>(0, 1);
+    }
+
+    /// One Q4_K block with `d = 1`, `dmin = 0`, scale 1 and minimum 0 in every sub-block, and
+    /// nibbles `0x21`: the pattern the quantiser tests use, so the kernel does its real arithmetic
+    /// at representative magnitudes instead of multiplying zeros.
+    fn q4k_block() -> Vec<u8> {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
+        block[4..8].fill(1);
+        block[12..16].fill(1);
+        block[16..144].fill(0x21);
+        block
+    }
+
+    /// Where a prefill product's wall clock goes at `B = 128`: the activation prepare (with and
+    /// without the shared tile it also fills), the row fill on its own, and the call as the model
+    /// makes it. Written because `ffn_down` (1536 rows x 8960 cols) streams 1 GB/s while
+    /// `ffn_gate` (8960 x 1536) streams 3.3 GB/s at the same block count, and the kernel alone is
+    /// equally fast on both shapes.
+    ///
+    /// ```text
+    /// VIPERA_THREADS=8 cargo test -p vipera-backend-cpu --release --lib prefill_product_breakdown -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn prefill_product_breakdown() {
+        const B: usize = 128;
+        let participants = quant::max_threads();
+        for &(rows, blocks) in &[(8960usize, 6usize), (1536, 35)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let block_bytes = q4k_block();
+            let matrix: Vec<u8> = (0..rows * blocks)
+                .flat_map(|_| block_bytes.clone())
+                .collect();
+            let inputs: Vec<Vec<f32>> = (0..B)
+                .map(|entry| pseudo_random(11 + entry as u64, cols))
+                .collect();
+            let views: [&[f32]; B] = std::array::from_fn(|entry| inputs[entry].as_slice());
+            let gate: Arc<[f32]> = Arc::from(pseudo_random(7, B * cols));
+            let silu = Fusion::Silu {
+                gate: Arc::clone(&gate),
+                width: cols,
+            };
+            let matrix_info = quant::Matrix {
+                ty: vipera_core::gguf::GgmlType::Q4K,
+                cols,
+                rows,
+            };
+            let mut out = vec![0.0_f32; B * rows];
+            std::thread::scope(|scope| {
+                let pool = Pool::<B>::new(scope, participants.saturating_sub(1).max(1));
+                // whole call, prepare with tile, prepare without tile, row fill alone
+                let mut best = [f64::INFINITY; 4];
+                for _ in 0..10 {
+                    for (arm, slot) in best.iter_mut().enumerate() {
+                        let started = std::time::Instant::now();
+                        match arm {
+                            0 => {
+                                quant::matvec_pooled_batch(
+                                    &pool,
+                                    matrix_info,
+                                    &matrix,
+                                    &views,
+                                    &silu,
+                                    &mut out,
+                                )
+                                .expect("product");
+                                std::hint::black_box(&out);
+                            }
+                            1 | 2 => {
+                                let tile =
+                                    (arm == 1).then(|| pool.take_tile(blocks, B.div_ceil(16)));
+                                let owned = pool
+                                    .prepare(
+                                        vipera_core::gguf::GgmlType::Q4K,
+                                        &views,
+                                        &silu,
+                                        participants,
+                                        tile.clone(),
+                                    )
+                                    .expect("prepare");
+                                std::hint::black_box(&owned);
+                                if let Some(tile) = tile {
+                                    pool.recycle_tile(tile);
+                                }
+                            }
+                            _ => {
+                                let owned: Arc<[OwnedActivation; B]> =
+                                    Arc::new(std::array::from_fn(|entry| {
+                                        OwnedActivation::new(
+                                            vipera_core::gguf::GgmlType::Q4K,
+                                            views[entry],
+                                        )
+                                    }));
+                                let tile = pool.take_tile(blocks, B.div_ceil(16));
+                                pool.fill_batch(
+                                    vipera_core::gguf::GgmlType::Q4K,
+                                    &matrix,
+                                    stride,
+                                    participants,
+                                    &owned,
+                                    &mut out,
+                                    Some(tile.clone()),
+                                )
+                                .expect("fill");
+                                std::hint::black_box(&out);
+                                pool.recycle_tile(tile);
+                            }
+                        }
+                        *slot = slot.min(started.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                let bytes = (rows * stride) as f64;
+                println!(
+                    "{rows:>5}x{cols:<5} {participants}T: whole {:>6.2} ms ({:>4.1} GB/s) | prep+tile {:>5.2} | prep {:>5.2} | fill {:>5.2} (prep {:.0}% of fill)",
+                    best[0],
+                    bytes / (best[0] * 1e6),
+                    best[1],
+                    best[2],
+                    best[3],
+                    100.0 * (best[0] - best[3]) / best[3]
+                );
+            });
+        }
     }
 
     /// What building a batched product's activations costs on the calling thread against the pool,
@@ -519,7 +717,7 @@ mod tests {
                             std::hint::black_box(serial);
                         } else {
                             let pooled = pool
-                                .prepare(GgmlType::Q4K, &views, &Fusion::None, participants)
+                                .prepare(GgmlType::Q4K, &views, &Fusion::None, participants, None)
                                 .expect("prepare");
                             std::hint::black_box(pooled);
                         }

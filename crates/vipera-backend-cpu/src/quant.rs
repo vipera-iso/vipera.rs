@@ -951,9 +951,34 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
         rows.saturating_mul(B),
         rows.saturating_mul(cols).saturating_mul(B),
     );
+    // A wide Q4_K batch builds its activation tile once, in the prep workers, and every row
+    // participant reads that copy instead of building its own (measured at ~44 ms of a 770 ms
+    // chunk, `docs/benchmarks.md` 2026-11-22). Narrow batches and the serial path keep the old
+    // per-participant build, so a decode/speculative batch is untouched.
+    let block = match ty {
+        GgmlType::Q4K => Some(144),
+        GgmlType::Q6K => Some(210),
+        _ => None,
+    };
+    let tiled = block
+        .filter(|block| {
+            B >= PARALLEL_PREP_MIN_BATCH
+                && threads > 1
+                && parallel_prep_enabled()
+                && shared_tile_enabled()
+                && stride.is_multiple_of(*block)
+        })
+        .map(|block| {
+            let (blocks, halves) = (stride / block, B.div_ceil(16));
+            if tile_reuse_enabled() {
+                pool.take_tile(blocks, halves)
+            } else {
+                std::sync::Arc::new(crate::simd::SharedTile::new(blocks, halves))
+            }
+        });
     let owned: std::sync::Arc<[OwnedActivation; B]> =
         if B >= PARALLEL_PREP_MIN_BATCH && threads > 1 && parallel_prep_enabled() {
-            pool.prepare(ty, activations, fusion, threads)?
+            pool.prepare(ty, activations, fusion, threads, tiled.clone())?
         } else {
             std::sync::Arc::new(std::array::from_fn(|entry| {
                 let x = activations[entry];
@@ -962,7 +987,31 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
                 OwnedActivation::from_buffer_fused(ty, buffer, cols, fusion, entry)
             }))
         };
-    pool.fill_batch(ty, data, stride, threads, &owned, out)
+    let result = pool.fill_batch(ty, data, stride, threads, &owned, out, tiled.clone());
+    if tile_reuse_enabled()
+        && let Some(tile) = tiled
+    {
+        pool.recycle_tile(tile);
+    }
+    result
+}
+
+/// Whether a wide Q4_K batch builds its activation tile once in the prep workers.
+///
+/// On by default; `VIPERA_SHARED_TILE=0` restores the per-participant build. The two paths write
+/// the same bytes, so the result is bit-identical either way.
+/// Whether a product's tile buffer is taken from and returned to the pool's free list.
+///
+/// On by default; `VIPERA_TILE_REUSE=0` allocates a fresh tile per product, which is what the
+/// one-per-product build did before the free list existed. The two are numerically identical.
+fn tile_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VIPERA_TILE_REUSE").is_ok_and(|value| value.trim() == "0"))
+}
+
+fn shared_tile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VIPERA_SHARED_TILE").is_ok_and(|value| value.trim() == "0"))
 }
 
 /// Entries a batched product needs before its activations are built by the pool instead of by the
@@ -1048,6 +1097,7 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     first_row: usize,
     activation: &BatchActivation<'_, B>,
     out: &mut [f32],
+    tile: Option<&crate::simd::SharedTile>,
 ) {
     let count = out.len() / B;
     // Integer tiled path, the prefill default: on an AVX-512 VNNI CPU a Q4_K
@@ -1075,13 +1125,16 @@ pub(crate) fn fill_rows_batch<const B: usize>(
                 xs,
                 activation.sums(),
                 out,
+                tile,
             )
         {
             return;
         }
         if ty == GgmlType::Q6K
             && let Some(xs) = activation.quantized()
-            && crate::simd::try_q6k_matvec_tiled_range(data, stride, first_row, count, xs, out)
+            && crate::simd::try_q6k_matvec_tiled_range(
+                data, stride, first_row, count, xs, out, tile,
+            )
         {
             return;
         }
@@ -1389,6 +1442,7 @@ mod tests {
                             participants,
                             &activations,
                             &mut out,
+                            None,
                         )
                         .expect("dispatch");
                         inside += started.elapsed();
@@ -1459,7 +1513,7 @@ mod tests {
             let xs = [&xq];
             let sums = [sums.as_slice()];
             assert!(crate::simd::try_q4k_matvec_tiled_range::<1>(
-                &data, stride, 0, rows, &xs, &sums, &mut out
+                &data, stride, 0, rows, &xs, &sums, &mut out, None
             ));
             out
         };
