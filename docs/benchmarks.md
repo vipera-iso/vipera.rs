@@ -2066,6 +2066,40 @@ form makes text clearly less likely" and does not prove the two are interchangea
 the row-kernel error in §2.4 of ADR-003, it is the evidence that keeps that ADR's opt-in default a
 policy choice about changed output rather than about arithmetic quality.
 
+### Attention is 10% of a short chunk and 30% of a deep one, and one switch is now over the gate — 2026-11-22
+
+Attention used to be 3% of a prefill chunk. The dots got faster and attention did not, so it is now
+**10%** of chunk 4 of the 524-token prompt (median 66.25 ms of 649.71) and **29-30%** at 2.9k tokens
+(245-257 ms of 828-858) — it grows with the history, which nothing else in a chunk does.
+
+The cost is the history walk per query row: a chunk of ~105 positions calls attention once per layer
+with one row per position, and every row reads every K and V row. At ~370 positions that is
+105 rows × 28 layers × 2 KV heads × 370 positions × 128 values × 2 bytes × 2 (K and V) ≈ **1.1 GB** of
+KV reads for the chunk, against 0.9 GB of weights — at 66 ms that is ~17 GB/s, so it is neither at
+the memory ceiling (42.8 GB/s) nor at the arithmetic one.
+
+`VIPERA_ATTN_QBLOCK=1` is the existing answer to exactly that: one history walk feeds four queries,
+cutting the row traffic fourfold. It is implemented, tested and off by default with the note that it
+"does not pay for itself end to end yet". Five interleaved pairs, chunk 4:
+
+| arm | attention | chunk 4 |
+|---|---:|---:|
+| default | 66.25 ms median (64.19-69.42) | 649.71 ms median |
+| `VIPERA_ATTN_QBLOCK=1` | 47.77 ms median (47.21-49.27), **-27.9%** | 629.16 ms median, **-3.2%**, 5/5 pairs |
+
+So it is over the 3% gate now, and the reason is not that the kernel changed: the slice it cuts grew
+from 3% to 10% while it stayed still. A fourfold cut in row traffic buying only 28% of the attention
+time also says the walk is no longer purely memory-bound once rows are shared — that part is measured,
+the explanation is not.
+
+It is still not bit-identical (it regroups the softmax sums, as the position-chunked kernel and
+`VIPERA_ATTN_GQA_SHARE` already do by default), and this time the change is visible: `vipera score`
+puts mean NLL at **+0.11%** (2.826631 to 2.829815) on the 986-token text and **+0.05%** on the
+2444-token one, both in the direction of *less* likely text, and 16 greedy tokens from the 524-token
+prompt come out different. That is a decision with a cost on both sides — 3.2% of a chunk against a
+small likelihood regression — so the default is unchanged here and the numbers are waiting for an
+owner's call.
+
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 
 The engine already ships prompt-lookup (`VIPERA_SPECULATIVE`), so this was a measurement, not a new
