@@ -996,10 +996,6 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
     result
 }
 
-/// Whether a wide Q4_K batch builds its activation tile once in the prep workers.
-///
-/// On by default; `VIPERA_SHARED_TILE=0` restores the per-participant build. The two paths write
-/// the same bytes, so the result is bit-identical either way.
 /// Whether a product's tile buffer is taken from and returned to the pool's free list.
 ///
 /// On by default; `VIPERA_TILE_REUSE=0` allocates a fresh tile per product, which is what the
@@ -1009,6 +1005,10 @@ fn tile_reuse_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("VIPERA_TILE_REUSE").is_ok_and(|value| value.trim() == "0"))
 }
 
+/// Whether a wide Q4_K batch builds its activation tile once in the prep workers.
+///
+/// On by default; `VIPERA_SHARED_TILE=0` restores the per-participant build. The two paths write
+/// the same bytes, so the result is bit-identical either way.
 fn shared_tile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("VIPERA_SHARED_TILE").is_ok_and(|value| value.trim() == "0"))

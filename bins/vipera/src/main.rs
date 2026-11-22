@@ -805,7 +805,13 @@ fn score_command(args: &[String]) -> Result<u8, ViperaError> {
             "--json" => json = true,
             "--text" => {
                 let value = next_value(args, index, "--text")?;
-                texts.push(("<text>".to_owned(), value.to_owned()));
+                // Numbered so a corpus of inline texts keeps one entry per text in the report;
+                // a shared label would make two `--text` flags look like the same document.
+                let inline = texts
+                    .iter()
+                    .filter(|(label, _)| label.starts_with("<text"))
+                    .count();
+                texts.push((format!("<text {}>", inline + 1), value.to_owned()));
                 index += 1;
             }
             "--text-file" => {
