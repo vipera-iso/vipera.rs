@@ -140,7 +140,12 @@ Hai tiêu chí trượt là đủ để từ chối; không có chuyện lấy t
 
 ## 11. Open questions
 
-1. `QBLOCK = 8/16` có làm lợi ích ở ngữ cảnh ngắn tăng không, và có làm hồi quy NLL tệ hơn không?
+1. `QBLOCK = 8/16` có làm lợi ích tăng không? **Đã đo (2026-11-22, cùng ngày):** không. Hai binary
+   `QBLOCK = 4` và `= 8` chạy xen kẽ 3 cặp mỗi cặp ở cả hai chỗ, chunk 4 (ngắn) và chunk 24 (sâu):
+   ngắn 697.86 ms median (Q4) so với 706.43 (Q8), sâu 876.09 so với 883.82 — **Q8 chậm hơn ở 0/3
+   cặp** ở cả hai ngữ cảnh. `QBLOCK = 16` còn tệ hơn. Những lần trước đó *trông như* Q8 thắng ở độ
+   sâu chỉ vì hai binary được đo ở hai thời điểm khác nhau với box trôi ±2%; so sánh phải xen kẽ
+   cùng lượt. Hằng số giữ nguyên 4.
 2. Phần số học mỗi hàng ở 2.4k vị trí phân bổ thế nào giữa scores, `exp` và weighted sum? Chưa có phép
    đo nào tách ba phần đó — cần trước khi hứa bất kỳ con số nào.
 3. Có nên gộp quyết định này với ADR-003 thành một policy chung cho "thay đổi làm tròn trong prefill:

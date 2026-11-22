@@ -2045,10 +2045,13 @@ restructure would slow the common case.
 
 A prefill kernel that changes rounding cannot be judged by tokens alone when two builds disagree:
 the question is whether the text becomes less likely, and that needs a number. `vipera score
-<model.gguf> (--text|--text-file) [--ctx N] [--json]` prints the log-likelihood, mean NLL and
-perplexity this build assigns to a fixed text. It sends the text through the prefill path in chunks
-of 64 tokens and reads every position's row with `ForwardPass::logits_range`, so nothing is sampled
-and the prefill kernel is what is measured. Two runs of the same arm produce the same digits.
+<model.gguf> [--text TEXT]... [--text-file PATH]... [--ctx N] [--json]` prints the log-likelihood,
+mean NLL and perplexity this build assigns to each text and then to the corpus as a whole. Every flag
+may be repeated and each text gets its own KV cache, so a corpus is several independent documents;
+the summary is token-weighted, not the mean of the per-text means. It sends each text through the
+prefill path in chunks of 64 tokens and reads every position's row with `ForwardPass::logits_range`,
+so nothing is sampled and the prefill kernel is what is measured. Two runs of the same arm produce
+the same digits.
 
 Five texts cut from these docs, both arms, mean NLL per token:
 

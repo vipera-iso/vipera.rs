@@ -37,8 +37,8 @@ USAGE:
     vipera model-info <model.gguf> [--json]
     vipera plan <model.gguf> [--ctx N] [--kv-type f16|q8_0|q4_0] [--json]
     vipera profile [--json]
-    vipera score <model.gguf> (--text TEXT | --text-file PATH) [--ctx N] [--kv-type f16|q8_0]
-                 [--json]
+    vipera score <model.gguf> [--text TEXT]... [--text-file PATH]... [--ctx N]
+                 [--kv-type f16|q8_0] [--json]
     vipera tokenize <model.gguf> [--text TEXT | --text-file PATH | --ids IDS]
                    [--system TEXT] [--user TEXT] [--assistant TEXT] [--no-generation-prompt] [--json]
     vipera sample [--logits CSV | --logits-file PATH] [--model MODEL] [--count N] [--seed N]
@@ -793,8 +793,8 @@ fn log_probability(row: &[f32], index: u32) -> f64 {
 /// read through [`ForwardPass::logits_range`] — so a change to a prefill kernel shows up here.
 fn score_command(args: &[String]) -> Result<u8, ViperaError> {
     let mut json = false;
-    let mut text: Option<&str> = None;
-    let mut text_file: Option<&str> = None;
+    // Every text is scored on its own KV cache, so a corpus is a loop and not a wider batch.
+    let mut texts: Vec<(String, String)> = Vec::new();
     let mut ctx: Option<u64> = None;
     let mut kv_type = KvCacheType::F16;
     let mut path: Option<&str> = None;
@@ -804,11 +804,14 @@ fn score_command(args: &[String]) -> Result<u8, ViperaError> {
         match args[index].as_str() {
             "--json" => json = true,
             "--text" => {
-                text = Some(next_value(args, index, "--text")?);
+                let value = next_value(args, index, "--text")?;
+                texts.push(("<text>".to_owned(), value.to_owned()));
                 index += 1;
             }
             "--text-file" => {
-                text_file = Some(next_value(args, index, "--text-file")?);
+                let file = next_value(args, index, "--text-file")?.to_owned();
+                let source = std::fs::read_to_string(&file)?;
+                texts.push((file, source));
                 index += 1;
             }
             "--ctx" => {
@@ -837,28 +840,15 @@ fn score_command(args: &[String]) -> Result<u8, ViperaError> {
     }
 
     let path = path.ok_or_else(|| ViperaError::usage("score needs a model path"))?;
-    if text.is_some() && text_file.is_some() {
-        return Err(ViperaError::usage(
-            "--text and --text-file are alternatives, not both",
-        ));
+    if texts.is_empty() {
+        texts.push(("<stdin>".to_owned(), read_stdin()?));
     }
-    let source = match (text, text_file) {
-        (Some(value), _) => value.to_owned(),
-        (None, Some(value)) => std::fs::read_to_string(value)?,
-        (None, None) => read_stdin()?,
-    };
 
     let bytes = std::fs::read(resolve_model_path(path)?)?;
     let file = GgufFile::parse(&bytes)?;
     let tokenizer = Tokenizer::from_gguf(&file)?;
     let mut backend = CpuBackend::from_bytes(bytes, &file)?;
     let model = backend.config();
-    let ids = tokenizer.encode(&source)?;
-    if ids.len() < 2 {
-        return Err(ViperaError::usage(
-            "score needs at least two tokens: the first has nothing before it to be scored against",
-        ));
-    }
 
     let bytes_per_token = model.kv_bytes_per_token_for(kv_type).ok_or_else(|| {
         ViperaError::unsupported(format!(
@@ -868,13 +858,85 @@ fn score_command(args: &[String]) -> Result<u8, ViperaError> {
     })?;
     let context_limit = file.describe().context_limit.unwrap_or(2048);
     let context_length = ctx.unwrap_or(context_limit.min(4096));
-    if ids.len() as u64 > context_length {
-        return Err(ViperaError::unsupported(format!(
-            "the text is {} tokens, longer than the {context_length} this run reserves; pass a \
-             larger --ctx",
-            ids.len()
-        )));
+
+    let started = Instant::now();
+    let mut totals: Vec<(String, f64, usize)> = Vec::with_capacity(texts.len());
+    for (label, source) in &texts {
+        let ids = tokenizer.encode(source)?;
+        if ids.len() < 2 {
+            return Err(ViperaError::usage(format!(
+                "{label}: needs at least two tokens, since the first has nothing before it to be \
+                 scored against"
+            )));
+        }
+        if ids.len() as u64 > context_length {
+            return Err(ViperaError::unsupported(format!(
+                "{label}: {} tokens, longer than the {context_length} this run reserves; pass a \
+                 larger --ctx",
+                ids.len()
+            )));
+        }
+        let (log_likelihood, scored) =
+            score_ids(&mut backend, &ids, context_length, bytes_per_token)?;
+        totals.push((label.clone(), log_likelihood, scored));
     }
+    let elapsed = started.elapsed().as_secs_f64();
+
+    // Token-weighted, not the mean of the per-text means: a twelve-token sentence must not weigh as
+    // much as a fifteen-hundred-token document.
+    let tokens: usize = totals.iter().map(|(_, _, scored)| scored).sum();
+    let log_likelihood: f64 = totals.iter().map(|(_, total, _)| total).sum();
+    let mean_nll = -log_likelihood / tokens as f64;
+
+    if json {
+        let entries: Vec<String> = totals
+            .iter()
+            .map(|(label, total, scored)| {
+                let mean = -total / *scored as f64;
+                format!(
+                    "    {{\"label\": {}, \"tokens\": {scored}, \"log_likelihood\": {total:.6}, \
+                     \"mean_nll\": {mean:.6}, \"perplexity\": {:.6}}}",
+                    quote(label),
+                    mean.exp()
+                )
+            })
+            .collect();
+        emit(&format!(
+            "{{\n  \"texts\": [\n{}\n  ],\n  \"tokens\": {tokens},\n  \"log_likelihood\": \
+             {log_likelihood:.6},\n  \"mean_nll\": {mean_nll:.6},\n  \"bits_per_token\": {:.6},\n  \
+             \"perplexity\": {:.6},\n  \"seconds\": {elapsed:.3}\n}}\n",
+            entries.join(",\n"),
+            mean_nll / std::f64::consts::LN_2,
+            mean_nll.exp()
+        ))?;
+    } else {
+        for (label, total, scored) in &totals {
+            let mean = -total / *scored as f64;
+            emit(&format!(
+                "{label}: {scored} tokens, {total:.4} nats, mean nll {mean:.4}, perplexity {:.4}\n",
+                mean.exp()
+            ))?;
+        }
+        emit(&format!(
+            "all texts: {tokens} tokens, {log_likelihood:.4} nats, mean nll {mean_nll:.4} \
+             nats/token ({:.4} bits/token), perplexity {:.4}\n",
+            mean_nll / std::f64::consts::LN_2,
+            mean_nll.exp()
+        ))?;
+    }
+    Ok(0)
+}
+
+/// The log-likelihood this backend gives `ids`, summed over every token after the first.
+///
+/// A fresh KV cache per text keeps the texts independent: a corpus is several documents, not one
+/// long one, and sharing the cache would score each text against everything that came before it.
+fn score_ids(
+    backend: &mut CpuBackend,
+    ids: &[u32],
+    context_length: u64,
+    bytes_per_token: u64,
+) -> Result<(f64, usize), ViperaError> {
     // No window: scoring reads every position the text has, so a ring would only add bookkeeping.
     let mut kv = KvCache::new(KvConfig::for_run(
         bytes_per_token,
@@ -891,7 +953,6 @@ fn score_command(args: &[String]) -> Result<u8, ViperaError> {
         .to_vec();
     let storage = kv.storage_mut();
 
-    let started = Instant::now();
     let mut log_likelihood = 0.0_f64;
     let mut scored = 0usize;
     let mut start = 0usize;
@@ -917,30 +978,7 @@ fn score_command(args: &[String]) -> Result<u8, ViperaError> {
         }
         start = end;
     }
-    let elapsed = started.elapsed().as_secs_f64();
-
-    let mean_nll = if scored == 0 {
-        0.0
-    } else {
-        -log_likelihood / scored as f64
-    };
-    if json {
-        emit(&format!(
-            "{{\n  \"tokens\": {scored},\n  \"log_likelihood\": {log_likelihood:.6},\n  \
-             \"mean_nll\": {mean_nll:.6},\n  \"bits_per_token\": {:.6},\n  \
-             \"perplexity\": {:.6},\n  \"seconds\": {elapsed:.3}\n}}\n",
-            mean_nll / std::f64::consts::LN_2,
-            mean_nll.exp()
-        ))?;
-    } else {
-        emit(&format!(
-            "tokens: {scored}\nlog-likelihood: {log_likelihood:.4} nats\n\
-             mean nll: {mean_nll:.4} nats/token ({:.4} bits/token)\nperplexity: {:.4}\n",
-            mean_nll / std::f64::consts::LN_2,
-            mean_nll.exp()
-        ))?;
-    }
-    Ok(0)
+    Ok((log_likelihood, scored))
 }
 
 /// Print whatever part of `text` has not been printed, assuming the printed text is its prefix.
