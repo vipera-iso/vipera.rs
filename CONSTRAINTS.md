@@ -82,6 +82,7 @@ decode 30–33 tok/s. Full ledger in `HANDOFF.md` (local, gitignored).
 | AVX-512 integer tile at `B = 1` (decode) | decode 32.7–34.6 → 112–115 ms/step | rejected: 15 of the tile's 16 `dpbusd` columns are zeros |
 | Thread count 4 / 6 instead of 8 | decode 26.7 / 28.7 tok/s vs 33.4 | rejected: 8 logical CPUs are the best setting here |
 | Port llama.cpp's `bsums`-based Q6_K kernel | `output` Q6_K already 5.2 ms/call = 36.5 GB/s, near the ~43 GB/s read ceiling | not attempted: the bytes, not the kernel, are the limit |
+| New tile-resident attention micro-GEMM, wider than the existing `VIPERA_ATTN_QBLOCK` block | at depth ~380 the existing query-blocked fused kernel already cuts attention 24.5% (95.77 -> 72.32 ms) while the chunk moves +1.2% (inside noise); the 6-head f16 score dot is ~85% of the AVX2 FMA peak, leaving <=1.3x on the arithmetic | rejected: attention is ~10% of this chunk and already ~76% of its FLOP roofline; at most ~1% of a chunk |
 
 Where the time actually goes (measured, `VIPERA_PROFILE_STEP=1`): prefill chunk q4_k 68%,
 q6_k 19%, attention 5%, norm 2%, rest 6%; decode q4_k 61%, q6_k 28%, attention 7%. So attention

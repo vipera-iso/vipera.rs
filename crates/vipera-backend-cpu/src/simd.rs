@@ -2168,6 +2168,69 @@ pub fn vnni512_available() -> bool {
 /// Safe entry point for [`q4k_matvec_tiled_range`]: checks the CPU and the
 /// activation lengths itself, so callers outside this module can use it
 /// without `unsafe`.
+/// The Q4_K activation tile of one batched product, built once for every participant.
+///
+/// Layout is `(half, group, entry, 4)` `i8`, so one 64-byte load holds four codes for each of the
+/// sixteen columns of a half. The activation-prep workers fill the entries they own; the row
+/// workers only read it once [`crate::pool::Pool::prepare`] has joined them, which is the
+/// happens-before that makes the read safe. Building it per participant cost ~44 ms of a 770 ms
+/// chunk (`docs/benchmarks.md`, 2026-11-22).
+pub(crate) struct SharedTile {
+    act: std::cell::UnsafeCell<Vec<i8>>,
+    blocks: usize,
+    halves: usize,
+}
+
+// SAFETY: `fill_entries` is called only with the disjoint entry ranges of one `prepare`, and
+// `bytes` is read only after that prepare has joined every worker.
+unsafe impl Sync for SharedTile {}
+
+impl SharedTile {
+    pub(crate) fn new(blocks: usize, halves: usize) -> Self {
+        Self {
+            act: std::cell::UnsafeCell::new(vec![0_i8; blocks * halves * 64 * 16 * 4]),
+            blocks,
+            halves,
+        }
+    }
+
+    pub(crate) fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    pub(crate) fn halves(&self) -> usize {
+        self.halves
+    }
+
+    /// Write the columns of `first_entry..first_entry + q.len()`.
+    ///
+    /// Concurrent calls must cover disjoint entries: every entry owns its own `col` slot, so two
+    /// calls that touch different entries never write the same byte.
+    pub(crate) fn fill_entries(&self, first_entry: usize, q: &[&[i8]]) {
+        // SAFETY: disjoint columns per the contract above; no reader runs until `prepare` joins.
+        let act = unsafe { &mut *self.act.get() };
+        for (offset, chunk_all) in q.iter().enumerate() {
+            let entry = first_entry + offset;
+            let half = entry / 16;
+            let col = entry % 16;
+            for b in 0..self.blocks {
+                let chunk = &chunk_all[b * 256..b * 256 + 256];
+                let base = (b * self.halves + half) * 64 * 16 * 4;
+                for grp in 0..64 {
+                    act[base + grp * 64 + col * 4..][..4].copy_from_slice(&chunk[grp * 4..][..4]);
+                }
+            }
+        }
+    }
+
+    /// The built tile. Only call after every `fill_entries` for this product has returned.
+    fn bytes(&self) -> &[i8] {
+        // SAFETY: the caller's happens-before is documented on the type.
+        unsafe { &*self.act.get() }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     data: &[u8],
     stride: usize,
@@ -2176,6 +2239,7 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     xs: &[&QuantizedX; B],
     sums: &[&[f32]; B],
     out: &mut [f32],
+    tile: Option<&SharedTile>,
 ) -> bool {
     if !vnni512_available() || stride == 0 || !stride.is_multiple_of(144) || B == 0 || B > 128 {
         return false;
@@ -2190,7 +2254,7 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     }
     // SAFETY: vnni512_available checked the CPU and the lengths above match
     // the kernel's contract.
-    unsafe { q4k_matvec_tiled_range(data, stride, first_row, count, xs, sums, out) };
+    unsafe { q4k_matvec_tiled_range(data, stride, first_row, count, xs, sums, out, tile) };
     true
 }
 
@@ -2217,6 +2281,7 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
 /// every `xs[e].d` and `sums[e]` one entry per 32-value group, and the CPU
 /// must support AVX-512F/BW/VNNI (the caller checks via
 /// [`vnni512_available`]).
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
     data: &[u8],
@@ -2226,6 +2291,7 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
     xs: &[&QuantizedX; B],
     sums: &[&[f32]; B],
     out: &mut [f32],
+    tile: Option<&SharedTile>,
 ) {
     // SAFETY: the module contract above; every load below stays inside the
     // rows, blocks, and activation slices the caller validated.
@@ -2254,22 +2320,38 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         // load holds 4 codes for each of the 16 columns of that half.
         // The activation tile for every block is built once, up front, and stays in L2 while the
         // row windows below walk it. Building it per window would repeat the same copies 144 times.
-        let mut act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+        // The activation tile comes from the shared product-wide build when the pool prepared one;
+        // otherwise this participant builds its own, as before. The scale and sum vectors are tiny
+        // and stay per participant either way.
+        let mut owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+                for b in 0..blocks {
+                    for (entry, x) in xs.iter().enumerate() {
+                        let half = entry / COLS;
+                        let col = entry % COLS;
+                        let chunk = x.q.as_ptr().add(b * 256);
+                        let base = (b * halves + half) * 64 * COLS * 4;
+                        for grp in 0..64 {
+                            std::ptr::copy_nonoverlapping(
+                                chunk.add(grp * 4),
+                                owned_act.as_mut_ptr().add(base + grp * 64 + col * 4),
+                                4,
+                            );
+                        }
+                    }
+                }
+                &owned_act
+            }
+        };
         let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
         let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
         for b in 0..blocks {
             for entry in 0..B {
                 let half = entry / COLS;
                 let col = entry % COLS;
-                let chunk = xs[entry].q.as_ptr().add(b * 256);
-                let base = (b * halves + half) * 64 * COLS * 4;
-                for grp in 0..64 {
-                    std::ptr::copy_nonoverlapping(
-                        chunk.add(grp * 4),
-                        act.as_mut_ptr().add(base + grp * 64 + col * 4),
-                        4,
-                    );
-                }
                 for sub in 0..8 {
                     let at = ((b * halves + half) * 8 + sub) * COLS + col;
                     dxs[at] = xs[entry].d[b * 8 + sub];
@@ -2401,6 +2483,7 @@ pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
     count: usize,
     xs: &[&QuantizedX; B],
     out: &mut [f32],
+    tile: Option<&SharedTile>,
 ) -> bool {
     if !vnni512_available() || stride == 0 || !stride.is_multiple_of(210) || B == 0 || B > 128 {
         return false;
@@ -2414,7 +2497,7 @@ pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
     }
     // SAFETY: vnni512_available checked the CPU and the lengths above match
     // the kernel's contract.
-    unsafe { q6k_matvec_tiled_range(data, stride, first_row, count, xs, out) };
+    unsafe { q6k_matvec_tiled_range(data, stride, first_row, count, xs, out, tile) };
     true
 }
 
@@ -2437,6 +2520,7 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
     count: usize,
     xs: &[&QuantizedX; B],
     out: &mut [f32],
+    tile: Option<&SharedTile>,
 ) {
     // SAFETY: the module contract above; every load below stays inside the
     // rows, blocks, and activation slices the caller validated.
@@ -2453,7 +2537,31 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
         let mut scales = vec![[0_i32; ROW_WIN]; 16];
         let mut dvec = [0.0_f32; ROW_WIN];
         // Activation tile for every block, built once and reused by every row window.
-        let mut act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+        // The activation tile is the same bytes and layout as Q4_K's, so a product-wide build from
+        // the prep workers is reused here too. The integer sums and scales stay per participant.
+        let mut owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+                for b in 0..blocks {
+                    for (entry, x) in xs.iter().enumerate() {
+                        let col_half = entry / COLS;
+                        let col = entry % COLS;
+                        let chunk = x.q.as_ptr().add(b * 256);
+                        let base = (b * halves + col_half) * 64 * COLS * 4;
+                        for grp in 0..64 {
+                            std::ptr::copy_nonoverlapping(
+                                chunk.add(grp * 4),
+                                owned_act.as_mut_ptr().add(base + grp * 64 + col * 4),
+                                4,
+                            );
+                        }
+                    }
+                }
+                &owned_act
+            }
+        };
         let mut bsumt = vec![0_i32; blocks * halves * 16 * COLS];
         let mut dxs = vec![0.0_f32; blocks * halves * 16 * COLS];
         for b in 0..blocks {
@@ -2461,14 +2569,6 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                 let col_half = entry / COLS;
                 let col = entry % COLS;
                 let chunk = x.q.as_ptr().add(b * 256);
-                let base = (b * halves + col_half) * 64 * COLS * 4;
-                for grp in 0..64 {
-                    std::ptr::copy_nonoverlapping(
-                        chunk.add(grp * 4),
-                        act.as_mut_ptr().add(base + grp * 64 + col * 4),
-                        4,
-                    );
-                }
                 for k in 0..16 {
                     let mut sum = 0_i32;
                     for i in 0..16 {
@@ -3581,6 +3681,49 @@ mod tests {
         }
     }
 
+    /// A tile filled through `SharedTile::fill_entries` must produce the same bytes the kernel's
+    /// own build produces, so sharing it cannot change a result. The two runs below are the two
+    /// halves `Pool::prepare` would hand to two participants.
+    #[test]
+    fn a_shared_activation_tile_is_bit_identical_to_a_local_one() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x5eed_0001_0002_0003);
+        let rows = 48usize;
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 144;
+        let source: Vec<Vec<f32>> = (0..32)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 32] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 32] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let tile = SharedTile::new(blocks, 32usize.div_ceil(16));
+        let q: Vec<&[i8]> = xs.iter().map(|x| x.q.as_slice()).collect();
+        tile.fill_entries(0, &q[..16]);
+        tile.fill_entries(16, &q[16..]);
+        let mut shared = vec![0.0_f32; 32 * rows];
+        let mut local = vec![0.0_f32; 32 * rows];
+        assert!(try_q4k_matvec_tiled_range(
+            &data,
+            stride,
+            0,
+            rows,
+            &xs,
+            &sums,
+            &mut shared,
+            Some(&tile)
+        ));
+        assert!(try_q4k_matvec_tiled_range(
+            &data, stride, 0, rows, &xs, &sums, &mut local, None
+        ));
+        assert_eq!(shared, local, "the shared tile changed a result");
+    }
+
     #[test]
     fn q4k_tiled_range_matches_batch_vnni() {
         if !vnni_available() || !vnni512_available() {
@@ -3601,7 +3744,7 @@ mod tests {
         let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
         let mut got = vec![0.0_f32; 16 * rows];
         // SAFETY: whole blocks, VNNI-512 checked above.
-        unsafe { q4k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &sums, &mut got) };
+        unsafe { q4k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &sums, &mut got, None) };
         let mut totals = [0.0_f32; 16];
         for row in 0..rows {
             let row_bytes = &data[row * stride..(row + 1) * stride];
@@ -3616,6 +3759,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Measurement only: what allocating and zeroing one product tile costs, so the remaining
+    /// ceiling gap can be attributed before a reuse path is written.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn shared_tile_allocation_cost() {
+        let start = std::time::Instant::now();
+        for _ in 0..2000 {
+            std::hint::black_box(SharedTile::new(35, 8));
+        }
+        println!("{:?} per 35x8 tile", start.elapsed() / 2000);
+        let start = std::time::Instant::now();
+        for _ in 0..2000 {
+            std::hint::black_box(SharedTile::new(6, 8));
+        }
+        println!("{:?} per 6x8 tile", start.elapsed() / 2000);
+    }
+
+    /// Same byte-for-byte check as the Q4_K shared tile, on the Q6_K kernel.
+    #[test]
+    fn a_shared_q6k_tile_is_bit_identical_to_a_local_one() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x6b6b_1111_2222_3333);
+        let rows = 48usize;
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 210;
+        let source: Vec<Vec<f32>> = (0..32)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 32] = std::array::from_fn(|e| &xs_vec[e]);
+        let tile = SharedTile::new(blocks, 32usize.div_ceil(16));
+        let q: Vec<&[i8]> = xs.iter().map(|x| x.q.as_slice()).collect();
+        tile.fill_entries(0, &q[..16]);
+        tile.fill_entries(16, &q[16..]);
+        let mut shared = vec![0.0_f32; 32 * rows];
+        let mut local = vec![0.0_f32; 32 * rows];
+        assert!(try_q6k_matvec_tiled_range(
+            &data,
+            stride,
+            0,
+            rows,
+            &xs,
+            &mut shared,
+            Some(&tile)
+        ));
+        assert!(try_q6k_matvec_tiled_range(
+            &data, stride, 0, rows, &xs, &mut local, None
+        ));
+        assert_eq!(shared, local, "the shared tile changed a Q6_K result");
     }
 
     #[test]
@@ -3636,7 +3834,7 @@ mod tests {
         let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
         let mut got = vec![0.0_f32; 16 * rows];
         // SAFETY: whole blocks, VNNI-512 checked above.
-        unsafe { q6k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &mut got) };
+        unsafe { q6k_matvec_tiled_range::<16>(&data, stride, 0, rows, &xs, &mut got, None) };
         let mut totals = [0.0_f32; 16];
         for row in 0..rows {
             let row_bytes = &data[row * stride..(row + 1) * stride];
@@ -3677,7 +3875,7 @@ mod tests {
         let mut out = vec![0.0_f32; 16 * rows];
         let start = std::time::Instant::now();
         for _ in 0..reps {
-            let _ = try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs, &sums, &mut out);
+            let _ = try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs, &sums, &mut out, None);
         }
         let tiled = start.elapsed().as_secs_f64();
         println!("tiled single-thread: {:.2} GB/s", gb * reps as f64 / tiled);
@@ -3726,7 +3924,8 @@ mod tests {
                 let mut best = f64::INFINITY;
                 for _ in 0..reps {
                     let start = std::time::Instant::now();
-                    let _ = try_q6k_matvec_tiled_range(&data, stride, 0, $rows, &xs, &mut out);
+                    let _ =
+                        try_q6k_matvec_tiled_range(&data, stride, 0, $rows, &xs, &mut out, None);
                     best = best.min(start.elapsed().as_secs_f64());
                 }
                 std::hint::black_box(&out);
@@ -3781,9 +3980,11 @@ mod tests {
                     for _ in 0..3 {
                         let start = std::time::Instant::now();
                         let ok = if format == "q4k" {
-                            try_q4k_matvec_tiled_range(data, stride, 0, count, &xs, &sums, &mut out)
+                            try_q4k_matvec_tiled_range(
+                                data, stride, 0, count, &xs, &sums, &mut out, None,
+                            )
                         } else {
-                            try_q6k_matvec_tiled_range(data, stride, 0, count, &xs, &mut out)
+                            try_q6k_matvec_tiled_range(data, stride, 0, count, &xs, &mut out, None)
                         };
                         assert!(ok, "{format} tiled kernel refused");
                         best = best.min(start.elapsed().as_secs_f64());
@@ -3872,8 +4073,9 @@ mod tests {
                 let mut best = f64::INFINITY;
                 for _ in 0..reps {
                     let start = std::time::Instant::now();
-                    let _ =
-                        try_q4k_matvec_tiled_range(&data, stride, 0, $rows, &xs, &sums, &mut out);
+                    let _ = try_q4k_matvec_tiled_range(
+                        &data, stride, 0, $rows, &xs, &sums, &mut out, None,
+                    );
                     best = best.min(start.elapsed().as_secs_f64());
                 }
                 std::hint::black_box(&out);
@@ -3929,9 +4131,9 @@ mod tests {
         let mut one = vec![0.0_f32; 32 * rows];
         let reps = 5;
         let (lo, hi) = two.split_at_mut(16 * rows);
-        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_lo, &sums_lo, lo);
-        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_hi, &sums_hi, hi);
-        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs32, &sums32, &mut one);
+        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_lo, &sums_lo, lo, None);
+        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_hi, &sums_hi, hi, None);
+        try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs32, &sums32, &mut one, None);
         let mut worst = 0.0_f32;
         for (a, b) in two.iter().zip(one.iter()) {
             let tol = 1e-3 + 1e-4 * a.abs();
@@ -3943,13 +4145,13 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..reps {
             let (lo, hi) = two.split_at_mut(16 * rows);
-            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_lo, &sums_lo, lo);
-            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_hi, &sums_hi, hi);
+            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_lo, &sums_lo, lo, None);
+            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs_hi, &sums_hi, hi, None);
         }
         let t16 = start.elapsed().as_secs_f64() / reps as f64;
         let start = std::time::Instant::now();
         for _ in 0..reps {
-            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs32, &sums32, &mut one);
+            try_q4k_matvec_tiled_range(&data, stride, 0, rows, &xs32, &sums32, &mut one, None);
         }
         let t32 = start.elapsed().as_secs_f64() / reps as f64;
         println!(
@@ -4010,7 +4212,7 @@ mod tests {
         let mut out = vec![0.0_f32; 16 * rows];
         let start = std::time::Instant::now();
         for _ in 0..reps {
-            try_q6k_matvec_tiled_range(&data, stride, 0, rows, &xs, &mut out);
+            try_q6k_matvec_tiled_range(&data, stride, 0, rows, &xs, &mut out, None);
         }
         let tiled = start.elapsed().as_secs_f64();
         let mut totals = [0.0_f32; 16];
@@ -4370,7 +4572,7 @@ mod tests {
         for _ in 0..5 {
             let start = std::time::Instant::now();
             let ok = try_q4k_matvec_tiled_range::<B>(
-                matrix, stride, first_row, count, &xs, &sums, &mut out,
+                matrix, stride, first_row, count, &xs, &sums, &mut out, None,
             );
             assert!(ok, "tiled kernel must accept this shape");
             std::hint::black_box(&out);
@@ -4492,6 +4694,7 @@ mod tests {
                     &xs,
                     &sums,
                     &mut out,
+                    None,
                 );
                 assert!(ok, "tiled kernel must accept this shape");
                 std::hint::black_box(&out);

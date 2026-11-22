@@ -3099,3 +3099,137 @@ default, same policy as the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE`.
 
 Still off by default: it changes the summation order, and that is a numeric-policy decision, not a
 speed one.
+## Re-measuring the query-blocked attention kernel at depth ~380 — 2026-11-22
+
+Premise check for "a tile-resident micro-GEMM with the softmax fused". That kernel already exists:
+`attend_rows_shared` behind `VIPERA_ATTN_QBLOCK`, QBLOCK = 4, which scores a block of queries against
+each K row once and folds the block's V rows with `fold_chunk_block` (block online softmax). The open
+question was only whether a wider tile could beat the ~150 GFLOPS attention reaches.
+
+The box was shared while this ran (load average 3.0; chunk totals ~1020 ms against the 617 ms quiet
+window at the top of this session's B0), so only same-run ratios are quoted. i5-11300H,
+`taskset -c 2-7`, `VIPERA_THREADS=6`, Qwen2.5-1.5B Q4_K_M f16 KV, 520-token prompt, one run per arm
+interleaved, 5 pairs, medians:
+
+| chunk | attention off | attention on | delta | total off | total on | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| 3 (positions 256-383) | 89.96 ms | 59.72 ms | -33.6% | 1013.46 ms | 1025.50 ms | +1.2% |
+| 4 (positions 384-511) | 95.77 ms | 72.32 ms | -24.5% | 1022.07 ms | 1034.57 ms | +1.2% |
+
+Attention falls by a quarter and the chunk does not move: Q4_K is ~70% of the chunk and its
+drift between arms is larger than the ~23 ms saved. This reproduces the 2026-11-20 4k result at
+shallower depth (7.7% of attention, ~1-3% of a chunk, inside noise).
+
+Roofline for the wider kernel: for the 6-head group, `score_block_single` issues 96 FMAs (8 lanes)
+plus 16 f16 conversions per key row, ~6.9 MAC/instruction against AVX2's 8, so the dot already runs
+at ~85% of the f32 FMA peak. Attention's 150 GFLOPS is ~76% of that peak (~198 GFLOPS on 4 cores at
+3.1 GHz); a wider micro-GEMM has at most ~1.3x on the arithmetic, ~1% of a chunk at this depth, and
+cannot reach the 2.5x the 4k entry said would be needed. **NO-GO**; `VIPERA_ATTN_QBLOCK` stays off
+(regroups the softmax sums, does not pay end to end).
+
+## Prefill with 128-token chunks: where the 617 ms goes — 2026-11-22
+
+A 2050-token prompt (205 × the quick brown fox, ctx 4096, `--max-tokens 1`, `VIPERA_THREADS=8`,
+`VIPERA_PROFILE_STEP=1`) gives 16 full chunks plus a 2-token tail, so the per-shape table prints.
+The box was shared (chunk 16 at 995 ms against the 617 ms quiet chunks at the top of this file), so
+quote the shares and the same-run ratios, not the absolute times.
+
+Phase split, first and last full chunks:
+
+| chunk | total | q4k | q6k | attention |
+|---|---:|---:|---:|---:|
+| 1 (depth 128) | 813.8 ms | 584.7 (72%) | 160.7 (20%) | 50.8 (6%) |
+| 16 (depth 2048) | 994.6 ms | 602.3 (61%) | 163.0 (16%) | 211.6 (21%) |
+
+Per-shape table, 16 chunk passes, b128 (ms per pass and per call):
+
+| shape | calls/pass | ms/pass | ms/call |
+|---|---:|---:|---:|
+| Q4_K 8960×1536 (gate+up) | 56 | 370.6 | 6.618 |
+| Q6_K 1536×8960 (down, 14 layers) | 14 | 146.0 | 10.430 |
+| Q4_K 1536×8960 (down, 14 layers) | 14 | 116.7 | 8.337 |
+| Q4_K 1536×1536 (wq, wo) | 56 | 88.9 | 1.587 |
+| Q4_K 256×1536 (wk and 14 layer v) | 42 | 26.0 | 0.618 |
+| Q6_K 256×1536 (14 layer v) | 14 | 9.3 | 0.667 |
+| Q6_K 151936×1536 b1 (output) | 1 | 7.6 | 7.611 (25.2 GB/s) |
+
+The quiet-baseline q4k phase is 117 GMAC a chunk (32.6M MAC per layer-token × 28 × 128) in 441 ms,
+i.e. **530 GFLOPS**. The kernel's single-thread microbench is 77.3 GMAC/s (155 GFLOPS) on the gate/up
+shape, so four physical cores are worth ~620 GFLOPS and SMT adds the rest: at depth 2048, 8 threads
+run a chunk in 914.8/920.0 ms against 1142.4/1166.0 at 4 threads (1.25x), so the thread count is not
+the lever. In situ the product is at ~85% of the microbench ceiling; the named remainder is the
+tiled kernel's activation tile, built once per call on every participant (~0.03-0.06 ms at width
+1536, 0.37-0.47 ms at 8960, ~21 ms of CPU per thread per chunk ≈ 3% of a chunk), and sharing it
+needs a barrier.
+
+## One activation tile per product instead of one per participant — 2026-11-22
+
+Built as predicted above: the tiled Q4_K/Q6_K kernels used to build the same activation tile on every
+row participant (0.03-0.06 ms per call at width 1536, 0.37-0.47 ms at 8960). The activation-prep
+workers now fill one `SharedTile` for the product, each worker filling the entries its run owns, and
+`Pool::prepare`'s existing join is the happens-before the row workers need — no extra barrier.
+`VIPERA_SHARED_TILE=0` restores the per-participant build; both paths write the same bytes.
+
+Ceiling first, by making the build loop a no-op in a throwaway build: a 2048-token prefill's chunk 16
+fell 759.2 -> 712.2 ms with q4k 452.6 -> 425.3 and q6k 125.7 -> 109.0, i.e. ~44 ms of a 770 ms chunk
+(5.7%).
+
+Measured change, 5 interleaved pairs (shared on, off), 520-token prompt, chunk 4, i5-11300H,
+`VIPERA_THREADS=8`, `--max-tokens 1`:
+
+| pair | q4k on | q4k off | q6k on | q6k off | total on | total off |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 448.51 | 463.67 | 117.36 | 128.59 | 645.34 | 670.87 |
+| 2 | 451.67 | 467.36 | 122.53 | 132.10 | 656.14 | 680.14 |
+| 3 | 458.03 | 476.79 | 120.30 | 130.23 | 659.68 | 687.51 |
+| 4 | 457.96 | 475.79 | 120.89 | 130.99 | 660.24 | 689.48 |
+| 5 | 463.57 | 477.50 | 119.05 | 131.19 | 665.78 | 692.30 |
+| median | 457.96 | 475.79 | 120.30 | 130.99 | 659.68 | 687.51 |
+
+Medians: q4k **-3.8%**, q6k **-8.2%**, chunk **-4.0%**, and the direction held in 5/5 pairs. That is
+about 28 ms of a 660 ms chunk, three quarters of the 44 ms ceiling.
+
+The rest is not the per-call allocation, which was the next candidate. `shared_tile_allocation_cost`
+(ignored measurement test) times `SharedTile::new`: **16.4 us** for the 35x8 down tile and **2.4 us**
+for the 6x8 width-1536 tile. A chunk makes 28 down and ~112 smaller tiles, so the whole chunk's
+tile allocations are ~0.7 ms, 0.1% of it. A reuse path (taking the buffer back out of the `Arc` and
+caching it on the pool) would not clear the 3% gate, so it was not written; the two runs of the
+ceiling probe just landed on different box loads (759 ms against the 605-634 ms quiet baseline).
+
+Result is bit-identical: `a_shared_activation_tile_is_bit_identical_to_a_local_one` fills a tile in
+two disjoint runs and compares the kernel's output with the local build byte for byte. Whole crate:
+85 lib tests pass, `cargo clippy -p vipera-backend-cpu --all-targets -- -D warnings` clean,
+`cargo fmt --all --check` clean. The box was shared (chunk 4 at ~660 ms against the 617 ms quiet
+chunks earlier), so the ratios are the result.
+
+**Two hypotheses closed by this run.** `VIPERA_ATTN_QBLOCK` at depth 2048 cuts attention
+186.3→174.5 and 189.0→174.4 ms (−6.4% and −7.7%), chunk 914.2→902.6 and 916.0→898.8 ms (−1.3% and
+−1.9%): the −25% seen at depth ~380 does not hold at depth, and the chunk win is under the 3% gate,
+so it stays off. The 8-token tail is not expensive: a fresh 8-token chunk is 128.2 ms total (q4k
+94.3) at 8 threads, and 415.4 ms at one thread. The 552 ms the 520-token B0 run showed for its
+8-token fifth chunk was the shared box and depth, not the batch width. No code change at that point; prefill is at
+~85% of its measured kernel ceiling, and the only lever left in the tree was the tile-sharing barrier,
+which the shared-tile entry above then built.
+
+## Quiet-box 128-token chunk baseline — 2026-11-22
+
+The box was measured first: 4.3% CPU busy over 3 s, load average 0.35, 94.8% idle, governor
+`powersave`, some cores at 3.9 GHz. Three runs of the 520-token prompt (52 × the quick brown fox,
+chunk 1 = 128 tokens), `VIPERA_THREADS=8`, `--max-tokens 1`, `--ctx 1024`, seed 1. This is the
+current default, i.e. with the shared activation tile on.
+
+| chunk | total | q4k | q6k | attention | elem | proj | rope | kv_write | rest |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 (depth 128) | 605.63 | 440.34 (73%) | 114.28 (19%) | 39.68 (7%) | 3.34 | 1.71 | 4.26 | 3.36 | 1.16 |
+| 2 (depth 256) | 625.58 | 436.38 (70%) | 112.59 (18%) | 62.80 (10%) | 3.40 | 1.73 | 4.31 | 3.41 | 1.04 |
+| 3 (depth 384) | 628.00 | 438.60 (70%) | 114.33 (18%) | 60.96 (10%) | 3.38 | 1.84 | 4.40 | 3.48 | 1.00 |
+| 4 (depth 512) | 633.73 | 439.77 (69%) | 114.87 (18%) | 65.05 (10%) | 3.36 | 1.77 | 4.40 | 3.48 | 0.99 |
+
+Medians of the three runs; the spread was 598.5-640.4 on chunk 1 and 627.6-653.0 on chunk 4 (the
+last run was 3-6% slow on every phase, governor ramp rather than one kernel). `norm` is 0.00
+because `VIPERA_PREP_FUSION` folds it into the preparation job.
+
+Against the 617.5 / 657.2 / 661.2 / 667.4 ms recorded at the start of this session (same prompt,
+same thread count, quiet box, per-participant tiles), the current build is 1.9% / 4.8% / 5.0% / 5.1%
+cheaper, which is the shared tile plus the usual run-to-run spread. Use the table above as the
+quiet reference for the next prefill change; the earlier numbers belong to the old tile path.
