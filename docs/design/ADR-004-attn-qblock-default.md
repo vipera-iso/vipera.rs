@@ -1,8 +1,9 @@
 # ADR-004: `VIPERA_ATTN_QBLOCK` có thành default không
 
-Status: **Rejected — giữ opt-in.** Lợi ích chỉ 3.2% ở chunk ngắn, 0.87% ở độ sâu, đổi lại là một
-hồi quy likelihood có hệ thống trên cả 5 văn bản và output khác đi. Không có dòng code nào đổi trong
-commit này; switch giữ nguyên.
+Status: **Rejected — giữ opt-in.** Lợi ích chỉ 3.2% ở chunk ngắn, 0.87% ở độ sâu; trên corpus 16
+văn bản (26,073 token được chấm) delta NLL trung bình là +0.000218 nats/token (+0.0086%), 8/16 xấu
+đi, 8/16 tốt lên — không còn là hồi quy nhất quán như 5 văn bản đầu, nhưng cũng không phải cải thiện.
+Output vẫn khác đi. Không có dòng code nào đổi trong commit này; switch giữ nguyên.
 Ngày: 2026-11-22 · Owner: *cần điền* · Supersedes: none
 
 ## 1. Context — vì sao câu hỏi này mở lại
@@ -52,25 +53,37 @@ còn bị chi phối bởi việc đọc K/V mà bởi phần số học trên m
 theo từng vị trí — mà chia sẻ hàng không cắt được. Đây là suy luận từ hai điểm đo, không phải một
 phép phân rã đã làm.
 
-## 4. Cái giá — hồi quy likelihood có hệ thống
+## 4. Cái giá — NLL trên corpus 16 văn bản
 
-`vipera score` (chunk 64 token qua đúng đường prefill), five texts, mean NLL mỗi token:
+`vipera score` (chunk 64 token qua đúng đường prefill), 16 văn bản, 26,073 token được chấm, cùng
+binary/box, một lần mỗi arm; `base_repeat` trùng khớp `base` từng văn bản đến 1e-6 nats (đo
+determinism của chính đường đo).
 
-| văn bản | token | default | `QBLOCK=1` | Δ | % |
+| văn bản | token | default | `QBLOCK=1` | Δ nats | % |
 |---|---:|---:|---:|---:|---:|
-| popcount / rays | 986 | 2.826631 | 2.829815 | +0.003184 | +0.113% |
-| gate and up shapes | 1697 | 3.084673 | 3.084879 | +0.000206 | +0.007% |
-| the ggml bind | 2444 | 2.637364 | 2.638594 | +0.001230 | +0.047% |
-| ADR-001 opening | 1492 | 3.324126 | 3.328024 | +0.003898 | +0.117% |
-| ADR-003 §2 | 1494 | 3.581916 | 3.586679 | +0.004763 | +0.133% |
+| `code_engine.txt` | 2167 | 2.081623 | 2.081391 | −0.000232 | −0.011% |
+| `code_simd.txt` | 3186 | 1.995802 | 1.996672 | +0.000870 | +0.044% |
+| `conduct.txt` | 901 | 1.467963 | 1.476067 | +0.008104 | +0.552% |
+| `constraints.txt` | 2694 | 3.146751 | 3.144952 | −0.001799 | −0.057% |
+| `contributing.txt` | 683 | 2.949100 | 2.953552 | +0.004452 | +0.151% |
+| `design_adr3.txt` | 3296 | 2.938148 | 2.936934 | −0.001214 | −0.041% |
+| `design_spec.txt` | 735 | 3.456324 | 3.454851 | −0.001473 | −0.043% |
+| `license_apache.txt` | 1794 | 0.185466 | 0.182424 | −0.003042 | −1.640% |
+| `license_mit.txt` | 222 | 0.256879 | 0.254909 | −0.001970 | −0.767% |
+| `readme.txt` | 2625 | 2.606336 | 2.605167 | −0.001169 | −0.045% |
+| `security.txt` | 421 | 3.374109 | 3.373122 | −0.000987 | −0.029% |
+| `t1.txt` | 1697 | 3.084673 | 3.084879 | +0.000206 | +0.007% |
+| `t2.txt` | 2444 | 2.637364 | 2.638594 | +0.001230 | +0.047% |
+| `t3.txt` | 1492 | 3.324126 | 3.328024 | +0.003898 | +0.117% |
+| `t4.txt` | 1494 | 3.581916 | 3.586679 | +0.004763 | +0.133% |
+| `vi_vn.txt` | 222 | 3.036606 | 3.019003 | −0.017603 | −0.580% |
 
-Trung bình **+0.002656 nats/token (+0.086%)**, và **5/5 cùng chiều**: văn bản kém khả năng hơn. Khác
-với FMA epilogue (ADR-003), ở đó 2 văn bản tốt lên và 3 xấu đi quanh 0 — ở đây không có văn bản nào
-tốt lên. Một hồi quy nhỏ nhưng nhất quán như vậy không phải nhiễu, và nó đi ngược chiều với mục tiêu
-của engine.
+Trung bình có trọng số token: **+0.000218 nats/token (+0.0086%)**, 8/16 văn bản xấu đi, 8/16 tốt
+lên. Kết quả này **thay thế** kết luận "5/5 cùng chiều" từ corpus 5 văn bản trước đó: với mẫu lớn
+hơn, QBLOCK không cho thấy hồi quy NLL có hệ thống, mà là nhiễu nhỏ quanh 0.
 
-Ngoài ra 16 token greedy từ prompt 524 token **khác nhau** giữa hai arm. Đây là thay đổi số học, không
-phải tối ưu thuần tuý: `attend_rows_shared` gộp lại các tổng softmax theo nhóm khác.
+Điều không đổi: 16 token greedy từ prompt 524 token **khác nhau** giữa hai arm. Đây vẫn là thay đổi
+số học, không phải tối ưu thuần tuý: `attend_rows_shared` gộp lại các tổng softmax theo nhóm khác.
 
 ## 5. Options
 
@@ -84,8 +97,8 @@ phải tối ưu thuần tuý: `attend_rows_shared` gộp lại các tổng soft
 
 **A — giữ opt-in.** Lý do theo thứ tự:
 
-1. **Hồi quy nhất quán**: 5/5 văn bản xấu đi, +0.086% NLL trung bình, không văn bản nào tốt lên. Một
-   thay đổi có hướng rõ ràng như vậy không được biện minh bằng 3.2% thời gian chunk.
+1. **Không có lợi ích chất lượng bù lại**: trên 16 văn bản, delta NLL là +0.0086% (nhiễu quanh 0,
+   không nhất quán). QBLOCK không mua chất lượng; nó chỉ mua thời gian ở một số ngữ cảnh.
 2. **Lợi ích nhỏ nhất ở chỗ đắt nhất**: prefill ở 2.4k vị trí tốn 854 ms/chunk và chỉ được 0.87%;
    chỗ được 3.2% là chunk ngắn, nơi 650 ms/chunk là mức thấp nhất trong ngày.
 3. **Không phải lever duy nhất**: phần số học mà hai điểm đo cho thấy là giới hạn thật (scores, `exp`,
@@ -117,7 +130,7 @@ phải tối ưu thuần tuý: `attend_rows_shared` gộp lại các tổng soft
 |---|---|---|
 | 1 | chunk 4, 5 cặp xen kẽ | ≥ 3% | đạt: −3.2% |
 | 2 | chunk 24 (2.4k vị trí), 3 cặp | ≥ 3% | **trượt**: −0.87% |
-| 3 | mean NLL trên 5 văn bản | **không tăng** | **trượt**: +0.086%, 5/5 xấu |
+| 3 | mean NLL trên corpus lớn | không hồi quy có hệ thống | **mờ**: +0.0086% trên 16 văn bản, 8/16 xấu, 8/16 tốt; không còn là hồi quy nhất quán |
 | 4 | token greedy | ghi rõ nếu đổi | đổi |
 | 5 | decode | không chậm hơn | không áp dụng: `entries == 1`, đường này không chạy |
 
@@ -129,8 +142,9 @@ Hai tiêu chí trượt là đủ để từ chối; không có chuyện lấy t
   share của slice. Nếu một kernel khác nhanh lên lần nữa, số ở mục 3 phải đo lại trước khi trích dẫn.
 - **Hai điểm đo**: ngắn (370 vị trí) và sâu (2.4k). Giữa hai điểm đó chưa đo; giả thuyết "lợi ích nhỏ
   dần theo độ sâu" là suy luận từ hai điểm, không phải đường cong.
-- **NLL trên văn bản cùng repo**: domain hẹp, và perplexity không nhìn thấy khác biệt hành vi. Nó đủ
-  để bác một hồi quy nhất quán, không đủ để kết luận hai arm tương đương.
+- **NLL trên văn bản cùng repo/mix**: corpus 16 văn bản (26k token) đã làm mất tính "5/5 cùng chiều"
+  của mẫu 5 văn bản, nhưng domain vẫn hẹp và perplexity không nhìn thấy khác biệt hành vi. Kết luận
+  đúng là "không có hồi quy nhất quán trên corpus này", không phải "tương đương".
 
 ## 10. Non-goals
 

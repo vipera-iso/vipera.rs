@@ -2101,18 +2101,13 @@ chunk 854.45 ms to 847.02 ms (**−0.87%**). Four times less row traffic buys a 
 at 370 positions, so at depth the per-row arithmetic — scores, `exp`, the weighted sum — is what the
 kernel is spending its time on, not the reads. That is measured as two points, not as a curve.
 
-`docs/design/ADR-004-attn-qblock-default.md` takes the decision from here: the switch stays opt-in,
-because the same five-text `score` run puts mean NLL **up 0.086% with all five texts worse**
-(+0.003184, +0.000206, +0.001230, +0.003898, +0.004763 nats/token), and the win is smallest exactly
-where a chunk costs the most.
-
-It is still not bit-identical (it regroups the softmax sums, as the position-chunked kernel and
-`VIPERA_ATTN_GQA_SHARE` already do by default), and this time the change is visible: `vipera score`
-puts mean NLL at **+0.11%** (2.826631 to 2.829815) on the 986-token text and **+0.05%** on the
-2444-token one, both in the direction of *less* likely text, and 16 greedy tokens from the 524-token
-prompt come out different. That is a decision with a cost on both sides — 3.2% of a chunk against a
-small likelihood regression — so the default is unchanged here and the numbers are waiting for an
-owner's call.
+`docs/design/ADR-004-attn-qblock-default.md` takes the decision from here: the switch stays opt-in.
+A 16-text, 26,073-token `vipera score` corpus (same binary/box, one arm each, `base_repeat` identical
+to `base` to 1e-6 nats) tightened the earlier 5-text picture: mean NLL moved **+0.000218 nats/token
+(+0.0086%)**, 8/16 worse, 8/16 better — noise around zero, not the 5/5 regression the small sample
+showed. The speed side is unchanged: −3.2% chunk at short depth, −0.87% at 2.4k positions, smallest
+where prefill costs the most. It is still not bit-identical (it regroups the softmax sums) and 16
+greedy tokens from the 524-token prompt come out different, so the default stays off.
 
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 
