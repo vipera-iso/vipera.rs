@@ -1962,7 +1962,16 @@ keeps its `s`-then-`g` order and its single `buf` add, so the switch was all the
 | two rows by four halves | 152.3 / 150.3 GFLOPS | 169.9 / 168.7 GFLOPS | median 786.81 ms (−1.7%, 4 of 5 pairs) |
 
 −1.7% is under the 3% gate and the change is ~100 dense lines, so it was removed rather than kept
-behind the switch. The useful part is what the two arms say together: **cutting a third of the loads
+behind the switch. Nine interleaved pairs on a quieter box (load 1.04) then failed to reproduce it
+at all: 791.65 ms median off against 792.87 ms on, +0.15%, five of nine pairs either way, median
+paired difference +0.89 ms. The 1.7% was noise, which is what a five-pair result just above the
+machine's run-to-run spread will sometimes be — the reason the gate asks for ratios and repeats, not
+for one good afternoon.
+
+Scale folded into the activation scales would have cut one multiply out of the epilogue without
+changing the loop, but it cannot be bit-identical: `(cvt·scale)·dx` and `cvt·(dx·scale)` round
+twice in a different order. It also saves nothing — `dxs` depends on the block and the half, so
+building `dx·scale` costs exactly the multiply it removes. The useful part is what the two arms say together: **cutting a third of the loads
 changes nothing**, so the load ports were never the binding constraint. What the
 `VIPERA_PROBE_NO_WEIGHT` arm was buying is the hoist — with the broadcast replaced by a constant the
 compiler keeps one `set1` per group instead of eight, one per row, and the loop gets shorter, which
@@ -1978,6 +1987,27 @@ Clean baseline for the rows above, same binary and model, commit `35f265f`: chun
 2953-token prompt at `B=128`: gate+up 8.07 ms/call, Q6_K down 11.46, Q4_K down 8.91, wo 1.95. Twenty
 minutes earlier, with no code change, the same command gave 985–1043 ms — that is the machine, and
 the reason every row above is a ratio.
+
+### The epilogue is worth 5% of a chunk, at the cost of the arithmetic — 2026-11-22
+
+The probes above put the tiled kernel's epilogue at +33% (8960×1536) and +42% (1536×8960) when it
+is removed entirely, and that arithmetic is required: `sum over s of (cvt(acc_s)·scale_s·dx_s -
+sum_s·min_s)`. The patch under discussion folds it into four vector ops instead of six,
+`fma(cvt(acc)·dxv, scale, facc)` then `fnmadd(sumv, min, ..)`, and it delivers:
+
+| arm | 8960×1536, 1T | 1536×8960, 1T | chunk 4, 5 interleaved pairs |
+|---|---:|---:|---:|
+| multiply-then-add (default) | 153.4 / 149.5 GFLOPS | 165.2 / 173.2 GFLOPS | median 785.16 ms |
+| fused epilogue (`VIPERA_Q4K_FMA_EPI=1`) | 165.1 / 167.4 (+8.6%) | 193.4 / 189.3 (+12%) | median 746.04 ms (−5.0%, 5 of 5 pairs) |
+
+That is the largest measured chunk gain since the tiled kernel landed, and it is **not** a perf
+change: the fused form rounds once where the two multiplies round twice. Sixteen greedy tokens from
+the 524-token prompt come out different between the arms (49 vs 69 bytes of text), so this moves
+output, not just the last bit of an intermediate. It is therefore behind a switch that defaults off,
+with the numbers recorded here; flipping the default needs an ADR and a quality comparison (fixed
+prompts, and preferably perplexity against the exact path), not a benchmark row. `q4k_tiled_range_matches_batch_vnni`
+still passes on the fused arm — tolerance parity with the row kernel is unchanged, which is why this
+is a policy decision rather than a correctness bug.
 
 ### Prompt-lookup at short context — wins on repeats, and a fallback for prose — 2026-11-22
 

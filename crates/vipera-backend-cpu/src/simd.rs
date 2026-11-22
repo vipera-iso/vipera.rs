@@ -87,9 +87,9 @@ use std::arch::x86_64::{
     _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256,
     _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps,
     _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32, _mm256_sub_ps, _mm512_add_ps,
-    _mm512_cvtepi32_ps, _mm512_dpbusd_epi32, _mm512_loadu_ps, _mm512_loadu_si512, _mm512_mul_ps,
-    _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps, _mm512_setzero_si512,
-    _mm512_storeu_ps, _mm512_sub_epi32, _mm512_sub_ps,
+    _mm512_cvtepi32_ps, _mm512_dpbusd_epi32, _mm512_fmadd_ps, _mm512_fnmadd_ps, _mm512_loadu_ps,
+    _mm512_loadu_si512, _mm512_mul_ps, _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps,
+    _mm512_setzero_ps, _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_epi32, _mm512_sub_ps,
 };
 
 use vipera_core::gguf::GgmlType;
@@ -2287,6 +2287,15 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     true
 }
 
+/// Whether the tiled Q4_K kernel folds the epilogue's scale and minimum with a fused multiply-add.
+///
+/// Off by default; `VIPERA_Q4K_FMA_EPI=1` turns it on. Read per call so one process can measure both
+/// arms, and because the switch is about arithmetic, not speed: the fused form is faster and gives
+/// different tokens.
+fn tiled_fma_enabled() -> bool {
+    std::env::var_os("VIPERA_Q4K_FMA_EPI").is_some()
+}
+
 /// Tiled Q4_K matvec range: `count` rows from `first_row`, `B` quantized
 /// activations, token-major `out` holding `B * count` values.
 ///
@@ -2389,6 +2398,16 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
             }
         }
         let low_mask = _mm256_set1_epi8(0x0f);
+        // Fused epilogue: `fma(cvt(acc) * dxv, scale, facc)` followed by `fnmadd(sumv, min, ..)` is
+        // four vector ops per row and sub-block where the multiply-then-add form is six. Measured
+        // +8.6% (8960x1536) and +12% (1536x8960) GFLOPS single thread, and -5.0% of a prefill chunk
+        // over five interleaved pairs.
+        //
+        // It also changes the arithmetic: the fused form rounds once where the two multiplies round
+        // twice, and 16 greedy tokens from the 524-token prompt came out different. Off by default
+        // for that reason; `VIPERA_Q4K_FMA_EPI=1` turns it on, and flipping the default needs an ADR
+        // and a quality comparison, not a perf change.
+        let fused_epi = tiled_fma_enabled();
         // Window-major accumulation: one row window of `ROW_WIN` rows keeps its partial sums in
         // `buf` (ROW_WIN * stride_cols floats, L2-resident) across every block, and `out` is written
         // once per window. The old order walked all rows per 256-column slab and parked partials in
@@ -2473,6 +2492,17 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                                 acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
                             {
                                 let row = band + t;
+                                if fused_epi {
+                                    let scaled = _mm512_mul_ps(_mm512_cvtepi32_ps(*acc_slot), dxv);
+                                    let sum = _mm512_fmadd_ps(
+                                        scaled,
+                                        _mm512_set1_ps(scale_f[row][s]),
+                                        *facc_slot,
+                                    );
+                                    *facc_slot =
+                                        _mm512_fnmadd_ps(sumv, _mm512_set1_ps(min_f[row][s]), sum);
+                                    continue;
+                                }
                                 let main = _mm512_mul_ps(
                                     _mm512_mul_ps(
                                         _mm512_cvtepi32_ps(*acc_slot),
