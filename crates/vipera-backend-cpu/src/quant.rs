@@ -969,7 +969,12 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
                 && stride.is_multiple_of(*block)
         })
         .map(|block| {
-            std::sync::Arc::new(crate::simd::SharedTile::new(stride / block, B.div_ceil(16)))
+            let (blocks, halves) = (stride / block, B.div_ceil(16));
+            if tile_reuse_enabled() {
+                pool.take_tile(blocks, halves)
+            } else {
+                std::sync::Arc::new(crate::simd::SharedTile::new(blocks, halves))
+            }
         });
     let owned: std::sync::Arc<[OwnedActivation; B]> =
         if B >= PARALLEL_PREP_MIN_BATCH && threads > 1 && parallel_prep_enabled() {
@@ -982,13 +987,28 @@ pub(crate) fn matvec_pooled_batch<'d, const B: usize>(
                 OwnedActivation::from_buffer_fused(ty, buffer, cols, fusion, entry)
             }))
         };
-    pool.fill_batch(ty, data, stride, threads, &owned, out, tiled)
+    let result = pool.fill_batch(ty, data, stride, threads, &owned, out, tiled.clone());
+    if tile_reuse_enabled()
+        && let Some(tile) = tiled
+    {
+        pool.recycle_tile(tile);
+    }
+    result
 }
 
 /// Whether a wide Q4_K batch builds its activation tile once in the prep workers.
 ///
 /// On by default; `VIPERA_SHARED_TILE=0` restores the per-participant build. The two paths write
 /// the same bytes, so the result is bit-identical either way.
+/// Whether a product's tile buffer is taken from and returned to the pool's free list.
+///
+/// On by default; `VIPERA_TILE_REUSE=0` allocates a fresh tile per product, which is what the
+/// one-per-product build did before the free list existed. The two are numerically identical.
+fn tile_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("VIPERA_TILE_REUSE").is_ok_and(|value| value.trim() == "0"))
+}
+
 fn shared_tile_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("VIPERA_SHARED_TILE").is_ok_and(|value| value.trim() == "0"))

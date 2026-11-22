@@ -2179,6 +2179,8 @@ pub(crate) struct SharedTile {
     act: std::cell::UnsafeCell<Vec<i8>>,
     blocks: usize,
     halves: usize,
+    /// The prefix of `act` this product needs; the buffer itself may be a reused larger one.
+    len: usize,
 }
 
 // SAFETY: `fill_entries` is called only with the disjoint entry ranges of one `prepare`, and
@@ -2186,12 +2188,39 @@ pub(crate) struct SharedTile {
 unsafe impl Sync for SharedTile {}
 
 impl SharedTile {
+    fn needed(blocks: usize, halves: usize) -> usize {
+        blocks * halves * 64 * 16 * 4
+    }
+
     pub(crate) fn new(blocks: usize, halves: usize) -> Self {
+        let len = Self::needed(blocks, halves);
         Self {
-            act: std::cell::UnsafeCell::new(vec![0_i8; blocks * halves * 64 * 16 * 4]),
+            act: std::cell::UnsafeCell::new(vec![0_i8; len]),
             blocks,
             halves,
+            len,
         }
+    }
+
+    /// Wrap a buffer recycled from an earlier product. The bytes a later `fill_entries`
+    /// overwrites are the bytes that matter; columns past the batch are multiplied by a zero
+    /// scale on every participant, so stale bytes there cannot reach an output.
+    pub(crate) fn from_buffer(mut buffer: Vec<i8>, blocks: usize, halves: usize) -> Self {
+        let len = Self::needed(blocks, halves);
+        if buffer.len() < len {
+            buffer.resize(len, 0);
+        }
+        Self {
+            act: std::cell::UnsafeCell::new(buffer),
+            blocks,
+            halves,
+            len,
+        }
+    }
+
+    /// Give the buffer back to the pool's free list.
+    pub(crate) fn into_buffer(self) -> Vec<i8> {
+        self.act.into_inner()
     }
 
     pub(crate) fn blocks(&self) -> usize {
@@ -2226,7 +2255,7 @@ impl SharedTile {
     /// The built tile. Only call after every `fill_entries` for this product has returned.
     fn bytes(&self) -> &[i8] {
         // SAFETY: the caller's happens-before is documented on the type.
-        unsafe { &*self.act.get() }
+        unsafe { &(&*self.act.get())[..self.len] }
     }
 }
 
@@ -3776,6 +3805,83 @@ mod tests {
             std::hint::black_box(SharedTile::new(6, 8));
         }
         println!("{:?} per 6x8 tile", start.elapsed() / 2000);
+    }
+
+    /// A recycled buffer must not leak the previous product into the next one, including when the
+    /// next product is narrower and only a prefix of the old buffer is used.
+    #[test]
+    fn a_recycled_tile_does_not_leak_the_previous_product() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x0bad_c0de_1234_5678);
+        let rows = 40usize;
+        let big_cols = 512usize;
+        let big_blocks = big_cols / 256;
+        let big: Vec<u8> = (0..rows)
+            .flat_map(|_| q4k_row(&mut rng, big_blocks))
+            .collect();
+        let big_stride = big_blocks * 144;
+        let small_cols = 256usize;
+        let small: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, 1)).collect();
+        let small_stride = 144;
+        let activations = |count: usize, cols: usize, rng: &mut Rng| {
+            let source: Vec<Vec<f32>> = (0..count)
+                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                .collect();
+            let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+            let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+            (xs_vec, sums_vec)
+        };
+        let (first, first_sums) = activations(32, big_cols, &mut rng);
+        let (second, second_sums) = activations(32, small_cols, &mut rng);
+        let first_xs: [&QuantizedX; 32] = std::array::from_fn(|e| &first[e]);
+        let first_s: [&[f32]; 32] = std::array::from_fn(|e| first_sums[e].as_slice());
+        let tile = SharedTile::new(big_blocks, 2);
+        let q: Vec<&[i8]> = first_xs.iter().map(|x| x.q.as_slice()).collect();
+        tile.fill_entries(0, &q[..16]);
+        tile.fill_entries(16, &q[16..]);
+        let mut out = vec![0.0_f32; 32 * rows];
+        assert!(try_q4k_matvec_tiled_range(
+            &big,
+            big_stride,
+            0,
+            rows,
+            &first_xs,
+            &first_s,
+            &mut out,
+            Some(&tile)
+        ));
+        // Same buffer, narrower product, different activations.
+        let recycled = SharedTile::from_buffer(tile.into_buffer(), 1, 2);
+        let second_xs: [&QuantizedX; 32] = std::array::from_fn(|e| &second[e]);
+        let second_s: [&[f32]; 32] = std::array::from_fn(|e| second_sums[e].as_slice());
+        let q: Vec<&[i8]> = second_xs.iter().map(|x| x.q.as_slice()).collect();
+        recycled.fill_entries(0, &q[..16]);
+        recycled.fill_entries(16, &q[16..]);
+        let mut shared = vec![0.0_f32; 32 * rows];
+        let mut local = vec![0.0_f32; 32 * rows];
+        assert!(try_q4k_matvec_tiled_range(
+            &small,
+            small_stride,
+            0,
+            rows,
+            &second_xs,
+            &second_s,
+            &mut shared,
+            Some(&recycled)
+        ));
+        assert!(try_q4k_matvec_tiled_range(
+            &small,
+            small_stride,
+            0,
+            rows,
+            &second_xs,
+            &second_s,
+            &mut local,
+            None
+        ));
+        assert_eq!(shared, local, "a recycled tile changed a result");
     }
 
     /// Same byte-for-byte check as the Q4_K shared tile, on the Q6_K kernel.

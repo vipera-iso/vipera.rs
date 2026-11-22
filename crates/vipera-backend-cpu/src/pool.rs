@@ -75,6 +75,10 @@ pub(crate) struct Pool<'d, const B: usize> {
     workers: Vec<Sender<Task<'d, B>>>,
     replies: Receiver<(usize, Vec<f32>)>,
     prepared: Receiver<PrepReply>,
+    /// Activation-tile buffers handed back after their product, so a chunk's ~196 products do not
+    /// allocate a megabyte each. A chunk alternates two sizes (width 1536 and 8960), and a buffer
+    /// that has served the larger one keeps its capacity for both.
+    tiles: std::sync::Mutex<Vec<Vec<i8>>>,
 }
 
 impl<'d, const B: usize> Pool<'d, B> {
@@ -97,6 +101,33 @@ impl<'d, const B: usize> Pool<'d, B> {
             workers,
             replies,
             prepared,
+            tiles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take a tile buffer for this product, or allocate one when the free list is empty.
+    pub(crate) fn take_tile(&self, blocks: usize, halves: usize) -> Arc<SharedTile> {
+        let buffer = self
+            .tiles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop();
+        Arc::new(match buffer {
+            Some(buffer) => SharedTile::from_buffer(buffer, blocks, halves),
+            None => SharedTile::new(blocks, halves),
+        })
+    }
+
+    /// Return a tile's buffer to the free list, if this was the last reference to it.
+    pub(crate) fn recycle_tile(&self, tile: Arc<SharedTile>) {
+        let Ok(tile) = Arc::try_unwrap(tile) else {
+            return;
+        };
+        let buffer = tile.into_buffer();
+        let mut free = self.tiles.lock().unwrap_or_else(|error| error.into_inner());
+        // Two shapes per chunk; a handful of buffers covers them without holding memory forever.
+        if free.len() < 4 {
+            free.push(buffer);
         }
     }
 
