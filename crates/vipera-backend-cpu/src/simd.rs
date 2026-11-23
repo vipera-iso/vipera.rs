@@ -99,7 +99,7 @@ use crate::quant::{BatchActivation, QuantizedX, f16_to_f32};
 /// Tile halves the tiled kernels keep activation coefficients for: 16
 /// activations per half, and batches up to 64 wide run four halves against one
 /// weight pass.
-const MAX_HALVES: usize = 8;
+const MAX_HALVES: usize = 16;
 
 /// Whether this CPU can run the kernels below. Cached by the standard library.
 pub fn available() -> bool {
@@ -2270,7 +2270,12 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     out: &mut [f32],
     tile: Option<&SharedTile>,
 ) -> bool {
-    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(144) || B == 0 || B > 128 {
+    if !vnni512_available()
+        || stride == 0
+        || !stride.is_multiple_of(144)
+        || B == 0
+        || B > MAX_HALVES * 16
+    {
         return false;
     }
     let blocks = stride / 144;
@@ -2658,7 +2663,12 @@ pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
     out: &mut [f32],
     tile: Option<&SharedTile>,
 ) -> bool {
-    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(210) || B == 0 || B > 128 {
+    if !vnni512_available()
+        || stride == 0
+        || !stride.is_multiple_of(210)
+        || B == 0
+        || B > MAX_HALVES * 16
+    {
         return false;
     }
     let blocks = stride / 210;
@@ -5468,6 +5478,39 @@ mod tests {
     /// whether binding that kernel is worth a second toolchain.
     ///
     /// Single-threaded on purpose: ggml's figure in `vipera-ggml` is
+    /// Does a wider prefill batch pay? Same shapes and kernel as the B=128 bench below, one arm each.
+    #[test]
+    #[ignore]
+    fn q4k_tiled_batch_width_128_against_256() {
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        for &(rows, blocks) in &[(8960usize, 6usize), (1536, 35)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let mut rng = Rng(0x5eed_0d07_0000_0009);
+            let row = q4k_row(&mut rng, blocks);
+            let matrix: Vec<u8> = (0..rows).flat_map(|_| row.clone()).collect();
+            for &b in &[128usize, 256] {
+                let (seconds, gflops) = if b == 128 {
+                    let s = time_tiled::<128>(&matrix, stride, blocks, 0, rows);
+                    (s, 2.0 * (rows * cols * 128) as f64 / s / 1e9)
+                } else {
+                    let s = time_tiled::<256>(&matrix, stride, blocks, 0, rows);
+                    (s, 2.0 * (rows * cols * 256) as f64 / s / 1e9)
+                };
+                println!(
+                    "q4_K {:>6}x{:<5} x {b:>3} rows 1T: {:>7.1} ms  {:>6.1} GFLOPS",
+                    rows,
+                    cols,
+                    seconds * 1e3,
+                    gflops
+                );
+            }
+        }
+    }
+
     /// single-threaded too, and the pool would hide the kernel difference.
     #[test]
     #[ignore]
