@@ -1113,7 +1113,8 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     if !exact_dot_requested()
         && crate::tiled::tiled_enabled()
         && crate::simd::vnni512_available()
-        && (crate::tiled::TILE_MIN_BATCH..=128).contains(&B)
+        // The activation tile is `B / 16` halves wide, and `MAX_HALVES` is what bounds `B` here.
+        && (crate::tiled::TILE_MIN_BATCH..=crate::simd::max_batch()).contains(&B)
     {
         if ty == GgmlType::Q4K
             && let Some(xs) = activation.quantized()

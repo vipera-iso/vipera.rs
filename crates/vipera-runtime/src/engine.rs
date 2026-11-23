@@ -788,12 +788,14 @@ impl<F: ForwardPass> Engine<F> {
         // paid once per chunk. Measured over the whole run on the reference prompt, same binary,
         // five interleaved runs of a 512-position prompt: 7968 ms at one KV block per chunk, 7370
         // at 64, 6989 at 128. The kernel itself does not get faster with the wider batch, so this
-        // is overhead removal, not a wider tile, and 128 is simply `MAX_BATCH`.
+        // is overhead removal, not a wider tile, and the number here is simply the CPU backend's
+        // `MAX_BATCH`. It moved from 128 to 256 with that constant: the tiled Q4_K kernel measured
+        // 10-14% less time per token at B=256 than at B=128 (docs/benchmarks.md, 2026-11-23).
         //
         // When another turn shares the engine the chunk stays one block: the wider one is paid for
         // by whoever is waiting for a decode step.
         let prefill_chunk = if turns.len() == 1 {
-            tokens_per_block.max(128)
+            tokens_per_block.max(256)
         } else {
             tokens_per_block
         };

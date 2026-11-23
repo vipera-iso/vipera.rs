@@ -27,7 +27,7 @@ use crate::quant::{self, Fusion, f16_to_f32, f32_to_f16};
 /// prefill weight reuse (`ceil(n/16)` reads vs `ceil(n/8)`) — the linear-streaming win from the
 /// llama.cpp tiled mul_mat paper's first step — for a few extra megabytes of scratch. The kernels
 /// spill registers at 16 but the weight read saved dominates on prefill.
-const MAX_BATCH: usize = 128;
+const MAX_BATCH: usize = 256;
 
 /// The numbers a forward pass needs, read from the file rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -840,10 +840,15 @@ impl CpuBackend {
         let mut rest: &mut [BatchEntry<'_>] = entries;
         let mut results: Vec<Vec<f32>> = Vec::with_capacity(size);
         while !rest.is_empty() {
+            // Only the widths `dispatch!` names exist, so a long prefill run takes whole 256-token
+            // passes and then the multiple-of-8 widths below it. A width of 256 is measured at
+            // 10-14% less time per token on the tiled Q4_K kernel (docs/benchmarks.md, 2026-11-23).
             let width = if rest.len() <= 8 {
                 rest.len()
+            } else if rest.len() >= MAX_BATCH {
+                MAX_BATCH
             } else {
-                (rest.len() & !7).min(MAX_BATCH)
+                (rest.len() & !7).min(128)
             };
             crate::profile::note_batch_width(width);
             let is_last_piece = rest.len() == width;
@@ -871,7 +876,7 @@ impl CpuBackend {
             }
             dispatch!(
                 1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
-                128,
+                128, 256,
             )?;
         }
         Ok(results)

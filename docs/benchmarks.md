@@ -3957,3 +3957,24 @@ Absolute GFLOPS are low because the box was loaded; the ratio is the point and i
 v, attn, gate, up` and the logits buffer (77.8 -> 155.6 MB at a 151,936-token vocabulary), widens the
 activation tile to 392 KB at 6 blocks, and needs a `run_batch_n::<256>` instantiation. Nothing here
 has been wired into the engine: only the cap (`MAX_HALVES`) and the bench exist on this branch.
+
+### The same width in the engine: 7% worse — 2026-11-23
+
+The kernel bench above says B=256 is 10-14% cheaper per token, so it was wired: `MAX_BATCH` 128 -> 256,
+a `run_batch_n::<256>` arm, `MAX_HALVES` 16, and the runtime's prefill chunk raised with it (its
+`tokens_per_block.max(128)` was the real cap, not `MAX_BATCH` — the profile showed 9 chunks either way
+until that line moved).
+
+Three interleaved pairs, Qwen2.5-1.5B Q4_K_M, ~1.1k prompt, sums over the chunk lines:
+
+| pair | 9 chunks of 128 | 5 chunks of 256 |
+|---|---:|---:|
+| 1 | 6341 ms | 6897 ms |
+| 2 | 6489 | 6938 |
+| 3 | 6641 | 6950 |
+
+**+7% slower.** The kernel gets cheaper per token and the engine gets slower, which puts the cost
+outside the kernel: at 6 blocks the activation tile is 393 KB against 196 KB, and every participant
+reads it for the whole product. The prefill chunk also stops matching the KV block, so the tail pass
+(98 tokens here) is a separate weight read. Not landed; the wiring lives on `perf/prefill-batch-256`
+as the measurement.

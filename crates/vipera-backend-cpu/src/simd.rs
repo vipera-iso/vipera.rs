@@ -101,6 +101,11 @@ use crate::quant::{BatchActivation, QuantizedX, f16_to_f32};
 /// weight pass.
 const MAX_HALVES: usize = 16;
 
+/// The widest batch the tiled kernels accept: one 16-activation tile half per 16 entries.
+pub(crate) const fn max_batch() -> usize {
+    MAX_HALVES * 16
+}
+
 /// Whether this CPU can run the kernels below. Cached by the standard library.
 pub fn available() -> bool {
     std::is_x86_feature_detected!("avx2")
