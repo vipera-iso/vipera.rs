@@ -4567,6 +4567,127 @@ mod tests {
         std::hint::black_box((&two, &one));
     }
 
+    /// Hai dạng microkernel cho cùng một 16x16 tile của Q4_K, đo cái nào nhanh hơn trên máy này.
+    ///
+    /// A giống kernel đang chạy: zmm là 16 *activation* x 4 cột của **một** hàng weight, nên mỗi
+    /// `dpbusd` cần một `vpbroadcastd` từ `wq` (64 broadcast cho 64 dot trong codegen gate).
+    /// B là dạng đã repack: zmm là 16 **hàng weight** x 4 code, activation broadcast từ bộ nhớ
+    /// (dạng `{1to16}` của `vpdpbusd`, nếu compiler gấp được) — một broadcast miễn phí thay vì một
+    /// lần load + broadcast mỗi dot.
+    ///
+    /// Số MAC như nhau (64 mỗi lệnh), nên thời gian nói thẳng cái nào trả tiền cho broadcast.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn repacked_gemm_form_against_the_broadcast_form() {
+        use std::arch::x86_64::*;
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const ROWS: usize = 16;
+        const GROUPS: usize = 64; // 256 cột / 4 code mỗi dword
+        let mut rng = Rng(0x5eed_0d08_0000_0001);
+        // A: weight theo (hàng, group) là một dword; activation theo (group, activation) là zmm.
+        let weights_dword: Vec<u32> = (0..ROWS * GROUPS).map(|_| rng.next() as u32).collect();
+        let acts: Vec<u8> = (0..GROUPS * 64).map(|_| rng.byte()).collect();
+        // B: weight đã repack thành zmm = 16 hàng x 4 code cho từng group.
+        let mut weights_packed = vec![0u8; GROUPS * 64];
+        for group in 0..GROUPS {
+            for row in 0..ROWS {
+                let dword = weights_dword[row * GROUPS + group].to_le_bytes();
+                weights_packed[group * 64 + row * 4..group * 64 + row * 4 + 4]
+                    .copy_from_slice(&dword);
+            }
+        }
+        // Intrinsics chỉ inline khi chính hàm mang `target_feature`; gọi chúng từ một hàm test
+        // thường thì mỗi lệnh thành một call và bench đo overhead (đo được 30 chu kỳ/lệnh).
+        #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+        unsafe fn run_a(words: *const u32, acts: *const u8, out: *mut i32, groups: usize) {
+            // SAFETY: the caller hands buffers of `ROWS * groups` words, `groups * 64` bytes and
+            // `ROWS` outputs.
+            unsafe {
+                let mut acc = [_mm512_setzero_si512(); ROWS];
+                for group in 0..groups {
+                    let codes = _mm512_loadu_si512(acts.add(group * 64).cast());
+                    for (row, slot) in acc.iter_mut().enumerate() {
+                        let word = std::ptr::read_unaligned(words.add(row * groups + group));
+                        *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word as i32), codes);
+                    }
+                }
+                for (row, value) in acc.iter().enumerate() {
+                    let mut lanes = [0_i32; 16];
+                    _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *value);
+                    *out.add(row) = lanes[0];
+                }
+            }
+        }
+        #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+        unsafe fn run_b(packed: *const u8, acts: *const u8, out: *mut i32, groups: usize) {
+            // SAFETY: the caller hands `groups * 64` bytes for both the packed weights and the
+            // activations, and `ROWS` outputs.
+            unsafe {
+                let mut acc = [_mm512_setzero_si512(); ROWS];
+                for group in 0..groups {
+                    let weight = _mm512_loadu_si512(packed.add(group * 64).cast());
+                    for (quad, slot) in acc.iter_mut().enumerate().take(16) {
+                        let act = _mm512_set1_epi32(std::ptr::read_unaligned(
+                            acts.add(group * 64 + quad * 4).cast::<i32>(),
+                        ));
+                        *slot = _mm512_dpbusd_epi32(*slot, weight, act);
+                    }
+                }
+                for (quad, value) in acc.iter().enumerate() {
+                    let mut lanes = [0_i32; 16];
+                    _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *value);
+                    *out.add(quad) = lanes[0];
+                }
+            }
+        }
+        let mut out_a = [0_i32; ROWS * 16];
+        let mut out_b = [0_i32; ROWS * 16];
+        // Mười sáu hàng weight, mỗi hàng một accumulator; `codes` của group được load một lần và
+        // dùng cho cả 16 hàng — đúng như kernel tiled đang chạy.
+        let mut form_a = || unsafe {
+            run_a(
+                weights_dword.as_ptr(),
+                acts.as_ptr(),
+                out_a.as_mut_ptr(),
+                GROUPS,
+            )
+        };
+        let mut form_b = || unsafe {
+            run_b(
+                weights_packed.as_ptr(),
+                acts.as_ptr(),
+                out_b.as_mut_ptr(),
+                GROUPS,
+            )
+        };
+        const ROUNDS: usize = 20_000;
+        let run = |body: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                body();
+            }
+            start.elapsed().as_secs_f64() / ROUNDS as f64
+        };
+        let a = run(&mut form_a);
+        let b = run(&mut form_b);
+        // 16 hàng x 256 cột x 16 activation, nhân 2 cho MAC.
+        let flops = 2.0 * (ROWS * 256 * 16) as f64;
+        println!(
+            "form A (broadcast per dot): {:>8.1} ns  {:>7.1} GFLOPS",
+            a * 1e9,
+            flops / a / 1e9
+        );
+        println!(
+            "form B (weight vector, mem broadcast): {:>8.1} ns  {:>7.1} GFLOPS  ({:+.1}%)",
+            b * 1e9,
+            flops / b / 1e9,
+            (a / b - 1.0) * 100.0
+        );
+    }
+
     fn q4k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
         let mut row = Vec::with_capacity(blocks * 144);
         for _ in 0..blocks {
