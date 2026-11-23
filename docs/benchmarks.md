@@ -4004,3 +4004,20 @@ products of 393 KB per chunk against 196 KB).
 
 What this means for the ik_llama.cpp gap: ik's pp512 implies ~806 GFLOPS over the same kind of
 cores, i.e. the same per-token compute. The batch width is not where the difference lives.
+
+#### Where the remaining per-token time goes — 2026-11-23
+
+pp512 (four chunks of 128), eight workers on eight CPUs, three runs: 2431 / 2501 / 2426 ms of chunk
+time, **204.7-211.1 tok/s**. Per chunk: q4k 416-424 ms, q6k 96-101, attention 39-64, everything else
+under 12.
+
+- q4k totals 1676 ms for 512 positions = 916 GFLOPS over four cores, or ~229 per core. A 512-bit
+  `dpbusd` on this part is double-pumped, so the ceiling at the ~4 GHz turbo is ~268 per core: the
+  kernel is at **87% of the instruction peak**, and 31% of the chunk is q6k plus attention.
+- SMT pays here. Four workers: 6900 / 6943 ms at 1.1k positions. Eight: 5654 / 5626 (-18%). The
+  `dpbusd` stream alternates with tile loads, and the sibling fills that latency. The default thread
+  count already takes every CPU the OS reports, so this is a description of the default, not a knob.
+
+For the ik_llama.cpp comparison, its pp512 of 268.7 tok/s implies ~280 GFLOPS per core at the same
+q4k share — at or above that ceiling. Before another kernel rewrite, re-run ik on this rig with the
+same worker count and the same prompt, because the number to beat may be a measurement, not a kernel.

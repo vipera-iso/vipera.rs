@@ -1041,9 +1041,14 @@ const PARALLEL_MIN_PRODUCT: usize = 1 << 18;
 /// Threads to split one `matvec` across, capped by the rows there are to fill.
 ///
 /// `VIPERA_THREADS` overrides the detected count. Hyper-threading reports twice the physical cores,
-/// and these kernels are memory-bound enough that the sibling threads do not always pay for their
-/// spawn, so being able to pin the count is worth one `std::env` read per process. The override is
-/// parsed once and cached; a value of `0` or nonsense falls back to the detected count.
+/// so the detected count puts a second worker on every sibling; being able to pin the count is
+/// worth one `std::env` read per process. The override is parsed once and cached; a value of `0` or
+/// nonsense falls back to the detected count.
+///
+/// On prefill the siblings do pay: at ~1.1k positions on the i5-11300H, four workers took 6900 and
+/// 6943 ms over two runs where eight took 5654 and 5626 (-18%). The Q4_K dot alternates `dpbusd`
+/// with tile loads, so the second thread per core fills latency the single thread leaves, which is
+/// why the default keeps every reported CPU (docs/benchmarks.md, 2026-11-23).
 pub(crate) fn thread_budget(rows: usize, product: usize) -> usize {
     if product < PARALLEL_MIN_PRODUCT {
         return 1;
