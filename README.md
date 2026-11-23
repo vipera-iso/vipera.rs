@@ -47,6 +47,34 @@ The shape behind those numbers: decode is a weight stream (Q4_K 19 ms and Q6_K 1
 step), prefill is attention, and prefill's remaining cost at 4k is the attention kernel rather than
 the matmuls. Each of those sentences is a measurement with a date, not a hypothesis.
 
+The attention read has since been acted on: a tiled flash-attention pass (online softmax over 32x64
+tiles, two AVX-512 GEMMs instead of a dot per key) cut the attention phase from 1455 to 695 ms at
+1.5k of history and from 6637 to 3464 ms at 3.7k, which is 13% of a 3.7k prefill chunk and takes
+prefill there from 140 to ~167 tok/s. It is in `perf/attn-tiled-gemm`, off the default path because
+regrouping the softmax flips a greedy token; `VIPERA_ATTN_GEMM=1` turns it on.
+
+### Repacking the weights, and what it is worth
+
+llama.cpp's prefill is measured here at 217-227 tok/s (512 tokens) against the engine's 172, and
+ik_llama.cpp at 268.7 / 199.4 tok/s at 512 / 4096 tokens against 209.6 / 140.3. Two explanations were
+carried for a while; both are now measured rather than assumed.
+
+- **Ubatch is not it.** Running ik_llama.cpp at `-ub 128`, 256 and 512 moves it by 3-8%, not 15-20%.
+- **The per-dot broadcast is not it either.** The tiled kernel spends one `vpbroadcastd` and one
+  scratch load per `vpdpbusd`, where ik_llama.cpp reads a packed `__m512i` of weights and broadcasts
+the activation instead. Both microkernels for the same 16x16 tile were timed against each other
+(`repacked_gemm_form_against_the_broadcast_form`): 496-507 GFLOPS broadcast, 366-508 repacked, a
+median of +0.3%, and the one -26% run was a load spike. The older `NO_WEIGHT` probe that suggested
++29%/+56% was pricing the compiler hoisting the load out of the loop, not the broadcast.
+
+What is left of the idea is the **unpack**, which the ledger already priced at 8.8% of the Q4_K phase:
+splitting the nibbles, unpacking twelve header bytes and converting four f16 values per row-block on
+every call. A tensor repacked at load removes that work, at 2.2x the bytes (i8 codes plus two f32 per
+sub-block, 320 against 144), so it is a trade the engine has not taken: it buys at most 5-6% of a
+prefill chunk and costs 2.2x the model's resident weights. Both numbers are in
+[`CONSTRAINTS.md`](CONSTRAINTS.md) under `Rejected` with the way they were measured, including the
+two ways the instrument lied first.
+
 ## Quick start
 
 Requires stable Rust (edition 2024, toolchain pinned by `rust-toolchain.toml`). No system libraries,
