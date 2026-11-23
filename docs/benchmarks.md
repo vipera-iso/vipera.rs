@@ -3847,3 +3847,53 @@ Not attempted here: the port itself. `iqk_gemm_kquants.cpp` is 5337 lines of per
 `iqk_quantize.cpp` another 12492, so this needs its own branch, a load-time repack with the GGUF path
 as fallback, and the usual gate. The target to beat is stated: prefill +15% at pp512, +19% at pp4096,
 bit-identity not required but a greedy-text check against the current path is.
+## Tiled attention: one GEMM for a query tile's scores, a second for its values — 2026-11-23
+
+Prefill's flat cost is the weight matvec (one read of 1.1 GB per 128-token chunk, ~900 GFLOPS on this
+box). What grows with prompt length is attention: 52 ms of the first chunk, 162 ms of the twelfth at
+1.5k tokens, so a long prompt is where the throughput goes. At 3.7k tokens attention was 6.6 s of a
+25.5 s prefill. The kernel behind `VIPERA_ATTN_GEMM`/`VIPERA_ATTN_QBLOCK` shared each K/V row across a
+block of queries but still scored it a dot at a time — the row traffic went away and the arithmetic
+did not, which is why it measured 7.7% off attention.
+
+This replaces the inner loop with two tile GEMMs, the layout llama.cpp's CPU tiled flash attention
+uses (`ggml/src/ggml-cpu/simd-gemm.h`, `GGML_FA_TILE_Q/KV 64`, MIT):
+
+- a `[Q_TILE x KV_TILE]` = `[32 x 64]` score tile from one `C += A*B` per query head, with the K rows
+  decoded once per tile into the `[head_dim][keys]` operand that GEMM wants;
+- the online softmax over the tile (vectorized exp already existed), then the value fold as a second
+  GEMM against the `[keys][head_dim]` V tile;
+- the score tile is zeroed per head, because the GEMM accumulates and the previous head's weights
+  were still in it.
+
+New kernels: `simd::gemm` (4 rows x 2 vectors of 16 lanes on AVX-512, masked tail, scalar fallback),
+`simd::f16_row_to_f32` and `simd::f16_row_to_f32_strided`.
+
+Measurement: Qwen2.5-1.5B Q4_K_M, `VIPERA_THREADS=8`, two release binaries (switch off and on)
+interleaved, `VIPERA_PROFILE_STEP=1`, prompt built from a repeated sentence so the token count is
+stable, sums of the `PROFILE chunk` lines. Load average 3-6, so ratios only.
+
+| prompt | test | off | on | |
+|---|---:|---:|---:|---:|
+| ~1.5k tokens | attention | 1455 ms | 695 ms | **-52%** (3/3) |
+| ~1.5k tokens | chunks | 9426 ms | 8793 ms | -6.7% (3/3) |
+| ~3.7k tokens | attention | 6637 ms | 3464 ms | **-48%** (5/5) |
+| ~3.7k tokens | chunks | 25479 ms | 22170 ms | -13.0% (5/5) |
+
+That is a 1.9x on the attention phase and 145 -> 167 tok/s of prefill at 3.7k tokens. Both totals are
+medians; the pair spread is 5-6% on this box.
+
+**Not bit-identical, and it shows.** The equivalence test (6 heads, 2 KV heads, head dim 64, causal
+tail) holds to 1e-5 against the per-entry kernel, but a 40-token greedy probe reads `1000 times` on
+the per-entry path and `100 times,` on this one, so the regrouping flips a near-tie token. The default
+is therefore unchanged; the tiled path stays behind the switch, same policy as the position-chunked
+kernel. The per-entry path is still bit-identical to the previous tree over 100 prompts (10-209 words,
+seeds 0-4, greedy, 4 tokens each).
+
+Two bugs this port found in its own new code, both worth a sentence because both were silent:
+
+- `_mm256_store_ps` into an 8-lane stack array segfaults; the unaligned form is the one that works on
+  a local.
+- `out.len() / stride` undercounts the slots of a strided transpose by one for the last rows of a
+  tile, which drops the final dim of those K rows and moved the answer by 0.5% with no other symptom.
+  The slot count is the ceiling.
