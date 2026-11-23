@@ -1086,6 +1086,88 @@ pub(crate) fn fill_rows(
     }
 }
 
+/// A Q4_K tensor repacked at load: signed codes plus the premultiplied sub-block factors.
+///
+/// 320 bytes per block against the file's 144, so a repacked model holds 2.2x its weights. That is
+/// the whole trade `VIPERA_REPACK=1` makes, and why it is off by default.
+struct PackedQ4K {
+    codes: Box<[i8]>,
+    scale_f: Box<[f32]>,
+    min_f: Box<[f32]>,
+    blocks: usize,
+}
+
+/// Whether the packed Q4_K path is wanted (`VIPERA_REPACK=1`).
+///
+/// Exactly `1`, unlike the `is_some()` switches elsewhere: this one doubles the resident weights, so
+/// `VIPERA_REPACK=0` has to mean off.
+fn repack_enabled() -> bool {
+    std::env::var("VIPERA_REPACK").is_ok_and(|value| value == "1")
+}
+
+/// Repack a Q4_K row set: split the nibbles, decode the header, and premultiply `d * scale` and
+/// `dmin * min` once instead of on every call.
+fn repack_q4k(data: &[u8], stride: usize) -> Option<Arc<PackedQ4K>> {
+    if stride == 0 || !stride.is_multiple_of(144) {
+        return None;
+    }
+    let blocks = stride / 144;
+    let rows = data.len().checked_div(stride)?;
+    if rows == 0 {
+        return None;
+    }
+    let mut codes = vec![0_i8; rows * blocks * 256];
+    let mut scale_f = vec![0.0_f32; rows * blocks * 8];
+    let mut min_f = vec![0.0_f32; rows * blocks * 8];
+    for row in 0..rows {
+        for b in 0..blocks {
+            let block = &data[row * stride + b * 144..row * stride + b * 144 + 144];
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales = &block[4..16];
+            for s in 0..8 {
+                let (scale, min) = q4k_scale_min(scales, s);
+                let at = (row * blocks + b) * 8 + s;
+                scale_f[at] = d * f32::from(scale);
+                min_f[at] = dmin * f32::from(min);
+            }
+            let out = &mut codes[(row * blocks + b) * 256..(row * blocks + b) * 256 + 256];
+            for j in 0..4 {
+                for k in 0..32 {
+                    let byte = block[16 + j * 32 + k];
+                    out[j * 64 + k] = (byte & 0x0f) as i8;
+                    out[j * 64 + 32 + k] = (byte >> 4) as i8;
+                }
+            }
+        }
+    }
+    Some(Arc::new(PackedQ4K {
+        codes: codes.into_boxed_slice(),
+        scale_f: scale_f.into_boxed_slice(),
+        min_f: min_f.into_boxed_slice(),
+        blocks,
+    }))
+}
+
+/// The packed copy of a tensor, built on first use and kept for the life of the process.
+///
+/// Keyed by the slice's address, length and stride: the engine holds one mmap for the life of the
+/// model, so a key's address cannot be reused for different weights. The mutex is only taken on the
+/// first call for a tensor (and on the lookup), never inside the kernel.
+fn packed_q4k(data: &[u8], stride: usize) -> Option<Arc<PackedQ4K>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(usize, usize, usize), Arc<PackedQ4K>>>> = OnceLock::new();
+    let key = (data.as_ptr() as usize, data.len(), stride);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().ok()?.get(&key).cloned() {
+        return Some(hit);
+    }
+    let packed = repack_q4k(data, stride)?;
+    cache.lock().ok()?.insert(key, Arc::clone(&packed));
+    Some(packed)
+}
+
 /// Fill `B * rows` results, reading each row once for all `B` activations.
 ///
 /// Rows are filled one at a time: two rows in flight was measured at 0% on this machine, because the
@@ -1115,6 +1197,27 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         && crate::simd::vnni512_available()
         && (crate::tiled::TILE_MIN_BATCH..=128).contains(&B)
     {
+        // The repacked path is the same kernel with the unpack moved to load time; it is preferred
+        // when asked for, and falls through to the file bytes if it cannot run.
+        if ty == GgmlType::Q4K
+            && repack_enabled()
+            && let Some(xs) = activation.quantized()
+            && let Some(packed) = packed_q4k(data, stride)
+            && crate::simd::try_q4k_packed_tiled_range(
+                &packed.codes,
+                &packed.scale_f,
+                &packed.min_f,
+                packed.blocks,
+                first_row,
+                count,
+                xs,
+                activation.sums(),
+                out,
+                tile,
+            )
+        {
+            return;
+        }
         if ty == GgmlType::Q4K
             && let Some(xs) = activation.quantized()
             && crate::simd::try_q4k_matvec_tiled_range(
@@ -1455,6 +1558,71 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// The repacked path has to produce exactly the tiled path's numbers: same codes, same
+    /// premultiplied factors, same order of operations. A tolerance here would hide the one kind of
+    /// bug a repack can introduce.
+    #[test]
+    fn repacked_q4k_matches_the_tiled_kernel_bit_for_bit() {
+        if !crate::simd::vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 16;
+        let blocks = 2;
+        let rows = 40;
+        let stride = blocks * 144;
+        let cols = blocks * 256;
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut data = Vec::with_capacity(rows * stride);
+        for _ in 0..rows {
+            for _ in 0..blocks {
+                data.extend_from_slice(&0x2c00_u16.to_le_bytes());
+                data.extend_from_slice(&0x2400_u16.to_le_bytes());
+                for _ in 0..12 {
+                    data.push((next() >> 24) as u8);
+                }
+                for _ in 0..128 {
+                    data.push((next() >> 32) as u8);
+                }
+            }
+        }
+        let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+            .map(|entry| {
+                let x: Vec<f32> = (0..cols)
+                    .map(|i| ((i * 31 + entry * 7) % 97) as f32 / 97.0 - 0.5)
+                    .collect();
+                (QuantizedX::new(&x), x_sums(&x))
+            })
+            .collect();
+        let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+        let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+        let mut plain = vec![0.0_f32; B * rows];
+        assert!(crate::simd::try_q4k_matvec_tiled_range::<B>(
+            &data, stride, 0, rows, &xs, &sums, &mut plain, None
+        ));
+        let packed = repack_q4k(&data, stride).expect("repacks");
+        let mut repacked = vec![0.0_f32; B * rows];
+        assert!(crate::simd::try_q4k_packed_tiled_range::<B>(
+            &packed.codes,
+            &packed.scale_f,
+            &packed.min_f,
+            packed.blocks,
+            0,
+            rows,
+            &xs,
+            &sums,
+            &mut repacked,
+            None
+        ));
+        assert_eq!(plain, repacked);
     }
 
     /// Whether a 512-bit VNNI Q4_K kernel is worth having for a decode batch of one.

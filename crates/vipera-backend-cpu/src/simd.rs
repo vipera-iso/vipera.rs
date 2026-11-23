@@ -2533,6 +2533,197 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
     }
 }
 
+/// Safe entry point for [`q4k_packed_tiled_range`]: the same tiled kernel over a row set that was
+/// repacked at load, or `false` when the shapes or the CPU do not allow it.
+///
+/// The repack decided the nibble split, the twelve header bytes and the two f16 conversions once, at
+/// load, so the hot loop carries none of them — the work `CONSTRAINTS.md` prices at 8.8% of the Q4_K
+/// phase. The arithmetic is the same and in the same order, so results match
+/// [`q4k_matvec_tiled_range`] bit for bit.
+pub(crate) fn try_q4k_packed_tiled_range<const B: usize>(
+    codes: &[i8],
+    scale_f: &[f32],
+    min_f: &[f32],
+    blocks: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) -> bool {
+    if !vnni512_available() || blocks == 0 || B == 0 || B > 128 {
+        return false;
+    }
+    let needed = (first_row + count) * blocks;
+    if codes.len() < needed * 256
+        || scale_f.len() < needed * 8
+        || min_f.len() < needed * 8
+        || out.len() != B.saturating_mul(count)
+    {
+        return false;
+    }
+    let cols = blocks * 256;
+    if xs.iter().any(|x| x.q.len() < cols || x.d.len() < cols / 32) {
+        return false;
+    }
+    // SAFETY: the lengths above match the kernel's contract and the CPU has been checked.
+    unsafe {
+        q4k_packed_tiled_range(
+            codes, scale_f, min_f, blocks, first_row, count, xs, sums, out, tile,
+        )
+    };
+    true
+}
+
+/// Tiled Q4_K matvec over repacked rows: [`q4k_matvec_tiled_range`] with the unpack moved to load
+/// time.
+///
+/// `codes` holds `rows * blocks * 256` signed codes in `0..16`, `scale_f` and `min_f` hold the
+/// pre-multiplied `d * scale` and `dmin * min` of each of the eight sub-blocks. Nothing in the band
+/// loop below reads a Qt block.
+///
+/// # Safety
+///
+/// The three packed slices must cover `(first_row + count) * blocks` blocks, every `xs[e].q` the row
+/// width, every `xs[e].d` and `sums[e]` one entry per 32-value group, and the CPU must support
+/// AVX-512F/BW/VNNI.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub(crate) unsafe fn q4k_packed_tiled_range<const B: usize>(
+    codes: &[i8],
+    scale_f: &[f32],
+    min_f: &[f32],
+    blocks: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) {
+    // SAFETY: the caller validated every length; the loads below stay inside them.
+    unsafe {
+        const ROW_WIN: usize = 32;
+        const BAND: usize = 8;
+        const COLS: usize = 16;
+        let halves = B.div_ceil(COLS);
+        debug_assert!(halves <= MAX_HALVES);
+        let stride_cols = halves * COLS;
+        let mut owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+                for b in 0..blocks {
+                    for (entry, x) in xs.iter().enumerate() {
+                        let half = entry / COLS;
+                        let col = entry % COLS;
+                        let chunk = x.q.as_ptr().add(b * 256);
+                        let base = (b * halves + half) * 64 * COLS * 4;
+                        for grp in 0..64 {
+                            std::ptr::copy_nonoverlapping(
+                                chunk.add(grp * 4),
+                                owned_act.as_mut_ptr().add(base + grp * 64 + col * 4),
+                                4,
+                            );
+                        }
+                    }
+                }
+                &owned_act
+            }
+        };
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
+        let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
+        for b in 0..blocks {
+            for entry in 0..B {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                for sub in 0..8 {
+                    let at = ((b * halves + half) * 8 + sub) * COLS + col;
+                    dxs[at] = xs[entry].d[b * 8 + sub];
+                    sumt[at] = sums[entry][b * 8 + sub];
+                }
+            }
+        }
+
+        let mut buf = vec![0.0_f32; ROW_WIN * stride_cols];
+        let mut win = 0;
+        while win < count {
+            let cnt = (count - win).min(ROW_WIN);
+            buf[..cnt * stride_cols].fill(0.0);
+            for b in 0..blocks {
+                let codes_ptr = codes.as_ptr();
+                let scale_ptr = scale_f.as_ptr();
+                let min_ptr = min_f.as_ptr();
+                for half in 0..halves {
+                    let half_act = act.as_ptr().add((b * halves + half) * 64 * COLS * 4);
+                    let dxs_ptr = dxs.as_ptr().add((b * halves + half) * 8 * COLS);
+                    let sumt_ptr = sumt.as_ptr().add((b * halves + half) * 8 * COLS);
+                    let mut band = 0;
+                    while band < cnt {
+                        let band_cnt = (cnt - band).min(BAND);
+                        let mut facc: [__m512; BAND] = [_mm512_setzero_ps(); BAND];
+                        for s in 0..8 {
+                            let mut acc: [__m512i; BAND] = [_mm512_setzero_si512(); BAND];
+                            for g in 0..8 {
+                                let grp = s * 8 + g;
+                                let codes_v =
+                                    _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
+                                for (t, slot) in acc.iter_mut().enumerate().take(band_cnt) {
+                                    let row = first_row + win + band + t;
+                                    let at = (row * blocks + b) * 256 + grp * 4;
+                                    let word = u32::from_le(std::ptr::read_unaligned(
+                                        codes_ptr.add(at) as *const u32,
+                                    ));
+                                    *slot = _mm512_dpbusd_epi32(
+                                        *slot,
+                                        _mm512_set1_epi32(word as i32),
+                                        codes_v,
+                                    );
+                                }
+                            }
+                            let dxv = _mm512_loadu_ps(dxs_ptr.add(s * COLS));
+                            let sumv = _mm512_loadu_ps(sumt_ptr.add(s * COLS));
+                            for (t, (acc_slot, facc_slot)) in
+                                acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
+                            {
+                                let row = first_row + win + band + t;
+                                let factor = (row * blocks + b) * 8 + s;
+                                let scale = *scale_ptr.add(factor);
+                                let minterm_factor = *min_ptr.add(factor);
+                                // Same two multiplies, then the subtract, in the same order as
+                                // `q4k_matvec_tiled_range`'s unfused epilogue.
+                                let main = _mm512_mul_ps(
+                                    _mm512_mul_ps(
+                                        _mm512_cvtepi32_ps(*acc_slot),
+                                        _mm512_set1_ps(scale),
+                                    ),
+                                    dxv,
+                                );
+                                let minterm = _mm512_mul_ps(sumv, _mm512_set1_ps(minterm_factor));
+                                *facc_slot =
+                                    _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
+                            }
+                        }
+                        for (t, value) in facc.iter().enumerate().take(band_cnt) {
+                            let slot = buf.as_mut_ptr().add((band + t) * stride_cols + half * COLS);
+                            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
+                        }
+                        band += band_cnt;
+                    }
+                }
+            }
+            for r in 0..cnt {
+                for entry in 0..B {
+                    out[entry * count + win + r] = buf[r * stride_cols + entry];
+                }
+            }
+            win += cnt;
+        }
+    }
+}
+
 /// Safe entry point for [`q6k_matvec_tiled_range`], as
 /// [`try_q4k_matvec_tiled_range`] is for Q4_K.
 pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
