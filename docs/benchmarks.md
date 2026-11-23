@@ -3767,3 +3767,40 @@ epilogue switch have landed since), not a different measurement.
 The engine is still behind at every length, but the gap is narrower than the 2026-11-15 table: 3-4%
 at 128, 10-11% at 512, 11-14% at 1024, 20-21% at 4096. Ratios are same-session; absolutes sit below
 the 2026-11-15 llama numbers on both sides, which is the box, not the engine.
+
+## Prefill against llama.cpp after the Q4_K band change — 2026-11-23
+
+The Q4_K tiled band lost its runtime row limit (`const N` band, PR #64), measured at -5.4% chunk and
+-6.9% on the Q4_K phase in 9 interleaved pairs. This re-runs the vipera ↔ llama.cpp prefill
+comparison on that tree, so the README rows can be checked against a tree that contains the change.
+
+Not a quiet box: load average 3.0 at the start and 6-7 by the end, and llama.cpp's own pp128 came back
+at 193.7 ± 22.4 t/s in the first round. Two llama-bench rounds and one serially-run vipera pass, so the
+ratios are the only thing worth reading, and even they carry a few percent.
+
+Machine/model:
+
+- CPU: 11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz, 4 cores / 8 threads
+- Model: `~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf` (Q4_K_M, 1.04 GiB)
+- llama.cpp: `/home/user/llama-latest/build/bin/llama-bench`, `e574a17` (build 466), `-ngl 0 -t 8 -r 3`
+- vipera: `perf/q4k-tiled-band-const` (`6586783`), `VIPERA_THREADS=8`, the `win_vs_llama` harness'
+
+| test | llama.cpp R1 | llama.cpp R2 | vipera | vipera / llama (R2) |
+|---|---:|---:|---:|---:|
+| pp64 | — | — | 200.1 tok/s | — |
+| pp128 | 193.73 ± 22.35 | 214.97 ± 4.58 | 209.6 tok/s | 0.98 |
+| pp512 | 203.09 ± 3.96 | 212.09 ± 1.88 | 199.3 tok/s | 0.94 |
+| pp1024 | 192.67 ± 1.26 | 198.69 ± 3.82 | 198.3 tok/s | 1.00 |
+| pp4096 | 152.72 ± 0.20 | 161.99 ± 0.95 | 140.3 tok/s | 0.87 |
+| decode ctx32 | — | — | 33.0 tok/s | — |
+
+Read: today's paired ratios (0.98 / 0.94 / 1.00 / 0.87) are closer than the 2026-11-23 paired entry
+above (0.93 / 0.89 / 0.90 / 0.80), but both sides of that entry lost 5-10% of absolute throughput to
+the load, so this is directional, not a replacement. The change itself is measured on the skewed
+side: -5.4% chunk in 9 pairs, so an expected prefill gain of that order, which is inside what the
+noise here can resolve. No README table was changed.
+
+Protocol trap, for whoever repeats this: `cargo test ... -- prefill` matches both `prefill_vs_decode`
+and `prefill_long_prompt`, and cargo runs them in parallel threads. Both tests saturate the SMT halves,
+so a parallel run returns roughly half throughput (74 tok/s at n=64) and looks like a regression. Pass
+`--test-threads=1`.
