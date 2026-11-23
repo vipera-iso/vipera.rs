@@ -3221,8 +3221,287 @@ pub(crate) unsafe fn q4k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32
     }
 }
 
+/// `out[i] = row[i]` read as `f16`, for every `i` the two slices share.
+///
+/// One key or value row of a KV tile, decoded once so the tile's GEMMs read `f32` unchanged.
+/// Safe to call: it uses the eight-lane conversion when the CPU has `f16c` and a value at a
+/// time otherwise.
+pub(crate) fn f16_row_to_f32(row: &[u8], out: &mut [f32]) {
+    use std::arch::x86_64::{_mm_loadu_si128, _mm256_cvtph_ps, _mm256_storeu_ps};
+    let length = row.len() / 2;
+    let keep = out.len().min(length);
+    let out = &mut out[..keep];
+    let values = out.len();
+    if values >= 8 && available() && std::is_x86_feature_detected!("f16c") {
+        // SAFETY: AVX2 and F16C were just detected, `row` holds `length` halves and `out` holds
+        // `values` of them, so every step below reads and writes inside both.
+        unsafe {
+            let input = row.as_ptr();
+            let target = out.as_mut_ptr();
+            let mut at = 0;
+            while at + 8 <= values {
+                _mm256_storeu_ps(
+                    target.add(at),
+                    _mm256_cvtph_ps(_mm_loadu_si128(input.add(at * 2).cast())),
+                );
+                at += 8;
+            }
+            while at < values {
+                let low = std::ptr::read_unaligned(input.add(at * 2).cast::<u16>());
+                target.add(at).write(f16_to_f32(low));
+                at += 1;
+            }
+        }
+        return;
+    }
+    for (slot, chunk) in out.iter_mut().zip(row.as_chunks::<2>().0) {
+        *slot = f16_to_f32(u16::from_le_bytes(*chunk));
+    }
+}
+
+/// `out[i * stride] = row[i]` read as `f16`: one key row written where a `[dim][rows]` operand
+/// wants it, so a tile of rows becomes the second operand of a score GEMM without a transpose
+/// pass over the tile.
+pub(crate) fn f16_row_to_f32_strided(row: &[u8], out: &mut [f32], stride: usize) {
+    use std::arch::x86_64::{_mm_loadu_si128, _mm256_cvtph_ps, _mm256_storeu_ps};
+    let length = row.len() / 2;
+    // Every write lands on `out[i * stride]`, so the row fits one value into each stride step: the
+    // slot count is the *ceiling* of the length over the stride. Truncating it drops the last dim
+    // of the rows whose base is more than a stride past the end, which is a silent wrong answer.
+    let slots = if stride == 0 {
+        0
+    } else {
+        out.len().div_ceil(stride).min(length)
+    };
+    if slots >= 8 && available() && std::is_x86_feature_detected!("f16c") {
+        // SAFETY: AVX2 and F16C were just detected; `row` holds `length` halves and every write
+        // below lands on `out[i * stride]` for `i < slots`, all inside `out`.
+        unsafe {
+            let input = row.as_ptr();
+            let target = out.as_mut_ptr();
+            let mut at = 0;
+            while at + 8 <= slots {
+                // The lane array is a stack local, so the store has to be the unaligned form:
+                // `_mm256_store_ps` faults on it, which is how this kernel first arrived.
+                let mut lanes = [0.0_f32; 8];
+                _mm256_storeu_ps(
+                    lanes.as_mut_ptr(),
+                    _mm256_cvtph_ps(_mm_loadu_si128(input.add(at * 2).cast())),
+                );
+                for (lane, value) in lanes.iter().enumerate() {
+                    target.add((at + lane) * stride).write(*value);
+                }
+                at += 8;
+            }
+            while at < slots {
+                let low = std::ptr::read_unaligned(input.add(at * 2).cast::<u16>());
+                target.add(at * stride).write(f16_to_f32(low));
+                at += 1;
+            }
+        }
+        return;
+    }
+    for at in 0..slots {
+        let chunk = &row[at * 2..at * 2 + 2];
+        out[at * stride] = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+}
+
+/// `C[m x n] += A[m x k] * B[k x n]`, with the row strides of `A` and `C` given.
+///
+/// `A` is `m` rows of `k` values every `a_row` values, `B` is `k` contiguous rows of `n`, and `C`
+/// is `m` rows of `n` every `c_row`: the shape a tile GEMM needs when its operands are slices of
+/// the attention buffers (a query head inside a chunk of positions, one head's output inside the
+/// chunk's output). Converts the register tile into 4 rows x 2 vectors of 16 lanes on AVX-512 and
+/// falls back to the plain triple loop otherwise.
+///
+/// Safe to call; it checks the extents itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    a_row: usize,
+    b: &[f32],
+    c: &mut [f32],
+    c_row: usize,
+) {
+    if m == 0 || k == 0 || n == 0 {
+        return;
+    }
+    let a_last = (m - 1) * a_row + k;
+    let c_last = (m - 1) * c_row + n;
+    assert!(
+        a.len() >= a_last && b.len() >= k * n && c.len() >= c_last,
+        "a {m}x{k} every {a_row}, b {k}x{n}, c {m}x{n} every {c_row} need {a_last}/{}/{c_last} values, got {}/{}/{}",
+        k * n,
+        a.len(),
+        b.len(),
+        c.len()
+    );
+    if std::is_x86_feature_detected!("avx512f") && n >= 16 && k >= 4 {
+        // SAFETY: AVX-512F was just detected and the extents were checked above; the kernel only
+        // reads and writes inside them.
+        unsafe { gemm_avx512(m, k, n, a, a_row, b, c, c_row) };
+        return;
+    }
+    for i in 0..m {
+        let arow = &a[i * a_row..][..k];
+        let crow = &mut c[i * c_row..][..n];
+        for (j, target) in crow.iter_mut().enumerate() {
+            let column = &b[j..];
+            let mut total = *target;
+            for (offset, weight) in arow.iter().enumerate() {
+                total += weight * column[offset * n];
+            }
+            *target = total;
+        }
+    }
+}
+
+/// # Safety
+///
+/// AVX-512F, and the extents [`gemm`] checks: `a` holds `(m-1)*a_row + k` values, `b` `k*n`, `c`
+/// `(m-1)*c_row + n`.
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_avx512(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    a_row: usize,
+    b: &[f32],
+    c: &mut [f32],
+    c_row: usize,
+) {
+    use std::arch::x86_64::{
+        __mmask16, _mm512_mask_loadu_ps, _mm512_mask_storeu_ps, _mm512_mask3_fmadd_ps,
+        _mm512_set1_ps,
+    };
+    // SAFETY: the caller checked the extents; every pointer below stays inside `a`, `b` and `c`.
+    unsafe {
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let cp = c.as_mut_ptr();
+        let mut i = 0;
+        while i + 4 <= m {
+            let a0 = ap.add(i * a_row);
+            let a1 = a0.add(a_row);
+            let a2 = a1.add(a_row);
+            let a3 = a2.add(a_row);
+            let c0 = cp.add(i * c_row);
+            let c1 = c0.add(c_row);
+            let c2 = c1.add(c_row);
+            let c3 = c2.add(c_row);
+            let mut j = 0;
+            while j < n {
+                let lanes = (n - j).min(16);
+                let mask = if lanes == 16 {
+                    u16::MAX
+                } else {
+                    (1_u16 << lanes) - 1
+                };
+                let mask: __mmask16 = mask;
+                let mut s0 = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, c0.add(j));
+                let mut s1 = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, c1.add(j));
+                let mut s2 = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, c2.add(j));
+                let mut s3 = _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, c3.add(j));
+                for step in 0..k {
+                    let values =
+                        _mm512_mask_loadu_ps(_mm512_setzero_ps(), mask, bp.add(step * n + j));
+                    s0 = _mm512_mask3_fmadd_ps(_mm512_set1_ps(*a0.add(step)), values, s0, mask);
+                    s1 = _mm512_mask3_fmadd_ps(_mm512_set1_ps(*a1.add(step)), values, s1, mask);
+                    s2 = _mm512_mask3_fmadd_ps(_mm512_set1_ps(*a2.add(step)), values, s2, mask);
+                    s3 = _mm512_mask3_fmadd_ps(_mm512_set1_ps(*a3.add(step)), values, s3, mask);
+                }
+                _mm512_mask_storeu_ps(c0.add(j), mask, s0);
+                _mm512_mask_storeu_ps(c1.add(j), mask, s1);
+                _mm512_mask_storeu_ps(c2.add(j), mask, s2);
+                _mm512_mask_storeu_ps(c3.add(j), mask, s3);
+                j += lanes;
+            }
+            i += 4;
+        }
+        // Fewer than four rows left: one row at a time, so the tile always uses its full width.
+        while i < m {
+            let arow = ap.add(i * a_row);
+            let crow = cp.add(i * c_row);
+            for j in 0..n {
+                let mut total = *crow.add(j);
+                for step in 0..k {
+                    total += *arow.add(step) * *bp.add(step * n + j);
+                }
+                *crow.add(j) = total;
+            }
+            i += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The tiled GEMM against the plain triple loop, over the shapes the attention kernel asks
+    /// for: a score tile that lands on the vector width, one that does not, a single row, and the
+    /// strided `A` and `C` a head inside a chunk's buffers gives it.
+    #[test]
+    fn gemm_matches_the_triple_loop_at_every_shape_the_attention_tiles_take() {
+        let mut rng = Rng(0x6e_11_00_00_00_00_0a_01);
+        let shapes = [
+            (1_usize, 1_usize, 1_usize),
+            (1, 16, 16),
+            (3, 64, 5),
+            (9, 64, 64),
+            (9, 64, 17),
+            (32, 128, 64),
+            (32, 128, 128),
+            (7, 128, 64),
+            (4, 5, 3),
+        ];
+        for (m, k, n) in shapes {
+            let a_row = k + 3;
+            let c_row = n + 5;
+            let a: Vec<f32> = (0..(m - 1) * a_row + k)
+                .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let seed: Vec<f32> = (0..(m - 1) * c_row + n)
+                .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut expected = seed.clone();
+            for i in 0..m {
+                for j in 0..n {
+                    let mut total = expected[i * c_row + j];
+                    for step in 0..k {
+                        total += a[i * a_row + step] * b[step * n + j];
+                    }
+                    expected[i * c_row + j] = total;
+                }
+            }
+            let mut actual = seed.clone();
+            super::gemm(m, k, n, &a, a_row, &b, &mut actual, c_row);
+            for (at, (want, got)) in expected.iter().zip(&actual).enumerate() {
+                let tolerance = 1e-5 * want.abs().max(1.0);
+                assert!(
+                    (want - got).abs() <= tolerance,
+                    "{m}x{k}x{n} at {at}: {want} against {got}"
+                );
+            }
+            for (row, value) in actual.iter().enumerate() {
+                let column = row % c_row;
+                if column >= n {
+                    assert_eq!(
+                        *value, seed[row],
+                        "{m}x{k}x{n}: wrote past the row at {row}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Reading an `f16` row in place must give the bits that decoding it into `f32` and calling
     /// the `f32` kernels gives. The attention path relies on this: it compares against the decoded
     /// oracle bit for bit, so an inexact conversion or a different reduction tree would show up as

@@ -3517,15 +3517,28 @@ fn attend(
 /// spills the accumulators to L2, where the V pass pays for them again.
 const QBLOCK: usize = 4;
 
-/// Whether a chunk's attention shares each K/V row across a block of queries.
+/// Queries and key/value rows one tile of the shared-history attention kernel handles: a `[Q_TILE
+/// x KV_TILE]` score tile, `Q_TILE` query rows, and one decode of the `KV_TILE` K and V rows that
+/// the score and value GEMMs read.
+const Q_TILE: usize = 32;
+const KV_TILE: usize = 64;
+
+/// Whether a chunk's attention runs the tiled kernel: one decode of `KV_TILE` K and V rows per
+/// query tile, the scores of all `Q_TILE` queries out of one GEMM per head, and the value fold out
+/// of a second one.
 ///
 /// **Off unless `VIPERA_ATTN_GEMM` or `VIPERA_ATTN_QBLOCK` is set to `1`, `true`, `on` or `yes`.**
-/// Measured at 4k on the i5-11300H, `VIPERA_ATTN_QBLOCK=1` took attention from 435-445 ms to
-/// 399-411 ms of a chunk, 7.7%, and a chunk from 1280 ms to 1261-1273 ms, which was inside that
-/// ledger's own 8-15% window spread: the sharing removes the row traffic and leaves the
-/// arithmetic, and attention is already bound by that. Off by default because it regroups the
-/// softmax sums - within rounding (~1e-7) of the per-entry kernel, not bit-identical, the policy
-/// the position-chunked kernel and `VIPERA_ATTN_GQA_SHARE` follow.
+/// The per-row version of this kernel measured 7.7% off attention and nothing off a chunk; the
+/// tile GEMM is what makes the sharing pay. On the i5-11300H with a 3.7k-token prompt, five
+/// interleaved pairs: attention 6637 -> 3464 ms (-48%) and a chunk set 25479 -> 22170 ms (-13%);
+/// at 1.5k, attention 1455 -> 695 ms (-52%) and the chunk set -6.7%. That is the shape of a cost
+/// that grows with depth, which is why it shows up at long prompts and not at short ones.
+///
+/// Off by default because it regroups the softmax sums and the GEMM reorders them further: within
+/// rounding (~1e-7) of the per-entry kernel on the test shapes, not bit-identical, and on a real
+/// model that is enough to flip a greedy token (the 40-token probe reads `1000 times` on the
+/// per-entry path and `100 times,` on this one). Same policy as the position-chunked kernel and
+/// `VIPERA_ATTN_GQA_SHARE`: the bit-exact path stays the default until the owner says otherwise.
 fn attention_qblock_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3593,65 +3606,132 @@ fn attend_rows_shared(
     let layer_bytes = kv[0].layout.bytes_per_row(width);
     let order = AttentionSwitches::from_env().order;
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let blocks = entries.div_ceil(QBLOCK);
+    // One worker per tile of queries: the tile is what shares a decode of the history, so a split
+    // inside one would hand two workers the same rows to decode.
+    let blocks = entries.div_ceil(Q_TILE);
     let workers = workers.min(blocks).max(1);
 
-    let block_rows = crate::simd::GROUP_ROWS;
+    let group = shape.heads / shape.kv_heads.max(1);
     let run = |first: usize, end: usize, slot_out: &mut [f32]| -> Result<(), ViperaError> {
         let rows = end - first;
         let mut m = vec![f32::NEG_INFINITY; rows * heads];
         let mut d = vec![0.0_f32; rows * heads];
         let mut o = vec![0.0_f32; rows * query];
-        let mut block_scores = vec![0.0_f32; heads * block_rows];
-        let mut key_bases = [0_usize; crate::simd::GROUP_ROWS];
-        let mut value_bases = [0_usize; crate::simd::GROUP_ROWS];
-        let history = positions[first..end].iter().copied().max().unwrap_or(0);
+        // One KV tile decoded for the GEMMs: K as the `[head_dim][keys]` operand the score GEMM
+        // reads, V as the `[keys][head_dim]` operand the value GEMM reads, and the score tile the
+        // two share (it becomes the weights the value GEMM multiplies).
+        let mut keys_f32 = vec![0.0_f32; KV_TILE * head_dim];
+        let mut values_f32 = vec![0.0_f32; KV_TILE * head_dim];
+        let mut scores = vec![0.0_f32; Q_TILE * KV_TILE];
+        let mut key_bases = [0_usize; KV_TILE];
         let storage = kv[0].storage;
 
-        // One walk of the history per block of positions, feeding every query of the block: the
-        // K and V rows are decoded and read once, and each query folds the same sixteen rows into
-        // its own running (max, sum, weighted V).
-        let mut start = 0;
-        while start < history {
-            let stop = (start + block_rows).min(history);
-            let mut pending = 0;
-            kv[0].for_each_row_range(
-                order,
-                layer,
-                layer_bytes,
-                start,
-                stop,
-                |_position, base| {
-                    key_bases[pending] = base;
-                    value_bases[pending] = kv[0].value_row(order, base, layer_bytes);
-                    pending += 1;
-                    Ok(())
-                },
-            )?;
-            for slot in 0..rows {
-                // The rows at or past this query's own position are its future: the block is a
-                // prefix of what it may see, so the allowed rows are a slice of the gathered ones.
-                let seen = positions[first + slot];
-                let allowed = (0..pending).take_while(|row| start + row < seen).count();
-                if allowed == 0 {
+        // One walk of the history per tile of queries and keys: the K and V rows are decoded once
+        // into the tile, the scores of all `Q_TILE` queries come out of one GEMM per head, and the
+        // value fold is the second GEMM. The per-row dot kernels this replaces read the same rows
+        // and paid a call and a scatter per row per head.
+        for tile in (0..rows).step_by(Q_TILE) {
+            let tile_end = (tile + Q_TILE).min(rows);
+            let width = tile_end - tile;
+            // A run's positions increase, so the tile's last one has its longest history.
+            let history = positions[first + tile_end - 1];
+            for kv_head in 0..kv_heads {
+                let head_first = (kv_head * group).min(heads);
+                let head_last = ((kv_head + 1) * group).min(heads);
+                if head_first >= head_last {
                     continue;
                 }
-                let heads_slice = slot * heads..(slot + 1) * heads;
-                fold_chunk_block(
-                    storage,
-                    &key_bases[..allowed],
-                    &value_bases[..allowed],
-                    &q[(first + slot) * query..][..query],
-                    shape,
-                    &(0..heads),
-                    scale,
-                    &mut block_scores,
-                    &mut m[heads_slice.clone()],
-                    &mut d[heads_slice.clone()],
-                    &mut o[slot * query..][..query],
-                );
+                let mut start = 0;
+                while start < history {
+                    let stop = (start + KV_TILE).min(history);
+                    let mut pending = 0;
+                    kv[0].for_each_row_range(
+                        order,
+                        layer,
+                        layer_bytes,
+                        start,
+                        stop,
+                        |_position, base| {
+                            key_bases[pending] = base;
+                            pending += 1;
+                            Ok(())
+                        },
+                    )?;
+                    let keys = pending;
+                    for row in 0..keys {
+                        let base = key_bases[row] + kv_head * head_dim * 2;
+                        crate::simd::f16_row_to_f32_strided(
+                            &storage[base..][..head_dim * 2],
+                            &mut keys_f32[row..],
+                            keys,
+                        );
+                        let value = kv[0].value_row(order, key_bases[row], layer_bytes)
+                            + kv_head * head_dim * 2;
+                        crate::simd::f16_row_to_f32(
+                            &storage[value..][..head_dim * 2],
+                            &mut values_f32[row * head_dim..][..head_dim],
+                        );
+                    }
+                    for head in head_first..head_last {
+                        // The GEMM accumulates into its output, and the previous head's weights are
+                        // still in the tile.
+                        scores[..width * keys].fill(0.0);
+                        crate::simd::gemm(
+                            width,
+                            head_dim,
+                            keys,
+                            &q[(first + tile) * query + head * head_dim..],
+                            query,
+                            &keys_f32[..head_dim * keys],
+                            &mut scores[..width * keys],
+                            keys,
+                        );
+                        for row in 0..width {
+                            let at = (tile + row) * heads + head;
+                            // The rows at or past this query's own position are its future: the
+                            // tile is a prefix of what it may see, so the visible rows are a slice.
+                            let seen = positions[first + tile + row];
+                            let visible = keys.min(seen.saturating_sub(start));
+                            let weights = &mut scores[row * keys..][..keys];
+                            for weight in &mut weights[visible..] {
+                                *weight = 0.0;
+                            }
+                            if visible == 0 {
+                                continue;
+                            }
+                            for weight in &mut weights[..visible] {
+                                *weight *= scale;
+                            }
+                            let block_max = weights[..visible]
+                                .iter()
+                                .copied()
+                                .fold(f32::NEG_INFINITY, f32::max);
+                            let largest = m[at].max(block_max);
+                            let alpha = (m[at] - largest).exp();
+                            if alpha != 1.0 {
+                                d[at] *= alpha;
+                                let slot = (tile + row) * query + head * head_dim;
+                                for value in &mut o[slot..][..head_dim] {
+                                    *value *= alpha;
+                                }
+                            }
+                            m[at] = largest;
+                            d[at] += crate::simd::exp_sum_shifted(&mut weights[..visible], largest);
+                        }
+                        crate::simd::gemm(
+                            width,
+                            keys,
+                            head_dim,
+                            &scores[..width * keys],
+                            keys,
+                            &values_f32[..keys * head_dim],
+                            &mut o[tile * query + head * head_dim..],
+                            query,
+                        );
+                    }
+                    start = stop;
+                }
             }
-            start = stop;
         }
 
         for slot in 0..rows {
@@ -3676,8 +3756,8 @@ fn attend_rows_shared(
     for part in 0..workers {
         let first = blocks * part / workers;
         let end = blocks * (part + 1) / workers;
-        let row_start = first * QBLOCK;
-        let row_end = (end * QBLOCK).min(entries);
+        let row_start = first * Q_TILE;
+        let row_end = (end * Q_TILE).min(entries);
         let (slot, rest) = cursor.split_at_mut((row_end - row_start) * query);
         cursor = rest;
         jobs.push((row_start, row_end, slot));
