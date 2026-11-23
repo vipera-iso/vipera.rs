@@ -50,14 +50,14 @@ static COUNTERS: [AtomicU64; 9] = [
     AtomicU64::new(0),
 ];
 
-/// How often each batch width was dispatched, indexed by width.
+/// How often each batch width was dispatched, indexed by width, up to `MAX_BATCH` (256).
 ///
 /// A generic kernel is monomorphised per width, and the widths are not interchangeable: the same
 /// function can pass a codegen gate at one width and fail it at another. Without this counter the
 /// only way to know which one a benchmark exercises is to guess from token counts, which is how a
 /// session ends up optimising a kernel that never runs. Empty unless `VIPERA_PROFILE_WIDTHS` is
 /// set, so the cost when it is off is one relaxed load of a `OnceLock`.
-static WIDTH_COUNTS: [AtomicU64; 129] = [const { AtomicU64::new(0) }; 129];
+static WIDTH_COUNTS: [AtomicU64; 257] = [const { AtomicU64::new(0) }; 257];
 
 /// Whether dispatch widths are being counted.
 fn widths_enabled() -> bool {

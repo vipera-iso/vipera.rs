@@ -3978,3 +3978,29 @@ outside the kernel: at 6 blocks the activation tile is 393 KB against 196 KB, an
 reads it for the whole product. The prefill chunk also stops matching the KV block, so the tail pass
 (98 tokens here) is a separate weight read. Not landed; the wiring lives on `perf/prefill-batch-256`
 as the measurement.
+
+#### Phase totals: the dot does not get cheaper per token
+
+Summed over every chunk line of the same ~1.1k prompt:
+
+| phase | 9 x 128 | 5 x 256 |
+|---|---:|---:|
+| q4k | ~4100 ms | ~4050 ms |
+| q6k | 1005 | 1068 |
+| attention | 936 | 996 |
+| rope + kv_write + elem + proj | 180 | 204 |
+| chunk total | 6396 | 6801 |
+
+A chunk of 256 costs 2.0x a chunk of 128 in the dot (482 -> 940 ms), so 256 tokens in one pass take
+the same time per token as 128 in one pass. The weight stream per token is halved and nothing
+changes: at 1.5B and these shapes the tiled Q4_K kernel is **compute bound** at ~837 GFLOPS over four
+workers, which is what its own single-thread bench already said (191-228 GFLOPS per core). The
+microbench's 10-14% per token at B=256 is the fixed per-window unpack cost, and in the engine that
+cost is already amortised at B=128.
+
+The remaining ~300 ms of the 405 ms gap is not in any phase line, so it sits in the per-product tile
+work, which doubles with the tile (`prepare` builds `blocks * B/16 * 4 KiB` bytes per product: 196
+products of 393 KB per chunk against 196 KB).
+
+What this means for the ik_llama.cpp gap: ik's pp512 implies ~806 GFLOPS over the same kind of
+cores, i.e. the same per-token compute. The batch width is not where the difference lives.
