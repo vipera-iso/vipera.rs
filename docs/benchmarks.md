@@ -4018,6 +4018,8 @@ under 12.
   `dpbusd` stream alternates with tile loads, and the sibling fills that latency. The default thread
   count already takes every CPU the OS reports, so this is a description of the default, not a knob.
 
-For the ik_llama.cpp comparison, its pp512 of 268.7 tok/s implies ~280 GFLOPS per core at the same
-q4k share — at or above that ceiling. Before another kernel rewrite, re-run ik on this rig with the
-same worker count and the same prompt, because the number to beat may be a measurement, not a kernel.
+ik_llama.cpp re-measured on this rig, same GGUF, same `taskset -c 0-7`, `llama-bench -p 512 -n 0 -r 3`:
+**272.52 ± 3.10 tok/s** at 8 threads, **271.21 ± 1.41** at 4 threads. Vipera on the same prompt shape
+is 204.7-211.1 tok/s (2430-2500 ms chunk). The gap is real on this machine (~23%), not a thread-count
+artifact. Our Q4_K dot already sits at ~87% of the double-pumped VNNI ceiling and q6k+attention take
+31% of the chunk, so closing it needs per-phase comparison against ik, not another blind q4k rewrite.
