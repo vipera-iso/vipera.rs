@@ -19,22 +19,23 @@ under [`specs/001-vipera-rs-engine/`](specs/001-vipera-rs-engine/).
 
 One laptop, not a claim about yours: i5-11300H (4 cores, 8 threads), `VIPERA_THREADS=8`, Qwen2.5-1.5B
 Q4_K_M, f16 KV, against llama.cpp `e574a17` (build 466), CPU only, same threads and model. Every row is
-a dated section in [`docs/benchmarks.md`](docs/benchmarks.md), including the ones that lost.
+a dated section in [`docs/benchmarks.md`](docs/benchmarks.md), including the ones that lost. The
+prefill rows are the 2026-11-23 paired session; the decode rows are the 2026-11-15 one.
 
 | | vipera | llama.cpp, same machine | vipera / llama.cpp |
 |---|---:|---:|---:|
-| prefill, 128 tokens | 188 tok/s | 205–230 | 0.82–0.92x |
-| prefill, 512 tokens | 172 tok/s | 217–227 | 0.76–0.79x |
-| prefill, 1024 tokens | 164 tok/s | 204–211 | 0.78–0.81x |
-| prefill, 4096 tokens | 105 tok/s | 159–168 | 0.62–0.66x |
+| prefill, 128 tokens | 194 tok/s | 202 | 0.96–0.97x |
+| prefill, 512 tokens | 186 tok/s | 204–212 | 0.89–0.90x |
+| prefill, 1024 tokens | 177 tok/s | 196–207 | 0.86–0.89x |
+| prefill, 4096 tokens | 129 tok/s | 159–164 | 0.79–0.80x |
 | decode, shallow | 34.6 tok/s | 33.9–36.7 | 0.94–1.02x |
 | decode, 4k of history | 24.2 tok/s | 25.3 | 0.96x |
 | decode, 32k of history, window 2048 | 28.0 tok/s (35.8 ms/step) | not measured | — (6.8 tok/s with the full history) |
 | KV held for a windowed 32k run | 61 MB | not measured | — (896 MB with the full history) |
 
 llama.cpp is ahead on prefill at every length and level on decode. The prefill gap is not a batch-width
-artefact: at the engine's own 128-token width, llama.cpp still measures 216 / 203 / 190 / 139 tok/s,
-which puts the engine at 0.87x, 0.85x, 0.86x and 0.75x. It is the batched attention pass: the matvecs
+artefact: at the engine's own 128-token width, the 2026-11-15 matched-ubatch arm still put llama.cpp
+at 0.87x, 0.85x, 0.86x and 0.75x. It is the batched attention pass: the matvecs
 cost the same per chunk at 4k as at 1k, while attention grows with the history, from 6% of the first
 chunk to 41% of a 4k one. An earlier table here quoted a slower llama.cpp build from 2026-11-05
 (143.6 / 150.0 tok/s) and showed the engine ahead; the ledger records the correction.
@@ -167,8 +168,8 @@ docs/benchmarks/              the surveys the plan was written from
   Metal or Vulkan backend, no batched (prefill) kernel yet, no sliding window (a ring table is
   refused), and the CLI has no `--backend cuda` yet, so a normal build still runs on the CPU. `verify`
   reports host memory only.
-- **Prefill**: llama.cpp is faster at every prompt length measured here, from 9–22% at 128 tokens to
-  52–61% at 4096; decode is level. Both are measured on the machine described above, not estimated.
+- **Prefill**: llama.cpp is faster at every prompt length measured here, from 3–4% at 128 tokens to
+  20–21% at 4096; decode is level. Both are measured on the machine described above, not estimated.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
 - **Server**: TLS needs a certificate; there is no ACME client, so issue or renew it out of band and

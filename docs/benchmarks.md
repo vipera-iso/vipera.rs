@@ -3740,3 +3740,30 @@ guard stream was ~a fifth of the uop stream, and removing it also removed the sp
 neighbouring idea — folding the weight broadcast into `vpdpbusd`'s memory operand — is closed by the
 ISA and now sits in `CONSTRAINTS.md` §Rejected: the `m32bcst` form is the *signed* source and the
 weight dword is the unsigned one.
+## README prefill rows, paired on a quiet box — 2026-11-23
+
+Re-measured the prefill rows the README quotes, in one session, so the table and the ratios come
+from the same load: i5-11300H, `VIPERA_THREADS=8`, Qwen2.5-1.5B Q4_K_M f16 KV, llama.cpp `e574a17`
+(build 466), CPU only. Load average 1.4 at the start. Two interleaved passes (llama, vipera, llama,
+vipera), `llama-bench -p 128,512,1024,4096 -n 0 -t 8 -r 3 -ngl 0` against the engine's ignored
+`prefill_vs_decode` and `prefill_long_prompt` tests.
+
+| workload | pass | llama.cpp e574a17 | vipera | vipera / llama.cpp |
+|---|---|---:|---:|---:|
+| pp128 | 1 | 201.83 ± 9.48 | 195.9 | 0.97x |
+| pp128 | 2 | 201.73 ± 4.51 | 193.2 | 0.96x |
+| pp512 | 1 | 211.99 ± 4.92 | 187.6 | 0.89x |
+| pp512 | 2 | 204.15 ± 1.63 | 184.0 | 0.90x |
+| pp1024 | 1 | 207.28 ± 0.62 | 178.5 | 0.86x |
+| pp1024 | 2 | 196.42 ± 1.39 | 174.6 | 0.89x |
+| pp4096 | 1 | 164.09 ± 0.53 | 129.3 | 0.79x |
+| pp4096 | 2 | 159.20 ± 0.44 | 127.8 | 0.80x |
+
+Medians: vipera **194 / 186 / 177 / 129**, llama.cpp **202 / 204–212 / 196–207 / 159–164**, ratios
+**0.96–0.97x / 0.89–0.90x / 0.86–0.89x / 0.79–0.80x**. The 2026-11-15 section above quoted 105 tok/s
+at 4096; this session's 128-129 is the same test on the current tree (shared tile and the fused
+epilogue switch have landed since), not a different measurement.
+
+The engine is still behind at every length, but the gap is narrower than the 2026-11-15 table: 3-4%
+at 128, 10-11% at 512, 11-14% at 1024, 20-21% at 4096. Ratios are same-session; absolutes sit below
+the 2026-11-15 llama numbers on both sides, which is the box, not the engine.
