@@ -3897,3 +3897,43 @@ Two bugs this port found in its own new code, both worth a sentence because both
 - `out.len() / stride` undercounts the slots of a strided transpose by one for the last rows of a
   tile, which drops the final dim of those K rows and moved the answer by 0.5% with no other symptom.
   The slot count is the ceiling.
+## 2026-11-23 — the Q4_K repack, measured twice and closed
+
+Two questions, both answered on the reference box (i5-11300H, 8 threads, `taskset -c 2-7`), the model
+`qwen2.5-1.5b-instruct-q4_k_m.gguf`.
+
+### Is the per-dot broadcast the cost?
+
+`cargo test --release -p vipera-backend-cpu --lib -- --ignored --nocapture repacked_gemm_form` times the
+two microkernels for one 16x16 tile: (A) a `vpbroadcastd` of a scratch dword per `vpdpbusd`, as the tiled
+kernel does, against (B) a packed 16-row weight `zmm` with the activation dword broadcast from memory.
+
+| run | A | B |
+|---|---:|---:|
+| 1 | 496.3 GFLOPS | 365.9 |
+| 2 | 506.6 | 508.0 |
+| 3 | 500.0 | 501.7 |
+
+Median +0.3%, and the one -26% sample was a load spike. The `NO_WEIGHT` probe that previously suggested
++29% / +56% was pricing the compiler hoisting the load out of the loop, not the broadcast.
+
+### Is the unpack worth repacking the weights for?
+
+Branch `perf/q4k-repack-engine` (commit `6d532a7`) implements `VIPERA_REPACK=1`: each Q4_K tensor is
+repacked at load into signed codes plus premultiplied `d * scale` / `dmin * min` (320 bytes per block
+against 144), and the tiled kernel runs with no nibble split, no header decode and no f16 conversion. It
+is bit-identical to the tiled path (`repacked_q4k_matches_the_tiled_kernel_bit_for_bit`).
+
+Three interleaved pairs, chunk 2 of the same 20x repeated-sentence prompt:
+
+| pair | q4k, repack off | q4k, repack on | chunk, off | chunk, on |
+|---|---:|---:|---:|---:|
+| 1 | 430.99 ms | 892.08 ms | 601.86 ms | 1062.28 ms |
+| 2 | 427.43 | 903.45 | 601.31 | 1078.48 |
+| 3 | 438.12 | 902.88 | 621.08 | 1071.62 |
+
+**2.08x slower.** The unpack is 8.8% of the Q4_K phase and the repack widens the weight stream 1.78x
+(codes alone; 2.22x with the factors), on a kernel already reading 29-30 of the 43 GB/s this box can
+reach. Trading 78% more DRAM traffic for 8.8% less CPU work loses by roughly the traffic ratio, which is
+what the table shows. The path stays on that branch as the measurement; it is not for landing, and the
+`VIPERA_REPACK` switch does not exist on `main`.
