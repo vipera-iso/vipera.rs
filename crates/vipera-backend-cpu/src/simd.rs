@@ -2466,60 +2466,43 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                     let dxs_ptr = dxs.as_ptr().add((b * halves + half) * 8 * COLS);
                     let sumt_ptr = sumt.as_ptr().add((b * halves + half) * 8 * COLS);
                     let mut band = 0;
+                    // Every tensor this kernel serves is a whole number of windows, and a whole
+                    // number of bands inside one (8960, 1536 and 256 are all multiples of
+                    // `ROW_WIN`), so the band is always full. A runtime row bound here costs a
+                    // fused `cmp`+`jcc` per `dpbusd` — 512 per band-block, none of which a real
+                    // shape takes — so the full band gets a constant and only the last band of an
+                    // odd shape falls back to one row at a time.
+                    while band + BAND <= cnt {
+                        q4k_tiled_band::<BAND>(
+                            wq_ptr,
+                            half_act,
+                            dxs_ptr,
+                            sumt_ptr,
+                            band,
+                            &scale_f,
+                            &min_f,
+                            buf.as_mut_ptr(),
+                            stride_cols,
+                            half,
+                            fused_epi,
+                        );
+                        band += BAND;
+                    }
                     while band < cnt {
-                        let band_cnt = (cnt - band).min(BAND);
-                        let mut facc: [__m512; BAND] = [_mm512_setzero_ps(); BAND];
-                        for s in 0..8 {
-                            let mut acc: [__m512i; BAND] = [_mm512_setzero_si512(); BAND];
-                            for g in 0..8 {
-                                let grp = s * 8 + g;
-                                let codes =
-                                    _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
-                                for (t, slot) in acc.iter_mut().enumerate().take(band_cnt) {
-                                    let word = u32::from_le(std::ptr::read_unaligned(
-                                        wq_ptr.add((band + t) * 256 + grp * 4) as *const u32,
-                                    ));
-                                    *slot = _mm512_dpbusd_epi32(
-                                        *slot,
-                                        _mm512_set1_epi32(word as i32),
-                                        codes,
-                                    );
-                                }
-                            }
-                            let dxv = _mm512_loadu_ps(dxs_ptr.add(s * COLS));
-                            let sumv = _mm512_loadu_ps(sumt_ptr.add(s * COLS));
-                            for (t, (acc_slot, facc_slot)) in
-                                acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
-                            {
-                                let row = band + t;
-                                if fused_epi {
-                                    let scaled = _mm512_mul_ps(_mm512_cvtepi32_ps(*acc_slot), dxv);
-                                    let sum = _mm512_fmadd_ps(
-                                        scaled,
-                                        _mm512_set1_ps(scale_f[row][s]),
-                                        *facc_slot,
-                                    );
-                                    *facc_slot =
-                                        _mm512_fnmadd_ps(sumv, _mm512_set1_ps(min_f[row][s]), sum);
-                                    continue;
-                                }
-                                let main = _mm512_mul_ps(
-                                    _mm512_mul_ps(
-                                        _mm512_cvtepi32_ps(*acc_slot),
-                                        _mm512_set1_ps(scale_f[row][s]),
-                                    ),
-                                    dxv,
-                                );
-                                let minterm = _mm512_mul_ps(sumv, _mm512_set1_ps(min_f[row][s]));
-                                *facc_slot =
-                                    _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
-                            }
-                        }
-                        for (t, value) in facc.iter().enumerate().take(band_cnt) {
-                            let slot = buf.as_mut_ptr().add((band + t) * stride_cols + half * COLS);
-                            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
-                        }
-                        band += band_cnt;
+                        q4k_tiled_band::<1>(
+                            wq_ptr,
+                            half_act,
+                            dxs_ptr,
+                            sumt_ptr,
+                            band,
+                            &scale_f,
+                            &min_f,
+                            buf.as_mut_ptr(),
+                            stride_cols,
+                            half,
+                            fused_epi,
+                        );
+                        band += 1;
                     }
                 }
             }
@@ -2595,6 +2578,70 @@ unsafe fn q6k_tile_rows<const R: usize>(
         }
         for (t, value) in facc.iter().enumerate() {
             let slot = dst.add(t * dst_stride);
+            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
+        }
+    }
+}
+
+/// One band of `N` rows of [`q4k_matvec_tiled_range`], with the row count a constant.
+///
+/// The bound has to be a constant: as a runtime `take(band_cnt)` it costs a fused `cmp`+`jcc` per
+/// `dpbusd`, and every tensor this kernel serves takes the full band.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q4k_tiled_band<const N: usize>(
+    wq: *const u8,
+    half_act: *const i8,
+    dxs: *const f32,
+    sumt: *const f32,
+    band: usize,
+    scale_f: &[[f32; 8]],
+    min_f: &[[f32; 8]],
+    buf: *mut f32,
+    stride_cols: usize,
+    half: usize,
+    fused_epi: bool,
+) {
+    // SAFETY: every pointer is one the caller built for this block and band, and the `N` rows from
+    // `band` are inside the window the caller clamped to `cnt`.
+    unsafe {
+        const COLS: usize = 16;
+        let mut facc: [__m512; N] = [_mm512_setzero_ps(); N];
+        for s in 0..8 {
+            let mut acc: [__m512i; N] = [_mm512_setzero_si512(); N];
+            for g in 0..8 {
+                let grp = s * 8 + g;
+                let codes = _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
+                for (t, slot) in acc.iter_mut().enumerate() {
+                    let word = u32::from_le(std::ptr::read_unaligned(
+                        wq.add((band + t) * 256 + grp * 4) as *const u32,
+                    ));
+                    *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word as i32), codes);
+                }
+            }
+            let dxv = _mm512_loadu_ps(dxs.add(s * COLS));
+            let sumv = _mm512_loadu_ps(sumt.add(s * COLS));
+            for (t, (acc_slot, facc_slot)) in acc.iter().zip(facc.iter_mut()).enumerate() {
+                let row = band + t;
+                if fused_epi {
+                    let scaled = _mm512_mul_ps(_mm512_cvtepi32_ps(*acc_slot), dxv);
+                    let sum = _mm512_fmadd_ps(scaled, _mm512_set1_ps(scale_f[row][s]), *facc_slot);
+                    *facc_slot = _mm512_fnmadd_ps(sumv, _mm512_set1_ps(min_f[row][s]), sum);
+                    continue;
+                }
+                let main = _mm512_mul_ps(
+                    _mm512_mul_ps(
+                        _mm512_cvtepi32_ps(*acc_slot),
+                        _mm512_set1_ps(scale_f[row][s]),
+                    ),
+                    dxv,
+                );
+                let minterm = _mm512_mul_ps(sumv, _mm512_set1_ps(min_f[row][s]));
+                *facc_slot = _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
+            }
+        }
+        for (t, value) in facc.iter().enumerate() {
+            let slot = buf.add((band + t) * stride_cols + half * COLS);
             _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
         }
     }

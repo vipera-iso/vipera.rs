@@ -3679,3 +3679,64 @@ Verdict: kept on request even though the chunk gain is under the pre-registered 
 bias table and three per-block clears. The Q4_K half of the patch (transposed activation tile) was not
 ported: the tile is now built once per product by the prep workers, so the per-participant transpose
 buys nothing.
+### The Q4_K tiled band loses its runtime row bound — 2026-11-23
+
+The tiled kernel's inner loop walked `acc.iter_mut().take(band_cnt)`, and `band_cnt` is 8 for every
+tensor this kernel serves: 8960, 1536 and 256 are all multiples of `ROW_WIN` (32), and the pool hands
+the kernel whole windows. The assembly showed what that bound cost — one fused `cmp`+`jcc` per
+`dpbusd`, 512 of them per band-block of 8 rows x 256 columns, every one predicted not taken:
+
+```
+2db1d0: vpdpbusd %zmm18,%zmm8,%zmm15
+2db1d6: vpbroadcastd -0x61c(%rsi,%r13,8),%zmm8
+...
+2dc73e: cmp    $0x1,%r10        # per row, per group: 64 groups x 8 rows
+2dc742: je     2dc7d0
+```
+
+Hypothesis written before the code: a constant row count must be worth **>= 3% of a chunk**; reject
+under 3%, or on any token difference. The band body moved into `q4k_tiled_band<const N: usize>`
+(`#[inline(always)]`), called as `::<BAND>` for full bands and `::<1>` for the last band of a shape
+that is not a multiple of 32. No switch, no arithmetic change: same ops, same order, same state per
+row.
+
+Codegen, same gate and the same monomorphization (`simd22q4k_matvec_tiled_rangeKj80_`):
+
+| | before | after |
+|---|---:|---:|
+| instructions | 2310 | 2215 |
+| `cmp`/`test` | 202 | 144 |
+| branches | 291 | 213 |
+| vector `%rsp` store / load | 25 / 19 | 11 / 10 |
+| `vpdpbusd` (static) | 64 | 72 = 64 full band + 8 one-row tail |
+| gate verdict | FAIL: `zmm`, `rsp`, branches | FAIL: `zmm` only |
+
+`zmm` stays FAIL because this kernel is 512-bit by construction (eight halves per `dpbusd`); the
+`zmm = 0` rule is written for the row kernel, and this ledger already records `::<40>` at zmm=86 as
+expected for this family. The branch rule passes now, and the accumulator spill the old body carried
+(`vmovups %zmm1,0x300(%rsp)`) is gone.
+
+Kernel bench, `q4k_tiled_batch128_throughput`, 1 thread, three runs per arm, medians:
+
+| shape | before | after | |
+|---|---:|---:|---:|
+| 8960x1536 | 192.4 GFLOPS | 206.6 | +7.4% |
+| 1536x8960 | 223.1 GFLOPS | 238.6 | +6.9% |
+
+End to end, two binaries, 9 interleaved pairs, the same 375-token prompt, `VIPERA_THREADS=8`, box at
+load 5.8 — so absolutes here are ~4x this ledger's and only the ratios are read: chunk median
+**3136.83 -> 2967.32 ms (-5.4%)**, q4k **2163.19 -> 2013.70 ms (-6.9%)**, direction 9/9, per-pair
+chunk ratios 0.93-0.96. A first set of five pairs on the 530-token prompt read +2.0% on the median
+while three of five pairs favoured the new arm; that set is recorded as the reason the run was
+repeated, not as a result.
+
+Bit-identical: 100 prompts (20-399 words, seeds 0-4) at `--temperature 0`, 8 tokens each, `cmp`
+clean between the two binaries; `q4k_tiled_range_matches_batch_vnni` and
+`q4k_tiled_matches_scalar_q4k_dot_within_tolerance` pass. `qwen3_logits_match_the_reference_run`
+needs a qwen3 GGUF this box does not have — **not run**.
+
+Read: a bound that is constant for every shape the kernel serves does not belong in the loop. The
+guard stream was ~a fifth of the uop stream, and removing it also removed the spill. The obvious
+neighbouring idea — folding the weight broadcast into `vpdpbusd`'s memory operand — is closed by the
+ISA and now sits in `CONSTRAINTS.md` §Rejected: the `m32bcst` form is the *signed* source and the
+weight dword is the unsigned one.
