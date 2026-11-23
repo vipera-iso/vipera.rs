@@ -88,8 +88,8 @@ use std::arch::x86_64::{
     _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps,
     _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32, _mm256_sub_ps, _mm512_add_ps,
     _mm512_cvtepi32_ps, _mm512_dpbusd_epi32, _mm512_fmadd_ps, _mm512_fnmadd_ps, _mm512_loadu_ps,
-    _mm512_loadu_si512, _mm512_mul_ps, _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps,
-    _mm512_setzero_ps, _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_epi32, _mm512_sub_ps,
+    _mm512_loadu_si512, _mm512_mul_ps, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps,
+    _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_ps,
 };
 
 use vipera_core::gguf::GgmlType;
@@ -2533,6 +2533,73 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
     }
 }
 
+/// Where one 16-activation tile half sits for the Q6_K kernel: its codes in (group, column, 4)
+/// order, then per 16-value group the bias to start the integer sum from and the activation scale.
+#[derive(Clone, Copy)]
+struct Q6TileHalf {
+    act: *const i8,
+    bias: *const i32,
+    dxs: *const f32,
+}
+
+/// `R` weight rows of one 256-column Q6_K block against one 16-activation tile half, added into
+/// `dst`.
+///
+/// `wq` holds the rows' unpacked codes (256 bytes each, biased by +32), `coef[k][first + t]` is
+/// `d * scale` of row `t` for 16-value group `k`, and `tile` is the half. `dst` is `R` rows of 16
+/// floats, `dst_stride` floats apart. `R` is a constant so the accumulators stay in registers.
+///
+/// Each group's integer sum starts from `-32 * (sum of the group's activation codes)`, which is
+/// the `raw - 32 * bsum` bias correction applied before the first `dpbusd` instead of after the
+/// last: the same integer, one vector op fewer per row and group. Every row's arithmetic is
+/// independent of `R`, so a window's tail rows run with `R = 1` and give the same bits.
+///
+/// # Safety
+///
+/// The CPU must support AVX-512F/BW/VNNI, and every pointer must cover what the description above
+/// says: `R * 256` bytes at `wq`, `64 * 64` bytes at `tile.act`, `16 * 16` words at `tile.bias` and
+/// `tile.dxs`, and `16` floats in each of `R` rows at `dst`. `first + R` must be at most
+/// `ROW_WIN`.
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[inline]
+unsafe fn q6k_tile_rows<const R: usize>(
+    wq: *const u8,
+    coef: &[[f32; 32]; 16],
+    first: usize,
+    tile: Q6TileHalf,
+    dst: *mut f32,
+    dst_stride: usize,
+) {
+    // SAFETY: the contract above.
+    unsafe {
+        let mut facc = [_mm512_setzero_ps(); R];
+        for (k, coefs) in coef.iter().enumerate() {
+            let bias = _mm512_loadu_si512(tile.bias.add(k * 16) as *const __m512i);
+            let mut acc = [bias; R];
+            for g in 0..4 {
+                let grp = k * 4 + g;
+                let codes = _mm512_loadu_si512(tile.act.add(grp * 64) as *const __m512i);
+                for (t, slot) in acc.iter_mut().enumerate() {
+                    let word = u32::from_le(std::ptr::read_unaligned(
+                        wq.add(t * 256 + grp * 4) as *const u32
+                    ));
+                    *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word as i32), codes);
+                }
+            }
+            let dxv = _mm512_loadu_ps(tile.dxs.add(k * 16));
+            for t in 0..R {
+                let lanes = _mm512_mul_ps(_mm512_cvtepi32_ps(acc[t]), dxv);
+                let scaled = _mm512_mul_ps(lanes, _mm512_set1_ps(coefs[first + t]));
+                facc[t] = _mm512_add_ps(facc[t], scaled);
+            }
+        }
+        for (t, value) in facc.iter().enumerate() {
+            let slot = dst.add(t * dst_stride);
+            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
+        }
+    }
+}
+
 /// Safe entry point for [`q6k_matvec_tiled_range`], as
 /// [`try_q4k_matvec_tiled_range`] is for Q4_K.
 pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
@@ -2563,7 +2630,8 @@ pub(crate) fn try_q6k_matvec_tiled_range<const B: usize>(
 /// Tiled Q6_K matvec range, the Q6_K twin of [`q4k_matvec_tiled_range`]:
 /// `row = d * sum over 16-value groups of scale * (sum of (wq - 32) * xq)`,
 /// with the weights biased by +32 so the unsigned side of `dpbusd` can read
-/// them directly and the bias corrected per group as `raw - 32 * bsum`.
+/// them directly and the bias corrected per group before the first `dpbusd`
+/// (see [`q6k_tile_rows`]).
 ///
 /// # Safety
 ///
@@ -2592,9 +2660,8 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
         let stride_cols = halves * COLS;
         let blocks = stride / 210;
         let mut wq = vec![0_u8; ROW_WIN * 256];
-        // Sub-block major: `scales[k][row]`, so the sub-block loop reads one contiguous band.
-        let mut scales = vec![[0_i32; ROW_WIN]; 16];
-        let mut dvec = [0.0_f32; ROW_WIN];
+        // `d * scale` per 16-value group and row, group-major so a band reads one contiguous run.
+        let mut coef = [[0.0_f32; ROW_WIN]; 16];
         // Activation tile for every block, built once and reused by every row window.
         // The activation tile is the same bytes and layout as Q4_K's, so a product-wide build from
         // the prep workers is reused here too. The integer sums and scales stay per participant.
@@ -2621,11 +2688,13 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                 &owned_act
             }
         };
-        let mut bsumt = vec![0_i32; blocks * halves * 16 * COLS];
+        // The bias is the same integer the kernel used to apply after the last `dpbusd`
+        // (`raw - 32 * bsum`), moved into the accumulator's starting value.
+        let mut bias = vec![0_i32; blocks * halves * 16 * COLS];
         let mut dxs = vec![0.0_f32; blocks * halves * 16 * COLS];
         for b in 0..blocks {
             for (entry, x) in xs.iter().enumerate() {
-                let col_half = entry / COLS;
+                let half = entry / COLS;
                 let col = entry % COLS;
                 let chunk = x.q.as_ptr().add(b * 256);
                 for k in 0..16 {
@@ -2633,8 +2702,8 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                     for i in 0..16 {
                         sum += i32::from(*chunk.add(k * 16 + i));
                     }
-                    let at = ((b * halves + col_half) * 16 + k) * COLS + col;
-                    bsumt[at] = sum;
+                    let at = ((b * halves + half) * 16 + k) * COLS + col;
+                    bias[at] = -32 * sum;
                     dxs[at] = x.d[b * 8 + k / 2];
                 }
             }
@@ -2659,17 +2728,13 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                         prefetch_ahead(data, at + 192);
                     }
                 }
-                wq.fill(0);
-                for slot in scales.iter_mut() {
-                    *slot = [0; ROW_WIN];
-                }
-                dvec.fill(0.0);
+                // Only rows `0..cnt` are read below, so `wq` and `coef` need no clearing.
                 for r in 0..cnt {
                     let block = data.as_ptr().add((first_row + win + r) * stride + b * 210);
-                    dvec[r] = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+                    let d = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
                     let scale_bytes = std::slice::from_raw_parts(block.add(192), 16);
-                    for (column, byte) in scales.iter_mut().zip(scale_bytes) {
-                        column[r] = i32::from(*byte as i8);
+                    for (column, byte) in coef.iter_mut().zip(scale_bytes) {
+                        column[r] = d * f32::from(*byte as i8);
                     }
                     let wrow = wq.as_mut_ptr().add(r * 256);
                     for half in 0..2 {
@@ -2689,54 +2754,24 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                 }
                 let wq_ptr = wq.as_ptr();
                 for col_half in 0..halves {
-                    let half_act = act.as_ptr().add((b * halves + col_half) * 64 * COLS * 4);
-                    let bsumt_ptr = bsumt.as_ptr().add((b * halves + col_half) * 16 * COLS);
-                    let dxs_ptr = dxs.as_ptr().add((b * halves + col_half) * 16 * COLS);
+                    let at = b * halves + col_half;
+                    let tile = Q6TileHalf {
+                        act: act.as_ptr().add(at * 64 * COLS * 4),
+                        bias: bias.as_ptr().add(at * 16 * COLS),
+                        dxs: dxs.as_ptr().add(at * 16 * COLS),
+                    };
                     let mut band = 0;
                     while band < cnt {
-                        let band_cnt = (cnt - band).min(BAND);
-                        let mut facc: [__m512; BAND] = [_mm512_setzero_ps(); BAND];
-                        for (k, by_row) in scales.iter().enumerate() {
-                            let mut acc: [__m512i; BAND] = [_mm512_setzero_si512(); BAND];
-                            for g in 0..4 {
-                                let grp = k * 4 + g;
-                                let codes =
-                                    _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
-                                for (t, slot) in acc.iter_mut().enumerate().take(band_cnt) {
-                                    let word = u32::from_le(std::ptr::read_unaligned(
-                                        wq_ptr.add((band + t) * 256 + grp * 4) as *const u32,
-                                    ));
-                                    *slot = _mm512_dpbusd_epi32(
-                                        *slot,
-                                        _mm512_set1_epi32(word as i32),
-                                        codes,
-                                    );
-                                }
-                            }
-                            let bias = _mm512_mullo_epi32(
-                                _mm512_loadu_si512(bsumt_ptr.add(k * COLS) as *const __m512i),
-                                _mm512_set1_epi32(32),
-                            );
-                            let dxv = _mm512_loadu_ps(dxs_ptr.add(k * COLS));
-                            for (t, (acc_slot, facc_slot)) in
-                                acc.iter().zip(facc.iter_mut()).enumerate().take(band_cnt)
-                            {
-                                let row = band + t;
-                                let corr = _mm512_sub_epi32(*acc_slot, bias);
-                                let main = _mm512_mul_ps(
-                                    _mm512_mul_ps(_mm512_cvtepi32_ps(corr), dxv),
-                                    _mm512_set1_ps(dvec[row] * by_row[band + t] as f32),
-                                );
-                                *facc_slot = _mm512_add_ps(*facc_slot, main);
-                            }
+                        // Full bands take the unrolled path, the tail goes a row at a time.
+                        let wq_rows = wq_ptr.add(band * 256);
+                        let dst = buf.as_mut_ptr().add(band * stride_cols + col_half * COLS);
+                        if cnt - band >= BAND {
+                            q6k_tile_rows::<BAND>(wq_rows, &coef, band, tile, dst, stride_cols);
+                            band += BAND;
+                        } else {
+                            q6k_tile_rows::<1>(wq_rows, &coef, band, tile, dst, stride_cols);
+                            band += 1;
                         }
-                        for (t, value) in facc.iter().enumerate().take(band_cnt) {
-                            let slot = buf
-                                .as_mut_ptr()
-                                .add((band + t) * stride_cols + col_half * COLS);
-                            _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), *value));
-                        }
-                        band += band_cnt;
                     }
                 }
             }
@@ -5523,6 +5558,78 @@ mod tests {
             // SAFETY: as above; the batch kernel has the same contract as the single one.
             unsafe { q6k_dot_batch(&row, xs, &mut actual) };
             assert_eq!(actual, expected, "trial {trial}");
+        }
+    }
+
+    /// The pool gives each thread its own slice of rows, so a row's tiled result must not depend on
+    /// where the slice starts or where the row sits in its 32-row window and 8-row band.
+    #[test]
+    fn tiled_rows_do_not_depend_on_how_the_range_is_split() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let rows = 45usize;
+        let blocks = 2usize;
+        let cols = blocks * 256;
+        let q4: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let q6: Vec<u8> = (0..rows).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+        let source: Vec<Vec<f32>> = (0..32)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 32] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 32] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let run4 = |first: usize, count: usize| {
+            let mut out = vec![0.0_f32; 32 * count];
+            assert!(try_q4k_matvec_tiled_range(
+                &q4,
+                blocks * 144,
+                first,
+                count,
+                &xs,
+                &sums,
+                &mut out,
+                None,
+            ));
+            out
+        };
+        let run6 = |first: usize, count: usize| {
+            let mut out = vec![0.0_f32; 32 * count];
+            assert!(try_q6k_matvec_tiled_range(
+                &q6,
+                blocks * 210,
+                first,
+                count,
+                &xs,
+                &mut out,
+                None,
+            ));
+            out
+        };
+        for split in [1usize, 5, 8, 13, 32, 37] {
+            for (name, run) in [
+                ("Q4_K", &run4 as &dyn Fn(usize, usize) -> Vec<f32>),
+                ("Q6_K", &run6),
+            ] {
+                let whole = run(0, rows);
+                let (head, tail) = (run(0, split), run(split, rows - split));
+                for entry in 0..32 {
+                    for row in 0..rows {
+                        let part = if row < split {
+                            head[entry * split + row]
+                        } else {
+                            tail[entry * (rows - split) + row - split]
+                        };
+                        assert_eq!(
+                            whole[entry * rows + row].to_bits(),
+                            part.to_bits(),
+                            "{name} split {split}: entry {entry} row {row}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
