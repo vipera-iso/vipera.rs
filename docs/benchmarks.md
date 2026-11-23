@@ -3937,3 +3937,23 @@ Three interleaved pairs, chunk 2 of the same 20x repeated-sentence prompt:
 reach. Trading 78% more DRAM traffic for 8.8% less CPU work loses by roughly the traffic ratio, which is
 what the table shows. The path stays on that branch as the measurement; it is not for landing, and the
 `VIPERA_REPACK` switch does not exist on `main`.
+
+## 2026-11-23 — prefill batch width, the one difference ik_llama.cpp has over us
+
+The phase shares put this on the table: at ~1.1k of prompt a 128-token chunk is 66-72% Q4_K, 17-18%
+Q6_K and 7-16% attention, so attention cannot explain a 15-20% prefill gap. ik_llama.cpp runs at
+`-ub 512` and loses 12% when forced to `-ub 128` (237.2 against 268.7 tok/s), which is the size of the
+gap we see.
+
+`q4k_tiled_batch_width_128_against_256` (single thread, the two ADR-001 shapes, one arm each):
+
+| shape | B=128 | B=256 | per token |
+|---|---:|---:|---:|
+| 8960x1536 | 31.1 ms / 113.2 GFLOPS | 56.1 ms / 125.6 GFLOPS | -9.9% |
+| 1536x8960 | 29.1 ms / 121.0 GFLOPS | 50.0 ms / 141.0 GFLOPS | -14.1% |
+
+Absolute GFLOPS are low because the box was loaded; the ratio is the point and it matches ik's own
+`-ub 128` penalty. What it costs to take: `MAX_BATCH` 128 -> 256 doubles the scratch for `x, h, q, k,
+v, attn, gate, up` and the logits buffer (77.8 -> 155.6 MB at a 151,936-token vocabulary), widens the
+activation tile to 392 KB at 6 blocks, and needs a `run_batch_n::<256>` instantiation. Nothing here
+has been wired into the engine: only the cap (`MAX_HALVES`) and the bench exist on this branch.
