@@ -3576,3 +3576,50 @@ same 520-token prompt, chunk 4:
 Medians: q4k **-4.8%**, q6k 118.27 vs 128.67 (**-8.1%**), chunk **-4.9%**, direction 5/5. Both
 sides drift up across the pairs as the box loads, which if anything understates the gain in the
 last pairs, and every pair is read within itself. The change holds on a quiet box.
+
+## Q6_K tiled epilogue: precomputed coefficients, folded bias, no clears — 2026-11-23
+
+Ported from `prefill-tiled-kernels.patch`, which was written against the tree before `SharedTile`
+and does not apply; only the Q6_K half is kept here. The Q6_K tiled band now:
+
+- precomputes `d * scale` per 16-value group and row (`coef`) instead of carrying `dvec[row]` and the
+  signed scale separately and multiplying them in the epilogue;
+- starts each group's integer accumulator at `-32 * (sum of the group's activation codes)` instead of
+  running `dpbusd` from zero and correcting with `mullo` + `sub` after it. Integer addition is
+  associative and exact, so the integer is the same;
+- drops `wq.fill(0)`, the scale clear and `dvec.fill(0.0)` per block: every read below is inside
+  rows `0..cnt`, which the unpack loop just wrote;
+- runs the tail of a row window one row at a time through the same `const R` kernel (full bands stay
+  `R = 8`), and adds `tiled_rows_do_not_depend_on_how_the_range_is_split`, which checks Q4_K and Q6_K
+  at six split points.
+
+**Bit-identical.** 24 greedy tokens from a fixed prompt are byte-identical between the two binaries
+(`cmp`), and the arithmetic is unchanged: the bias move is integer, `coef` is the same `d * scale`
+product the old epilogue formed, and the multiply order is `(cvt * dx) * coef` in both.
+
+Measurement: Qwen2.5-1.5B Q4_K_M, f16 KV, `VIPERA_THREADS=8`, 520-token prompt (48 repetitions of
+"The quick brown fox jumps over the lazy dog."), `--max-tokens 1`, `VIPERA_PROFILE_STEP=1`, chunk 4,
+two release binaries run interleaved, 5 pairs in a quiet window:
+
+| pair | q6k base | q6k new | total base | total new |
+|---|---:|---:|---:|---:|
+| 1 | 109.69 | 96.81 | 611.82 | 594.82 |
+| 2 | 110.76 | 97.17 | 618.50 | 597.85 |
+| 3 | 112.87 | 94.70 | 618.67 | 598.42 |
+| 4 | 111.95 | 95.99 | 614.76 | 600.82 |
+| 5 | 112.39 | 97.43 | 616.87 | 605.57 |
+| median | 111.95 | 96.81 | 616.87 | 598.42 |
+
+Medians: q6k **-13.5%**, chunk **-2.99%**, direction 5/5. Q4_K is flat (427.03 -> 426.72 ms), so the
+chunk move is the q6k phase. That is at, not clearly over, the 3% gate.
+
+Five more pairs were started and abandoned for the chunk claim: the box rose to load average 14-15
+(a browser process at 145% of a core), chunk 4 went to 2.7-2.8 s, and totals in that window are not
+comparable. The q6k phase still fell in 4 of those 5 pairs. A 2050-token probe in the same window
+saw q6k fall 16-22% at equal load but could not give a chunk ratio.
+
+Verdict: kept on request even though the chunk gain is under the pre-registered 3% gate, as with
+`VIPERA_TILE_REUSE` (+/-0.4%); the kernel is strictly faster, bit-identical, and removes a 16-group
+bias table and three per-block clears. The Q4_K half of the patch (transposed activation tile) was not
+ported: the tile is now built once per product by the prep workers, so the per-participant transpose
+buys nothing.
