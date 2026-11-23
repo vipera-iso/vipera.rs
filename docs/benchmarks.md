@@ -3740,3 +3740,110 @@ guard stream was ~a fifth of the uop stream, and removing it also removed the sp
 neighbouring idea — folding the weight broadcast into `vpdpbusd`'s memory operand — is closed by the
 ISA and now sits in `CONSTRAINTS.md` §Rejected: the `m32bcst` form is the *signed* source and the
 weight dword is the unsigned one.
+## README prefill rows, paired on a quiet box — 2026-11-23
+
+Re-measured the prefill rows the README quotes, in one session, so the table and the ratios come
+from the same load: i5-11300H, `VIPERA_THREADS=8`, Qwen2.5-1.5B Q4_K_M f16 KV, llama.cpp `e574a17`
+(build 466), CPU only. Load average 1.4 at the start. Two interleaved passes (llama, vipera, llama,
+vipera), `llama-bench -p 128,512,1024,4096 -n 0 -t 8 -r 3 -ngl 0` against the engine's ignored
+`prefill_vs_decode` and `prefill_long_prompt` tests.
+
+| workload | pass | llama.cpp e574a17 | vipera | vipera / llama.cpp |
+|---|---|---:|---:|---:|
+| pp128 | 1 | 201.83 ± 9.48 | 195.9 | 0.97x |
+| pp128 | 2 | 201.73 ± 4.51 | 193.2 | 0.96x |
+| pp512 | 1 | 211.99 ± 4.92 | 187.6 | 0.89x |
+| pp512 | 2 | 204.15 ± 1.63 | 184.0 | 0.90x |
+| pp1024 | 1 | 207.28 ± 0.62 | 178.5 | 0.86x |
+| pp1024 | 2 | 196.42 ± 1.39 | 174.6 | 0.89x |
+| pp4096 | 1 | 164.09 ± 0.53 | 129.3 | 0.79x |
+| pp4096 | 2 | 159.20 ± 0.44 | 127.8 | 0.80x |
+
+Medians: vipera **194 / 186 / 177 / 129**, llama.cpp **202 / 204–212 / 196–207 / 159–164**, ratios
+**0.96–0.97x / 0.89–0.90x / 0.86–0.89x / 0.79–0.80x**. The 2026-11-15 section above quoted 105 tok/s
+at 4096; this session's 128-129 is the same test on the current tree (shared tile and the fused
+epilogue switch have landed since), not a different measurement.
+
+The engine is still behind at every length, but the gap is narrower than the 2026-11-15 table: 3-4%
+at 128, 10-11% at 512, 11-14% at 1024, 20-21% at 4096. Ratios are same-session; absolutes sit below
+the 2026-11-15 llama numbers on both sides, which is the box, not the engine.
+
+## Prefill against llama.cpp after the Q4_K band change — 2026-11-23
+
+The Q4_K tiled band lost its runtime row limit (`const N` band, PR #64), measured at -5.4% chunk and
+-6.9% on the Q4_K phase in 9 interleaved pairs. This re-runs the vipera ↔ llama.cpp prefill
+comparison on that tree, so the README rows can be checked against a tree that contains the change.
+
+Not a quiet box: load average 3.0 at the start and 6-7 by the end, and llama.cpp's own pp128 came back
+at 193.7 ± 22.4 t/s in the first round. Two llama-bench rounds and one serially-run vipera pass, so the
+ratios are the only thing worth reading, and even they carry a few percent.
+
+Machine/model:
+
+- CPU: 11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz, 4 cores / 8 threads
+- Model: `~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf` (Q4_K_M, 1.04 GiB)
+- llama.cpp: `/home/user/llama-latest/build/bin/llama-bench`, `e574a17` (build 466), `-ngl 0 -t 8 -r 3`
+- vipera: `perf/q4k-tiled-band-const` (`6586783`), `VIPERA_THREADS=8`, the `win_vs_llama` harness'
+
+| test | llama.cpp R1 | llama.cpp R2 | vipera | vipera / llama (R2) |
+|---|---:|---:|---:|---:|
+| pp64 | — | — | 200.1 tok/s | — |
+| pp128 | 193.73 ± 22.35 | 214.97 ± 4.58 | 209.6 tok/s | 0.98 |
+| pp512 | 203.09 ± 3.96 | 212.09 ± 1.88 | 199.3 tok/s | 0.94 |
+| pp1024 | 192.67 ± 1.26 | 198.69 ± 3.82 | 198.3 tok/s | 1.00 |
+| pp4096 | 152.72 ± 0.20 | 161.99 ± 0.95 | 140.3 tok/s | 0.87 |
+| decode ctx32 | — | — | 33.0 tok/s | — |
+
+Read: today's paired ratios (0.98 / 0.94 / 1.00 / 0.87) are closer than the 2026-11-23 paired entry
+above (0.93 / 0.89 / 0.90 / 0.80), but both sides of that entry lost 5-10% of absolute throughput to
+the load, so this is directional, not a replacement. The change itself is measured on the skewed
+side: -5.4% chunk in 9 pairs, so an expected prefill gain of that order, which is inside what the
+noise here can resolve. No README table was changed.
+
+Protocol trap, for whoever repeats this: `cargo test ... -- prefill` matches both `prefill_vs_decode`
+and `prefill_long_prompt`, and cargo runs them in parallel threads. Both tests saturate the SMT halves,
+so a parallel run returns roughly half throughput (74 tok/s at n=64) and looks like a regression. Pass
+`--test-threads=1`.
+
+## ik_llama.cpp on the same machine, and what its kernel actually does — 2026-11-23
+
+Built `ikawrakow/ik_llama.cpp` at `1180df7` on this box (`-DGGML_NATIVE=ON` plus
+`GGML_AVX512/VNNI/VBMI=ON`, which is what turns on the IQK quantized GEMMs; without them the build
+silently falls back to AVX2) and ran it against the same GGUF, because upstream numbers on Zen 5 and
+16 threads do not transfer to a 4-core Tiger Lake.
+
+| engine | pp512 | pp4096 | notes |
+|---|---:|---:|---|
+| ik_llama.cpp `1180df7` | 268.7 ± 2.7 | 199.4 ± 1.9 | `-ub 512`, load 7.9 |
+| ik_llama.cpp `1180df7` | 245.7 ± 3.2 | 191.6 ± 0.9 | second session, load 10.2 |
+| llama.cpp `e574a17` | 202.7 ± 5.8 | 158.4 ± 1.5 | same session, same flags |
+| vipera (default path) | 209.6 | 140.3 | `win_vs_llama`, serial |
+| vipera (`VIPERA_ATTN_GEMM=1`) | 209.6 | ~167 (at 3.7k) | tiled attention, PR #65 |
+
+Ubatch is not the explanation: ik at `-ub 128` still reads 237.2 pp512 / 176.7 pp4096, so the width
+accounts for 3-8%, not the gap. At equal ubatch ik is 15-20% ahead of vipera on prefill and 13-19%
+ahead at 4096.
+
+**What its kernel does differently.** In `ggml/src/iqk/iqk_gemm_kquants.cpp` the 512-bit loop is
+
+```c
+p1 = _mm512_dpbusd_epi32(zero, values[0], q8.load_quants64(iy, i, 0));
+p2 = _mm512_dpbusd_epi32(zero, values[1], q8.load_quants64(iy, i, 1));
+```
+
+i.e. the weight arrives as a full `__m512i` of quantized values covering several rows, and the
+activation is a full vector load; there is no per-row broadcast anywhere in the hot loop. vipera's
+tiled kernel does one `vpbroadcastd` from its `wq` scratch per `vpdpbusd` (64:64 in the codegen gate),
+which is what the `NO_WEIGHT` probe priced in 2026-11-22: replacing that broadcast with a constant
+made the kernel 29% (8960x1536) and 56% (1536x8960) faster.
+
+So the remaining gap is not unpacking cost — that was measured at 8.8% of q4k — it is **one broadcast
+and one scalar load per dot product**, and the fix upstream uses is a repacked weight layout whose
+rows are already contiguous i8 vectors. That is the same family as the Q4_K 8x8 repack this ledger
+rejected on 2026-11-22, but that rejection priced the *unpack* and not the *broadcast*; the two
+measurements now agree on which one is worth the work.
+
+Not attempted here: the port itself. `iqk_gemm_kquants.cpp` is 5337 lines of per-ISA variants and
+`iqk_quantize.cpp` another 12492, so this needs its own branch, a load-time repack with the GGUF path
+as fallback, and the usual gate. The target to beat is stated: prefill +15% at pp512, +19% at pp4096,
+bit-identity not required but a greedy-text check against the current path is.
