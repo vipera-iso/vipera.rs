@@ -312,4 +312,44 @@ mod tests {
         let policy = KeepKv::new(128, 4);
         assert_eq!(policy.retain(&narrow, &[1.0; 32]).len(), 16);
     }
+
+    #[test]
+    fn empty_scores_keep_nothing() {
+        let flat = Geometry {
+            bytes_per_token: 1,
+            tokens_per_block: 1,
+        };
+        let policy = KeepKv::new(1024, 8);
+        assert!(policy.retain(&flat, &[]).is_empty());
+    }
+
+    #[test]
+    fn single_entry_keeps_it() {
+        let flat = Geometry {
+            bytes_per_token: 1,
+            tokens_per_block: 1,
+        };
+        let policy = KeepKv::new(1024, 8);
+        assert_eq!(policy.retain(&flat, &[0.5]), vec![0]);
+    }
+
+    #[test]
+    fn oversized_budget_keeps_all() {
+        let flat = Geometry {
+            bytes_per_token: 1,
+            tokens_per_block: 1,
+        };
+        let policy = KeepKv::new(u64::MAX, 8);
+        assert_eq!(policy.retain(&flat, &[0.1, 0.9, 0.5]), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn single_entry_with_oversized_budget_keeps_it() {
+        let flat = Geometry {
+            bytes_per_token: 1,
+            tokens_per_block: 1,
+        };
+        let policy = KeepKv::new(u64::MAX, 8);
+        assert_eq!(policy.retain(&flat, &[0.5]), vec![0]);
+    }
 }
