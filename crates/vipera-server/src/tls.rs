@@ -66,7 +66,7 @@ impl TlsSource {
     }
 
     /// The configuration to hand the next handshake. The lock is poisoned only if another
-    /// thread panicked while holding it, which `build` and `refresh` don't do.
+    /// thread panicked while holding it; the failure comes back as an error rather than a panic.
     pub(crate) fn config(&self) -> Result<Arc<rustls::ServerConfig>, String> {
         Ok(Arc::clone(
             &self
@@ -77,24 +77,26 @@ impl TlsSource {
         ))
     }
 
-    /// Rebuilds the configuration when either file moved. Returns whether it was replaced.
-    pub(crate) fn refresh(&self) -> bool {
+    /// Rebuilds the configuration when either file moved. Returns whether it was replaced, or the
+    /// lock could not be read: a poisoned lock is handed back as an error so the caller keeps
+    /// serving with the configuration that is already current instead of taking the connection
+    /// thread down with an `expect`.
+    pub(crate) fn refresh(&self) -> Result<bool, String> {
         let stamp = (FileStamp::of(&self.cert), FileStamp::of(&self.key));
-        if self.current.lock().expect("TLS configuration").stamp == stamp {
-            return false;
+        let mut current = self.current.lock().map_err(|poison| poison.to_string())?;
+        if current.stamp == stamp {
+            return Ok(false);
         }
         match Self::build(&self.cert, &self.key) {
             Ok((config, stamp)) => {
-                let mut current = self.current.lock().expect("TLS configuration");
                 current.config = config;
                 current.stamp = stamp;
-                true
+                Ok(true)
             }
             Err(error) => {
-                let mut current = self.current.lock().expect("TLS configuration");
                 current.stamp = stamp;
                 eprintln!("vipera: keeping the previous certificate: {error}");
-                false
+                Ok(false)
             }
         }
     }
@@ -211,15 +213,18 @@ mod tests {
         )
         .expect("the fixture pair loads");
 
-        assert!(!source.refresh(), "nothing moved since startup");
+        assert!(!source.refresh().expect("nothing moved since startup"));
         let serving = source.config().unwrap();
 
         // A half-written renewal keeps the certificate that works: a broken file must not take
         // the server down, and the bad stamp is remembered instead of retried every connection.
         std::fs::write(&cert, b"not a certificate").expect("write");
-        assert!(!source.refresh());
+        assert!(!source.refresh().expect("refresh"));
         assert!(Arc::ptr_eq(&serving, &source.config().unwrap()));
-        assert!(!source.refresh(), "the bad stamp is remembered");
+        assert!(
+            !source.refresh().expect("refresh"),
+            "the bad stamp is remembered"
+        );
 
         std::fs::write(
             &cert,
@@ -227,13 +232,49 @@ mod tests {
         )
         .expect("write");
         assert!(
-            source.refresh(),
+            source.refresh().expect("refresh"),
             "a usable renewal replaces the configuration"
         );
         assert!(!Arc::ptr_eq(&serving, &source.config().unwrap()));
-        assert!(!source.refresh(), "the new stamp is remembered");
+        assert!(
+            !source.refresh().expect("refresh"),
+            "the new stamp is remembered"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_poisoned_configuration_lock_is_reported_not_panicked_on() {
+        // The refresh path used to `expect` on the configuration lock, so a poisoned lock took the
+        // whole connection thread down instead of coming back as an error the caller could take.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let dir = std::env::temp_dir().join(format!("vipera-tls-poison-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cert = dir.join("chain.crt");
+        let key = dir.join("server.key");
+        std::fs::copy(fixtures.join("chain.crt"), &cert).expect("chain");
+        std::fs::copy(fixtures.join("server.key"), &key).expect("key");
+        let source = std::sync::Arc::new(
+            TlsSource::new(
+                cert.to_str().expect("utf-8 path"),
+                key.to_str().expect("utf-8 path"),
+            )
+            .expect("the fixture pair loads"),
+        );
+        let poisoned = std::thread::spawn({
+            let source = std::sync::Arc::clone(&source);
+            move || {
+                let _guard = source.current.lock().expect("lock");
+                panic!("poison the TLS configuration lock");
+            }
+        });
+        assert!(poisoned.join().is_err());
+        assert!(
+            source.refresh().is_err(),
+            "a poisoned lock must come back as an error, not a panic"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

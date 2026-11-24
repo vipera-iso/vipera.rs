@@ -287,7 +287,8 @@ pub fn command(args: &[String]) -> Result<u8, ViperaError> {
                 // A renewed certificate is a file write, not a restart: pick it up here, where
                 // the socket is still ours and no request is in flight.
                 if let Some(tls) = &served.tls
-                    && tls.refresh()
+                    && let Ok(refreshed) = tls.refresh()
+                    && refreshed
                 {
                     eprintln!("vipera: reloaded the TLS certificate");
                 }
