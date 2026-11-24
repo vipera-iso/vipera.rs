@@ -451,4 +451,62 @@ mod tests {
         let error = map_engine_error(&ViperaError::infeasible("too big"));
         assert_eq!(error, (422, "context_too_long"));
     }
+
+    #[test]
+    fn malformed_requests_get_a_structured_error_instead_of_a_panic() {
+        // The contract promises a structured error and no crash for a malformed request. Each
+        // edge below has to be answered, not left hanging or turned into a panic.
+        let oversized = vec![b'x'; MAX_HEAD_BYTES * 2];
+        let overflow = b"GET / HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n";
+        let two_encodings =
+            b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\ntransfer-encoding: gzip\r\n\r\n";
+        let two_keys =
+            b"GET / HTTP/1.1\r\nAuthorization: Bearer a\r\nauthorization: Bearer b\r\n\r\n";
+        let cases: Vec<(&[u8], u16)> = vec![
+            (b"\r\n\r\n", 400),                                      // no request line
+            (b"GET\r\n\r\n", 400),                                   // no path
+            (b"GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n", 400), // not a number
+            (b"GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", 400),  // negative
+            (overflow, 400),                                         // length does not fit in usize
+            (b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
+            (two_encodings, 400), // conflicting framing
+            (two_keys, 400),      // conflicting identity
+            (&oversized, 400),    // header block never ends
+        ];
+        for (bytes, expected) in cases {
+            let mut peer = Sent::new(bytes);
+            let status = match read_request(&mut peer).expect("read") {
+                Incoming::Rejected { status } => status,
+                Incoming::Request(_) => panic!("malformed input must not become a request"),
+                Incoming::Closed => panic!("a malformed peer did not get an answer"),
+            };
+            assert_eq!(status, expected);
+            let answer = String::from_utf8_lossy(&peer.written);
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {expected}")),
+                "{answer}"
+            );
+            assert!(
+                answer.contains(r#""type":"invalid_request_error""#),
+                "{answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_head_is_lossy_not_fatal() {
+        // A peer is allowed to send arbitrary bytes in the request line and headers. The path is
+        // derived from them by splitting on '?' after conversion, so both steps must tolerate a
+        // bad sequence instead of panicking on a UTF-8 boundary.
+        let mut peer = Sent::new(b"GET /\xff/chat?q=1&x=\xfe HTTP/1.1\r\nX-Bad: \xfe\r\n\r\n");
+        match read_request(&mut peer).expect("read") {
+            Incoming::Request(request) => {
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.path, "/\u{fffd}/chat");
+                assert_eq!(request.header("X-Bad"), Some("\u{fffd}"));
+            }
+            Incoming::Rejected { .. } => panic!("a lossy-decoded head should still be a request"),
+            Incoming::Closed => panic!("the peer did not close"),
+        }
+    }
 }
