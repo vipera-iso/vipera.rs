@@ -152,4 +152,27 @@ mod tests {
         let err = Reader::new(&bytes).string().unwrap_err();
         assert!(err.to_string().contains("UTF-8"));
     }
+
+    #[test]
+    fn rejects_truncated_string_payload() {
+        // Length is within the allocation limit but the bytes are missing.
+        let mut bytes = 5u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"ab");
+        let err = Reader::new(&bytes).string().unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("unexpected end of file"));
+    }
+
+    #[test]
+    fn rejects_truncated_string_length() {
+        let err = Reader::new(&[0x01, 0x02]).string().unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("unexpected end of file"));
+    }
+
+    #[test]
+    fn reads_empty_string() {
+        let bytes = 0u64.to_le_bytes();
+        assert_eq!(Reader::new(&bytes).string().unwrap(), "");
+    }
 }
