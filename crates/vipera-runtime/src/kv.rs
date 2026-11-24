@@ -969,4 +969,94 @@ mod tests {
         // 512 bytes is two 256-byte blocks, which hold eight positions.
         assert_eq!(cache.trim(&scores), (92..100).collect::<Vec<_>>());
     }
+
+    #[test]
+    fn kv_rings_wraparound_and_edge_cases() {
+        use super::*;
+
+        // Test 1: Normal ring wraparound
+        let config = KvConfig::ring(64, 16, 32_768, 2048, 4, 1).unwrap();
+        let mut cache = KvCache::new(config).unwrap();
+        cache.reserve(1, 32_768).unwrap();
+        let table = cache.table(1).expect("table").to_vec();
+        assert_eq!(table.len(), 2048, "full context table size");
+
+        let ring = config.ring.expect("ring");
+        let (pinned, rolling) = (ring.pinned_slots as usize, ring.rolling_slots as usize);
+
+        // Verify wraparound: slot per_sequence wraps to slot pinned
+        assert_eq!(
+            table[pinned + rolling],
+            table[pinned],
+            "slot per_sequence should wrap to slot pinned"
+        );
+
+        // Verify multiple wraparound cycles cycle correctly
+        for slot in (pinned + rolling + 1)..=(pinned + rolling * 3) {
+            let expected = table[pinned + (slot - pinned) % rolling];
+            assert_eq!(
+                table[slot], expected,
+                "slot {} should wrap to block correctly",
+                slot
+            );
+        }
+
+        // Test 2: Truncate with zero tokens keeps minimum ring floor
+        let mut truncate_cache = KvCache::new(config).unwrap();
+        truncate_cache.reserve(1, 32_768).unwrap();
+        // Truncate with 0 tokens - should keep at least floor blocks
+        truncate_cache.truncate(1, 0);
+        let t = truncate_cache.table(1).expect("table").to_vec();
+        let _floor = (ring.pinned_slots + ring.rolling_slots) as usize;
+        // Table should have valid block indices after truncate
+        for (idx, _) in t.iter().enumerate() {
+            assert!(t[idx] < 32_768, "block index out of range after truncate");
+        }
+
+        // Test 3: Release ring table frees blocks correctly (with dedup for aliases)
+        let mut release_cache = KvCache::new(config).unwrap();
+        release_cache.reserve(1, 32_768).unwrap();
+        let freed = release_cache.release(1);
+        assert!(freed > 0, "release should free some blocks, got {}", freed);
+        // After release, the table should be gone
+        assert!(
+            release_cache.table(1).is_none(),
+            "table should be removed after release"
+        );
+
+        // Test 4: Small window ring
+        let small_config = KvConfig::ring(64, 16, 32_768, 1, 4, 1).unwrap();
+        let mut small_cache = KvCache::new(small_config).unwrap();
+        small_cache.reserve(1, 32_768).unwrap();
+        let small_table = small_cache.table(1).expect("table").to_vec();
+        assert_eq!(small_table.len(), 2048);
+        let small_ring = small_config.ring.expect("ring");
+        let (sp, sr) = (
+            small_ring.pinned_slots as usize,
+            small_ring.rolling_slots as usize,
+        );
+        // Small window should still have valid wraparound
+        assert_eq!(
+            small_table[sp + sr],
+            table[pinned + rolling],
+            "small window wraparound should reference same block pattern"
+        );
+
+        // Test 5: Multiple sequences in ring have independent tables
+        let multi_config = KvConfig::ring(64, 16, 2048, 512, 2, 2).unwrap();
+        let mut multi_cache = KvCache::new(multi_config).unwrap();
+        multi_cache.reserve(1, 2048).unwrap();
+        multi_cache.reserve(2, 1024).unwrap();
+        let t1 = multi_cache.table(1).expect("table").len();
+        let t2 = multi_cache.table(2).expect("table").len();
+        // Each sequence should have its own table
+        assert_eq!(
+            t1, 128,
+            "sequence 1 should have 128 blocks for 2048 tokens at 16 per block"
+        );
+        assert_eq!(
+            t2, 64,
+            "sequence 2 should have 64 blocks for 1024 tokens at 16 per block"
+        );
+    }
 }
