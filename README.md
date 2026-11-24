@@ -40,6 +40,11 @@ that lost.
 | decode, 32k of history, window 2048 | 28.0 tok/s (35.8 ms/step) | not measured | — (6.8 tok/s with the full history) |
 | KV held for a windowed 32k run | 61 MB | not measured | — (896 MB with the full history) |
 
+Decode baseline recorded via CLI, 2026-11-24 (`vipera generate` reports `tokens_per_second` in
+its `--json` output): two runs of `vipera generate
+~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf --prompt "The capital of France is"
+--max-tokens 32 --json` → 25.90 / 26.01, mean ≈ **26.0 tok/s** (avx512-vnni, this machine).
+
 Prefill is level at 128 and 512 tokens (1.01x and 0.99x), 3% behind at 1024 and **13% behind at
 4096**; decode is **21% behind** at shallow depth. Those five rows (128 through shallow decode) were
 measured in one session on 2026-11-24, vipera from its own chunk/step clock and llama.cpp from

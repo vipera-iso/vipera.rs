@@ -4449,6 +4449,7 @@ trong epilogue. Switch default OFF.
 từ 68–165 tok/s nên không thể tách win. **Trạng thái: chưa đo xong, chưa có verdict.** H4 rời có thể
 re-run khi máy ổn; nếu muốn đo "pure skip" có thể đặt `VIPERA_TRIATTENTION_THRESHOLD=0` (skip
 không điều kiện).
+<<<<<<< HEAD
 
 ## Prefill re-measured, 128 / 512 / 1024 / 4096, against llama.cpp — 2026-11-24
 
@@ -4765,3 +4766,5 @@ không `take`; dòng `PROFILE` thêm `(this pass X ms)` sau trung bình, phần 
 
 Tổng `this pass` + 0.56 s nạp khớp wall trong 0.6 s ở cả hai chế độ, và không còn dòng decode nào
 trong lúc prefill. Đây là công cụ đo, không phải đường chạy model: không đổi kết quả, chỉ đổi số báo.
+=======
+>>>>>>> origin/main
