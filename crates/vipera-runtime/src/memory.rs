@@ -193,4 +193,52 @@ mod tests {
         // If it fails, that's also acceptable - the error should be a valid error type.
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn checked_arithmetic_zero_len_nonzero_offset() {
+        // Test that loading with len = 0 and a non-zero offset behaves sensibly.
+        // The buffer should be empty regardless of offset (as long as offset <= file_len).
+        let path = std::env::temp_dir().join("vipera-runtime-weights-zero-offset.bin");
+        // File with 10 bytes of data
+        std::fs::write(&path, [0u8; 10]).unwrap();
+
+        // Zero-length load from offset 5: should succeed with empty buffer
+        let result = WeightBuffer::load(&path, 5, 0);
+        assert!(
+            result.is_ok(),
+            "Expected zero-length load from offset 5 to succeed, got: {}",
+            result.unwrap_err()
+        );
+        let weights = result.unwrap();
+        assert_eq!(weights.len(), 0);
+
+        // Zero-length load from offset 0: should also succeed
+        let result2 = WeightBuffer::load(&path, 0, 0);
+        assert!(
+            result2.is_ok(),
+            "Expected zero-length load from offset 0 to succeed, got: {}",
+            result2.unwrap_err()
+        );
+        let weights2 = result2.unwrap();
+        assert_eq!(weights2.len(), 0);
+
+        // Zero-length load from offset 10 (at end of file): should succeed
+        let result3 = WeightBuffer::load(&path, 10, 0);
+        assert!(
+            result3.is_ok(),
+            "Expected zero-length load from offset 10 to succeed, got: {}",
+            result3.unwrap_err()
+        );
+        let weights3 = result3.unwrap();
+        assert_eq!(weights3.len(), 0);
+
+        // Zero-length load from offset 11 (beyond file): should fail with truncation
+        let result4 = WeightBuffer::load(&path, 11, 0);
+        assert!(
+            result4.is_err(),
+            "Expected zero-length load from offset 11 to fail with file beyond bounds"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
