@@ -1241,9 +1241,13 @@ fn fill_rows_q4k8(
 ) {
     let end_row = first_row + out.len();
     let row = fill_rows_q4k8_groups(data, stride, first_row, out.len(), &[activation.x], out);
-    for absolute in row..end_row {
+    let readable_end = end_row.min(data.len().checked_div(stride).unwrap_or(0));
+    for absolute in row..readable_end {
         let start = absolute * stride;
         out[absolute - first_row] = dot(GgmlType::Q4K, &data[start..start + stride], activation);
+    }
+    for absolute in readable_end.max(row)..end_row {
+        out[absolute - first_row] = 0.0;
     }
 }
 
@@ -1267,10 +1271,15 @@ fn fill_rows_q4k8_groups<const B: usize>(
     xs: &[&[f32]; B],
     out: &mut [f32],
 ) -> usize {
-    let blocks = stride / 144;
     // A zero-width row has no stride and no blocks. `matvec` rejects zero columns, but a pooled
-    // batch can reach here directly, so leave every output to the row-kernel tail below.
-    if stride == 0 {
+    // batch can reach here directly, so leave every output to the row-kernel tail below. Also
+    // fall back when the stride is not a whole number of Q4_K blocks or does not match the
+    // activation width: `quantize_q8k` and the packer assume `stride / 144 == x.len() / 256`.
+    if stride == 0 || !stride.is_multiple_of(144) {
+        return first_row;
+    }
+    let blocks = stride / 144;
+    if xs.iter().any(|x| x.len() != blocks * crate::simd::QK) {
         return first_row;
     }
     // Rows this slice of `data` can read; a group is only computed whole when all eight fit.
@@ -1416,12 +1425,21 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         && crate::simd::vnni512_available()
     {
         let row = fill_rows_q4k8_groups(data, stride, first_row, count, &activation.x, out);
+        let readable_end = (first_row + count).min(data.len().checked_div(stride).unwrap_or(0));
         let mut values = [0.0_f32; B];
-        for offset in row - first_row..count {
+        let tail_start = row.saturating_sub(first_row);
+        let tail_dot_end = readable_end.saturating_sub(first_row).min(count);
+        for offset in tail_start..tail_dot_end.max(tail_start) {
             let start = (first_row + offset) * stride;
             dot_batch(ty, &data[start..start + stride], activation, &mut values);
             for (entry, value) in values.iter().enumerate() {
                 out[entry * count + offset] = *value;
+            }
+        }
+        let tail_zero_start = readable_end.max(row).saturating_sub(first_row);
+        for offset in tail_zero_start..count {
+            for entry in 0..B {
+                out[entry * count + offset] = 0.0;
             }
         }
         return;
@@ -2430,6 +2448,152 @@ mod tests {
         assert_eq!(
             split, whole,
             "a row must not change when the split moves its group boundary"
+        );
+    }
+
+    /// A pooled batch shares one 8-row group fill across entries, and a row's value must not depend
+    /// on whether it landed in a group or in the tail: the same rows through a B=2 pooled batch
+    /// must match each activation run alone, including a row count that is not a multiple of eight.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k8_pooled_batch_matches_single_runs_across_group_boundaries() {
+        if !crate::simd::vnni512_available() || !crate::simd::q4k8_enabled() {
+            return;
+        }
+        const ROWS: usize = 20;
+        const COLS: usize = 512;
+        let stride = row_bytes(GgmlType::Q4K, COLS).expect("stride");
+        let blocks = stride / 144;
+        let mut data = vec![0u8; stride * ROWS];
+        for row in 0..ROWS {
+            for block in 0..blocks {
+                let at = row * stride + block * 144;
+                data[at..at + 2].copy_from_slice(&f16(0.02 + row as f32 * 0.001));
+                data[at + 2..at + 4].copy_from_slice(&f16(0.01));
+                for i in 0..12 {
+                    data[at + 4 + i] = ((row * 7 + block * 3 + i) % 251) as u8;
+                }
+                for i in 0..128 {
+                    data[at + 16 + i] = ((row * 13 + block * 5 + i * 3) % 251) as u8;
+                }
+            }
+        }
+        let x0: Vec<f32> = (0..COLS).map(|at| ((at % 13) as f32 - 6.0) / 7.0).collect();
+        let x1: Vec<f32> = (0..COLS).map(|at| ((at % 17) as f32 - 8.0) / 9.0).collect();
+
+        let mut single0 = vec![0.0_f32; ROWS];
+        let mut single1 = vec![0.0_f32; ROWS];
+        matvec(GgmlType::Q4K, &data, COLS, ROWS, &x0, &mut single0).expect("single 0");
+        matvec(GgmlType::Q4K, &data, COLS, ROWS, &x1, &mut single1).expect("single 1");
+
+        thread::scope(|scope| {
+            let pool = crate::pool::Pool::new(scope, 4);
+            let mut batched = vec![0.0_f32; 2 * ROWS];
+            matvec_pooled_batch(
+                &pool,
+                Matrix {
+                    ty: GgmlType::Q4K,
+                    cols: COLS,
+                    rows: ROWS,
+                },
+                &data,
+                &[&x0, &x1],
+                &Fusion::None,
+                &mut batched,
+            )
+            .expect("pooled batch");
+            assert_eq!(
+                &batched[..ROWS],
+                single0.as_slice(),
+                "batch entry 0 must match its single run"
+            );
+            assert_eq!(
+                &batched[ROWS..],
+                single1.as_slice(),
+                "batch entry 1 must match its single run"
+            );
+        });
+    }
+
+    /// An unusual stride (not a whole number of Q4_K blocks) or an activation width that does not
+    /// match the stride cannot be consumed by the 8x8 group fill; it must fall back to the row
+    /// kernel instead of dividing or indexing out of bounds.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k8_group_fill_rejects_unusual_stride_without_oob() {
+        const COLS: usize = 256;
+        let stride = row_bytes(GgmlType::Q4K, COLS).expect("stride");
+        assert_eq!(stride, 144);
+        let mut data = vec![0u8; stride * 8];
+        for row in 0..8 {
+            let at = row * stride;
+            data[at..at + 2].copy_from_slice(&f16(0.03));
+            data[at + 2..at + 4].copy_from_slice(&f16(0.0));
+            for i in 0..12 {
+                data[at + 4 + i] = 1;
+            }
+            for i in 0..128 {
+                data[at + 16 + i] = 0x21;
+            }
+        }
+        let x: Vec<f32> = (0..COLS).map(|i| (i % 7) as f32 * 0.1).collect();
+        let xq = QuantizedX::new(&x);
+        let sums = x_sums(&x);
+        let activation = Activation {
+            x: &x,
+            sums: &sums,
+            q: Some(&xq),
+        };
+
+        let mut reference = vec![0.0_f32; 8];
+        fill_rows(GgmlType::Q4K, &data, stride, 0, activation, &mut reference);
+
+        // A stride not divisible by 144 is unusual for Q4_K; the group fill must not panic or read
+        // out of bounds, and it must leave the output to the row-kernel tail. Pad each row so the
+        // tail can read a full (unusual) stride.
+        let unusual_stride = stride + 16;
+        let mut padded = vec![0u8; unusual_stride * 8];
+        for row in 0..8 {
+            padded[row * unusual_stride..row * unusual_stride + stride]
+                .copy_from_slice(&data[row * stride..(row + 1) * stride]);
+        }
+        let mut unusual = vec![0.0_f32; 8];
+        let wrote =
+            fill_rows_q4k8_groups(&padded, unusual_stride, 0, 8, &[x.as_slice()], &mut unusual);
+        assert_eq!(wrote, 0, "unusual stride must fall back to the tail");
+        for (absolute, slot) in unusual.iter_mut().enumerate() {
+            let start = absolute * unusual_stride;
+            *slot = dot(
+                GgmlType::Q4K,
+                &padded[start..start + unusual_stride],
+                activation,
+            );
+        }
+        assert_eq!(
+            unusual, reference,
+            "padded layout must match the canonical row"
+        );
+
+        // A stride/activation mismatch must also fall back, not panic inside quantize_q8k.
+        let x_short: Vec<f32> = vec![0.1; 256];
+        let stride_two_blocks = 288;
+        let mut data_two = vec![0u8; stride_two_blocks * 8];
+        for row in 0..8 {
+            data_two[row * stride_two_blocks..row * stride_two_blocks + stride]
+                .copy_from_slice(&data[row * stride..(row + 1) * stride]);
+        }
+        let mut mismatch = vec![0.0_f32; 8];
+        let wrote = fill_rows_q4k8_groups(
+            &data_two,
+            stride_two_blocks,
+            0,
+            8,
+            &[x_short.as_slice()],
+            &mut mismatch,
+        );
+        assert_eq!(
+            wrote, 0,
+            "mismatched activation width must fall back to the tail"
         );
     }
 
