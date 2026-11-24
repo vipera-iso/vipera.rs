@@ -65,9 +65,16 @@ impl TlsSource {
         Ok((tls_config(&cert_pem, &key_pem)?, stamp))
     }
 
-    /// The configuration to hand the next handshake.
-    pub(crate) fn config(&self) -> Arc<rustls::ServerConfig> {
-        Arc::clone(&self.current.lock().expect("TLS configuration").config)
+    /// The configuration to hand the next handshake. The lock is poisoned only if another
+    /// thread panicked while holding it, which `build` and `refresh` don't do.
+    pub(crate) fn config(&self) -> Result<Arc<rustls::ServerConfig>, String> {
+        Ok(Arc::clone(
+            &self
+                .current
+                .lock()
+                .map_err(|poison| poison.to_string())?
+                .config,
+        ))
     }
 
     /// Rebuilds the configuration when either file moved. Returns whether it was replaced.
@@ -205,13 +212,13 @@ mod tests {
         .expect("the fixture pair loads");
 
         assert!(!source.refresh(), "nothing moved since startup");
-        let serving = source.config();
+        let serving = source.config().unwrap();
 
         // A half-written renewal keeps the certificate that works: a broken file must not take
         // the server down, and the bad stamp is remembered instead of retried every connection.
         std::fs::write(&cert, b"not a certificate").expect("write");
         assert!(!source.refresh());
-        assert!(Arc::ptr_eq(&serving, &source.config()));
+        assert!(Arc::ptr_eq(&serving, &source.config().unwrap()));
         assert!(!source.refresh(), "the bad stamp is remembered");
 
         std::fs::write(
@@ -223,7 +230,7 @@ mod tests {
             source.refresh(),
             "a usable renewal replaces the configuration"
         );
-        assert!(!Arc::ptr_eq(&serving, &source.config()));
+        assert!(!Arc::ptr_eq(&serving, &source.config().unwrap()));
         assert!(!source.refresh(), "the new stamp is remembered");
 
         std::fs::remove_dir_all(&dir).ok();

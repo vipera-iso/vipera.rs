@@ -356,7 +356,11 @@ fn resolve_model_path(path: &str) -> Result<String, ViperaError> {
         }
     }
     match found.len() {
-        1 => Ok(found.into_iter().next().expect("one gguf")),
+        1 => Ok(found.into_iter().next().ok_or_else(|| {
+            ViperaError::usage(format!(
+                "directory \"{path}\" has no .gguf file after listing"
+            ))
+        })?),
         0 => Err(ViperaError::usage(format!(
             "directory \"{path}\" contains no .gguf file; pass a model file directly"
         ))),
@@ -838,8 +842,9 @@ fn handle(served: &Served, mut stream: TcpStream) -> std::io::Result<()> {
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
     if let Some(source) = &served.tls {
-        let connection = rustls::ServerConnection::new(source.config())
-            .map_err(|error| std::io::Error::other(format!("TLS: {error}")))?;
+        let connection =
+            rustls::ServerConnection::new(source.config().map_err(std::io::Error::other)?)
+                .map_err(|error| std::io::Error::other(format!("TLS: {error}")))?;
         let mut tls = rustls::StreamOwned::new(connection, stream);
         let result = serve_connection(served, &mut tls, &peer);
         // `Connection: close` is the contract here, and over TLS that means close_notify before
