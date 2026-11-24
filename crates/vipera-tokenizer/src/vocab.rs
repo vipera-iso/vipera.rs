@@ -70,16 +70,20 @@ impl Vocabulary {
             ));
         }
 
-        let scores = number_array(file, "tokenizer.ggml.scores").ok();
-        if let Some(scores) = &scores
-            && scores.len() != tokens.len()
-        {
-            return Err(ViperaError::unsupported(format!(
-                "tokenizer has {} tokens but {} scores",
-                tokens.len(),
-                scores.len()
-            )));
-        }
+        let scores = match file.metadata.get("tokenizer.ggml.scores") {
+            None => None,
+            Some(_) => {
+                let scores = number_array(file, "tokenizer.ggml.scores")?;
+                if scores.len() != tokens.len() {
+                    return Err(ViperaError::unsupported(format!(
+                        "tokenizer has {} tokens but {} scores",
+                        tokens.len(),
+                        scores.len()
+                    )));
+                }
+                Some(scores)
+            }
+        };
 
         let types = int_array(file, "tokenizer.ggml.token_type")
             .ok()
@@ -301,13 +305,24 @@ fn number_array(file: &GgufFile, key: &str) -> Result<Vec<f32>, ViperaError> {
     match file.metadata.get(key) {
         Some(Value::Array(items)) => items
             .iter()
-            .map(|item| match item {
-                Value::F32(value) => Ok(*value),
-                Value::F64(value) => Ok(*value as f32),
-                other => Err(ViperaError::unsupported(format!(
-                    "{key} contains a {} where a score was expected",
-                    other.type_name()
-                ))),
+            .enumerate()
+            .map(|(index, item)| {
+                let value = match item {
+                    Value::F32(value) => *value,
+                    Value::F64(value) => *value as f32,
+                    other => {
+                        return Err(ViperaError::unsupported(format!(
+                            "{key} contains a {} where a score was expected",
+                            other.type_name()
+                        )));
+                    }
+                };
+                if !value.is_finite() {
+                    return Err(ViperaError::unsupported(format!(
+                        "{key} contains a non-finite score at index {index}"
+                    )));
+                }
+                Ok(value)
             })
             .collect(),
         Some(other) => Err(ViperaError::unsupported(format!(
@@ -368,5 +383,57 @@ mod tests {
         assert_eq!(TokenType::from_code(3), TokenType::Control);
         assert_eq!(TokenType::from_code(6), TokenType::Byte);
         assert_eq!(TokenType::from_code(99), TokenType::Normal);
+    }
+
+    #[test]
+    fn malformed_scores_are_rejected() {
+        use vipera_conformance::{GgufBuilder, MetaValue};
+        use vipera_core::gguf::GgufFile;
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut builder = GgufBuilder::minimal();
+            builder.metadata.push((
+                "tokenizer.ggml.tokens".to_owned(),
+                MetaValue::StrArray(vec!["a".to_owned()]),
+            ));
+            builder.metadata.push((
+                "tokenizer.ggml.scores".to_owned(),
+                MetaValue::F32Array(vec![bad]),
+            ));
+            let file = GgufFile::parse(&builder.build()).expect("fixture parses");
+            let err = Vocabulary::from_gguf(&file)
+                .expect_err("non-finite score must be rejected")
+                .to_string();
+            assert!(
+                err.contains("non-finite score"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_empty_token_lookups_are_safe() {
+        use vipera_conformance::{GgufBuilder, MetaValue};
+        use vipera_core::gguf::GgufFile;
+
+        let mut builder = GgufBuilder::minimal();
+        builder.metadata.push((
+            "tokenizer.ggml.tokens".to_owned(),
+            MetaValue::StrArray(vec!["a".to_owned(), "<unk>".to_owned()]),
+        ));
+        builder.metadata.push((
+            "tokenizer.ggml.token_type".to_owned(),
+            MetaValue::I32Array(vec![1, 2]),
+        ));
+        let file = GgufFile::parse(&builder.build()).expect("fixture parses");
+        let vocab = Vocabulary::from_gguf(&file).expect("vocabulary loads");
+
+        assert_eq!(vocab.id("a"), Some(0));
+        assert_eq!(vocab.id("<unk>"), Some(1));
+        assert_eq!(vocab.id("missing"), None);
+        assert_eq!(vocab.id(""), None);
+        assert_eq!(vocab.unknown_id(), Some(1));
+        assert_eq!(vocab.piece(0), Some("a"));
+        assert_eq!(vocab.piece(99), None);
     }
 }
