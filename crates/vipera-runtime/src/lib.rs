@@ -31,3 +31,4 @@ pub use pipeline::{
     BatchContext, BatchEntry, ForwardContext, ForwardPass, RequestLog, Stage, StageTimings,
 };
 pub use sequence::{FinishReason, Sequence, SequenceState, Snapshot};
+pub use vipera_algo_keepkv::KeepKv;

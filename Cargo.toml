@@ -10,6 +10,7 @@ members = [
     "crates/vipera-backend-cpu",
     "crates/vipera-backend-gpu",
     "crates/vipera-core",
+    "crates/vipera-algo-keepkv",
     "crates/vipera-server",
     "bins/vipera",
 ]
