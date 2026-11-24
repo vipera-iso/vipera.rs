@@ -1183,7 +1183,10 @@ pub(crate) fn fill_rows(
         && crate::simd::q6k_iqk_enabled()
         && crate::simd::vnni512_available()
     {
-        let xq = activation.q.as_ref().unwrap_or_else(|| panic!("Q6_K builds a quantized activation"));
+        let xq = activation
+            .q
+            .as_ref()
+            .unwrap_or_else(|| panic!("Q6_K builds a quantized activation"));
         let whole = out.len() - out.len() % 4;
         if whole > 0 {
             let repack = crate::simd::pack_q6k_iqk(data, stride, first_row, whole);
