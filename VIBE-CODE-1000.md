@@ -267,10 +267,31 @@ tmux capture-pane -t fb-vipera -p | tail -20
 
 ---
 
+## PLAN 24H (từ 2h sáng)
+
+| Thời gian | Freebuff | OpenCode | Ghi chú |
+|---|---|---|---|
+| 2h-10h | Glyph Cluster (free) — tasks P1-P2 | tidepool-alpha (free) — P0 hard-q6k-iqk | Freebuff queue #10, ~200s wait |
+| 10h-18h | **DeepSeek V4.1 Flash (mạnh, 8h)** — tasks P1 | tidepool-alpha — P0/P1 (đổi WiFi nếu hết) | DeepSeek reset 24h → code 8h |
+| 18h-2h | Glyph Cluster (free) — tasks P2-P3 | tidepool-alpha (đổi WiFi Nho) | Back model free |
+
+**WiFi:**
+- **Nho**: Freebuff (mặc định, giữ 24h)
+- **Tang Thuong 5G**: OpenCode reset token khi hết (đổi 5-10s)
+- **Hermes**: không bị ảnh hưởng đổi WiFi (chạy local)
+
+**Rules:**
+1. Freebuff hết 8h DeepSeek → đổi lại Glyph Cluster (free, không giới hạn)
+2. OpenCode hết tidepool-alpha → đổi WiFi Tang Thuong 5G → reset → chạy tiếp
+3. Mỗi task = 1 PR squash merge = ~4 contributions
+4. Target: 51 tasks × 5 cycles = 1020+ contributions/ngày
+
+---
+
 ## HIỆN TẠI (cập nhật liên tục)
 
 - **Hermes**: orchestrate + verify + merge
-- **OpenCode**: đang chạy `hard-q6k-iqk` (P0, task khó nhất)
-- **Freebuff**: đang chạy `p1-mla-attention` (P0.3)
+- **OpenCode**: đang chạy `hard-q6k-iqk` (P0, test pass 0, đang code)
+- **Freebuff**: đang chạy `pinned-staging` (Glyph Cluster, queue #10)
 - **PRs mở**: #70 (tasks 007-009, CI green, chờ merge)
 - **Branch**: `perf/attn-triattention` → main
