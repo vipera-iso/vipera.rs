@@ -7263,6 +7263,46 @@ mod tests {
             }
         }
     }
+    /// Regression: the Q6_K tiled range must agree with the integer row kernel on an odd row
+    /// count and a narrow activation count, the shape a decode step can hit.
+    #[test]
+    fn q6k_tiled_range_matches_batch_q8_on_odd_narrow_shapes() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x9e37_79b9_1234_5678);
+        let total_rows = 7usize;
+        let first_row = 2usize;
+        let count = 5usize;
+        let cols = 256usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..total_rows)
+            .flat_map(|_| q6k_row(&mut rng, blocks))
+            .collect();
+        let stride = blocks * 210;
+        let b = 3usize;
+        let source: Vec<Vec<f32>> = (0..b)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xsr = [&xs_vec[0], &xs_vec[1], &xs_vec[2]];
+        let mut got = vec![0.0_f32; b * count];
+        assert!(try_q6k_matvec_tiled_range(
+            &data, stride, first_row, count, &xsr, &mut got, None
+        ));
+        for row in 0..count {
+            let rr = first_row + row;
+            for entry in 0..b {
+                let rb = &data[rr * stride..(rr + 1) * stride];
+                let want = crate::quant::q6k_dot_q8(rb, &xs_vec[entry]);
+                let gotv = got[entry * count + row];
+                assert!(
+                    (gotv - want).abs() <= 1e-3 + 1e-4 * want.abs(),
+                    "row {row} entry {entry}: got {gotv}, want {want}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
