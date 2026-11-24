@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use vipera_errors::ViperaError;
 use vipera_sampler::{Sampler, SamplerConfig};
-use vipera_traits::SparseAttention;
+// Re-exported so a backend that depends only on the runtime can implement the contracts the engine
+// accepts without adding a dependency edge of its own.
+pub use vipera_traits::{KvCompression, SparseAttention};
 
 use crate::kv::KvCache;
 use crate::pipeline::{

@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod bus;
+pub mod compress;
 pub mod model;
 mod pool;
 pub mod profile;
@@ -43,6 +44,7 @@ pub(crate) mod simd {
 }
 pub(crate) mod tiled;
 
+pub use compress::Q8Kv;
 pub use model::{CpuBackend, ModelConfig};
 pub use quant::{dequantize, f16_to_f32, f32_to_f16, matvec, read_row, row_bytes};
 

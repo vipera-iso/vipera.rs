@@ -18,7 +18,7 @@ use vipera_errors::ViperaError;
 use vipera_runtime::{BatchContext, BatchEntry, ForwardContext, ForwardPass};
 
 use crate::pool::Pool;
-use crate::quant::{self, Fusion, f16_to_f32, f32_to_f16};
+use crate::quant::{self, Fusion, f32_to_f16};
 
 /// The most sequences one batched step computes at once.
 ///
@@ -270,22 +270,7 @@ impl KvLayout {
                         "a q8_0 KV row needs a whole number of 32-value blocks",
                     ));
                 }
-                for (block, chunk) in destination
-                    .as_chunks_mut::<34>()
-                    .0
-                    .iter_mut()
-                    .zip(values.as_chunks::<32>().0)
-                {
-                    let largest = chunk
-                        .iter()
-                        .fold(0.0_f32, |max, value| max.max(value.abs()));
-                    let scale = if largest == 0.0 { 0.0 } else { largest / 127.0 };
-                    block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
-                    let inverse = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-                    for (slot, value) in block[2..].iter_mut().zip(chunk) {
-                        *slot = (value * inverse).round().clamp(-127.0, 127.0) as i8 as u8;
-                    }
-                }
+                crate::compress::encode_q8_0(values, destination);
                 Ok(())
             }
         }
@@ -303,17 +288,7 @@ impl KvLayout {
                         "a q8_0 KV row needs a whole number of 32-value blocks",
                     ));
                 }
-                for (chunk, block) in values
-                    .as_chunks_mut::<32>()
-                    .0
-                    .iter_mut()
-                    .zip(source.as_chunks::<34>().0)
-                {
-                    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-                    for (value, quantized) in chunk.iter_mut().zip(&block[2..]) {
-                        *value = scale * f32::from(*quantized as i8);
-                    }
-                }
+                crate::compress::decode_q8_0(source, values);
                 Ok(())
             }
         }
