@@ -308,12 +308,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **161 tasks** (P0-P15) × 1 cycle = **644 contributions**
-> 161 × 3 cycles = **483 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 161 × 5 cycles = **805 contributions** → đạt 1000 rule trong **3 ngày** ✓
-> 161 × 7 cycles = **1127 contributions** → đạt 1000 rule trong **4 ngày** ✓
+> **211 tasks** (P0-P20) × 1 cycle = **844 contributions**
+> 211 × 3 cycles = **2532 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 211 × 5 cycles = **4220 contributions** → đạt 2000 rule trong **5 ngày** ✓
 
-**Gợi ý: 3 cycles trong 48h → 483 contributions (an toàn cho 1000 rule)**
+**Gợi ý: 2 cycles trong 48h → 844 contributions (an toàn cho 1000 rule)**
 
 ## LỆNH CHẠY
 
