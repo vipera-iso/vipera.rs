@@ -85,3 +85,36 @@ cargo test --release -p vipera-backend-cpu --lib bench_q8r16_against_f32_batch -
 The bench compares the f32 batch row kernel against the repack back to back in one process; the
 result only becomes a claim once its ratio is written into a dated section of the ledger
 [`../benchmarks.md`](../benchmarks.md). Until then the switch stays off.
+
+## Round-2 correctness fixes — 2026-11-25
+
+Three bugs found in round 2, recorded together so the next person does not have to re-derive the
+repro. These are **correctness fixes, not performance results**: no speed number is claimed for any
+of them, none changes a default switch, and all five regression tests are plain unit tests with no
+model or hardware dependency.
+
+| Fix | Commit | What was wrong | Regression test(s) |
+|---|---|---|---|
+| Divide-by-zero in Q4K8 | `97162b6` | `matvec` accepted a zero-column matrix (zero is a whole number of blocks, so `row_bytes` passed it), and with `VIPERA_Q4K8=1` the 8x8 Q4_K kernel divided the tensor length by that zero stride. The public boundary now rejects it with a "zero columns" error, as `dequantize` already did. | `quant::tests::zero_columns_is_an_error_not_a_division_by_zero`, `quant::tests::q4k_and_q6k_round_trip_within_limits_at_block_boundaries` |
+| Malformed BPE merges | `154669e` | `BpeEncoder::from_vocab` turned every merge pair into a rank, so a pair with an empty side produced a rank keyed by the separator alone. Empty sides are now skipped. | `bpe::tests::empty_merges_produce_no_merges_without_panic` |
+| Malformed HTTP input | `0203c46` | The request reader had to answer, not panic or hang, on a missing request line or path, a non-numeric/negative/overflowing `Content-Length`, conflicting `Transfer-Encoding`, duplicate `Authorization`, and an unterminated oversized head; invalid UTF-8 in the head had to decode lossily rather than panic on a UTF-8 boundary. | `http::tests::malformed_requests_get_a_structured_error_instead_of_a_panic`, `http::tests::invalid_utf8_in_a_head_is_lossy_not_fatal` |
+
+Exact commands, from the repository root; each targeted test also runs inside the full-crate
+command recorded in its fix commit:
+
+```sh
+# divide-by-zero in Q4K8 (vipera-backend-cpu)
+cargo test -p vipera-backend-cpu --lib zero_columns_is_an_error_not_a_division_by_zero
+cargo test -p vipera-backend-cpu --lib q4k_and_q6k_round_trip_within_limits_at_block_boundaries
+
+# malformed BPE merges (vipera-tokenizer)
+cargo test -p vipera-tokenizer --lib empty_merges_produce_no_merges_without_panic
+
+# malformed HTTP input (vipera-server)
+cargo test -p vipera-server --lib malformed_requests_get_a_structured_error_instead_of_a_panic
+cargo test -p vipera-server --lib invalid_utf8_in_a_head_is_lossy_not_fatal
+```
+
+The full-crate commands the round-2 workers ran alongside `cargo fmt --check` and
+`cargo clippy -p <crate> --all-targets` were `cargo test -p vipera-backend-cpu`,
+`cargo test -p vipera-tokenizer` and `cargo test -p vipera-server`.
