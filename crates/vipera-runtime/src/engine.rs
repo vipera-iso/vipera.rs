@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use vipera_errors::ViperaError;
 use vipera_sampler::{Sampler, SamplerConfig};
+use vipera_traits::SparseAttention;
 
 use crate::kv::KvCache;
 use crate::pipeline::{
@@ -311,6 +312,25 @@ pub struct StepReport {
     pub failed: Vec<(u64, String)>,
 }
 
+/// The sparse-attention policy a build registered, and the buffer it writes its selection into.
+///
+/// The selection is not handed to the backend yet — [`BatchEntry`] carries no position list — so
+/// what the engine does with it today is time it and check it against the trait's contract.
+struct SparsePolicy {
+    policy: &'static dyn SparseAttention,
+    positions: Vec<u32>,
+}
+
+/// A registered policy is named rather than dumped, and the buffer is reported by its length.
+impl fmt::Debug for SparsePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SparsePolicy")
+            .field("name", &self.policy.name())
+            .field("selected", &self.positions.len())
+            .finish()
+    }
+}
+
 /// Sequences, KV blocks, and the model behind them.
 #[derive(Debug)]
 pub struct Engine<F: ForwardPass> {
@@ -332,6 +352,9 @@ pub struct Engine<F: ForwardPass> {
     prefix_cache: bool,
     /// For each parked sequence, the prompt tokens whose KV it holds and a request may reuse.
     retired: BTreeMap<u64, Vec<u32>>,
+    /// The sparse-attention policy the `sparse` stage consults; `None` leaves it the identity
+    /// strategy. See [`Engine::set_sparse_attention`].
+    sparse: Option<SparsePolicy>,
 }
 
 impl<F: ForwardPass> Engine<F> {
@@ -349,7 +372,21 @@ impl<F: ForwardPass> Engine<F> {
             owe_decode: false,
             prefix_cache: prefix_cache_enabled(false),
             retired: BTreeMap::new(),
+            sparse: None,
         }
+    }
+
+    /// Register the policy the `sparse` stage consults, or clear it with `None`.
+    ///
+    /// The policy is a `'static` reference because one algorithm serves every turn in the process
+    /// and [`Engine`] carries no lifetime parameter to borrow through; a host builds its policies
+    /// once at startup, beside the backend. With no policy registered the stage stays the identity
+    /// strategy and costs nothing, which is how every build ran before algorithms existed.
+    pub fn set_sparse_attention(&mut self, policy: Option<&'static dyn SparseAttention>) {
+        self.sparse = policy.map(|policy| SparsePolicy {
+            policy,
+            positions: Vec::new(),
+        });
     }
 
     /// Turn the prefix cache on or off for later requests.
@@ -780,6 +817,7 @@ impl<F: ForwardPass> Engine<F> {
             forward,
             sequences,
             turns,
+            sparse,
             ..
         } = self;
         let tokens_per_block = kv.config().tokens_per_block as usize;
@@ -822,11 +860,26 @@ impl<F: ForwardPass> Engine<F> {
             let started = Instant::now();
             kv.reserve(*id, end as u64)?;
             turn.timings.record(Stage::Allocate, started.elapsed());
-            // Identity strategies until their algorithms land: nothing is compressed, no draft tokens
-            // are produced, and every requested position is computed.
-            for stage in [Stage::Compress, Stage::Speculative, Stage::Sparse] {
+            // Compress and speculate are identity strategies until their algorithms land: nothing
+            // is compressed and no draft tokens are produced. Sparse is no longer one: a registered
+            // policy is consulted for the newest position of this range and its cost is recorded.
+            for stage in [Stage::Compress, Stage::Speculative] {
                 turn.timings.record(stage, Duration::ZERO);
             }
+            let context = u32::try_from(end)
+                .map_err(|_| ViperaError::internal("sequence position exceeds 32 bits"))?;
+            let started = Instant::now();
+            if let Some(sparse) = sparse.as_mut() {
+                sparse.positions.clear();
+                sparse
+                    .policy
+                    .positions(context.saturating_sub(1), context, &mut sparse.positions);
+                debug_assert!(
+                    sparse.positions.iter().all(|&position| position < context),
+                    "a sparse policy selected a position past the retained context"
+                );
+            }
+            turn.timings.record(Stage::Sparse, started.elapsed());
             ranges.push((start, end));
         }
 
@@ -1280,6 +1333,7 @@ fn end_turn(sequence: &mut Sequence, turn: &mut Turn, reason: FinishReason) -> G
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::kv::KvConfig;
@@ -1713,6 +1767,41 @@ mod tests {
         let generation = engine.generate(id).unwrap();
         assert_eq!(generation.finish, FinishReason::EndOfSequence);
         assert_eq!(generation.tokens, vec![5]);
+    }
+
+    /// A sparse policy that keeps every other retained position and records that it was consulted.
+    struct EveryOtherSparse;
+
+    static SPARSE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    impl SparseAttention for EveryOtherSparse {
+        fn name(&self) -> &'static str {
+            "every-other"
+        }
+
+        fn positions(&self, query: u32, context: u32, out: &mut Vec<u32>) {
+            SPARSE_CALLS.fetch_add(1, Ordering::Relaxed);
+            // Charge the policy real time, so a stage that only reports `Duration::ZERO` fails here.
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            out.extend((0..=query.min(context - 1)).step_by(2));
+        }
+    }
+
+    #[test]
+    fn a_registered_sparse_policy_is_called_and_timed() {
+        let before = SPARSE_CALLS.load(Ordering::Relaxed);
+        let mut engine = engine_with(greedy(), ToyForward::new(32), 32);
+        engine.set_sparse_attention(Some(&EveryOtherSparse));
+        let id = engine.admit(&[1, 2, 3], 2).unwrap();
+        let generation = engine.generate(id).unwrap();
+        assert!(
+            SPARSE_CALLS.load(Ordering::Relaxed) > before,
+            "the registered sparse policy was never consulted"
+        );
+        assert!(
+            generation.timings.micros(Stage::Sparse) > 0,
+            "sparse time was not recorded"
+        );
     }
 
     #[test]
