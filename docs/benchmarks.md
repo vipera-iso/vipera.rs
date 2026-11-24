@@ -4568,32 +4568,30 @@ YaRN native và `scripts/logits-dump.sh` chạy ở đúng độ dài đó.
 ## Bậc dispatch và trần fallback (portability trên CPU không VNNI) — 2026-11-24
 
 **Câu hỏi:** engine "tổng quát cho các thiết bị phần cứng khác nhau" tới đâu? Máy này có AVX-512
-VNNI nên đường nhanh luôn chạy; cần biết máy không có nó trả giá bao nhiêu, và trả giá vì *độ rộng
-512-bit* hay vì *layout tiled*.
+VNNI nên đường nhanh luôn chạy; cần biết máy không có nó trả giá bao nhiêu, và trả giá vì *layout
+tiled* hay vì *độ rộng vector*.
 
-**Thang đo ba bậc**, cùng model, `VIPERA_THREADS=8`, greedy, prefill là tổng `PROFILE chunk`,
-decode là median các bước `PROFILE decode` (bỏ bước đầu), 2 vòng xen kẽ theo bậc:
+**Phương pháp (đã sửa — xem mục "Bài học đo" bên dưới):** wall-clock của cả tiến trình, trừ hằng số
+nạp model. Hằng số đo bằng `--prompt "Hi" --max-tokens 1`: **0.57 s** ở cả hai nhánh. Prefill 512 và
+4096 token (`" the"` lặp), greedy, `--max-tokens 1`, `VIPERA_THREADS=8`; decode là
+`(wall_64 − 0.57)/63` với prompt `Hi`. Sweep xen kẽ hai chiều (vnni → avx2 → avx2 → vnni) để tỉ lệ
+không lệch theo nhịp throttled; mỗi nhánh 2 lần.
 
 | bậc | cờ | prefill 512 | prefill 4096 | decode |
 |---|---|---:|---:|---:|
-| `avx512-vnni` (tiled + dpbusd zmm) | — | **216.2** tok/s | **170.0** tok/s | **25.3** tok/s |
-| `vnni256` (row kernel, dpbusd ymm) | `VIPERA_TILED=0` | 51.6 | 46.9 | — |
-| `avx2` (`pmaddubsw`, không VNNI) | `VIPERA_NO_VNNI=1` | 29.2 | 27.7 | 21.5 tok/s |
+| `avx512-vnni` (tiled + dpbusd zmm) | — | **185.8** tok/s (3.30/3.35 s) | **121.6** tok/s (33.26/35.26 s) | **30.5** tok/s (32.8 ms/step) |
+| `vnni256` (row kernel, dpbusd ymm) | `VIPERA_TILED=0` | — | 49.0 tok/s (84.11 s) | — |
+| `avx2` (`pmaddubsw`, không VNNI) | `VIPERA_NO_VNNI=1` | 34.1 tok/s (15.41/15.79 s) | 29.4 tok/s (138.91/141.18 s) | 21.3 tok/s (46.9 ms/step) |
 
-Số thô (tok/s): prefill 512 = 228.07 / 204.40 (vnni), 30.04 / 28.44 (avx2); prefill 4096 = 177.45 /
-162.58 (vnni), 28.10 / 27.22 (avx2); decode = 25.88 / 24.72 (vnni), 21.62 / 21.45 (avx2). Vòng `vnni256`
-chỉ chạy một lần mỗi độ dài (máy throttled ±10% giữa hai vòng cùng cấu hình, nên đọc theo bậc chứ
-không so từng số lẻ).
+Tỉ lệ: prefill **5.45×** ở 512 và **4.14×** ở 4096; decode **1.43×** (−30%). Bỏ tile (vẫn còn VNNI
+256-bit) mất **2.5×**; phần còn lại **1.7×** là `pmaddubsw` so với `vpdpbusd`.
 
 **Đọc số:**
-- Khoảng cách **6–7×** ở prefill không phải do thiếu 512-bit: bỏ tiled (vẫn còn VNNI 256-bit) đã mất
-  **3.6×**; phần còn lại là `pmaddubsw` so với `vpdpbusd`. Nghĩa là layout tiled — quét weight theo
-  block, một lần unpack cho cả 16 activation — mới là thứ đáng port, không phải độ rộng vector.
-- Decode chỉ mất **15%** vì batch = 1 đi qua kernel hàng, không qua tile; đó là lý do máy AVX2 vẫn
-  dùng được, còn prefill là chỗ hỏng.
-- Đây là **trần của bản hiện tại**, không phải giả thuyết đã thắng: chưa có kernel tiled cho AVX2, nên
-  không có số "sau". Muốn lấp phải viết band 256-bit (`pmaddubsw` trên tile 8 cột) — việc của một
-  phiên riêng, có gate codegen và test parity riêng.
+- Prefill trên CPU không VNNI chậm 4–5×, và quá nửa khoảng cách đó là **layout tiled** (một lần unpack
+  weight cho cả 16 activation), không phải độ rộng 512-bit. Đó là thứ đáng port nếu muốn lấp.
+- Decode chỉ mất 30% vì batch = 1 không đi qua tile; máy AVX2 vẫn dùng được, prefill mới là chỗ hỏng.
+- 512 nhanh hơn 4096 ở cả hai nhánh (185.8 vs 121.6): attention lớn dần theo độ sâu, đúng như mục
+  prefill 2026-11-24 ở trên, không phải batch width.
 
 **Tính ổn định — cùng prompt, khác bậc:**
 - Prompt ngắn (10 token), 32 token greedy: **giống hệt từng byte** giữa `avx512-vnni` và `avx2`.
@@ -4601,6 +4599,22 @@ không so từng số lẻ).
   trong `q4k_tiled_matvec_worker`: thứ tự cộng qua sub-block khác kernel hàng (sai khác ≤ `1e-3 +
   1e-4·|ref|`), đủ để đổi một token gần tie. Vì vậy "deterministic" chỉ hứa trong *một* bậc dispatch
   trên *một* máy; khác phần cứng có thể khác token ở temperature 0.
+
+### Bài học đo — `PROFILE` in trung bình luỹ tiến, không phải thời gian từng pass
+
+Bản đầu của mục này cộng các dòng `PROFILE chunk N X ms`. Sai hai lần: `X` là **trung bình của N pass
+đã chạy** (`finish_pass` chia cho `steps`), nên cộng chúng không ra tổng; và khi một chunk bị chia
+thành nhiều `run_batch` (ví dụ `MAX_BATCH=32`), dòng chunk chỉ phản ánh một phần công việc. Hệ quả: một
+thí nghiệm hạ `MAX_BATCH` 128 → 32 đọc ra "622 tok/s" (3.7×) từ `PROFILE` trong khi wall-clock là
+**32.7 s so với 29.5 s** — chậm hơn, và con số 3.7× không tồn tại.
+
+Số đúng cho thí nghiệm đó (wall, 4096 token, cùng cửa sổ): width 128 = 33.26/35.26 s (vnni) và
+138.91/141.18 s (avx2); width 32 = 34.6/35.2 s (vnni) và 143.8/146.5 s (avx2). Tức **neutral đến −17%
+ở nhánh nhanh**, không có lợi: bác, không mở nhánh. Lý do cơ học: hạ width nhân số lần đọc weight lên
+4×, đúng thứ prefill không thừa.
+
+Từ nay: mọi tổng prefill/decode lấy **wall-clock** (trừ hằng số nạp model đo riêng), `PROFILE` chỉ
+dùng để đọc *tỉ lệ phần trăm* trong một pass cùng width.
 
 **Không sửa kernel trong phiên này.** Thay đổi kèm theo: `vipera profile` in `cpu_simd` (bậc hiệu
 dụng, tôn trọng `VIPERA_NO_VNNI`) ở cả text và `--json`, để fleet đọc được máy nào rơi xuống bậc
