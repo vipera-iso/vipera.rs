@@ -276,13 +276,14 @@ tmux capture-pane -t fb-vipera -p | tail -20
 | 18h-2h | Glyph Cluster (free) — tasks P2-P3 | tidepool-alpha (đổi WiFi Tang Thuong 5G nếu hết) | Back model free |
 
 **WiFi:**
-- **CAFE PHANSU 5G**: hiện tại (OpenCode đang dùng, giữ đến hết token)
-- **Tang Thuong 5G**: dự phòng (đổi khi OpenCode hết token → reset)
+- **CAFE PHANSU 5G**: hiện tại — OpenCode + Freebuff chạy trên này
+- **Tang Thuong 5G**: dự phòng — đổi khi OpenCode hết token (reset)
+- **Glyph Cluster (Freebuff)**: free unlimited, KHÔNG cần đổi WiFi, không giới hạn giờ
 - **Hermes**: không bị ảnh hưởng đổi WiFi (chạy local)
 
-**Lệnh đổi WiFi (5-10s, Hermes vẫn chạy):**
+**Lệnh đổi WiFi (5-10s, chỉ cho OpenCode reset):**
 ```bash
-# Đổi sang Tang Thuong 5G (reset OpenCode)
+# Đổi sang Tang Thuong 5G (reset OpenCode token)
 nmcli dev wifi disconnect wlp0s20f3
 nmcli dev wifi connect "Tang Thuong 5G" wlp0s20f3
 sleep 10
@@ -290,6 +291,7 @@ sleep 10
 nmcli dev wifi disconnect wlp0s20f3
 nmcli dev wifi connect "CAFE PHANSU 5G" wlp0s20f3
 ```
+Glyph Cluster không cần đổi WiFi — chạy liên tục 24h không giới hạn.
 
 **Rules:**
 1. Freebuff hết 8h DeepSeek → đổi lại Glyph Cluster (free, không giới hạn)
