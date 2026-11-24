@@ -141,6 +141,32 @@ mod tests {
     }
 
     #[test]
+    fn repeated_hits_refresh_recency_before_eviction() {
+        let mut cache = MoEExpertCache::new(2);
+        assert!(!cache.load_expert(10));
+        assert!(!cache.load_expert(11));
+
+        // Repeated hits on 10 make it the most recently used, even though 11 was loaded later.
+        for _ in 0..8 {
+            assert!(cache.load_expert(10));
+        }
+
+        assert!(!cache.load_expert(12));
+        assert!(!cache.contains(11)); // 11 is now the least recently used
+        assert!(cache.contains(10));
+        assert!(cache.contains(12));
+
+        // Hits on 12 refresh it; on the next miss 10, not 12, is the victim.
+        for _ in 0..8 {
+            assert!(cache.load_expert(12));
+        }
+        assert!(!cache.load_expert(13));
+        assert!(!cache.contains(10));
+        assert!(cache.contains(12));
+        assert!(cache.contains(13));
+    }
+
+    #[test]
     fn hotness_tracks_accesses_in_rolling_window() {
         let mut cache = MoEExpertCache::new(4);
         for _ in 0..FREQ_WINDOW + 1 {
