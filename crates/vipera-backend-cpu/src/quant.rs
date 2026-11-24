@@ -930,6 +930,14 @@ fn checked_stride(
     x: &[f32],
     out: &[f32],
 ) -> Result<usize, ViperaError> {
+    // `row_bytes` accepts zero columns (`0` is a whole number of blocks), but a zero-width row has
+    // no stride. The 8x8 Q4_K kernel divides the tensor length by that stride, so letting this
+    // through would panic there. `dequantize` refuses zero columns for the same reason.
+    if cols == 0 {
+        return Err(ViperaError::invalid_argument(
+            "cannot multiply a matrix with zero columns",
+        ));
+    }
     if x.len() != cols || out.len() != rows {
         return Err(ViperaError::internal(format!(
             "matvec expected a {cols}-value input and {rows} outputs, got {} and {}",
@@ -1260,6 +1268,11 @@ fn fill_rows_q4k8_groups<const B: usize>(
     out: &mut [f32],
 ) -> usize {
     let blocks = stride / 144;
+    // A zero-width row has no stride and no blocks. `matvec` rejects zero columns, but a pooled
+    // batch can reach here directly, so leave every output to the row-kernel tail below.
+    if stride == 0 {
+        return first_row;
+    }
     // Rows this slice of `data` can read; a group is only computed whole when all eight fit.
     let readable_rows = data.len() / stride;
     let per_entry = blocks * crate::simd::Q8K_BLOCK;
@@ -2418,5 +2431,138 @@ mod tests {
             split, whole,
             "a row must not change when the split moves its group boundary"
         );
+    }
+
+    /// A zero-column matrix has no stride, yet zero is a whole number of blocks, so `row_bytes`
+    /// accepts it. `matvec` used to pass it through and the 8x8 Q4_K kernel then divided the tensor
+    /// length by that zero stride. Refuse it at the public boundary, as `dequantize` already does.
+    #[test]
+    fn zero_columns_is_an_error_not_a_division_by_zero() {
+        for ty in [GgmlType::F32, GgmlType::Q4K, GgmlType::Q6K] {
+            let error = matvec(ty, &[], 0, 2, &[], &mut [0.0, 0.0])
+                .expect_err("a zero-column matrix has no stride");
+            assert!(error.to_string().contains("zero columns"), "{error}");
+        }
+    }
+
+    /// Encode two whole 256-value blocks as Q4_K. Every sub-block gets scale 1 and minimum 0, so
+    /// the block scale is `max|x| / 15` and each unsigned nibble is `round(x / d)`. That is the
+    /// widest code step the format can give one value and keeps the minimum term out of the way.
+    fn encode_q4k_pair(values: &[f32]) -> Vec<u8> {
+        let mut row = vec![0_u8; 2 * 144];
+        for (b, chunk) in values.as_chunks::<256>().0.iter().enumerate() {
+            let block = &mut row[b * 144..(b + 1) * 144];
+            let largest = chunk.iter().fold(0.0_f32, |max, v| max.max(v.abs()));
+            let d = if largest == 0.0 { 0.0 } else { largest / 15.0 };
+            block[0..2].copy_from_slice(&f16(d));
+            block[4..8].fill(1); // scales 0..3
+            block[8..12].fill(0); // minimums 0..3
+            block[12..16].fill(0x01); // high two bits of scales 4..7; minimums 4..7 stay zero
+            for (j, q) in block[16..144]
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                for (i, slot) in q.iter_mut().enumerate() {
+                    let low = (chunk[j * 64 + i] / d).round().clamp(0.0, 15.0) as u8;
+                    let high = (chunk[j * 64 + i + 32] / d).round().clamp(0.0, 15.0) as u8;
+                    *slot = low | (high << 4);
+                }
+            }
+        }
+        row
+    }
+
+    /// Encode two whole blocks as Q6_K: every signed sub-block scale is 1 and the block scale is
+    /// `max|x| / 31`, so each six-bit level is `round(x / d) + 32` (32 is the format's centre).
+    fn encode_q6k_pair(values: &[f32]) -> Vec<u8> {
+        let mut row = vec![0_u8; 2 * 210];
+        for (b, chunk) in values.as_chunks::<256>().0.iter().enumerate() {
+            let block = &mut row[b * 210..(b + 1) * 210];
+            let largest = chunk.iter().fold(0.0_f32, |max, v| max.max(v.abs()));
+            let d = if largest == 0.0 { 0.0 } else { largest / 31.0 };
+            block[208..210].copy_from_slice(&f16(d));
+            block[192..208].fill(1);
+            for half in 0..2 {
+                for l in 0..32 {
+                    for run in 0..4 {
+                        let value = chunk[half * 128 + run * 32 + l];
+                        let level = if d == 0.0 {
+                            32
+                        } else {
+                            (value / d).round().clamp(-31.0, 31.0) as i32 + 32
+                        };
+                        let (low, high) = ((level & 15) as u8, ((level >> 4) & 3) as u8);
+                        let plane = if run % 2 == 0 { l } else { 32 + l };
+                        if run < 2 {
+                            block[half * 64 + plane] |= low;
+                        } else {
+                            block[half * 64 + plane] |= low << 4;
+                        }
+                        block[128 + half * 32 + l] |= high << (run * 2);
+                    }
+                }
+            }
+        }
+        row
+    }
+
+    /// A two-block row crosses a real format boundary at 255/256. Encode a known f32 row in each
+    /// format, dequantize two copies of it, and check both the round-trip limit (half a code step
+    /// plus the f16 rounding of the block scale) and that the row stride leaves the blocks intact.
+    #[test]
+    fn q4k_and_q6k_round_trip_within_limits_at_block_boundaries() {
+        let q4_values: Vec<f32> = (0..512)
+            .map(|at| 0.02 + (at % 31) as f32 * 0.03 + (at / 256) as f32 * 0.05)
+            .collect();
+        let q6_values: Vec<f32> = (0..512)
+            .map(|at| {
+                let sign = if at % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (0.02 + (at % 31) as f32 * 0.03 + (at / 256) as f32 * 0.05)
+            })
+            .collect();
+
+        for (ty, values, row) in [
+            (
+                GgmlType::Q4K,
+                q4_values.clone(),
+                encode_q4k_pair(&q4_values),
+            ),
+            (
+                GgmlType::Q6K,
+                q6_values.clone(),
+                encode_q6k_pair(&q6_values),
+            ),
+        ] {
+            let denom = if ty == GgmlType::Q4K { 15.0 } else { 31.0 };
+            let largest = values.iter().fold(0.0_f32, |max, v| max.max(v.abs()));
+            let step = largest / denom;
+            let tolerance = step * 0.5 + step * 0.001 + 1e-6;
+            let mut data = row.clone();
+            data.extend_from_slice(&row);
+            let restored = dequantize(ty, &data, 512, 2).expect("two whole rows");
+            assert_eq!(restored.len(), 1024);
+            for at in 0..512 {
+                let (want, got) = (values[at], restored[at]);
+                assert!(
+                    (want - got).abs() <= tolerance,
+                    "{ty:?} value {at}: {want} became {got}, tolerance {tolerance}"
+                );
+                assert_eq!(got, restored[512 + at], "{ty:?} row 1 differs at {at}");
+            }
+            assert!(
+                (restored[255] - values[255]).abs() <= tolerance,
+                "{ty:?} last value of block 0"
+            );
+            assert!(
+                (restored[256] - values[256]).abs() <= tolerance,
+                "{ty:?} first value of block 1"
+            );
+            assert!(
+                restored.iter().all(|value| value.is_finite()),
+                "{ty:?} produced a non-finite value"
+            );
+        }
     }
 }
