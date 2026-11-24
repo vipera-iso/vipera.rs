@@ -99,6 +99,9 @@ impl BpeEncoder {
     pub fn from_vocab(vocab: &Vocabulary) -> Self {
         let mut ranks = HashMap::with_capacity(vocab.merge_count());
         for (rank, (left, right)) in vocab.merges().iter().enumerate() {
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
             ranks
                 .entry(format!("{left}{MERGE_SEPARATOR}{right}"))
                 .or_insert(rank as u32);
@@ -394,5 +397,16 @@ mod tests {
         );
         assert_eq!(PreTokenizer::from_pre(Some("qwen2")), PreTokenizer::Qwen2);
         assert_eq!(PreTokenizer::from_pre(None), PreTokenizer::WholeText);
+    }
+
+    #[test]
+    fn empty_merges_produce_no_merges_without_panic() {
+        // An encoder with no merge ranks should leave pieces unchanged.
+        let encoder = BpeEncoder {
+            ranks: std::collections::HashMap::new(),
+            pre: PreTokenizer::WholeText,
+        };
+        let out = encoder.merge(vec!['a', 'b', 'c']);
+        assert_eq!(out, vec!["a", "b", "c"]);
     }
 }
