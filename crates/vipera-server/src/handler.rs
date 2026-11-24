@@ -1523,4 +1523,99 @@ mod tests {
             Some("stop")
         );
     }
+
+    #[test]
+    fn malformed_json_and_path_inputs_do_not_panic() {
+        // Malformed/hostile JSON bodies and wrong-typed fields must be rejected
+        // cleanly (or ignored where the parser is lenient), never panicking.
+        let bodies = [
+            "null",
+            "true",
+            "false",
+            "0",
+            "-1",
+            "1e309",
+            "\"x\"",
+            "[]",
+            "{}",
+            r#"{"messages":null}"#,
+            r#"{"messages":"no"}"#,
+            r#"{"messages":0}"#,
+            r#"{"messages":[null]}"#,
+            r#"{"messages":[1]}"#,
+            r#"{"messages":["x"]}"#,
+            r#"{"messages":[{}]}"#,
+            r#"{"messages":[{"role":null,"content":"x"}]}"#,
+            r#"{"messages":[{"role":"user"}]}"#,
+            r#"{"messages":[{"role":"user","content":null}]}"#,
+            r#"{"messages":[{"role":"user","content":123}]}"#,
+            r#"{"messages":[{"role":"user","content":true}]}"#,
+            r#"{"messages":[{"role":"user","content":{}}]}"#,
+            r#"{"messages":[{"role":"user","content":[1,"x",null,{"text":1},{"text":"ok"}]}]}"#,
+            r#"{"messages":[{"role":1,"content":"x"}]}"#,
+            r#"{"messages":[{"role":"tool","content":"x"}]}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"temperature":"hot"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"temperature":1e309}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"temperature":-1e309}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"top_p":-5}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"min_p":99}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"top_k":-1}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"seed":-1}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"repetition_penalty":"x"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"presence_penalty":"x"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"frequency_penalty":"x"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":null}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":[]}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":{"a":"b"}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":{"1":1e309}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":{"1":-1e309}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":{"999999999999999999999":1}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":{"-1":1}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logit_bias":{"1":1,"2":1,"3":1,"4":1,"5":1,"6":1,"7":1,"8":1,"9":1,"10":1,"11":1,"12":1,"13":1,"14":1,"15":1,"16":1,"17":1}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"stop":123}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"stop":[1]}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"stop":[[]]}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"stop":["a","b","c","d","e"]}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"response_format":"json_object"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"response_format":[]}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"response_format":{"type":123}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"response_format":{"type":"json_schema"}}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"n":"two"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"n":0}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"n":-1}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"n":9999999999}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"top_logprobs":"x"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"top_logprobs":-1}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"top_logprobs":6}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"logprobs":"yes"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"stream":"yes"}"#,
+            r#"{"messages":[{"role":"user","content":"x"}],"stream_options":"x"}"#,
+            r#"{"prompt":123}"#,
+            r#"{"prompt":null}"#,
+            r#"{"prompt":[]}"#,
+            r#"{"prompt":{}}"#,
+            r#"{"prompt":"hi","stop":[[]]}"#,
+            r#"{"prompt":"hi","logit_bias":{"1":{}}}"#,
+            r#"{"prompt":"hi","n":0}"#,
+            r#"{"prompt":"hi","top_logprobs":6}"#,
+            r#"{"model":"/../../etc/passwd","messages":[{"role":"user","content":"x"}]}"#,
+            r#"{"model":"","messages":[{"role":"user","content":"x"}]}"#,
+        ];
+        for body in bodies {
+            let parsed = Json::parse(body).expect("json should parse");
+            let _ = messages_of(&parsed);
+            let _ = sampler_of(&parsed);
+            let _ = stop_sequences_of(&parsed);
+            let _ = json_mode_of(&parsed);
+            let _ = choices_of(&parsed);
+            let _ = include_usage_of(&parsed);
+        }
+
+        // Exactly the maximum accepted logit_bias size must not panic.
+        let bias16 = Json::parse(
+            r#"{"logit_bias":{"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"11":11,"12":12,"13":13,"14":14,"15":15,"16":16}}"#,
+        )
+        .unwrap();
+        assert!(sampler_of(&bias16).is_ok());
+    }
 }
