@@ -298,6 +298,102 @@
 - [ ] `dist-auto-shard` — Auto-shard (model > 1 GPU) — OpenCode
 - [ ] `dist-checkpoint` — Checkpoint/resume (distributed state) — Freebuff
 
+### P21 — MODEL ARCHITECTURES (thêm)
+- [ ] `arch-mistral` — Mistral 7B/Instruct support (sliding window + RoPE) — Freebuff
+- [ ] `arch-gemma` — Gemma/Gemma-2 support (GQA + sliding window) — Freebuff
+- [ ] `arch-phi` — Phi-3/Phi-4 support (GQA + alternating attention) — OpenCode
+- [ ] `arch-command-r` — Command-R/R+ support (sliding window + GQA) — Freebuff
+- [ ] `arch-olmo` — OLMo/OLMoE support (GQA + RoPE) — Freebuff
+- [ ] `arch-jamba` — Jamba hybrid (Mamba + attention layers) — OpenCode
+- [ ] `arch-retiflex` — Refined Flex (flex attention pattern) — OpenCode
+- [ ] `arch-mamba` — Mamba2/Samba (state space model, no attention) — OpenCode
+- [ ] `arch-recurrent` — RWKV/RetNet (linear attention, no KV cache) — OpenCode
+- [ ] `arch-norm-v2` — RMSNorm + QK-norm variants (per-arch) — Freebuff
+
+### P22 — LONG CONTEXT (thêm)
+- [ ] `long-4096` — 4096 context (already, but optimize) — OpenCode
+- [ ] `long-32k` — 32k context (sliding window + ring KV) — OpenCode
+- [ ] `long-128k` — 128k context (paged KV + sliding) — OpenCode
+- [ ] `long-1m` — 1M context (ring + paged + streaming) — OpenCode
+- [ ] `long-rope` — RoPE extrapolation (NTK, YaRN, dynamic) — OpenCode
+- [ ] `long-ring` — Ring attention (infinite, distributed) — OpenCode
+- [ ] `long-paged` — Paged KV cache (vLLM-style) — OpenCode
+- [ ] `long-streaming` — Streaming KV (write-once, read-many) — Freebuff
+- [ ] `long-summarize` — Summarize-and-replace (compress old context) — Freebuff
+- [ ] `long-hierarchical` — Hierarchical KV (fast/slow layers) — OpenCode
+
+### P23 — TRAINING + TUNING (thêm)
+- [ ] `train-lora` — LoRA training (rank 16/64, CPU) — OpenCode
+- [ ] `train-qlora` — QLoRA (4-bit base + LoRA) — OpenCode
+- [ ] `train-adapter` — Adapter tuning (bottleneck layers) — OpenCode
+- [ ] `train-quantize` — Post-hoc quantization (calibrate + quantize) — Freebuff
+- [ ] `train-dpo` — DPO (direct preference optimization) — OpenCode
+- [ ] `train-orpo` — ORPO (preference optimization, no reference) — OpenCode
+- [ ] `train-rlhf` — RLHF (reward model + PPO) — OpenCode
+- [ ] `train-distill` — Knowledge distillation (large → small) — OpenCode
+- [ ] `train-prune` — Structure pruning (remove least-used neurons) — OpenCode
+- [ ] `train-merge` — Model merging (TIES, DARE, SLERP) — Freebuff
+
+### P24 — SAFETY + ALIGNMENT (thêm)
+- [ ] `align-sft` — Supervised fine-tuning (SFT on CPU) — OpenCode
+- [ ] `align-ref-model` — Reference model (for DPO/RLHF) — OpenCode
+- [ ] `align-reward` — Reward model (train on preference data) — OpenCode
+- [ ] `align-toxicity` — Toxicity classifier (filter outputs) — Freebuff
+- [ ] `align-jailbreak` — Jailbreak detection (prompt injection) — Freebuff
+- [ ] `align-bias` — Bias detection (gender, race, political) — OpenCode
+- [ ] `align-hallucination` — Hallucination detection (fact-check) — Freebuff
+- [ ] `align-fairness` — Fairness metrics (demographic parity) — Freebuff
+- [ ] `align-privacy` — Privacy (no training on user data) — Freebuff
+- [ ] `align-audit` — Model card + audit report — Freebuff
+
+### P25 — INFERENCE OPTIMIZATION (thêm)
+- [ ] `opt-batch` — Dynamic batching (group requests by length) — OpenCode
+- [ ] `opt-priority` — Priority scheduling (VIP requests first) — Freebuff
+- [ ] `opt-queue` — Request queue (FIFO + preempt) — Freebuff
+- [ ] `opt-slo` — SLO-aware scheduling (latency target) — OpenCode
+- [ ] `opt-cache` — Semantic cache (similar prompts → cached answer) — Freebuff
+- [ ] `opt-dedup` — Prompt deduplication (same prompt → 1 inference) — Freebuff
+- [ ] `opt-predict` — Load prediction (scale up/down) — Freebuff
+- [ ] `opt-autoscale` — Auto-scaling (K8s HPA + custom metric) — Freebuff
+- [ ] `opt-spark` — Spark-like distributed inference — OpenCode
+- [ ] `opt-mojo` — Mojo language integration (inference) — OpenCode
+
+### P26 — DATA + EMBEDDING (thêm)
+- [ ] `data-vector-db` — Vector database (FAISS, ScaNN) integration — Freebuff
+- [ ] `data-chunk` — Text chunking (sliding window, semantic) — Freebuff
+- [ ] `data-embed` — Embedding model (BGE, E5, MTEB) — OpenCode
+- [ ] `data-rerank` — Reranker (Cross-Encoder, MonoT5) — OpenCode
+- [ ] `data-train` — Training data pipeline (clean, label, split) — Freebuff
+- [ ] `data-eval` — Eval pipeline (MMLU, HellaSwag, TruthfulQA) — Freebuff
+- [ ] `data-finetune` — Fine-tune dataset format (JSONL) — Freebuff
+- [ ] `data-preference` — Preference dataset (DPO, ORPO) — Freebuff
+- [ ] `data-reward` — Reward dataset (score, preference) — Freebuff
+- [ ] `data-leaderboard` — Auto-leaderboard (MMLU, GSM8K, HumanEval) — Freebuff
+
+### P27 — DEPLOYMENT + OPS (thêm)
+- [ ] `ops-monitor` — Prometheus + Grafana dashboard — Freebuff
+- [ ] `ops-alert` — Alerting (latency, error rate, memory) — Freebuff
+- [ ] `ops-logging` — Structured logging (JSON, ELK) — Freebuff
+- [ ] `ops-tracing` — Distributed tracing (Jaeger, Zipkin) — Freebuff
+- [ ] `ops-chaos` — Chaos engineering (fault injection) — Freebuff
+- [ ] `ops-backup` — Model backup (snapshot + restore) — Freebuff
+- [ ] `ops-rollback` — Rollback (version pin + instant switch) — Freebuff
+- [ ] `ops-blue-green` — Blue-green deployment (zero-downtime) — Freebuff
+- [ ] `ops-canary` — Canary release (10% traffic, monitor) — Freebuff
+- [ ] `ops-slo` — SLO monitoring (99.9% availability) — Freebuff
+
+### P28 — RESEARCH + EXPERIMENTS (thêm)
+- [ ] `research-attention` — New attention variants (linear, log) — OpenCode
+- [ ] `research-moe` — New MoE routing (expert choice) — OpenCode
+- [ ] `research-quant` — New quantization (4-bit, 2-bit, 1-bit) — OpenCode
+- [ ] `research-spec` — New speculative (EAGLE, MTP, DFlash) — OpenCode
+- [ ] `research-distill` — New distillation (progressive, self) — OpenCode
+- [ ] `research-alignment` — New alignment (DPO, ORPO, RLOO) — OpenCode
+- [ ] `research-benchmark` — New benchmark (GSM8K, MMLU, HumanEval) — Freebuff
+- [ ] `research-interpret` — Interpretability (activation, attention map) — OpenCode
+- [ ] `research-safety` — Safety (jailbreak, toxicity, bias) — Freebuff
+- [ ] `research-efficiency` — Efficiency (FLOPs, memory, energy) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -308,11 +404,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **211 tasks** (P0-P20) × 1 cycle = **844 contributions**
-> 211 × 3 cycles = **2532 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 211 × 5 cycles = **4220 contributions** → đạt 2000 rule trong **5 ngày** ✓
+> **291 tasks** (P0-P28) × 1 cycle = **1164 contributions**
+> 291 × 2 cycles = **2328 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 291 × 3 cycles = **3492 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 2 cycles trong 48h → 844 contributions (an toàn cho 1000 rule)**
+**Gợi ý: 2 cycles trong 48h → 1164 contributions (vượt 1000 rule)**
 
 ## LỆNH CHẠY
 
