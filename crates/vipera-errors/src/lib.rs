@@ -175,4 +175,65 @@ mod tests {
         assert_eq!(e.exit_code(), 2);
         assert!(std::error::Error::source(&e).is_some());
     }
+
+    #[test]
+    fn display_all_variants_with_empty_and_oversized_messages() {
+        let oversized = "x".repeat(4096);
+        let cases: Vec<(ViperaError, String)> = vec![
+            (
+                ViperaError::Io(std::io::Error::other("")),
+                "I/O error: other error".to_string(),
+            ),
+            (
+                ViperaError::Io(std::io::Error::other(oversized.clone())),
+                "I/O error: other error".to_string(),
+            ),
+            (
+                ViperaError::parse(0, ""),
+                "invalid model at byte 0: ".to_string(),
+            ),
+            (
+                ViperaError::parse(u64::MAX, oversized.clone()),
+                format!("invalid model at byte {}: {oversized}", u64::MAX),
+            ),
+            (ViperaError::unsupported(""), "unsupported: ".to_string()),
+            (
+                ViperaError::unsupported(oversized.clone()),
+                format!("unsupported: {oversized}"),
+            ),
+            (
+                ViperaError::usage(""),
+                "usage error: ; run `vipera --help`".to_string(),
+            ),
+            (
+                ViperaError::usage(oversized.clone()),
+                format!("usage error: {oversized}; run `vipera --help`"),
+            ),
+            (
+                ViperaError::invalid_argument(""),
+                "invalid argument: ".to_string(),
+            ),
+            (
+                ViperaError::invalid_argument(oversized.clone()),
+                format!("invalid argument: {oversized}"),
+            ),
+            (
+                ViperaError::infeasible(""),
+                "infeasible placement: ".to_string(),
+            ),
+            (
+                ViperaError::infeasible(oversized.clone()),
+                format!("infeasible placement: {oversized}"),
+            ),
+            (ViperaError::internal(""), "internal error: ".to_string()),
+            (
+                ViperaError::internal(oversized.clone()),
+                format!("internal error: {oversized}"),
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(err.to_string(), expected);
+        }
+    }
 }
