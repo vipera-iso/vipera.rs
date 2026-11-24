@@ -1001,10 +1001,15 @@ impl<F: ForwardPass> Engine<F> {
         let room = (capacity - sequence.len() as u64).min(remaining.saturating_sub(1));
         let cap = turn.draft_cap.max(2);
         let min_needle = if cap >= 4 { 2 } else { 3 };
+        // The n-gram draft is the Speculative stage's work: its time starts before anything else
+        // runs, and the Verify timing below measures the acceptance that follows it.
+        let spec_started = Instant::now();
         let mut draft = longest_ngram_draft_from(sequence.tokens(), cap, min_needle);
         draft.truncate(usize::try_from(room).unwrap_or(0));
         let mut all = sequence.tokens().to_vec();
         all.extend_from_slice(&draft);
+        turn.timings
+            .record(Stage::Speculative, spec_started.elapsed());
 
         let tokens_per_block = kv.config().tokens_per_block as usize;
         let bytes_per_token = kv.config().bytes_per_token;
@@ -1093,7 +1098,6 @@ impl<F: ForwardPass> Engine<F> {
                 top_logprobs: Vec::new(),
             });
         }
-        turn.timings.record(Stage::Speculative, Duration::ZERO);
         turn.timings.record(Stage::Verify, verify.elapsed());
 
         let eos = emit.last().is_some_and(|token| config.eos.contains(token));
@@ -1822,6 +1826,53 @@ mod tests {
         assert!(generation.log_line.starts_with("{\"event\":\"generation\""));
         assert!(generation.log_line.contains("\"generated_tokens\":2"));
         assert!(generation.log_line.contains("\"stage_micros\":{"));
+    }
+
+    /// Answers like [`ToyForward`], and answers a range of positions too, so the verify path runs.
+    struct RangeForward {
+        inner: ToyForward,
+    }
+
+    impl ForwardPass for RangeForward {
+        fn logits(&mut self, context: &mut ForwardContext<'_>) -> Result<Vec<f32>, ViperaError> {
+            self.inner.logits(context)
+        }
+
+        fn logits_range(
+            &mut self,
+            context: &mut ForwardContext<'_>,
+        ) -> Result<Vec<Vec<f32>>, ViperaError> {
+            let mut answers = Vec::with_capacity(context.new_tokens.len());
+            for _ in 0..context.new_tokens.len() {
+                let mut logits = vec![0.0f32; 32];
+                logits[3] = 10.0;
+                answers.push(logits);
+            }
+            Ok(answers)
+        }
+    }
+
+    #[test]
+    fn speculative_turns_time_the_draft_under_the_speculative_stage() {
+        let mut engine = engine_with_forward(
+            EngineConfig {
+                speculative: true,
+                ..greedy()
+            },
+            RangeForward {
+                inner: ToyForward::new(32),
+            },
+            64,
+        );
+        // A repeating prompt, so the n-gram draft path has context to work from.
+        let prompt: Vec<u32> = (0..200).map(|i| (i % 4) as u32).collect();
+        let id = engine.admit(&prompt, 8).unwrap();
+        let generation = engine.generate(id).unwrap();
+        assert!(
+            generation.timings.micros(Stage::Speculative) > 0,
+            "the draft path was not timed under Stage::Speculative"
+        );
+        assert!(generation.log_line.contains("\"speculative\":"));
     }
 
     #[test]
