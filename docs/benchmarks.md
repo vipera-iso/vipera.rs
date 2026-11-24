@@ -3938,6 +3938,7 @@ reach. Trading 78% more DRAM traffic for 8.8% less CPU work loses by roughly the
 what the table shows. The path stays on that branch as the measurement; it is not for landing, and the
 `VIPERA_REPACK` switch does not exist on `main`.
 
+<<<<<<< Updated upstream
 ## 2026-11-23 — prefill batch width, the one difference ik_llama.cpp has over us
 
 The phase shares put this on the table: at ~1.1k of prompt a 128-token chunk is 66-72% Q4_K, 17-18%
@@ -3957,3 +3958,380 @@ Absolute GFLOPS are low because the box was loaded; the ratio is the point and i
 v, attn, gate, up` and the logits buffer (77.8 -> 155.6 MB at a 151,936-token vocabulary), widens the
 activation tile to 392 KB at 6 blocks, and needs a `run_batch_n::<256>` instantiation. Nothing here
 has been wired into the engine: only the cap (`MAX_HALVES`) and the bench exist on this branch.
+=======
+### Does removing the broadcast help when the weights are streamed?
+
+The hoisting explanation leaves one honest question: replacing the load with a constant also lets the
+compiler hoist it. So measure the real fix instead. Branch `perf/q4k-repack-8x8` (uncommitted, reverted)
+kept `H = 4` batch halves live per 2-row pair, so the two weight broadcasts in the inner loop feed 8 dots
+instead of 2 — 75% fewer `vpbroadcastd` per `vpdpbusd`, same bytes, same accumulation order, and
+bit-identical to `q4k_tiled_band` (a `to_bits` comparison over a 96x768 tensor at B=64, passing before the
+variant was removed).
+
+The variant's own bench, both arms interleaved in one process, `taskset -c 2`:
+
+| shape | base | 2 rows x 4 halves | ratio |
+|---|---:|---:|---:|
+| 8960x1536 x128, 8 copies | 129.3 ms / 218.0 GFLOPS | 135.3 / 208.4 | 0.956x |
+| 1536x8960 x128 | 14.0 ms / 251.9 GFLOPS | 15.0 / 234.8 | 0.932x |
+
+Slower. Fewer broadcasts is not the win: a codes `zmm` that serves 2 rows instead of 8 costs four times as
+many 64-byte loads, and the two effects land in the same place. The constant-weight probe on a 0.25 GB
+stream (`bench_no_weight_probe_streaming`, kept as a test-only probe) reads 541.0 -> 359.1 ms, 1.507x, but
+that is an upper bound contaminated by hoisting; the number that transfers is 0.932-0.956x. Any repack
+that keeps a per-dot broadcast — which every same-byte layout must, because the packed nibbles have to be
+split per row before they can be lane-separated — inherits this result.
+
+## 2026-11-23 — where the rest of the Q4_K time is: the epilogue
+
+With the repack closed, the remaining question is what the 68% q4k phase spends outside `vpdpbusd`.
+The per (row, sub-block) epilogue is six vector ops (`cvtepi32_ps`, two muls for `(acc * scale) * dx`,
+one for `sumv * min`, a sub, an add into the f32 accumulator) plus two scalar broadcasts.
+
+`cargo test --release -p vipera-backend-cpu --lib -- --ignored --nocapture bench_epilogue_probe`
+(test-only probe: same dpbusd chain, epilogue folded to one convert and one add), `taskset -c 2`,
+both arms interleaved in one process:
+
+| shape | real | epilogue folded away | |
+|---|---:|---:|---:|
+| 8960x1536 x128, 8 copies | 129.7 ms / 217.2 GFLOPS | 102.6 / 274.8 | 1.265x |
+| 1536x8960 x128 | 13.8 ms / 255.8 GFLOPS | 10.6 / 331.1 | 1.294x |
+
+**The epilogue is 21-23% of the kernel**, about 15% of a prefill chunk. It is also irreducible while the
+result stays bit-identical: every one of those four multiplies has to round exactly where it rounds now,
+so the `fused_epi` form is the only cheaper shape (6 ops + 2 broadcasts becomes 4 + 2, a quarter of the
+epilogue), and it changes the tokens. That matches the +8.6% / +12% kernel and -5.0% chunk measured for
+it earlier: a third of the epilogue, not all of it. Any bigger win here is a numeric-policy decision with
+an ADR and a quality comparison, not a kernel change.
+
+The other two levers are closed by the same probe on the weight side: `bench_no_weight_probe_streaming`
+gives 1.507x for removing load and broadcast, and the bit-identical re-nesting that removes 75% of the
+broadcasts measures 0.932-0.956x, so the loads are not what the loop is waiting on.
+
+## 2026-11-23 — Q6_K: the epilogue is smaller, and the unpack is not the problem
+
+The same probe run on `q6k_matvec_tiled_range`. Per (row, 16-value group) its epilogue is four ops and one
+broadcast over four `dpbusd`, a worse ratio than Q4_K's, so it looked like the bigger target. It is not.
+`bench_q6k_epilogue_probe` (8960x1536 x16, 8 copies, both arms interleaved):
+
+| | real | folded away | |
+|---|---:|---:|---:|
+| kernel | 23.4 ms / 3.9 GB/s | 19.9 / 4.5 | 1.176x |
+
+**17.6% of the kernel.** The suspicion that the scalar 32-iteration, four-store weight unpack was the real
+cost is also wrong: `bench_q6k_unpack_probe` skips it and gets 23.3 -> 22.2 ms, **1.048x**. The compiler
+already vectorises that loop; what is left is the dpbusd chain itself.
+
+So Q6_K has 22 points less epilogue than Q4_K, and reaching it needs the same numeric-policy decision
+`fused_epi` already carries — worth folding into that ADR as a second switch (+1% of a chunk), not worth a
+change of its own.
+
+## 2026-11-23 — llama.cpp's Q4_K 8-row repack, ported and measured in-tree
+
+The last open question from the repack work: the 320 B layout measured 2.08x slower because it kept a
+per-dot broadcast. Upstream's `block_q4_Kx8` (`repack.h:48`, `make_block_q4_Kx8` in `repack.cpp:3177`)
+is the version that removes the broadcast itself — eight rows interleaved every eight bytes, so one
+`vbroadcastss` of an activation group feeds eight rows' `vpdpbusd`. That is the "optimisation
+technology" the earlier attempts were missing, so it is ported rather than reasoned about:
+`crates/vipera-backend-cpu/src/q4k8_lab.rs` (test-only, no production path touched) carries
+`BlockQ4Kx8` (1152 B), `pack_q4k8`, `quantize_q8k` and both the AVX2 `gemv_q4k8` and the scalar
+`gemv_q4k8_generic` reference, transcribed from `arch/x86/repack.cpp:1464` and `repack.cpp:958`.
+
+Three checks pin the port before any timing:
+
+- `q4k8_crafted_block_dots_256` — every nibble 1, every scale 1, every min 0, `d = 1`, activation all
+  ones, so the answer is exactly 256 in both kernels. The random rows only prove the kernels agree;
+  this one proves each scale, min and nibble lands where the kernel reads it.
+- `q4k8_gemv_matches_the_generic_reference` — SIMD against the scalar reference of the same layout,
+  under 1% per row.
+- `q4k8_layout_matches_the_row_kernel_within_quantization` — the 8-row layout against the production
+  row kernel it would replace.
+
+`bench_q4k8_gemv_vs_row`, both arms sharing the row split decode's pool uses, `taskset -c 0-7`,
+i5-11300H (4c/8t), 3 passes, best of the passes, 45 MB tensor (8960 rows x 35 blocks, past L3):
+
+| threads | row kernel | 8-row gemv | ratio |
+|---:|---:|---:|---:|
+| 1 | 4.02 ms / 11.2 GB/s | 3.01 ms / 15.0 GB/s | **1.338x** |
+| 2 | 2.10 / 21.5 | 1.65 / 27.4 | **1.273x** |
+| 4 | 1.20 / 37.7 | 1.12 / 40.3 | 1.070x |
+| 8 | 1.54 / 29.3 | 1.46 / 31.0 | 1.056x |
+
+A second run on the same code read 1.252x / 1.273x / 1.058x / 1.003x for those four columns. The 7.7 MB
+shapes (`8960x1536`, `1536x8960`) behave the same way: 1.24-1.40x at one thread, 1.07-1.15x at eight.
+
+**The layout is worth 1.27x at two threads and nothing at eight.** Decode runs at `max_threads()`,
+which is `available_parallelism()` — 8 here — and the 8-row kernel has already saturated the bus
+(40.3 GB/s at four threads against the 35.7 GB/s the whole decode step sustains): at eight threads
+the two kernels read the same 45 MB through the same bus and differ by 0.3-5.6%, inside run-to-run
+noise. Single-threaded the win is real and instruction-shaped — one broadcast per eight rows instead
+of one per dot, and the port reaches 15.0 GB/s though it uses 32-MAC `vpdpbusd` against the row
+kernel's 64-MAC `vpdpbusd`, i.e. half the arithmetic density still wins a third of the time.
+
+So the repack stays closed: it would need a second on-disk weight layout and a loader change to buy
+~5% of the q4k phase — about 3% of a decode step — and only on machines where the pool is 1-2 threads.
+The earlier number that made it look attractive (ik at 272 tok/s) is not this: at eight threads the
+kernel is bus-bound, and no layout that keeps the same bytes changes the bus.
+
+## 2026-11-23 — llama.cpp repack ON vs OFF on this machine (same commit, prefill)
+
+Before porting the GEMM half of `block_q4_Kx8` (the 300-line shuffle kernel in
+`arch/x86/repack.cpp:2042`, the part the layout was built for), the cheap gate: build llama.cpp
+`a8f8294c4` twice from the same source, only `GGML_CPU_REPACK` flipped, and measure prefill on the
+same model.
+
+Machine/model: i5-11300H (4c/8t, Tiger Lake, AVX-512VNNI), `powersave`, Qwen2.5-1.5B Q4_K_M,
+`llama-bench -p 128,512,1024 -n 0 -t 8 -ngl 0 -r 3`, `taskset -c 0-7`.
+
+| prompt | REPACK ON | REPACK OFF | ON / OFF |
+|---|---:|---:|---:|
+| pp128 | 204.53 ± 0.32 tok/s | 247.45 ± 1.80 tok/s | 0.826x |
+| pp512 | 200.47 ± 1.53 tok/s | 270.29 ± 0.52 tok/s | 0.742x |
+| pp1024 | 189.66 ± 0.51 tok/s | 254.86 ± 1.66 tok/s | 0.744x |
+
+**Repack is 26-35% slower on this box.** The "optimal technology" in llama.cpp's repack is not optimal
+here: the GEMM wins on machines where the shuffle kernel pays off, but on this i5-11300H the
+non-repacked path is the fast one (270 tok/s at pp512, which matches the `ik` number that made the
+repack look attractive earlier). Together with the gemv result above (1.27x at 1-2 threads, ~1.0x at 8),
+this closes the repack direction for this machine: do not port the GEMM half, do not add the on-disk
+layout, keep the lab as evidence.
+
+## 2026-11-23 — why the repack cannot help vipera.rs: the weight feed is already one uop
+
+The repack's whole idea is one weight load serving several rows. The disassembly of the shipping
+prefill band (`q4k_matvec_tiled_range`, B=10 instantiation, `cargo test --release -p
+vipera-backend-cpu --lib`, symbol `_RINvNtCs8O2dszLoaR1_18vipera_backend_cpu4simd
+22q4k_matvec_tiled_rangeKj10_EB4_`) shows the kernel already gets that for free from the ISA:
+
+```
+vpbroadcastd -0x71c(%r8,%rcx,8),%zmm8     # one 4-byte weight word, straight from memory
+vpdpbusd     %zmm18,%zmm8,%zmm15          # 4 values x 16 activation columns = 64 MAC
+vpbroadcastd -0x61c(%r8,%rcx,8),%zmm8
+vpdpbusd     %zmm18,%zmm8,%zmm14
+...
+```
+
+`vpbroadcastd` with a memory operand is one uop: the load and the broadcast are the same
+instruction, and the activation codes (`%zmm18`) are loaded once per four-value group and reused by
+all eight rows. So one (row, group) costs **1 broadcast + 1 dpbusd = 2 uops for 64 MAC**, and a full
+iteration (8 rows x 8 groups x 8 sub-blocks) is 9 memory uops + 8 `dpbusd` per 512 MAC, i.e. ~30
+MAC/uop with no shuffles anywhere.
+
+The interleaved layout has to do *more* than that: the eight rows' words are contiguous, so one
+64-byte load can fetch them, but each row still needs its own 16-lane broadcast, which now costs a
+lane extraction (`vpermd`/`vshufi32x4`/`vextracti32x4` + broadcast) instead of a memory-source
+broadcast. That is exactly the trade llama.cpp's GEMM makes — 24 blends and permutes per sub-block
+(`arch/x86/repack.cpp:2130-2200`) — and it is why `GGML_CPU_REPACK=ON` measures 0.74x of `OFF` here.
+
+So the port is done in the sense that matters: the technology (one feed serving many rows) is present,
+in the cheaper form the hardware offers, and the kernel is at 2 uops per 64 MAC. What is left of the
+prefill gap is not the weight feed — it is the 21-23% epilogue (ADR-003) and the dpbusd chain itself.
+
+## 2026-11-23 — single-thread prefill gap: phase attribution, and no llama.cpp kernel left to port
+
+The 1.31x single-thread prefill gap (67.0 vs 87.53 tok/s, see above) was split into phases instead of
+being read off the total. Everything below is one core, `taskset -c 2`, box idle.
+
+**Clock first.** `/proc/cpuinfo` sampled every 0.6 s during a pinned single-core run of each engine:
+median 4000 MHz for vipera, 4000 MHz for `llama-bench`. Both sit at the same 4.0 GHz, so the gap is
+not an AVX-512 licence downclock.
+
+**llama.cpp's dot is the narrow one.** In `build-ab-off` (REPACK=OFF), `ggml_vec_dot_q4_K_q8_K` at
+`0x12a2f0` contains **zero `zmm` operands** and 26 `vpmaddubsw` — it is the AVX2 256-bit branch, one
+dot per (row, token), `nrc == 1`. Per 64 MAC it issues *more* instructions than the vipera band's
+`vpbroadcastd` + `vpdpbusd` pair. There is no wider or cheaper dot kernel in the fork to port; the
+repack GEMM was the only candidate and it is 0.74x here.
+
+**Where the time goes** (`VIPERA_PROFILE_STEP=1 VIPERA_THREADS=1`, prefill chunks of 128 tokens,
+stable across chunks — e.g. `1409.77 ms: q4k 1113.13 (79%) q6k 224.50 (16%) attention 62.19 (4%)`):
+
+| phase | share of chunk | GFLOPS |
+|---|---:|---:|
+| q4k | 79% | 202 |
+| q6k | 16% | 179 |
+| attention | 4% | — |
+| whole prefill (n=128, 1785.8 ms) | 100% | 188 |
+| llama.cpp whole prefill (87.53 tok/s) | — | 229 |
+
+The phase rates use the model's real tensor mix, read from the GGUF header: Q4_K 1.345 G params
+(756.8 MB, of which `token_embd` 233.4 M is a lookup and is not a matmul), Q6_K 431.6 M (of which
+`output.weight` 233.4 M runs on one position per chunk and 14 `ffn_down` tensors, 198.2 M, run on all
+of them). That is 2.62 GFLOP per token at this batch width.
+
+**The kernel is not the loss.** `bench_prefill_band_gflops` (16384x1536 Q4_K, one core, three passes,
+best) runs the shipping path in isolation:
+
+| arm | ms | GFLOPS |
+|---|---:|---:|
+| tiled band B=128 (prefill width) | 29.50 | 218.4 |
+| tiled band B=16 (tile minimum) | 5.39 | 149.3 |
+| row kernel, 128 separate B=1 calls | 160.00 | 40.3 |
+
+The engine's q4k phase (202) is 93% of what the same kernel does alone (218), so per-call plumbing
+costs 7% of that phase. B=128 — the width `run_positions` already feeds through `run_batch_n::<128>`
+— is the best of the three by a wide margin.
+
+**The gap is the same at B=1.** Decode, one core: llama.cpp 14.54 ± 0.05 tok/s (`llama-bench -p 0
+-n 32 -t 1`), vipera 10.8 (92.4 ms/step) — 1.34x, the same ratio as prefill's 1.32x. A chunk-structure
+or batching explanation would have to vanish at B=1; it does not, so the difference is per-MAC and
+per-byte inside the quantized kernels, not in how positions are grouped.
+
+**What is left, priced.** Of the q4k phase, 21-23% is the scale/min epilogue (ADR-003; fusing it in the
+engine is worth 1.094x on the chunk, measured, at -0.094% NLL). Of the q6k phase, 17.6% is the same
+epilogue, which is 2.8% of a chunk — under the 3% gate. Everything else measured here is at parity or
+better with the fork's own kernel, which leaves the epilogue decision as the only lever above the gate.
+
+## 2026-11-23 — eight threads: the q4k phase is the kernel, not the pool
+
+Every prefill number in the entries above was taken at one thread, so the 8-thread gap (vipera 207.6 vs
+ik 268.7 tok/s at pp512) could still have been a chunking or pool effect. It is not: the phase
+attribution at eight threads lands on the same per-core rate as the isolated kernel.
+
+`VIPERA_PROFILE_STEP=1 taskset -c 0-7`, Qwen2.5-1.5B Q4_K_M, pp512 (128-token chunks):
+
+| | |
+|---|---:|
+| pp512 chunked | 2465.8 ms / **207.6 tok/s** |
+| chunk 10 | 458.53 ms |
+| q4k | 339.37 ms (**74%**) |
+| q6k | 78.57 ms (17%) |
+| attention | 29.50 ms (6%) |
+| rope / kv_write / elem / rest | 3.42 / 2.77 / 2.58 / 1.89 ms |
+
+At 128 tokens a chunk multiplies 1.1116 G Q4_K matmul parameters (1.345 G minus the `token_embd`
+lookup) by two FLOPs, i.e. 284.6 GFLOP, so the q4k phase runs at **838.7 GFLOPS = 209.7 GFLOPS per
+physical core**. The same kernel alone on one core measures 218.4 (`bench_prefill_band_gflops`), so the
+8-thread path is at **96% of its own kernel**; the 1T → 8T scaling is 202 → 209.7 per core, **4.15x on
+four physical cores**. Both numbers say the pool, the chunk width, and the per-call plumbing are not
+where the remaining 1.29x lives: a faster Q4_K kernel on one core is the only thing that moves it.
+
+Two pricing consequences, used by `docs/design/repack-port-plan.md`: the epilogue is 21-23% of that
+kernel (ADR-003, probe `NO_EPI`) and q4k is 74% of a chunk, so the whole epilogue ceiling is
+**+6..11% chunk**, not the +15% the earlier idea sheet assumed; and the weight-load probe
+(`NO_WEIGHT`, +29% / +56% on 8960x1536 and 1536x8960) overlaps with it rather than adding to it.
+
+## 2026-11-23 — a per-256 activation scale is worth 1.24-1.36x on the band, and costs 0.3-0.7% NLL
+
+The port analysis (`docs/design/repack-port-plan.md`) identified ik_llama.cpp's float-cheap epilogue as
+the last big prize, and then found that our activation cannot use it: `QuantizedX` carries **one scale
+per 32 values**, so `y_d` changes inside every 256-value block and the scale cannot be hoisted out of
+the per-sub-block loop. `block_q8_K` in llama.cpp and ik carries **one scale per 256**, which is exactly
+what lets them apply the weight scale in `i32` and pay one convert plus one multiply-add per block.
+
+Two measurements price the trade-off without writing the kernel.
+
+**Kernel ceiling.** A test-only probe (`PER_BLOCK_EPI_PROBE`, `bench_per_block_epilogue_probe`) keeps
+the same `dpbusd` chain and folds the epilogue into one convert and one multiply-add per (row, block),
+the shape a per-256 activation permits. One core, B=128, best of 5, two runs:
+
+| shape | real | one op/block | gain |
+|---|---|---:|---:|
+| 8960x1536, 8 copies | 152.8 / 151.7 GFLOPS | 189.5 / 194.5 | **1.24x / 1.28x** |
+| 1536x8960 | 168.8 / 168.9 GFLOPS | 221.9 / 229.1 | **1.31x / 1.36x** |
+
+That matches the `NO_EPI` ceiling (21-23% of the kernel), so the restructured epilogue recovers
+essentially all of it; the integer multiply per sub-block that replaces the float one costs nothing
+measurable. With q4k at 74% of a chunk this is **~+14..20% chunk at 8 threads**, the largest single win
+left on the table.
+
+**Quality cost.** Coarsening the activation scale only (codes and kernels untouched: one scale per
+group, repeated across the per-32 slots so every kernel stays correct) and scoring four texts with
+`vipera score --ctx 5200`, one core, mean NLL over ~12k tokens:
+
+| text | tokens | per-32 (today) | per-128 | per-256 |
+|---|---:|---:|---:|---:|
+| ADR-002 | 3706 | 3.0575 | 3.0675 (+0.33%) | 3.0750 (+0.57%) |
+| ADR-003 | 4740 | 2.9402 | — | 2.9540 (+0.47%) |
+| ADR-004 | 2994 | 2.8721 | 2.8873 (+0.53%) | 2.8849 (+0.45%) |
+| CONTRIBUTING | 683 | 2.9491 | 2.9607 (+0.39%) | 2.9694 (+0.69%) |
+
+Every text gets worse, in one direction, by 0.013-0.020 nats — four to seven times ADR-003's stated
+resolution of 0.003 nats, and per-128 is not reliably gentler than per-256 (ADR-004 prefers 256), so
+there is no cheap middle rung. Perplexity moves 17.67 → 17.90 on ADR-004.
+
+Decision this hands to the owner, not to a perf PR: **+14..20% prefill for +0.3..0.7% NLL on every text**.
+ADR-003 accepted a change only when no text moved more than 0.003 nats; this is 4-7x that, so it needs
+an ADR of its own (numbering: ADR-005, since ADR-004 is the attention q-block default) and the owner's
+call on whether prefill-only coarser activations — decode keeps per-32 either way — are acceptable.
+The kernel side is ready to implement: `docs/design/repack-port-plan.md`, W-1.
+
+## Pha 1b: 8x8 repack, wired into the decode row path — 2026-11-23
+
+**Hỏi:** layout repack của llama.cpp (`block_q4_Kx8` + `ggml_gemv_q4_K_8x8_q8_K`) đánh bại row kernel trên
+máy này, trên các shape thực của engine?
+
+**Đo lab (`bench_q4k8_gemv_vs_row`, 2026-11-23):**
+
+```
+q4k8 8960x1536 t=1: row 0.77 ms (10.0 GB/s) | 8x8 0.56 ms (13.9 GB/s) | 1.380x
+q4k8 8960x1536 t=8: row 0.33 ms (23.2 GB/s) | 8x8 0.32 ms (24.0 GB/s) | 1.035x
+q4k8 1536x8960 t=8: row 0.68 ms (11.4 GB/s) | 8x8 0.41 ms (19.0 GB/s) | 1.668x
+prefill band 16384x1536 B=128: 50.39 ms  127.8 GFLOPS
+```
+
+**Vào engine:** `fill_rows_q4k8` (quant.rs) — pack 8 hàng/call, `quantize_q8k` (lab port), `gemv_q4k8`
+(port của lab kernel vào `simd.rs`); `VIPERA_Q4K8` **mặc định tắt** (ADR-006), `=1` để bật.
+Parity: `q4k8_wire_matches_lab_kernel_within_tolerance` — wired kernel khớp
+`q4k8_lab::gemv_q4k8_generic` hơn `1e-3 + 1e-4·|want|`.
+
+**Decode, `bench.sh` median (8T, Qwen2.5-1.5B-Q4_K_M, i5-11300H):**
+
+| Thước | B0 (2026-11-23) | Sau (2026-11-23) | delta |
+|---|---|---|---|
+| step | 53.47 ms | 34.85 ms | −34.8% |
+| decode tok/s | 18.7 | 28.7 | +53% |
+| decode GB/s | 18.3 | 28.1 | +53% |
+| q4k matvec | 33.09 ms | 21.58 ms | −34.8% |
+| q6k matvec | 19.35 ms | 12.42 ms | −35.8% |
+
+**Bảng trên KHÔNG dùng được làm bằng chứng cho repack** (ghi chú thêm 2026-11-24): hai cột là hai
+phiên khác nhau, không phải phép đo paired, và `q6k matvec` "nhanh" −35.8% trong khi thay đổi này chỉ
+chạm Q4_K — một pha không đổi kernel mà cải thiện 35.8% nghĩa là hai phiên khác điều kiện, nên
+"−34.8% step" không quy được cho repack. Con số paired chưa chạy. Số duy nhất đứng được vẫn là lab
+(`bench_q4k8_gemv_vs_row`): 1.338x / 1.273x / 1.070x / **1.056x** ở 1/2/4/8 thread — tức 1.06x ở 8
+thread, đúng kết luận của #66 và dưới ngưỡng 3% chunk.
+
+**Cái cần ghi chú:** `repack-port-plan.md` §5 (2026-11-22) xếp "Không làm M1: 8x8 decode bus-bound —
+gemv 8 hàng 1.06x ở 8 thread", và đó vẫn là kết luận đúng. Switch `VIPERA_Q4K8` giữ lại đường port
+nhưng mặc định tắt cho tới khi có (a) phép đo paired ≥3% chunk/step, hoặc (b) ADR-005 chấp nhận
+activation per-256 — vì `block_q8_K` đổi granularity activation từ scale/32 sang scale/256, một thay
+đổi output trên mọi prompt. Chi tiết và điều kiện mở lại: `docs/design/ADR-006-q4k8-repack-default.md`.
+
+Thay đổi numerics kèm theo (2026-11-24): nhóm 8 hàng giờ hình thành trên chỉ số hàng **tuyệt đối** và
+đường batch dùng cùng kernel cho mọi width dưới `TILE_MIN_BATCH`, nên một hàng không còn phụ thuộc
+cách chia thread — `a_pooled_matvec_matches_the_spawned_one` và
+`a_batched_step_matches_every_sequence_run_alone` xanh ở cả hai nhánh switch (chạy `--lib`; test
+`batch.rs` cần model và chưa chạy lại được vì cây làm việc lúc ghi có W-1 đang dở).
+
+## Pha W-1a: band activation one scale per 256 (`VIPERA_TILED_A`, mặc định OFF) — 2026-11-24
+
+**Giá (plan `repack-port-plan.md` W-1a):** band đổi numerics (granularity activation) — giá bằng
+NLL gates; về speed: band instruction stream đổi sống (band đọc `dxv`/`sumv` như cũ — chỉ đổi
+VALUES trong `dxs`/`sumt`), builder thêm nhỏ — chunk 8T nên ≈ baseline.
+
+**Vào engine:**
+- `TiledActivation` (quant.rs): per entry × 256-block: `scale = max|x|/127`, `codes =
+  round(x/scale)` (định nghĩa `QuantizedX::quantize_group` ở granularity 256), `bsums[j] = Σ raw
+  x` over `[16j, 16j+16)` (min term). **Fix trong quá trình:** `bsums` ban đầu là i16
+  (`as i16` truncates — phát hiện bằng test W1A-vs-batch: diff 6.88 thay vì ~2.6) — đổi thành f32.
+- Band không đổi: `main = acc × d×scale_s × dxv` — W1A `dxv` = per-256 scale (cùng giá trị mọi sub
+  của block); `minterm = sumv × min_f` — W1A `sumv` = `bsums[b*16+2s] + bsums[b*16+2s+1]` (sub s
+  của band ↔ hai 16-group của block).
+- `q4k_matvec_tiled_range_a` + `try_q4k_matvec_tiled_range_a` (simd.rs) — band cũ
+  `q4k_matvec_tiled_range` refactor thành worker chung `q4k_tiled_matvec_worker`.
+
+**Parity:** `q4k_tiled_range_a_matches_batch_within_tolerance` (simd.rs) — W1A vs batch row kernel
+trên cùng shape; tolerance `2.0 + 0.2·|want|` — observed max diff 2.63 (W1A vs batch).
+
+**Chunk 8T (`bench.sh` median 5 cặp, VIPERA_TILED_A=1, 8T, B7 baseline 33.83 ms):**
+- step: **34.72 ms (+2.6%**, trong máy ±3%, band ≈ unchanged theo thiết kế).
+- q4k: 21.57 ms, q6k: 12.41 ms.
+- Các W1A-path cost thêm: `TiledActivation::new` (quantizer per product — tương đương
+  `QuantizedX::new` + `x_sums` cũ) — neutral trong giới hạn đo.
+
+**Không chạy:** lab band bench `bench_prefill_band_gflops` (lab kernel = per-32 path — W1A không
+đụng lab — và test build đang hỏng bởi missing `decode_ab.rs` — đã hỏi user: giữ declaration,
+báo vào đầu đường chạy). NLL 6-texts (ADR-003 ±0.5%) — cần engine — không chạy.
+
+**Quyết định của owner:** mặc định vẫn OFF (numerics change → ADR-005); switch `VIPERA_TILED_A`
+đặt tồn tại để bật/tắt khi có decision.
