@@ -22,11 +22,40 @@ pub(crate) struct PackedTile {
 }
 
 impl PackedTile {
+    fn validate(&self) -> Result<(), ViperaError> {
+        if self.cols == 0 || !self.cols.is_multiple_of(256) || self.blocks != self.cols / 256 {
+            return Err(ViperaError::invalid_argument(
+                "packed tile has inconsistent block/column geometry",
+            ));
+        }
+        let q_len = 8usize
+            .checked_mul(self.cols)
+            .ok_or_else(|| ViperaError::invalid_argument("packed tile size overflows"))?;
+        let groups = 8usize
+            .checked_mul(self.blocks)
+            .and_then(|n| n.checked_mul(8))
+            .ok_or_else(|| ViperaError::invalid_argument("packed tile size overflows"))?;
+        if self.q.len() != q_len || self.coeff.len() != groups || self.min_coeff.len() != groups {
+            return Err(ViperaError::invalid_argument(
+                "packed tile buffer lengths do not match its geometry",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PackedTile {
     /// Interleaved view (phòng thí nghiệm VNNI #27851): sắp xếp lại `q` thành
     /// `k*8 + r` để 8 hàng cùng cột nằm liên tục — activation `x` load 1 lần
     /// dùng cho 8 hàng (reuse 8x giống microkernel 16x16 của llama.cpp).
     /// `coeff`/`min_coeff` giữ nguyên row-major để dễ parity.
     pub fn interleaved_q(&self) -> Vec<u8> {
+        assert!(
+            self.cols.is_multiple_of(256)
+                && self.blocks == self.cols / 256
+                && self.q.len() == 8 * self.cols,
+            "packed tile has inconsistent geometry"
+        );
         let mut out = vec![0u8; self.cols * 8];
         for row in 0..8 {
             for k in 0..self.cols {
@@ -88,6 +117,7 @@ pub(crate) fn dot_packed(
     x: &[f32],
     sums: &[f32],
 ) -> Result<[f32; 8], ViperaError> {
+    tile.validate()?;
     if x.len() != tile.cols {
         return Err(ViperaError::invalid_argument(
             "dot_packed row width mismatch",
@@ -205,5 +235,47 @@ mod tests {
         let rows: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 144]).collect();
         let refs: [&[u8]; 8] = std::array::from_fn(|i| rows[i].as_slice());
         assert!(pack_q4k8(&refs, 100).is_err());
+    }
+
+    #[test]
+    fn narrow_one_block_shape_matches_scalar() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1e);
+        let cols = 256;
+        let blocks = cols / 256;
+        let rows: Vec<Vec<u8>> = (0..8).map(|_| q4k_row(&mut rng, blocks)).collect();
+        let refs: [&[u8]; 8] = std::array::from_fn(|i| rows[i].as_slice());
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let sums = x_sums(&x);
+        let packed = pack_q4k8(&refs, cols).expect("pack");
+        let got = dot_packed(&packed, &x, &sums).expect("dot");
+        for (row, g) in got.iter().enumerate() {
+            let want = q4k_dot(&rows[row], &x, &sums);
+            let tol = 1e-3 + 1e-4 * want.abs();
+            assert!((g - want).abs() <= tol, "row {row}: got {g}, want {want}");
+        }
+    }
+
+    #[test]
+    fn malformed_tile_geometry_is_rejected_without_oob() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1f);
+        let cols = 256;
+        let blocks = 1;
+        let rows: Vec<Vec<u8>> = (0..8).map(|_| q4k_row(&mut rng, blocks)).collect();
+        let refs: [&[u8]; 8] = std::array::from_fn(|i| rows[i].as_slice());
+        let mut tile = pack_q4k8(&refs, cols).expect("pack");
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let sums = x_sums(&x);
+
+        // Consistent narrow tile should still work.
+        dot_packed(&tile, &x, &sums).expect("valid narrow tile");
+
+        // Block/column mismatch must be rejected before indexing.
+        tile.blocks = 2;
+        assert!(dot_packed(&tile, &x, &sums).is_err());
+
+        // Restore geometry, then corrupt buffer lengths.
+        tile.blocks = 1;
+        tile.coeff.pop();
+        assert!(dot_packed(&tile, &x, &sums).is_err());
     }
 }
