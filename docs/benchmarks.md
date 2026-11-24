@@ -3938,7 +3938,6 @@ reach. Trading 78% more DRAM traffic for 8.8% less CPU work loses by roughly the
 what the table shows. The path stays on that branch as the measurement; it is not for landing, and the
 `VIPERA_REPACK` switch does not exist on `main`.
 
-<<<<<<< Updated upstream
 ## 2026-11-23 — prefill batch width, the one difference ik_llama.cpp has over us
 
 The phase shares put this on the table: at ~1.1k of prompt a 128-token chunk is 66-72% Q4_K, 17-18%
@@ -3958,7 +3957,6 @@ Absolute GFLOPS are low because the box was loaded; the ratio is the point and i
 v, attn, gate, up` and the logits buffer (77.8 -> 155.6 MB at a 151,936-token vocabulary), widens the
 activation tile to 392 KB at 6 blocks, and needs a `run_batch_n::<256>` instantiation. Nothing here
 has been wired into the engine: only the cap (`MAX_HALVES`) and the bench exist on this branch.
-=======
 ### Does removing the broadcast help when the weights are streamed?
 
 The hoisting explanation leaves one honest question: replacing the load with a constant also lets the
@@ -4449,7 +4447,6 @@ trong epilogue. Switch default OFF.
 từ 68–165 tok/s nên không thể tách win. **Trạng thái: chưa đo xong, chưa có verdict.** H4 rời có thể
 re-run khi máy ổn; nếu muốn đo "pure skip" có thể đặt `VIPERA_TRIATTENTION_THRESHOLD=0` (skip
 không điều kiện).
-<<<<<<< HEAD
 
 ## Prefill re-measured, 128 / 512 / 1024 / 4096, against llama.cpp — 2026-11-24
 
@@ -4766,5 +4763,25 @@ không `take`; dòng `PROFILE` thêm `(this pass X ms)` sau trung bình, phần 
 
 Tổng `this pass` + 0.56 s nạp khớp wall trong 0.6 s ở cả hai chế độ, và không còn dòng decode nào
 trong lúc prefill. Đây là công cụ đo, không phải đường chạy model: không đổi kết quả, chỉ đổi số báo.
-=======
->>>>>>> origin/main
+
+## H4 TriAttention phase-1 — ghi neutral — 2026-11-25
+
+**Bối cảnh:** H4 (`VIPERA_TRIATTENTION`, skip prefill QK tiles có max score < 1e-2 trong
+`attend_rows_shared`) chưa đo từ 2026-11-24 ("measurement pending" trong recent wins).
+
+**Giả thuyết đặt trước:** ON kéo prefill chunk ≥ 3%, decode 0.
+
+**Số đo (A/B xen kẽ, taskset -c 2-7, VIPERA_THREADS=8, median):**
+
+| Arm | Decode step ms/step (n=66) | Prefill chunk-sum (n=5) |
+|---|---:|---:|
+| OFF (mặc định) | 283.8 | 10,638.9 ms (pp512, 520 tok) |
+| ON (`VIPERA_TRIATTENTION=1`) | 290.1 | 9,241.0 ms |
+
+| Prefill p4096 (n=3) | OFF 37,659.1 ms | ON 35,580.6 ms |
+
+Machine ho ngày đo này — per ledger "Absolutes move ~20% between runs", cả hai arm đều
+trong nhiễu; không có con số khác đáng kể.
+
+**Kết quả:** **neutral** — switch giữ mặc định tắt; ghi số thực như trên vào ledger này.
+
