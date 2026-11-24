@@ -727,4 +727,47 @@ mod tests {
         }
         assert!(KvCacheType::parse("q2_k").is_err());
     }
+
+    #[test]
+    fn empty_or_unknown_model_metadata_does_not_panic() {
+        use crate::gguf::{GgufFile, Header, Metadata};
+
+        // Empty metadata: no architecture, so planning must refuse rather than panic.
+        let empty = GgufFile {
+            header: Header {
+                version: 3,
+                tensor_count: 0,
+                metadata_count: 0,
+            },
+            metadata: Metadata::default(),
+            tensors: Vec::new(),
+            data_offset: 0,
+            file_len: 0,
+        };
+        assert!(ModelShape::from_gguf(&empty).is_err());
+
+        // Unknown architecture: required keys are absent, so planning must refuse.
+        // Build the file through the parser to exercise the real metadata path.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // metadata count
+        // key "general.architecture"
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // string type
+        let val = b"no-such-arch";
+        bytes.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(val);
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        let file = GgufFile::parse(&bytes).unwrap();
+        // Identity and description must also stay panic-free on this metadata.
+        let _ = file.identity();
+        let _ = file.describe();
+        assert!(ModelShape::from_gguf(&file).is_err());
+    }
 }
