@@ -1258,6 +1258,126 @@
 - [ ] `future-scaling` — Scaling law (compute, data, model) — OpenCode
 - [ ] `future-agentic` — Agentic (autonomous, multi-agent) — OpenCode
 
+### P101 — OPTIMIZATION TECHNIQUES (thêm)
+- [ ] `opt-autotune` — Auto-tuning (tile, batch, thread) — OpenCode
+- [ ] `opt-kernels` — Custom kernel (CUDA, HIP, Metal) — OpenCode
+- [ ] `opt-fusion` — Kernel fusion (element-wise, reduce) — OpenCode
+- [ ] `opt-quantize` — Dynamic quantize (per-token, per-channel) — OpenCode
+- [ ] `opt-spec` — Speculative (draft, verify, reject) — OpenCode
+- [ ] `opt-moe` — MoE optimization (routing, cache, load) — OpenCode
+- [ ] `opt-long` — Long context (ring, paged, compress) — OpenCode
+- [ ] `opt-batch` — Batch optimization (dynamic, priority) — OpenCode
+- [ ] `opt-cache` — Cache (KV, semantic, prefix) — Freebuff
+- [ ] `opt-skip` — Skip (zero, pruned, masked) — OpenCode
+
+### P102 — COMPILATION + IR (thêm)
+- [ ] `ir-llvm` — LLVM IR (JIT, AOT) — OpenCode
+- [ ] `ir-cranelift` — Cranelift (fast, simple) — OpenCode
+- [ ] `ir-triton` — Triton (Python, GPU) — OpenCode
+- [ ] `ir-xla` — XLA (JAX, TF) — OpenCode
+- [ ] `ir-onnx` — ONNX (graph, opset) — OpenCode
+- [ ] `ir-tflite` — TFLite (mobile, edge) — Freebuff
+- [ ] `ir-coreml` — CoreML (iOS, macOS) — Freebuff
+- [ ] `ir-spirv` — SPIR-V (Vulkan, GPU) — OpenCode
+- [ ] `ir-cuda` — CUDA IR (PTX, SASS) — OpenCode
+- [ ] `ir-openvino` — OpenVINO IR (XML, BIN) — OpenCode
+
+### P103 — MODEL OPTIMIZATION (thêm)
+- [ ] `model-prune` — Prune (weight, neuron, layer) — OpenCode
+- [ ] `model-quant` — Quantize (4-bit, 8-bit, mixed) — OpenCode
+- [ ] `model-distill` — Distill (large → small) — OpenCode
+- [ ] `model-merge` — Merge (TIES, DARE, SLERP) — Freebuff
+- [ ] `model-skip` — Skip (connection, layer) — OpenCode
+- [ ] `model-share` — Share (parameter, weight) — OpenCode
+- [ ] `model-sparse` — Sparse (structured, unstructured) — OpenCode
+- [ ] `model-lowrank` — Low-rank (LoRA, SVD) — OpenCode
+- [ ] `model-moe` — MoE (expert, routing, capacity) — OpenCode
+- [ ] `model-hybrid` — Hybrid (dense + MoE, attention + SSM) — OpenCode
+
+### P104 — INFERENCE OPTIMIZATION (thêm)
+- [ ] `infer-continuous` — Continuous batching — OpenCode
+- [ ] `infer-paged` — Paged inference (vLLM) — OpenCode
+- [ ] `infer-stream` — Streaming (token-by-token) — Freebuff
+- [ ] `infer-priority` — Priority (VIP, SLO) — Freebuff
+- [ ] `infer-cost` — Cost optimization ($/token) — OpenCode
+- [ ] `infer-quality` — Quality (sample, temperature) — Freebuff
+- [ ] `infer-spec` — Speculative (draft, verify) — OpenCode
+- [ ] `infer-moe` — MoE (expert cache, offload) — OpenCode
+- [ ] `infer-long` — Long context (ring, paged) — OpenCode
+- [ ] `infer-edge` — Edge (mobile, embedded) — Freebuff
+
+### P105 — TRAINING OPTIMIZATION (thêm)
+- [ ] `train-lora` — LoRA (rank, alpha, target) — OpenCode
+- [ ] `train-qlora` — QLoRA (4-bit, NF4, BNB) — OpenCode
+- [ ] `train-adapter` — Adapter (bottleneck, SE) — OpenCode
+- [ ] `train-dpo` — DPO (preference, ref) — OpenCode
+- [ ] `train-rlhf` — RLHF (reward, PPO) — OpenCode
+- [ ] `train-orpo` — ORPO (preference, no ref) — OpenCode
+- [ ] `train-distill` — Distill (teacher, student) — OpenCode
+- [ ] `train-prune` — Prune (magnitude, movement) — OpenCode
+- [ ] `train-merge` — Merge (TIES, DARE, SLERP) — Freebuff
+- [ ] `train-mix` — Mix (multi-task, multi-model) — OpenCode
+
+### P106 — DATA OPTIMIZATION (thêm)
+- [ ] `data-clean` — Clean (dedup, normalize) — Freebuff
+- [ ] `data-filter` — Filter (quality, length) — Freebuff
+- [ ] `data-aug` — Augment (synthetic, back-translation) — OpenCode
+- [ ] `data-select` — Select (diversity, quality) — Freebuff
+- [ ] `data-weight` — Weight (importance, frequency) — Freebuff
+- [ ] `data-mix` — Mix (multi-domain, multi-task) — Freebuff
+- [ ] `data-split` — Split (train, val, test) — Freebuff
+- [ ] `data-version` — Version (DVC, LakeFS) — Freebuff
+- [ ] `data-lineage` — Lineage (track, audit) — Freebuff
+- [ ] `data-security` — Security (PII, encryption) — Freebuff
+
+### P107 — SYSTEM OPTIMIZATION (thêm)
+- [ ] `sys-schedule` — Schedule (task, thread) — Freebuff
+- [ ] `sys-mem` — Memory (pool, arena, slab) — Freebuff
+- [ ] `sys-io` — I/O (batch, async, overlap) — Freebuff
+- [ ] `sys-net` — Network (batch, pipeline) — Freebuff
+- [ ] `sys-cache` — Cache (L1, L2, semantic) — Freebuff
+- [ ] `sys-gpu` — GPU (kernel, memory, launch) — OpenCode
+- [ ] `sys-cpu` — CPU (SIMD, thread, branch) — OpenCode
+- [ ] `sys-disk` — Disk (SSD, HDD, NVMe) — Freebuff
+- [ ] `sys-power` — Power (throttle, DVFS) — Freebuff
+- [ ] `sys-thermal` — Thermal (throttle, monitor) — Freebuff
+
+### P108 — USER OPTIMIZATION (thêm)
+- [ ] `user-prompt` — Prompt (template, few-shot) — Freebuff
+- [ ] `user-context` — Context (manage, compress) — OpenCode
+- [ ] `user-tool` — Tool (select, use) — Freebuff
+- [ ] `user-chain` — Chain (ReAct, CoT) — Freebuff
+- [ ] `user-memory` — Memory (short, long) — Freebuff
+- [ ] `user-agent` — Agent (plan, execute) — Freebuff
+- [ ] `user-eval` — Eval (score, rank) — Freebuff
+- [ ] `user-optimize` — Optimize (search, evolve) — OpenCode
+- [ ] `user-custom` — Custom (plugin, extension) — Freebuff
+- [ ] `user-auto` — Auto (select, adapt) — OpenCode
+
+### P109 — BUSINESS OPTIMIZATION (thêm)
+- [ ] `biz-cost` — Cost ($/query, $/token) — Freebuff
+- [ ] `biz-revenue` — Revenue (usage, subscription) — Freebuff
+- [ ] `biz-margin` — Margin (cost, price) — Freebuff
+- [ ] `biz-scaling` — Scaling (user, request) — Freebuff
+- [ ] `biz-sla` — SLA (uptime, latency) — Freebuff
+- [ ] `biz-support` — Support (ticket, chat) — Freebuff
+- [ ] `biz-roi` — ROI (value, cost) — Freebuff
+- [ ] `biz-competitive` — Competitive (price, feature) — Freebuff
+- [ ] `biz-compliance` — Compliance (GDPR, HIPAA) — Freebuff
+- [ ] `biz-sustainability` — Sustainability (carbon, energy) — Freebuff
+
+### P110 — RESEARCH DIRECTIONS (thêm)
+- [ ] `research-transformer` — Transformer v2 (linear, log) — OpenCode
+- [ ] `research-mamba` — Mamba v2 (SSM, selective) — OpenCode
+- [ ] `research-rwkv` — RWKV v5 (linear, wkv) — OpenCode
+- [ ] `research-hyena` — Hyena (conv, attention) — OpenCode
+- [ ] `research-mimo` — MiMo (MoE, efficient) — OpenCode
+- [ ] `research-gated` — Gated (attention, SSM) — OpenCode
+- [ ] `research-long` — Long context (1M, 10M) — OpenCode
+- [ ] `research-multimodal` — Multi-modal (image, audio, video) — OpenCode
+- [ ] `research-world` — World model (physics, sim) — OpenCode
+- [ ] `research-agentic` — Agentic (autonomous, multi) — OpenCode
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -1268,11 +1388,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **1011 tasks** (P0-P100) × 1 cycle = **4044 contributions**
-> 1011 × 2 cycles = **8088 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 1011 × 3 cycles = **12132 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
+> **1111 tasks** (P0-P110) × 1 cycle = **4444 contributions**
+> 1111 × 2 cycles = **8888 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 1111 × 3 cycles = **13332 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 1 cycle trong 24h → 4044 contributions (vượt 1000 rule, 4x)**
+**Gợi ý: 1 cycle trong 24h → 4444 contributions (vượt 1000 rule, 4.4x)**
 
 ## LỆNH CHẠY
 
