@@ -571,4 +571,39 @@ mod tests {
                 .ok_or_else(|| "NoFiniteLogits".to_owned())
         });
     }
+
+    #[test]
+    fn empty_and_degenerate_inputs_do_not_panic() {
+        let no_cases: [Case; 0] = [];
+        assert!(run(&no_cases, |_| Ok(())).is_empty());
+        assert_conforms("empty", &no_cases, |_| Ok(()));
+
+        let no_sampler_cases: [SamplerCase; 0] = [];
+        assert!(run_sampler(&no_sampler_cases, |_| Ok(0)).is_empty());
+        assert_sampler_conforms("empty-sampler", &no_sampler_cases, |_| Ok(0));
+
+        let degenerate = GgufBuilder {
+            version: 3,
+            metadata: Vec::new(),
+            tensors: Vec::new(),
+            data_len: 0,
+        };
+        let bytes = degenerate.build();
+        assert_eq!(&bytes[0..4], b"GGUF");
+        assert_eq!(bytes.len() % 32, 0);
+
+        let empty_name = GgufBuilder {
+            version: 3,
+            metadata: vec![("".to_owned(), MetaValue::Str(String::new()))],
+            tensors: vec![TensorSpec {
+                name: String::new(),
+                dims: Vec::new(),
+                type_id: 0,
+                offset: 0,
+            }],
+            data_len: 0,
+        };
+        let bytes = empty_name.build();
+        assert_eq!(&bytes[0..4], b"GGUF");
+    }
 }
