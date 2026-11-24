@@ -21,7 +21,10 @@ use vipera_errors::ViperaError;
 use vipera_sampler::{Sampler, SamplerConfig};
 // Re-exported so a backend that depends only on the runtime can implement the contracts the engine
 // accepts without adding a dependency edge of its own.
-pub use vipera_traits::{KvCompression, SparseAttention};
+pub use vipera_traits::{
+    AlgorithmPlan, AlgorithmRegistry, KvCompression, MissingAlgorithm, PlannedAlgorithms,
+    SparseAttention,
+};
 
 use crate::kv::KvCache;
 use crate::pipeline::{
@@ -389,6 +392,37 @@ impl<F: ForwardPass> Engine<F> {
             policy,
             positions: Vec::new(),
         });
+    }
+
+    /// Plan which algorithm implementations this engine runs, resolving the names `plan` carries
+    /// against the build's `registry`.
+    ///
+    /// Planning is a startup step, and doing it here is what turns a name the build does not have
+    /// into an error instead of a stage that quietly runs its identity strategy because a typo
+    /// never matched anything. The plan is resolved whole before any policy is installed, and the
+    /// plan is the whole truth: a slot it leaves `None` is cleared, so planning an empty plan undoes
+    /// an earlier one.
+    ///
+    /// Only the `sparse` slot is consulted by this engine today; the other three are still checked
+    /// against the registry, so a plan that came from configuration is accepted or rejected in one
+    /// place rather than failing later in a stage that has an algorithm missing.
+    pub fn plan_algorithms(
+        &mut self,
+        registry: &AlgorithmRegistry,
+        plan: &AlgorithmPlan,
+    ) -> Result<(), ViperaError> {
+        let planned = registry.plan(plan).map_err(|missing: MissingAlgorithm| {
+            let mut available: Vec<&str> = registry.names().collect();
+            available.sort_unstable();
+            let available = if available.is_empty() {
+                "this build has none".to_owned()
+            } else {
+                format!("this build has {}", available.join(", "))
+            };
+            ViperaError::invalid_argument(format!("{missing}; {available}"))
+        })?;
+        self.set_sparse_attention(planned.sparse);
+        Ok(())
     }
 
     /// Turn the prefix cache on or off for later requests.
@@ -1807,6 +1841,77 @@ mod tests {
         assert!(
             generation.timings.micros(Stage::Sparse) > 0,
             "sparse time was not recorded"
+        );
+    }
+
+    static EVERY_OTHER_SPARSE: [&dyn SparseAttention; 1] = [&EveryOtherSparse];
+
+    fn sparse_registry() -> AlgorithmRegistry {
+        AlgorithmRegistry::new(&[], &EVERY_OTHER_SPARSE, &[], &[])
+    }
+
+    #[test]
+    fn a_planned_sparse_policy_is_installed_for_forward() {
+        let mut engine = engine_with(greedy(), ToyForward::new(32), 32);
+        engine
+            .plan_algorithms(
+                &sparse_registry(),
+                &AlgorithmPlan {
+                    sparse: Some("every-other"),
+                    ..AlgorithmPlan::default()
+                },
+            )
+            .expect("the build has that policy");
+        let id = engine.admit(&[1, 2, 3], 2).unwrap();
+        let generation = engine.generate(id).unwrap();
+        assert!(generation.timings.micros(Stage::Sparse) > 0);
+    }
+
+    #[test]
+    fn an_unknown_algorithm_name_is_refused_and_installs_nothing() {
+        let mut engine = engine_with(greedy(), ToyForward::new(32), 32);
+        let error = engine
+            .plan_algorithms(
+                &sparse_registry(),
+                &AlgorithmPlan {
+                    sparse: Some("absorbed"),
+                    ..AlgorithmPlan::default()
+                },
+            )
+            .expect_err("this build has no such sparse policy");
+        let message = error.to_string();
+        assert!(
+            message.contains("no sparse algorithm named 'absorbed'"),
+            "{message}"
+        );
+        assert!(
+            message.contains("every-other"),
+            "the error names what the build has: {message}"
+        );
+        let id = engine.admit(&[1, 2, 3], 2).unwrap();
+        let generation = engine.generate(id).unwrap();
+        assert_eq!(generation.timings.micros(Stage::Sparse), 0);
+    }
+
+    #[test]
+    fn an_empty_plan_clears_a_planned_policy() {
+        let mut engine = engine_with(greedy(), ToyForward::new(32), 32);
+        engine
+            .plan_algorithms(
+                &sparse_registry(),
+                &AlgorithmPlan {
+                    sparse: Some("every-other"),
+                    ..AlgorithmPlan::default()
+                },
+            )
+            .expect("the build has that policy");
+        engine
+            .plan_algorithms(&sparse_registry(), &AlgorithmPlan::default())
+            .expect("an empty plan asks for the identity strategy");
+        let id = engine.admit(&[1, 2, 3], 2).unwrap();
+        assert_eq!(
+            engine.generate(id).unwrap().timings.micros(Stage::Sparse),
+            0
         );
     }
 
