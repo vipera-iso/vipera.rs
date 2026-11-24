@@ -51,3 +51,23 @@ it measures:
 taskset -c 2-7 env VIPERA_THREADS=6 \
   cargo test --release -p vipera-backend-cpu --lib attention_combinations -- --ignored --nocapture
 ```
+
+## Q8_0_R16 activation repack — measurement pending
+
+`VIPERA_Q8R16` (default off) packs each 16-row group of a wide Q8_0 prompt chunk into Q8_0
+activations — 16 contiguous scales and transposed codes — so one pass over a weight row produces
+16 outputs. It is the ik_llama.cpp `Q8_0_R16` layout ported to the one integer-activation format
+this backend has; Q4_K and Q6_K already share a weight pass across the chunk. It is also a numeric
+change (one scale per 32 activation values), so tokens can differ from the f32 path.
+
+**No number is claimed for it.** `bench_q8r16_against_f32_batch` is `#[ignore]`d and has not been
+run on the reference machine, so there is no before/after to record yet. The exact measurement —
+release, because a debug build cannot time a 8960×1536 Q8_0 row pass at a usable speed:
+
+```sh
+cargo test --release -p vipera-backend-cpu --lib bench_q8r16_against_f32_batch -- --ignored --nocapture
+```
+
+The bench compares the f32 batch row kernel against the repack back to back in one process; the
+result only becomes a claim once its ratio is written into a dated section of the ledger
+[`../benchmarks.md`](../benchmarks.md). Until then the switch stays off.
