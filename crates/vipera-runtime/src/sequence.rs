@@ -287,7 +287,14 @@ impl Sequence {
             )));
         }
         let id = self.next_snapshot;
-        self.next_snapshot += 1;
+        // The counter is u32 and `snapshot` returns u32, so exhaustion must be reported instead
+        // of overflowing (a debug panic, or a silent wrap to duplicate ids in release).
+        self.next_snapshot = id.checked_add(1).ok_or_else(|| {
+            ViperaError::internal(format!(
+                "sequence {} has exhausted its snapshot id space",
+                self.id
+            ))
+        })?;
         self.snapshots.push(Snapshot {
             id,
             token_position: self.tokens.len(),
@@ -355,5 +362,59 @@ mod tests {
         sequence.push_prompt(&[3]);
         assert_eq!(sequence.tokens(), &[1, 2, 3]);
         assert_eq!(sequence.state(), SequenceState::Admitted);
+    }
+
+    #[test]
+    fn an_empty_or_degenerate_lifecycle_never_panics() {
+        let mut sequence = Sequence::new(1, 0);
+        sequence.push_prompt(&[]);
+        assert!(sequence.is_empty());
+        sequence.push_generated(7);
+        assert_eq!(sequence.tokens(), &[7]);
+
+        // Both counters clamp to what the sequence actually holds, even at usize::MAX.
+        sequence.set_processed(usize::MAX);
+        assert_eq!(sequence.processed(), 1);
+        sequence.truncate(usize::MAX);
+        assert_eq!(sequence.tokens(), &[7]);
+        sequence.truncate(0);
+        assert!(sequence.is_empty());
+        assert_eq!(sequence.processed(), 0);
+        assert_eq!(sequence.prompt_end(), 0);
+
+        // A snapshot taken on an empty context restores back to it cleanly.
+        let at_zero = sequence.snapshot(None).unwrap();
+        assert_eq!(sequence.snapshot_by_id(at_zero).unwrap().token_position, 0);
+        sequence.push_prompt(&[1, 2]);
+        // This is what Engine::restore does with a snapshot at position 0.
+        let target = sequence.snapshot_by_id(at_zero).unwrap().token_position;
+        sequence.truncate(target);
+        assert!(sequence.is_empty());
+        assert!(sequence.snapshot_by_id(at_zero).is_some());
+
+        sequence.set_reused(usize::MAX);
+        assert_eq!(sequence.take_reused(), usize::MAX);
+        assert_eq!(sequence.common_prefix(&[]), 0);
+        sequence.begin_prefill();
+        sequence.begin_decode();
+        sequence.finish(FinishReason::Length);
+        sequence.cancel();
+        assert!(!sequence.is_usable());
+        assert!(sequence.snapshot(None).is_err());
+        sequence.fail();
+        assert!(sequence.snapshot(None).is_err());
+    }
+
+    #[test]
+    fn snapshot_id_exhaustion_is_an_error_not_a_panic() {
+        let mut sequence = Sequence::new(1, 8);
+        sequence.push_prompt(&[1]);
+        sequence.next_snapshot = u32::MAX - 1;
+        let last = sequence.snapshot(None).unwrap();
+        assert_eq!(last, u32::MAX - 1);
+        // The next id would overflow u32: it is reported, not wrapped or panicked on.
+        let error = sequence.snapshot(None).unwrap_err();
+        assert!(error.to_string().contains("exhausted"));
+        assert!(sequence.snapshot_by_id(last).is_some());
     }
 }
