@@ -958,6 +958,186 @@
 - [ ] `qa-regression` — Regression (baseline, compare) — Freebuff
 - [ ] `qa-coverage` — Coverage (unit, integration, e2e) — Freebuff
 
+### P76 — LLM FEATURES (thêm)
+- [ ] `llm-chat` — Chat (multi-turn, streaming) — Freebuff
+- [ ] `llm-completion` — Completion (single-turn, batch) — Freebuff
+- [ ] `llm-embed` — Embedding (vector, similarity) — Freebuff
+- [ ] `llm-rerank` — Rerank (query, document) — Freebuff
+- [ ] `llm-classify` — Classify (label, multi-class) — Freebuff
+- [ ] `llm-extract` — Extract (entity, relation, fact) — Freebuff
+- [ ] `llm-summarize` — Summarize (extractive, abstractive) — Freebuff
+- [ ] `llm-translate` — Translate (multi-lingual, NMT) — Freebuff
+- [ ] `llm-code` — Code (gen, review, test) — OpenCode
+- [ ] `llm-math` — Math (symbolic, numeric) — OpenCode
+
+### P77 — MODEL ARCH (thêm)
+- [ ] `arch-llama` — Llama 2/3/4 (GQA, RoPE) — Freebuff
+- [ ] `arch-qwen` — Qwen 1/2/3 (GQA, RoPE, MoE) — OpenCode
+- [ ] `arch-mistral` — Mistral 7B/Instruct (sliding, GQA) — Freebuff
+- [ ] `arch-gemma` — Gemma/Gemma-2 (GQA, sliding) — Freebuff
+- [ ] `arch-phi` — Phi-3/4 (GQA, alternating) — OpenCode
+- [ ] `arch-command` — Command-R/R+ (sliding, GQA) — Freebuff
+- [ ] `arch-olmo` — OLMo/OLMoE (GQA, RoPE) — Freebuff
+- [ ] `arch-jamba` — Jamba (Mamba + attention) — OpenCode
+- [ ] `arch-mamba` — Mamba2/Samba (SSM, no attention) — OpenCode
+- [ ] `arch-rwkv` — RWKV (linear attention, no KV) — OpenCode
+
+### P78 — QUANTIZATION (thêm)
+- [ ] `q4_k` — Q4_K (4-bit, k-quant) — OpenCode
+- [ ] `q5_k` — Q5_K (5-bit, k-quant) — OpenCode
+- [ ] `q6_k` — Q6_K (6-bit, k-quant) — OpenCode
+- [ ] `q8_0` — Q8_0 (8-bit, per-block) — OpenCode
+- [ ] `q8_1` — Q8_1 (8-bit, per-channel) — OpenCode
+- [ ] `f16` — FP16 (half-precision) — OpenCode
+- [ ] `f32` — FP32 (single-precision) — OpenCode
+- [ ] `i8` — INT8 (8-bit, symmetric) — OpenCode
+- [ ] `i4` — INT4 (4-bit, symmetric) — OpenCode
+- [ ] `i2` — INT2 (2-bit, symmetric) — OpenCode
+
+### P79 — ATTENTION (thêm)
+- [ ] `attn-standard` — Standard (Q, K, V, softmax) — OpenCode
+- [ ] `attn-multi` — Multi-head (H heads) — OpenCode
+- [ ] `attn-group` — Grouped-query (GQA) — OpenCode
+- [ ] `attn-multi-query` — Multi-query (MQA) — OpenCode
+- [ ] `attn-sliding` — Sliding window (local) — OpenCode
+- [ ] `attn-linear` — Linear (no softmax) — OpenCode
+- [ ] `attn-log` — Log-attention (log-linear) — OpenCode
+- [ ] `attn-sparse` — Sparse (top-k) — OpenCode
+- [ ] `attn-flash` — Flash (tiling, on-the-fly) — OpenCode
+- [ ] `attn-flash2` — FlashAttention-2 (faster, less memory) — OpenCode
+
+### P80 — GEMM + KERNEL (thêm)
+- [ ] `gemm-f32` — GEMM FP32 (baseline) — OpenCode
+- [ ] `gemm-f16` — GEMM FP16 (FMA) — OpenCode
+- [ ] `gemm-i8` — GEMM INT8 (DQ8_0, Q8_0) — OpenCode
+- [ ] `gemm-i4` — GEMM INT4 (Q4_0, Q4_K) — OpenCode
+- [ ] `gemm-i2` — GEMM INT2 (Q2_K, Q3_K) — OpenCode
+- [ ] `gemm-tiled` — Tiled (cache, L1/L2) — OpenCode
+- [ ] `gemm-split` — Split-K (parallel, reduce) — OpenCode
+- [ ] `gemm-wino` — Winograd (conv, fast) — OpenCode
+- [ ] `gemm-sparse` — Sparse (skip zero) — OpenCode
+- [ ] `gemm-mixed` — Mixed (per-layer bit) — OpenCode
+
+### P81 — MEMORY + CACHE (thêm)
+- [ ] `mem-kv` — KV cache (f16, q8) — Freebuff
+- [ ] `mem-paged` — Paged KV (vLLM) — OpenCode
+- [ ] `mem-ring` — Ring KV (sliding) — Freebuff
+- [ ] `mem-share` — Shared KV (GQA, MQA) — OpenCode
+- [ ] `mem-compress` — Compressed KV (quant, prune) — OpenCode
+- [ ] `mem-pool` — Memory pool (preallocate) — Freebuff
+- [ ] `mem-mmap` — Memory-map (file, disk) — Freebuff
+- [ ] `mem-swizzle` — Swizzle (cache, L1/L2) — OpenCode
+- [ ] `mem-prefetch` — Prefetch (hint, AVX-512) — OpenCode
+- [ ] `mem-hbm` — HBM (high-bandwidth) — OpenCode
+
+### P82 — THREAD + PARALLEL (thêm)
+- [ ] `par-thread` — Thread (rayon, std::thread) — Freebuff
+- [ ] `par-simd` — SIMD (AVX2, AVX-512, NEON) — OpenCode
+- [ ] `par-vector` — Vector (SIMD, GPU) — OpenCode
+- [ ] `par-graph` — Graph (DAG, parallel) — OpenCode
+- [ ] `par-pipeline` — Pipeline (stage, overlap) — OpenCode
+- [ ] `par-data` — Data (embarrassing) — Freebuff
+- [ ] `par-task` — Task (work-stealing) — Freebuff
+- [ ] `par-async` — Async (tokio, async/await) — Freebuff
+- [ ] `par-gpu` — GPU (CUDA, HIP) — OpenCode
+- [ ] `par-distributed` — Distributed (multi-node) — OpenCode
+
+### P83 — COMPILER + CODEGEN (thêm)
+- [ ] `code-gen` — Code generation (LLVM, cranelift) — OpenCode
+- [ ] `code-opt` — Optimization (inliner, vectorizer) — OpenCode
+- [ ] `code-jit` — JIT (just-in-time, dynamic) — OpenCode
+- [ ] `code-aot` — AOT (ahead-of-time, static) — OpenCode
+- [ ] `code-wasm` — WASM (compile, execute) — OpenCode
+- [ ] `code-cuda` — CUDA (compile, kernel) — OpenCode
+- [ ] `code-opencl` — OpenCL (compile, kernel) — OpenCode
+- [ ] `code-spirv` — SPIR-V (Vulkan, compile) — OpenCode
+- [ ] `code-triton` — Triton (Python, GPU) — OpenCode
+- [ ] `code-xla` — XLA (JAX, compile) — OpenCode
+
+### P84 — TENSOR + MATH (thêm)
+- [ ] `tensor-add` — Addition (element-wise) — OpenCode
+- [ ] `tensor-mul` — Multiplication (element-wise, matmul) — OpenCode
+- [ ] `tensor-conv` — Convolution (1D, 2D, 3D) — OpenCode
+- [ ] `tensor-pool` — Pooling (max, avg) — OpenCode
+- [ ] `tensor-softmax` — Softmax (stable, fast) — OpenCode
+- [ ] `tensor-norm` — Normalization (LN, BN, RMS) — OpenCode
+- [ ] `tensor-relu` — ReLU (activation) — OpenCode
+- [ ] `tensor-sigmoid` — Sigmoid (activation) — OpenCode
+- [ ] `tensor-tanh` — Tanh (activation) — OpenCode
+- [ ] `tensor-geglu` — GELU, GeGLU (activation) — OpenCode
+
+### P85 — DATA + PIPELINE (thêm)
+- [ ] `data-load` — Load (CSV, JSON, Parquet) — Freebuff
+- [ ] `data-transform` — Transform (clean, normalize) — Freebuff
+- [ ] `data-split` — Split (train, val, test) — Freebuff
+- [ ] `data-augment` — Augment (synthetic, back-translation) — OpenCode
+- [ ] `data-embed` — Embed (vector, index) — OpenCode
+- [ ] `data-index` — Index (vector, BM25) — Freebuff
+- [ ] `data-retrieval` — Retrieval (search, rank) — Freebuff
+- [ ] `data-generate` — Generate (synthetic, LLM) — OpenCode
+- [ ] `data-verify` — Verify (quality, consistency) — Freebuff
+- [ ] `data-serve` — Serve (API, stream) — Freebuff
+
+### P86 — EVAL + BENCHMARK (thêm)
+- [ ] `eval-mmlu` — MMLU (57 subjects) — Freebuff
+- [ ] `eval-gsm8k` — GSM8K (math, grade school) — Freebuff
+- [ ] `eval-humaneval` — HumanEval (code, Python) — Freebuff
+- [ ] `eval-math` — MATH (competition) — Freebuff
+- [ ] `eval-code` — MBPP, EvalPlus (code) — Freebuff
+- [ ] `eval-chat` — MT-Bench, Alpaca (chat) — Freebuff
+- [ ] `eval-long` — LongBench (128k, 1M) — Freebuff
+- [ ] `eval-mm` — MMMU, MMBench (multi-modal) — Freebuff
+- [ ] `eval-agent` — SWE-bench, AgentBench (agent) — Freebuff
+- [ ] `eval-custom` — Custom (domain, task) — Freebuff
+
+### P87 — SAFETY + ALIGNMENT (thêm)
+- [ ] `safety-sft` — SFT (supervised) — OpenCode
+- [ ] `safety-dpo` — DPO (preference) — OpenCode
+- [ ] `safety-orpo` — ORPO (preference, no ref) — OpenCode
+- [ ] `safety-rlhf` — RLHF (reward, PPO) — OpenCode
+- [ ] `safety-guard` — Guard (filter, toxicity) — Freebuff
+- [ ] `safety-jailbreak` — Jailbreak (detect, prevent) — Freebuff
+- [ ] `safety-bias` — Bias (gender, race, political) — Freebuff
+- [ ] `safety-hallucination` — Hallucination (fact-check) — Freebuff
+- [ ] `safety-privacy` — Privacy (PII, GDPR) — Freebuff
+- [ ] `safety-audit` — Audit (model, system) — Freebuff
+
+### P88 — DEPLOYMENT + OPS (thêm)
+- [ ] `deploy-docker` — Docker (CPU, CUDA) — Freebuff
+- [ ] `deploy-k8s` — Kubernetes (Helm, operator) — Freebuff
+- [ ] `deploy-aws` — AWS (SageMaker, EC2) — Freebuff
+- [ ] `deploy-gcp` — GCP (Vertex, GKE) — Freebuff
+- [ ] `deploy-azure` — Azure (ML, AKS) — Freebuff
+- [ ] `deploy-serverless` — Serverless (Lambda, Cloud Functions) — Freebuff
+- [ ] `deploy-edge` — Edge (Jetson, RPi) — Freebuff
+- [ ] `deploy-browser` — Browser (WebGPU, WASM) — OpenCode
+- [ ] `deploy-mobile` — Mobile (iOS, Android) — Freebuff
+- [ ] `deploy-cloud` — Cloud (multi-region, global) — Freebuff
+
+### P89 — MONITORING + OBS (thêm)
+- [ ] `obs-metrics` — Metrics (Prometheus, OTel) — Freebuff
+- [ ] `obs-logs` — Logs (structured, ELK) — Freebuff
+- [ ] `obs-traces` — Traces (Jaeger, Zipkin) — Freebuff
+- [ ] `obs-alert` — Alerts (PagerDuty, Slack) — Freebuff
+- [ ] `obs-dash` — Dashboards (Grafana, Kibana) — Freebuff
+- [ ] `obs-slo` — SLO (error budget, burn) — Freebuff
+- [ ] `obs-cost` — Cost (CPU, GPU, per-query) — Freebuff
+- [ ] `obs-perf` — Perf (latency, throughput) — Freebuff
+- [ ] `obs-health` — Health (liveness, readiness) — Freebuff
+- [ ] `obs-audit` — Audit (who, what, when) — Freebuff
+
+### P90 — TESTING + QA (thêm)
+- [ ] `test-unit` — Unit (kernel, module) — Freebuff
+- [ ] `test-integration` — Integration (API, pipeline) — Freebuff
+- [ ] `test-e2e` — E2E (full flow) — Freebuff
+- [ ] `test-load` — Load (10k req/min) — Freebuff
+- [ ] `test-stress` — Stress (overload, failover) — Freebuff
+- [ ] `test-soak` — Soak (24h, memory leak) — Freebuff
+- [ ] `test-fuzz` — Fuzz (random, crash) — Freebuff
+- [ ] `test-a/b` — A/B (model, prompt) — Freebuff
+- [ ] `test-regression` — Regression (baseline) — Freebuff
+- [ ] `test-coverage` — Coverage (unit, integration) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -968,11 +1148,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **761 tasks** (P0-P75) × 1 cycle = **3044 contributions**
-> 761 × 2 cycles = **6088 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 761 × 3 cycles = **9132 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
+> **911 tasks** (P0-P90) × 1 cycle = **3644 contributions**
+> 911 × 2 cycles = **7288 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 911 × 3 cycles = **10932 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 1 cycle trong 24h → 3044 contributions (vượt 1000 rule)**
+**Gợi ý: 1 cycle trong 24h → 3644 contributions (vượt 1000 rule)**
 
 ## LỆNH CHẠY
 
