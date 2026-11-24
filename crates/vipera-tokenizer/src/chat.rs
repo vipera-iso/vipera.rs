@@ -438,4 +438,84 @@ mod tests {
         }
         assert!(Role::parse("tool").is_err());
     }
+
+    #[test]
+    fn empty_and_malformed_roles_are_rejected_without_panicking() {
+        for malformed in [
+            "",
+            " ",
+            "  ",
+            "\t",
+            "\n",
+            "tool",
+            "Tool",
+            "SYSTEM",
+            "User",
+            "ASSISTANT",
+            "user ",
+            " assistant",
+            "system\n",
+            "admin",
+            "function",
+            "\0",
+            "user\0",
+        ] {
+            let err = Role::parse(malformed);
+            assert!(err.is_err(), "expected {malformed:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn rendering_rejects_empty_and_role_only_conversations_without_panicking() {
+        // Empty message list is rejected, not a panic.
+        for family in [
+            TemplateFamily::ChatMl,
+            TemplateFamily::Llama3,
+            TemplateFamily::Llama2,
+            TemplateFamily::Mistral,
+        ] {
+            let err = render_family(family, &[], true).unwrap_err();
+            assert!(
+                err.to_string().contains("at least one message"),
+                "{family:?}: {err}"
+            );
+        }
+
+        // A system-only conversation is rejected, not a panic.
+        let system_only = [ChatMessage::system("")];
+        for family in [
+            TemplateFamily::ChatMl,
+            TemplateFamily::Llama3,
+            TemplateFamily::Llama2,
+            TemplateFamily::Mistral,
+        ] {
+            let err = render_family(family, &system_only, true).unwrap_err();
+            assert!(
+                err.to_string().contains("user message"),
+                "{family:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rendering_handles_empty_content_without_panicking() {
+        let messages = [
+            ChatMessage::system(""),
+            ChatMessage::user(""),
+            ChatMessage::assistant(""),
+            ChatMessage::user(""),
+        ];
+        for family in [
+            TemplateFamily::ChatMl,
+            TemplateFamily::Llama3,
+            TemplateFamily::Llama2,
+        ] {
+            let rendered = render_family(family, &messages, true).unwrap();
+            assert!(!rendered.is_empty(), "{family:?} rendered an empty prompt");
+        }
+        // Mistral has no system slot; validate should reject, not panic.
+        let mistral_messages = [ChatMessage::user(""), ChatMessage::assistant("")];
+        let rendered = render_family(TemplateFamily::Mistral, &mistral_messages, true).unwrap();
+        assert!(!rendered.is_empty());
+    }
 }
