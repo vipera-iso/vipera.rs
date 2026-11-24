@@ -241,7 +241,10 @@ docs/benchmarks/              the surveys the plan was written from
   (4096 tokens; 32.3 vs 204.8 at 512) and decode at **21.0 vs 31.0 tok/s** — a 4.9–6.3× prefill gap
   and −32% decode. The tiled layout is over half of it: with VNNI but `VIPERA_TILED=0`, prefill
   measured 44.9 tok/s. That arm also runs a 32-token prompt chunk instead of 128 (`prefill_chunk`,
-  `VIPERA_PREFILL_CHUNK` overrides it), measured 9% faster there and 15% slower on the tiled arm.
+  `VIPERA_PREFILL_CHUNK` overrides it), measured 9% faster there and 15% slower on the tiled arm,
+  and a 256-bit band that ports the tiled layout to `ymm` (`vpmaddubsw`, `VIPERA_TILED_AVX2=0` to
+  turn it off): 92.6 tok/s at 512 and 79.5 at 4096, 2.9× and 2.6× the row kernel, which brings the
+  gap to the 512-bit tile down from 4.9× to 1.8× at 4096.
   Greedy output is identical across the levels on a short prompt (32 tokens), but
   a long prefill sums in a different order, so a token can differ at temperature 0; the same build
   on the same machine is deterministic. Ledger: `docs/benchmarks.md`, 2026-11-24.

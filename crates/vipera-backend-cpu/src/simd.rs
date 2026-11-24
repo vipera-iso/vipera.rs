@@ -2297,6 +2297,290 @@ pub(crate) fn try_q4k_matvec_tiled_range<const B: usize>(
     true
 }
 
+/// Whether the 256-bit band runs: AVX2, no 512-bit VNNI tile, and no `VIPERA_TILED_AVX2=0`.
+///
+/// The band exists for the machines the 512-bit tile cannot serve — anything with AVX2 that is not
+/// an AVX-512 VNNI part, which is every AMD CPU before Zen 4 and every Intel one before Ice Lake.
+/// `VIPERA_TILED=0` still turns the whole tiled path off, and `VIPERA_NO_VNNI` makes this band the
+/// one a VNNI machine runs, which is how it is measured without such a CPU.
+fn tiled_ymm_enabled() -> bool {
+    !std::env::var("VIPERA_TILED_AVX2").is_ok_and(|value| value == "0")
+}
+
+/// Test override for the `!vnni512_available()` half of [`try_q4k_matvec_tiled_range_ymm`]: on a VNNI
+/// machine that check is what keeps the 256-bit band unreachable, and its parity test needs the band
+/// to run there. `2` forces it on, like `Q4K8_OVERRIDE`.
+#[cfg(test)]
+static YMM_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn ymm_forced() -> bool {
+    YMM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 2
+}
+
+#[cfg(not(test))]
+fn ymm_forced() -> bool {
+    false
+}
+
+/// Safe entry point for [`q4k_matvec_tiled_ymm`]: the 256-bit band, for a CPU with AVX2 and no
+/// 512-bit VNNI tile.
+///
+/// Same contract and same arithmetic as [`try_q4k_matvec_tiled_range`]; only the lane count differs
+/// (eight activation columns per `ymm` instead of sixteen per `zmm`), and the integer sums are exact
+/// in both, so a row gets the same bits from either band.
+pub(crate) fn try_q4k_matvec_tiled_range_ymm<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+) -> bool {
+    if !available()
+        || (vnni512_available() && !ymm_forced())
+        || !tiled_ymm_enabled()
+        || stride == 0
+        || !stride.is_multiple_of(144)
+        || B == 0
+        || B > MAX_HALVES * 8
+    {
+        return false;
+    }
+    let blocks = stride / 144;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || xs.iter().any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+        || sums.iter().any(|s| s.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: `available()` checked AVX2 and the lengths above match the kernel's contract.
+    unsafe { q4k_matvec_tiled_ymm::<B>(data, stride, first_row, count, xs, sums, out) };
+    true
+}
+
+/// The 256-bit band: the same block walk and epilogue as [`q4k_tiled_matvec_worker`], with eight
+/// activation columns per register and `maddubs`+`madd` in place of `dpbusd`.
+///
+/// `maddubs` multiplies unsigned weight codes 0..15 by signed activation codes and adds pairs into
+/// `i16` (the largest product is 15 × 127, so the pair sum is at most 3810 and cannot saturate),
+/// then `madd` against ones adds pairs of those into `i32` — the integer `dpbusd` computes, one
+/// instruction pair instead of one. The float epilogue is the same expression in the same order
+/// (multiply by `d * scale`, multiply by `dx`, subtract `dmin * min * sum`), so the result is the
+/// 512-bit band's bits.
+///
+/// Four rows per band instead of eight: AVX2 has sixteen vector registers, and four accumulators
+/// plus four running sums plus the code/weight temporaries leave one or two spare, where eight
+/// plus eight would spill every block.
+///
+/// # Safety
+///
+/// `data` must hold the rows with the given `stride` (a whole number of 144-byte Q4_K blocks), every
+/// `xs[e].q` must cover the row width, every `xs[e].d` and `sums[e]` one entry per 32-value group,
+/// and the CPU must support AVX2 (the caller checks via [`available`] and the absence of
+/// [`vnni512_available`]).
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_matvec_tiled_ymm<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+) {
+    // SAFETY: the caller validated the lengths; every load below stays inside the rows, blocks and
+    // activation slices the contract describes.
+    unsafe {
+        const COLS: usize = 8;
+        const ROW_WIN: usize = 32;
+        const BAND: usize = 4;
+        let blocks = stride / 144;
+        let halves = B.div_ceil(COLS);
+        let mut act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+        for b in 0..blocks {
+            for (entry, x) in xs.iter().enumerate() {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                let chunk = x.q.as_ptr().add(b * 256);
+                let base = (b * halves + half) * 64 * COLS * 4;
+                for grp in 0..64 {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.add(grp * 4),
+                        act.as_mut_ptr().add(base + grp * COLS * 4 + col * 4),
+                        4,
+                    );
+                }
+            }
+        }
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
+        let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
+        for b in 0..blocks {
+            for entry in 0..B {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                for sub in 0..8 {
+                    let at = ((b * halves + half) * 8 + sub) * COLS + col;
+                    dxs[at] = xs[entry].d[b * 8 + sub];
+                    sumt[at] = sums[entry][b * 8 + sub];
+                }
+            }
+        }
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let ones = _mm256_set1_epi16(1);
+        let mut wq = vec![0_u8; ROW_WIN * 256];
+        let mut scale_f = vec![[0.0_f32; 8]; ROW_WIN];
+        let mut min_f = vec![[0.0_f32; 8]; ROW_WIN];
+        let mut dvec = [0.0_f32; ROW_WIN];
+        let mut dminvec = [0.0_f32; ROW_WIN];
+        let mut buf = vec![0.0_f32; ROW_WIN * halves * COLS];
+        let mut win = 0;
+        while win < count {
+            let cnt = (count - win).min(ROW_WIN);
+            buf[..cnt * halves * COLS].fill(0.0);
+            for b in 0..blocks {
+                wq.fill(0);
+                for slot in scale_f.iter_mut() {
+                    *slot = [0.0; 8];
+                }
+                for slot in min_f.iter_mut() {
+                    *slot = [0.0; 8];
+                }
+                dvec.fill(0.0);
+                dminvec.fill(0.0);
+                for r in 0..cnt {
+                    let block = data.as_ptr().add((first_row + win + r) * stride + b * 144);
+                    dvec[r] = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+                    dminvec[r] = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+                    let scale_bytes = std::slice::from_raw_parts(block.add(4), 12);
+                    for s in 0..8 {
+                        let (scale, min) = crate::quant::q4k_scale_min(scale_bytes, s);
+                        scale_f[r][s] = dvec[r] * f32::from(scale);
+                        min_f[r][s] = dminvec[r] * f32::from(min);
+                    }
+                    let wrow = wq.as_mut_ptr().add(r * 256);
+                    for j in 0..4 {
+                        let packed = _mm256_loadu_si256(block.add(16 + j * 32) as *const __m256i);
+                        let low = _mm256_and_si256(packed, low_mask);
+                        let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                        _mm256_storeu_si256(wrow.add(j * 64) as *mut __m256i, low);
+                        _mm256_storeu_si256(wrow.add(j * 64 + 32) as *mut __m256i, high);
+                    }
+                }
+                let wq_ptr = wq.as_ptr();
+                for half in 0..halves {
+                    let half_act = act.as_ptr().add((b * halves + half) * 64 * COLS * 4);
+                    let dxs_ptr = dxs.as_ptr().add((b * halves + half) * 8 * COLS);
+                    let sumt_ptr = sumt.as_ptr().add((b * halves + half) * 8 * COLS);
+                    let mut band = 0;
+                    while band + BAND <= cnt {
+                        q4k_tiled_band_ymm::<BAND>(
+                            wq_ptr,
+                            half_act,
+                            dxs_ptr,
+                            sumt_ptr,
+                            band,
+                            &scale_f,
+                            &min_f,
+                            buf.as_mut_ptr(),
+                            halves * COLS,
+                            half * COLS,
+                            ones,
+                        );
+                        band += BAND;
+                    }
+                    while band < cnt {
+                        q4k_tiled_band_ymm::<1>(
+                            wq_ptr,
+                            half_act,
+                            dxs_ptr,
+                            sumt_ptr,
+                            band,
+                            &scale_f,
+                            &min_f,
+                            buf.as_mut_ptr(),
+                            halves * COLS,
+                            half * COLS,
+                            ones,
+                        );
+                        band += 1;
+                    }
+                }
+            }
+            for r in 0..cnt {
+                for entry in 0..B {
+                    out[entry * count + win + r] = buf[r * halves * COLS + entry];
+                }
+            }
+            win += cnt;
+        }
+    }
+}
+
+/// `N` rows of one 256-column block against one eight-column activation tile half, added into
+/// `buf`.
+///
+/// # Safety
+///
+/// Every pointer must cover what [`q4k_matvec_tiled_ymm`] built for this block and band, and the
+/// CPU must support AVX2.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_tiled_band_ymm<const N: usize>(
+    wq: *const u8,
+    half_act: *const i8,
+    dxs: *const f32,
+    sumt: *const f32,
+    band: usize,
+    scale_f: &[[f32; 8]],
+    min_f: &[[f32; 8]],
+    buf: *mut f32,
+    stride_cols: usize,
+    col_offset: usize,
+    ones: std::arch::x86_64::__m256i,
+) {
+    // SAFETY: as above.
+    unsafe {
+        const COLS: usize = 8;
+        let mut facc: [std::arch::x86_64::__m256; N] = [_mm256_setzero_ps(); N];
+        for s in 0..8 {
+            let mut acc: [std::arch::x86_64::__m256i; N] = [_mm256_setzero_si256(); N];
+            for g in 0..8 {
+                let grp = s * 8 + g;
+                let codes = _mm256_loadu_si256(half_act.add(grp * COLS * 4) as *const __m256i);
+                for (t, slot) in acc.iter_mut().enumerate() {
+                    let word = u32::from_le(std::ptr::read_unaligned(
+                        wq.add((band + t) * 256 + grp * 4) as *const u32,
+                    ));
+                    let products = _mm256_maddubs_epi16(_mm256_set1_epi32(word as i32), codes);
+                    *slot = _mm256_add_epi32(*slot, _mm256_madd_epi16(products, ones));
+                }
+            }
+            let dxv = _mm256_loadu_ps(dxs.add(s * COLS));
+            let sumv = _mm256_loadu_ps(sumt.add(s * COLS));
+            for (t, (acc_slot, facc_slot)) in acc.iter().zip(facc.iter_mut()).enumerate() {
+                let row = band + t;
+                let main = _mm256_mul_ps(
+                    _mm256_mul_ps(
+                        _mm256_cvtepi32_ps(*acc_slot),
+                        _mm256_set1_ps(scale_f[row][s]),
+                    ),
+                    dxv,
+                );
+                let minterm = _mm256_mul_ps(sumv, _mm256_set1_ps(min_f[row][s]));
+                *facc_slot = _mm256_add_ps(*facc_slot, _mm256_sub_ps(main, minterm));
+            }
+        }
+        for (t, value) in facc.iter().enumerate() {
+            let slot = buf.add((band + t) * stride_cols + col_offset);
+            _mm256_storeu_ps(slot, _mm256_add_ps(_mm256_loadu_ps(slot), *value));
+        }
+    }
+}
+
 /// Whether the tiled Q4_K kernel folds the epilogue's scale and minimum with a fused multiply-add.
 ///
 /// Off by default; `VIPERA_Q4K_FMA_EPI=1` turns it on. Read per call so one process can measure both
@@ -5506,6 +5790,83 @@ mod tests {
             _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, total);
             lanes.iter().sum()
         }
+    }
+
+    /// The 256-bit band must agree with the row kernel within the same tolerance the 512-bit band
+    /// does (`1e-3 + 1e-4·|ref|`), and every row must be a function of the row and its activation
+    /// only: the band splits rows into 32-row windows and 4-row bands, so a row's value must not
+    /// depend on where the split falls.
+    #[test]
+    fn the_256_bit_band_matches_the_row_kernel_and_ignores_the_window_split() {
+        if !available() {
+            eprintln!("skipped: no AVX2");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0026);
+        let cols = 512;
+        let blocks = cols / 256;
+        // 9 rows: two 4-row bands plus a one-row tail, so both band widths and the tail run.
+        let rows: Vec<Vec<u8>> = (0..9).map(|_| q4k_row(&mut rng, blocks)).collect();
+        let xs: Vec<Vec<f32>> = (0..4)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums: Vec<Vec<f32>> = xs.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xq: [&QuantizedX; 4] = std::array::from_fn(|entry| &quantized[entry]);
+        let sum_refs: [&[f32]; 4] = std::array::from_fn(|entry| sums[entry].as_slice());
+
+        YMM_OVERRIDE.store(2, std::sync::atomic::Ordering::Relaxed);
+        let stride = blocks * 144;
+        let mut data = Vec::with_capacity(rows.len() * stride);
+        for row in &rows {
+            data.extend_from_slice(row);
+        }
+        let mut out = vec![0.0_f32; 4 * rows.len()];
+        let ran = try_q4k_matvec_tiled_range_ymm::<4>(
+            &data,
+            stride,
+            0,
+            rows.len(),
+            &xq,
+            &sum_refs,
+            &mut out,
+        );
+        assert!(ran, "the 256-bit band refused a shape it accepts");
+
+        for entry in 0..4 {
+            for (row, row_bytes) in rows.iter().enumerate() {
+                // SAFETY: whole blocks and a quantized activation of the same width.
+                let want = unsafe {
+                    q4k_dot(
+                        row_bytes,
+                        &quantized[entry].q,
+                        &quantized[entry].d,
+                        &sums[entry],
+                    )
+                };
+                let got = out[entry * rows.len() + row];
+                let tol = 1e-3 + 1e-4 * want.abs();
+                assert!(
+                    (got - want).abs() <= tol,
+                    "entry {entry} row {row}: {got} vs {want} (tol {tol})"
+                );
+            }
+        }
+        // A second call with the rows split at a different boundary (5 rows, then 4) must give the
+        // same numbers for the overlapping rows: the window split is not part of the value.
+        let mut split = vec![0.0_f32; 4 * 5];
+        assert!(try_q4k_matvec_tiled_range_ymm::<4>(
+            &data, stride, 0, 5, &xq, &sum_refs, &mut split,
+        ));
+        for entry in 0..4 {
+            for row in 0..5 {
+                assert_eq!(
+                    split[entry * 5 + row].to_bits(),
+                    out[entry * rows.len() + row].to_bits()
+                );
+            }
+        }
+        YMM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

@@ -4584,10 +4584,13 @@ của mục này đo nhầm binary).
 |---|---|---:|---:|---:|
 | `avx512-vnni` (tiled + dpbusd zmm) | — | **204.8** tok/s (3.05/3.08 s) | **142.6** tok/s (29.02/29.55 s) | **31.0** tok/s (32.2 ms/step) |
 | `vnni256` (row kernel, dpbusd ymm) | `VIPERA_TILED=0` | — | 44.9 tok/s (91.80 s) | — |
-| `avx2` (`pmaddubsw`, không VNNI) | `VIPERA_NO_VNNI=1` | 32.3 tok/s (16.33/16.50 s) | 29.4 tok/s (139.55/140.17 s) | 21.0 tok/s (47.5 ms/step) |
+| `avx2` + band 256-bit (mặc định) | `VIPERA_NO_VNNI=1` | **92.6** tok/s (6.08/6.09 s) | **79.5** tok/s (51.37/54.77 s) | 21.0 tok/s (47.5 ms/step) |
+| `avx2` kernel hàng | `VIPERA_NO_VNNI=1 VIPERA_TILED=0` | 31.6 tok/s (16.80/16.68 s) | 30.0 tok/s (137.00 s) | 21.0 tok/s |
 
-Tỉ lệ: prefill **6.3×** ở 512 và **4.9×** ở 4096; decode **1.47×** (−32%). Bỏ tile (vẫn còn VNNI
-256-bit) mất **3.2×**; phần còn lại **1.53×** là `pmaddubsw` so với `vpdpbusd`.
+Tỉ lệ (sau khi có band 256-bit, mục cuối file): prefill **2.21×** ở 512 và **1.82×** ở 4096; decode
+**1.47×** (−32%). Trước band, nhánh AVX2 là 6.3×/4.9×; band cắt 2.9×/2.7× so với kernel hàng. Bỏ tile
+(vẫn còn VNNI 256-bit) mất **3.2×** so với đường zmm — đó là phần width+cột, phần còn lại của khoảng
+cách cũ là layout mà band đã lấp.
 
 **Đọc số:** quá nửa khoảng cách prefill trên máy không VNNI là **layout tiled** (một lần unpack weight
 cho 16 activation), không phải độ rộng 512-bit — nên nếu port thì port layout. Decode chỉ mất 32% vì
@@ -4694,3 +4697,43 @@ không phải Q4_K, không phải attention. Đây khớp với một ghi chú c
 6-bit chậm gấp đôi phần đọc; nếu một A/B cùng shape không kéo q6k xuống ≥2 ms/step thì bỏ. Trước khi
 viết kernel, đo lại 5.2 ms/call ngày trước bằng đúng bench đó, vì nếu con số cũ đo trên đường khác
 (tiled thay vì row) thì "regression" chỉ là so sai đường.
+
+## Band tiled 256-bit (AVX2) cho Q4_K prefill — 2026-11-24
+
+**Giả thuyết (đặt trước):** máy không AVX-512 VNNI chạy kernel hàng; cùng layout tiled như bản zmm
+nhưng 8 cột/`ymm` và `vpmaddubsw`+`vpmaddwd` thay `vpdpbusd` sẽ cắt phần lớn khoảng 4.9× ở prefill.
+Giữ nếu prefill ≥10% nhanh hơn; dưới thì bỏ.
+
+**Code:** `q4k_matvec_tiled_ymm` + `q4k_tiled_band_ymm::<N>` (`N` = 4 hàng/band thay vì 8: AVX2 chỉ
+có 16 thanh ghi), dùng chung `ROW_WIN` 32 và cùng thứ tự epilogue float như bản zmm. Chọn ở
+`fill_rows_batch` khi `available() && !vnni512_available()`; `VIPERA_TILED_AVX2=0` tắt, `VIPERA_TILED=0`
+quay về kernel hàng. Integer sums chính xác nên band cho cùng phép tính như tile zmm; khác biệt duy
+nhất là số cột mỗi thanh ghi.
+
+**Codegen gate** (`scripts/objdump_gate.py … q4k_tiled_band_ymm --dot-op vpmaddubsw`):
+`zmm=0`, `vector rsp st=0 ld=0`, `branches=9`, dot 148 instr với `vpmaddubsw=32 vpmaddwd=32
+vpaddd=28 vpbroadcastd=32` — **GATE: PASS**.
+
+**Parity:** test mới `the_256_bit_band_matches_the_row_kernel_and_ignores_the_window_split`: 9 hàng
+(2 band 4 + tail 1), 4 activation, sai khác ≤ `1e-3 + 1e-4·|ref|` so với `q4k_dot`; gọi lại với biên
+chia 5 hàng cho **cùng bit** ở các hàng chồng lấn (giá trị của một hàng không phụ thuộc cửa sổ).
+
+**Đo** (cùng binary, xen kẽ, 4096/512 token, wall − 0.56 s nạp; `VIPERA_NO_VNNI=1` để band chạy trên
+máy này):
+
+| | kernel hàng (`TILED=0`) | band 256-bit | tỉ lệ |
+|---|---:|---:|---:|
+| prefill 512 | 31.6 tok/s (16.80/16.68 s) | **92.6 tok/s** (6.08/6.09 s) | **2.93×** |
+| prefill 4096 | 30.0 tok/s (134.83/138.07/137.00 s) | **79.5 tok/s** (51.37/54.77 s) | **2.65×** |
+
+So với đường tiled 512-bit (204.8 / 144.7 tok/s), khoảng cách của nhánh AVX2 thu từ **4.9× xuống
+1.82×** ở 4096 và từ 6.3× xuống **2.21×** ở 512. Decode không đổi (band chỉ chạy ở batch ≥
+`TILE_MIN_BATCH`).
+
+**End-to-end:** prompt 530 token, 8 token greedy — band và kernel hàng ra **cùng văn bản**
+(`4862c0fc…`); đường zmm khác (`83583642…`) vì nhánh `NO_VNNI` cũng đổi kernel Q6_K, không phải vì
+band. Đây là hành vi numeric-policy giống tile zmm, không phải bit-identity với nó trên mọi prompt.
+
+**Verdict: giữ** (2.65–2.93×, vượt ngưỡng 10% rất xa). Điều bất ngờ: nút cổ chai của kernel hàng
+không phải độ rộng lệnh — `pmaddubsw` chỉ bằng nửa `vpdpbusd` mỗi lệnh — mà là việc mỗi hàng đọc lại
+activation và trả epilogue riêng; layout tiled hoá ra đáng giá hơn cả phần width.
