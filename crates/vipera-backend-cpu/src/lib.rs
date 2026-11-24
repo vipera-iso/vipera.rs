@@ -13,6 +13,7 @@
 
 pub mod bus;
 pub mod compress;
+pub mod mla;
 pub mod model;
 mod pool;
 pub mod profile;
