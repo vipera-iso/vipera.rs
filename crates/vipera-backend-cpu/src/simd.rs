@@ -1558,7 +1558,15 @@ pub(crate) fn try_dot(
                 }
             }
             GgmlType::Q6K => match xq {
-                Some(xq) => q6k_dot_q8(row, xq),
+                Some(xq) => {
+                    // SAFETY: the outer block of `try_dot` and `vnni_available()` above establish
+                    // the CPU features; both kernels take the same row/activation lengths.
+                    if vnni_available() && crate::quant::q6k_vnni_requested() {
+                        q6k_dot_vnni(row, xq)
+                    } else {
+                        q6k_dot_q8(row, xq)
+                    }
+                }
                 None => q6k_dot(row, x),
             },
             _ => return None,
@@ -3610,6 +3618,84 @@ pub(crate) unsafe fn q6k_dot_q8(row: &[u8], xq: &QuantizedX) -> f32 {
                     let high_scale = d * f32::from(scales[base + 1] as i8) * dx;
                     let scale = _mm256_set_m128(_mm_set1_ps(high_scale), _mm_set1_ps(low_scale));
                     accumulator = _mm256_add_ps(accumulator, _mm256_mul_ps(lanes, scale));
+                }
+            }
+            total += hsum(accumulator);
+        }
+        total
+    }
+}
+
+/// [`q6k_dot_q8`]'s unpacking with `vpdpbusd`: the six-bit levels are dotted in integers against
+/// the activation by one instruction per run, and the −32 of the six-bit levels is removed in the
+/// same integer domain (the unsigned `q` products minus a `32` shift of the activation sums), so
+/// the float side is one multiply-add per run like [`q6k_dot_q8`].
+///
+/// `vpdpbusd` takes the weight as unsigned and the activation as signed — exactly the shapes the
+/// unpacked `q` (0..63) and `x` have here — so the old kernel's `maddubs` pair and `madd` against
+/// ones become one `dpbusd` per run plus one more `dpbusd` against an all-ones activation vector
+/// for the −32 correction, as a shift of that sum. The lane values are the same eight lane sums
+/// of four products, so the float multiply and the per-run scale land in the same places.
+///
+/// # Safety
+///
+/// As [`q6k_dot_q8`]: `row` is whole 210-byte blocks, `xq` exactly 256 values and 8 scales per
+/// block, and the CPU must support AVX512-VNNI and AVX512-VL.
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+pub(crate) unsafe fn q6k_dot_vnni(row: &[u8], xq: &QuantizedX) -> f32 {
+    // SAFETY: the module contract is the same as in `q6k_dot_q8`; every load stays inside one
+    // block or one entry's activation.
+    unsafe {
+        let mut total = 0.0_f32;
+        let blocks = row.len() / 210;
+        let low_nibbles = _mm256_set1_epi8(0x0f);
+        let two_bits = _mm256_set1_epi8(0x03);
+        let ones = _mm256_set1_epi8(1);
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 210);
+            let d = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+            let scales = std::slice::from_raw_parts(block.add(192), 16);
+            let values = xq.q.as_ptr().add(b * 256);
+            let dxs = xq.d.as_ptr().add(b * 8);
+            let mut accumulator = _mm256_setzero_ps();
+            for half in 0..2 {
+                let ql = block.add(half * 64);
+                let qh = _mm256_loadu_si256(block.add(128 + half * 32) as *const __m256i);
+                // The two high bits of each value, one vector per run, so the shifts stay
+                // immediates.
+                let high_bits = [
+                    _mm256_and_si256(qh, two_bits),
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 2), two_bits),
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 4), two_bits),
+                    _mm256_and_si256(_mm256_srli_epi16(qh, 6), two_bits),
+                ];
+                for (run, high) in high_bits.iter().enumerate() {
+                    let (high_nibble, offset) = if run < 2 {
+                        (false, run * 32)
+                    } else {
+                        (true, (run - 2) * 32)
+                    };
+                    let packed = _mm256_loadu_si256(ql.add(offset) as *const __m256i);
+                    let levels = if high_nibble {
+                        _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_nibbles)
+                    } else {
+                        _mm256_and_si256(packed, low_nibbles)
+                    };
+                    let q = _mm256_or_si256(levels, _mm256_slli_epi16(*high, 4));
+                    let x = _mm256_loadu_si256(values.add(half * 128 + run * 32) as *const __m256i);
+                    // One `vpdpbusd`: each i32 lane sums four adjacent `q * x` products.
+                    let raw = _mm256_dpbusd_epi32(_mm256_setzero_si256(), q, x);
+                    // The −32 per value is `32` times the activation sum of the same four values;
+                    // a shift of an exact i32 sum, so `lanes` is the old kernel's integer lanes.
+                    let activation_sums = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones, x);
+                    let lanes = _mm256_sub_epi32(raw, _mm256_slli_epi32(activation_sums, 5));
+                    let base = half * 8 + run * 2;
+                    let dx = *dxs.add(half * 4 + run);
+                    let low_scale = d * f32::from(scales[base] as i8) * dx;
+                    let high_scale = d * f32::from(scales[base + 1] as i8) * dx;
+                    let scale = _mm256_set_m128(_mm_set1_ps(high_scale), _mm_set1_ps(low_scale));
+                    accumulator =
+                        _mm256_add_ps(accumulator, _mm256_mul_ps(_mm256_cvtepi32_ps(lanes), scale));
                 }
             }
             total += hsum(accumulator);
@@ -6442,6 +6528,32 @@ mod tests {
         }
     }
 
+    /// The VNNI Q6_K kernel against the scalar reference: `vpdpbusd` replaces the `maddubs`/`madd`
+    /// pair, and the integer lane sums are the same, so the results are close.
+    #[test]
+    fn avx2_q6k_vnni_matches_scalar() {
+        if !vnni_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0f6b_a1e5_0003);
+        for trial in 0..24 {
+            let blocks = 1 + trial % 4;
+            let cols = blocks * 256;
+            let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+            let xq = QuantizedX::new(&x);
+            let row = q6k_row(&mut rng, blocks);
+            let expected = crate::quant::q6k_dot_q8(&row, &xq);
+            // SAFETY: `row` is whole 210-byte blocks, `xq` covers them, and the test returned
+            // early unless `vnni_available()` saw AVX-512 VNNI on this CPU.
+            let actual = unsafe { q6k_dot_vnni(&row, &xq) };
+            assert!(
+                close(actual, expected),
+                "trial {trial}: avx512-vnni {actual} vs scalar {expected}"
+            );
+        }
+    }
+
     /// The same exactness claim for the integer Q6_K kernel: sharing the unpacking across entries
     /// may not change a bit of any entry's result.
     #[test]
@@ -7647,4 +7759,321 @@ pub(crate) fn q4k8_dot8(w: &[BlockQ4Kx8], blocks: usize, act: &[u8], out: &mut [
     // SAFETY: the caller checked `vnni512_available()` at the call site, and the slices satisfy
     // the kernel contract, which `make_blocks_q4k8` built for.
     unsafe { gemv_q4k8(w, blocks, act, out) }
+}
+
+// ---------------------------------------------------------------------------
+// VIPERA_Q6K_IQK: repacked Q6_K GEMM, AVX-512 VNNI with an i32 epilogue (default off)
+// ---------------------------------------------------------------------------
+
+/// Whether the IQK-style repacked Q6_K kernel is on: `VIPERA_Q6K_IQK`, default off.
+pub(crate) fn q6k_iqk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_Q6K_IQK").ok().is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
+/// Bytes per row in [`Q6KRepacked::w`]: the 256 codes of a row, row-major.
+const Q6K_REPACK_ROW: usize = 256;
+
+/// The Q6_K weights of a matrix, repacked in the IQK `repack_q6_k` layout family: four rows
+/// interleaved, one super-scale per row per 256-value block, and one `d * scales[...]`
+/// coefficient per row, block and 16-value group.
+pub(crate) struct Q6KRepacked {
+    /// Number of 256-value blocks per row.
+    pub(crate) blocks: usize,
+    /// Number of rows, a multiple of four.
+    pub(crate) rows: usize,
+    /// Per block: `rows * 256` codes (0..63), row-major — `w[(b * rows + r) * 272 + v]`.
+    pub(crate) w: Vec<u8>,
+    /// Per block: `rows * 16` coefficients `d * scales[...]` — `coef[(b * rows + r) * 16 + g]`.
+    pub(crate) coef: Vec<f32>,
+}
+
+/// Pack `rows` (a multiple of four) of one Q6_K matrix into the IQK repack.
+pub(crate) fn pack_q6k_iqk(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    rows: usize,
+) -> Q6KRepacked {
+    assert!(
+        stride.is_multiple_of(210),
+        "a Q6_K row is a whole number of 210-byte blocks"
+    );
+    assert_eq!(rows % 4, 0, "the IQK repack interleaves four rows");
+    let blocks = stride / 210;
+    let mut w = vec![0_u8; blocks * rows * Q6K_REPACK_ROW];
+    let mut coef = vec![0.0_f32; blocks * rows * 16];
+    for b in 0..blocks {
+        for r in 0..rows {
+            let row = &data[(first_row + r) * stride + b * 210..][..210];
+            let d = f16_to_f32(u16::from_le_bytes([row[208], row[209]]));
+            let scales = &row[192..208];
+            for half in 0..2 {
+                let ql = &row[half * 64..half * 64 + 64];
+                let qh = &row[128 + half * 32..128 + half * 32 + 32];
+                for run in 0..4 {
+                    // `run` picks one of the four 32-value runs of a half, the way
+                    // [`q6k_dot_q8`] reads them; `high_nibble` picks the high nibble of the run.
+                    let (high_nibble, offset) = if run < 2 {
+                        (false, run * 32)
+                    } else {
+                        (true, (run - 2) * 32)
+                    };
+                    let shift = run * 2;
+                    for sub in 0..2 {
+                        let g = half * 8 + run * 2 + sub;
+                        let base = offset + sub * 16;
+                        coef[(b * rows + r) * 16 + g] = d * f32::from(scales[g] as i8);
+                        for l in 0..16 {
+                            let byte = ql[base + l];
+                            let level = if high_nibble { byte >> 4 } else { byte & 0x0f };
+                            let high = (qh[sub * 16 + l] >> shift) & 0x03;
+                            // The six-bit code, 0..63, as [`q6k_dot_q8`] builds it.
+                            let code = level | (high << 4);
+                            let at = (b * rows + r) * Q6K_REPACK_ROW
+                                + half * 128
+                                + run * 32
+                                + sub * 16
+                                + l;
+                            w[at] = code;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Q6KRepacked {
+        blocks,
+        rows,
+        w,
+        coef,
+    }
+}
+
+/// Horizontal sum of the eight `i32` lanes of a 256-bit vector.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32(value: __m256i) -> i32 {
+    // SAFETY: every byte of the stack array is written by the store and read by the sum.
+    unsafe {
+        let mut lanes = [0_i32; 8];
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), value);
+        lanes.iter().sum()
+    }
+}
+
+/// The scalar form of [`q6k_repack_dot_avx512`] over the repack, for a CPU without AVX-512 VNNI.
+fn q6k_repack_dot_scalar(repack: &Q6KRepacked, row: usize, xq: &QuantizedX) -> f32 {
+    debug_assert!(row < repack.rows);
+    let mut total = 0.0_f32;
+    for b in 0..repack.blocks {
+        let at = b * repack.rows + row;
+        let coef = &repack.coef[at * 16..][..16];
+        let w = &repack.w[at * Q6K_REPACK_ROW..][..256];
+        for half in 0..2 {
+            for run in 0..4 {
+                let dx = xq.d[b * 8 + half * 4 + run];
+                for sub in 0..2 {
+                    let g = half * 8 + run * 2 + sub;
+                    let mut sum = 0_i32;
+                    let mut centered = 0_i32;
+                    for l in 0..16 {
+                        let v = i32::from(xq.q[b * 256 + half * 128 + run * 32 + sub * 16 + l]);
+                        sum += i32::from(w[half * 128 + run * 32 + sub * 16 + l]) * v;
+                        centered += v;
+                    }
+                    total += coef[g] * dx * (sum - 32 * centered) as f32;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// One row of the repack against a quantized activation — the `vpdpbusd` form.
+///
+/// Per 16-value group the integer sum runs in `i32` via one `_mm256_dpbusd_epi32` over the group's
+/// codes and activation bytes, and the group's single scale — `d * scales[...] * dx`, the same
+/// product [`q6k_dot_q8`] builds — is applied once at the end of the group.
+///
+/// # Safety
+///
+/// The CPU must support AVX-512F/BW/VNNI, `repack` must cover `row`, and `xq` must cover
+/// `repack.blocks` blocks of 256 values.
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
+pub(crate) unsafe fn q6k_repack_dot_avx512(
+    repack: &Q6KRepacked,
+    row: usize,
+    xq: &QuantizedX,
+) -> f32 {
+    // SAFETY: the caller states the contract; every load below stays inside `repack.w`, the
+    // row's slice of `xq.q`, and the 32-byte `dpbusd` window of each group.
+    unsafe {
+        debug_assert!(row < repack.rows);
+        let mut total = 0.0_f32;
+        for b in 0..repack.blocks {
+            let at = b * repack.rows + row;
+            let coef = repack.coef.as_ptr().add(at * 16);
+            let x_base = xq.q.as_ptr().add(b * 256);
+            let w_base = repack.w.as_ptr().add(at * Q6K_REPACK_ROW);
+            for half in 0..2 {
+                for run in 0..4 {
+                    let dx = *xq.d.as_ptr().add(b * 8 + half * 4 + run);
+                    for sub in 0..2 {
+                        let g = half * 8 + run * 2 + sub;
+                        let v0 = half * 128 + run * 32 + sub * 16;
+                        // The group's 16 codes and activation bytes go into zero-padded 32-byte
+                        // windows, so the `dpbusd` sums the group alone.
+                        let mut wbuf = [0_u8; 32];
+                        let mut xbuf = [0_i8; 32];
+                        for l in 0..16 {
+                            wbuf[l] = *w_base.add(v0 + l);
+                            xbuf[l] = *x_base.add(v0 + l);
+                        }
+                        // SAFETY: the stack arrays are fully written, so the loads are in bounds
+                        // and the zero tails contribute nothing.
+                        let w = _mm256_loadu_si256(wbuf.as_ptr().cast::<__m256i>());
+                        let x = _mm256_loadu_si256(xbuf.as_ptr().cast::<__m256i>());
+                        let sums = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, x);
+                        // The six-bit levels are centred on 32: `q6k_dot_q8` subtracts that for
+                        // the activation sum of the group before scaling.
+                        let mut centered = 0_i32;
+                        for l in 0..16 {
+                            centered += i32::from(*x_base.add(v0 + l));
+                        }
+                        // One float multiply per group at the end of the group.
+                        total += *coef.add(g) * dx * (hsum_i32(sums) - 32 * centered) as f32;
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
+/// One row of the repack against a quantized activation — the `vpdpbusd` kernel where this CPU
+/// has it, the scalar form of [`q6k_repack_dot_avx512`] otherwise.
+pub(crate) fn q6k_repack_dot(repack: &Q6KRepacked, row: usize, xq: &QuantizedX) -> f32 {
+    if vnni512_available() {
+        // SAFETY: `vnni512_available` checked the CPU; the repack covers `row` and `xq` covers
+        // `repack.blocks` blocks of 256 values.
+        unsafe { q6k_repack_dot_avx512(repack, row, xq) }
+    } else {
+        q6k_repack_dot_scalar(repack, row, xq)
+    }
+}
+
+#[cfg(test)]
+mod q6k_repack_tests {
+    use super::*;
+
+    /// Deterministic bytes, so a failure is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn byte(&mut self) -> u8 {
+            self.next() as u8
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() % 10_000) as f32 / 5_000.0 - 1.0
+        }
+
+        fn half(&mut self, low: f32, high: f32) -> [u8; 2] {
+            let value = low + (high - low) * (self.next() % 1_000) as f32 / 1_000.0;
+            crate::quant::f32_to_f16(value).to_le_bytes()
+        }
+    }
+
+    /// A Q6_K row of `blocks` blocks with random scales and bytes, as the engine's tests build.
+    fn q6k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
+        let mut row = Vec::with_capacity(blocks * 210);
+        for _ in 0..blocks {
+            for _ in 0..192 {
+                row.push(rng.byte());
+            }
+            for _ in 0..16 {
+                row.push(rng.byte());
+            }
+            row.extend_from_slice(&rng.half(0.001, 0.06));
+        }
+        row
+    }
+
+    fn close(actual: f32, expected: f32) -> bool {
+        (actual - expected).abs() <= 2e-4 * (1.0 + expected.abs())
+    }
+
+    /// The repack dot against `q6k_dot_q8` (the engine's integer row kernel): the parity the
+    /// row kernels themselves hold. The scalar form of the kernel computes the same integer
+    /// math and is covered by `q6k_repack_rows_do_not_depend_on_the_pack_offset`.
+    #[test]
+    fn q6k_repack_dot_matches_the_row_kernels() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x5eed_0f11_0000_0031);
+        for trial in 0..16 {
+            let blocks = 1 + trial % 4;
+            let cols = blocks * 256;
+            let stride = blocks * 210;
+            let data: Vec<u8> = (0..4).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+            let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+            let xq = QuantizedX::new(&x);
+            let repack = pack_q6k_iqk(&data, stride, 0, 4);
+            for row in 0..4 {
+                let row_bytes = &data[row * stride..][..stride];
+                let fast = q6k_repack_dot(&repack, row, &xq);
+                let q8 = crate::quant::q6k_dot_q8(row_bytes, &xq);
+                assert!(
+                    close(fast, q8),
+                    "trial {trial} row {row}: repack {fast} vs q6k_dot_q8 {q8}"
+                );
+            }
+        }
+    }
+
+    /// A row's repack value must not depend on where the pack put it: the same rows packed at
+    /// different `first_row` offsets give the same dots, bit for bit.
+    #[test]
+    fn q6k_repack_rows_do_not_depend_on_the_pack_offset() {
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x5eed_0f11_0000_0032);
+        let cols = 512;
+        let blocks = cols / 256;
+        let stride = blocks * 210;
+        let data: Vec<u8> = (0..24).flat_map(|_| q6k_row(&mut rng, blocks)).collect();
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let xq = QuantizedX::new(&x);
+        let first = pack_q6k_iqk(&data, stride, 0, 16);
+        let second = pack_q6k_iqk(&data, stride, 4, 16);
+        for row in 4..16 {
+            // SAFETY: both repacks cover the rows being dotted; q6k_repack_dot is a safe
+            // entry point that dispatches to the AVX-512/VNNI kernel when available.
+            let a = q6k_repack_dot(&first, row, &xq);
+            let b = q6k_repack_dot(&second, row - 4, &xq);
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "row {row} differs with the pack offset"
+            );
+        }
+    }
 }

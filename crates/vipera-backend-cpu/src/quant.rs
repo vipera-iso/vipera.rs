@@ -213,6 +213,18 @@ pub(crate) fn exact_dot_requested() -> bool {
     *EXACT.get_or_init(|| env_truthy(std::env::var("VIPERA_EXACT_DOT").ok().as_deref()))
 }
 
+/// Whether the `vpdpbusd` Q6_K kernel is on: it is the default, and `VIPERA_Q6K_VNNI=0` turns it
+/// off so the `maddubs` kernel can still be reproduced.
+pub(crate) fn q6k_vnni_requested() -> bool {
+    static Q6K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *Q6K.get_or_init(|| {
+        std::env::var("VIPERA_Q6K_VNNI").map_or(true, |value| {
+            let value = value.trim();
+            !value.is_empty() && !env_truthy(Some(value))
+        })
+    })
+}
+
 impl QuantizedX {
     /// Quantize `x` in groups of 32. A trailing partial group is ignored, and every caller in this
     /// module passes a length that is a whole number of groups.
@@ -1163,6 +1175,31 @@ pub(crate) fn fill_rows(
         fill_rows_q4k8(data, stride, first_row, activation, out);
         return;
     }
+    // VIPERA_Q6K_IQK: the repacked Q6_K GEMM (`q6k_repack_dot`), behind its switch. Rows of a
+    // four-row group run through the repack; any tail row stays on the row kernel.
+    #[cfg(target_arch = "x86_64")]
+    if ty == GgmlType::Q6K
+        && activation.q.is_some()
+        && crate::simd::q6k_iqk_enabled()
+        && crate::simd::vnni512_available()
+    {
+        let xq = activation.q.as_ref().unwrap_or_else(|| panic!("Q6_K builds a quantized activation"));
+        let whole = out.len() - out.len() % 4;
+        if whole > 0 {
+            let repack = crate::simd::pack_q6k_iqk(data, stride, first_row, whole);
+            let out_rows = &mut out[..whole];
+            for (offset, slot) in out_rows.iter_mut().enumerate() {
+                // SAFETY: the caller checked `vnni512_available`; the repack covers
+                // `first_row .. first_row + whole` and the activation covers the row.
+                *slot = crate::simd::q6k_repack_dot(&repack, offset, xq);
+            }
+        }
+        for (offset, slot) in out.iter_mut().enumerate().skip(whole) {
+            let start = (first_row + offset) * stride;
+            *slot = dot(ty, &data[start..start + stride], activation);
+        }
+        return;
+    }
     for (offset, slot) in out.iter_mut().enumerate() {
         let start = (first_row + offset) * stride;
         *slot = dot(ty, &data[start..start + stride], activation);
@@ -1370,14 +1407,52 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     // `data.len() < 1 MB`. It measured 1.006x the q4k phase and 1.017x the q6k phase — no help, so
     // the hint stays out. A first attempt gated on the worker's chunk instead of the whole tensor
     // and cost 15% on q4k, which is the same eviction effect as the 200 MB run.
+    // VIPERA_Q6K_IQK: the repacked Q6_K GEMM, per entry, through
+    // [`fill_rows_q6k_iqk_batch`]; the offsets it leaves fall to the row loop below.
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if !exact_dot_requested()
+        && ty == GgmlType::Q6K
+        && crate::simd::q6k_iqk_enabled()
+        && crate::simd::vnni512_available()
+        && let Some(xs) = activation.quantized()
+    {
+        done = fill_rows_q6k_iqk_batch(data, stride, first_row, count, xs, out);
+    }
     let mut row = [0.0_f32; B];
-    for offset in 0..count {
+    for offset in done..count {
         let start = (first_row + offset) * stride;
         dot_batch(ty, &data[start..start + stride], activation, &mut row);
         for (entry, value) in row.iter().enumerate() {
             out[entry * count + offset] = *value;
         }
     }
+}
+
+/// [`fill_rows_batch`]'s IQK-repacked Q6_K path: pack the whole-row range once and dot every
+/// entry against the repack. Returns the first offset the row loop still has to fill.
+#[cfg(target_arch = "x86_64")]
+fn fill_rows_q6k_iqk_batch<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+) -> usize {
+    let whole = count - count % 4;
+    if whole == 0 {
+        return 0;
+    }
+    let repack = crate::simd::pack_q6k_iqk(data, stride, first_row, whole);
+    for offset in 0..whole {
+        for entry in 0..B {
+            // SAFETY: the caller checked `vnni512_available` and the lengths; the repack covers
+            // the range and `xs[entry]` the activation of each row.
+            out[entry * count + offset] = crate::simd::q6k_repack_dot(&repack, offset, xs[entry]);
+        }
+    }
+    whole
 }
 
 #[cfg(test)]
