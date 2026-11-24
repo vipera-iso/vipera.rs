@@ -4564,3 +4564,46 @@ rule; model không khai báo scaling vẫn chạy và ra đúng continuation nh�
 **Không kiểm được:** đây vẫn là metadata YaRN gắn lên model train ở 32768 vị trí, không phải model
 được train/convert với YaRN thật, nên chưa có kết luận perplexity ở ngữ cảnh dài; muốn thế cần một GGUF
 YaRN native và `scripts/logits-dump.sh` chạy ở đúng độ dài đó.
+
+## Bậc dispatch và trần fallback (portability trên CPU không VNNI) — 2026-11-24
+
+**Câu hỏi:** engine "tổng quát cho các thiết bị phần cứng khác nhau" tới đâu? Máy này có AVX-512
+VNNI nên đường nhanh luôn chạy; cần biết máy không có nó trả giá bao nhiêu, và trả giá vì *độ rộng
+512-bit* hay vì *layout tiled*.
+
+**Thang đo ba bậc**, cùng model, `VIPERA_THREADS=8`, greedy, prefill là tổng `PROFILE chunk`,
+decode là median các bước `PROFILE decode` (bỏ bước đầu), 2 vòng xen kẽ theo bậc:
+
+| bậc | cờ | prefill 512 | prefill 4096 | decode |
+|---|---|---:|---:|---:|
+| `avx512-vnni` (tiled + dpbusd zmm) | — | **216.2** tok/s | **170.0** tok/s | **25.3** tok/s |
+| `vnni256` (row kernel, dpbusd ymm) | `VIPERA_TILED=0` | 51.6 | 46.9 | — |
+| `avx2` (`pmaddubsw`, không VNNI) | `VIPERA_NO_VNNI=1` | 29.2 | 27.7 | 21.5 tok/s |
+
+Số thô (tok/s): prefill 512 = 228.07 / 204.40 (vnni), 30.04 / 28.44 (avx2); prefill 4096 = 177.45 /
+162.58 (vnni), 28.10 / 27.22 (avx2); decode = 25.88 / 24.72 (vnni), 21.62 / 21.45 (avx2). Vòng `vnni256`
+chỉ chạy một lần mỗi độ dài (máy throttled ±10% giữa hai vòng cùng cấu hình, nên đọc theo bậc chứ
+không so từng số lẻ).
+
+**Đọc số:**
+- Khoảng cách **6–7×** ở prefill không phải do thiếu 512-bit: bỏ tiled (vẫn còn VNNI 256-bit) đã mất
+  **3.6×**; phần còn lại là `pmaddubsw` so với `vpdpbusd`. Nghĩa là layout tiled — quét weight theo
+  block, một lần unpack cho cả 16 activation — mới là thứ đáng port, không phải độ rộng vector.
+- Decode chỉ mất **15%** vì batch = 1 đi qua kernel hàng, không qua tile; đó là lý do máy AVX2 vẫn
+  dùng được, còn prefill là chỗ hỏng.
+- Đây là **trần của bản hiện tại**, không phải giả thuyết đã thắng: chưa có kernel tiled cho AVX2, nên
+  không có số "sau". Muốn lấp phải viết band 256-bit (`pmaddubsw` trên tile 8 cột) — việc của một
+  phiên riêng, có gate codegen và test parity riêng.
+
+**Tính ổn định — cùng prompt, khác bậc:**
+- Prompt ngắn (10 token), 32 token greedy: **giống hệt từng byte** giữa `avx512-vnni` và `avx2`.
+- Prompt 530 token (prefill đi qua tile), 8 token greedy: **lệch ngay token đầu**. Nguyên nhân đã ghi
+  trong `q4k_tiled_matvec_worker`: thứ tự cộng qua sub-block khác kernel hàng (sai khác ≤ `1e-3 +
+  1e-4·|ref|`), đủ để đổi một token gần tie. Vì vậy "deterministic" chỉ hứa trong *một* bậc dispatch
+  trên *một* máy; khác phần cứng có thể khác token ở temperature 0.
+
+**Không sửa kernel trong phiên này.** Thay đổi kèm theo: `vipera profile` in `cpu_simd` (bậc hiệu
+dụng, tôn trọng `VIPERA_NO_VNNI`) ở cả text và `--json`, để fleet đọc được máy nào rơi xuống bậc
+chậm thay vì đoán theo tên CPU; test `profile_reports_the_simd_level_the_engine_will_run` giữ khoá
+này. README: mục "Hardware floor" trong Limitations, và `VIPERA_Q4K8` sửa lại thành **mặc định tắt**
+(ADR-006) — README cũ ghi "default on", trái với `q4k8_enabled()`.

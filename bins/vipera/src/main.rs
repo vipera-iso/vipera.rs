@@ -1472,6 +1472,9 @@ fn render_profile_text(hardware: &HardwareProfile) -> String {
         "cpu_cores_physical: {}\n",
         hardware.cpu_cores_physical
     ));
+    // Which kernel level the engine will run: a fleet of mixed machines can read this per host
+    // instead of guessing from the CPU name.
+    out.push_str(&format!("cpu_simd: {}\n", vipera_backend_cpu::simd_level()));
     out.push_str(&format!("ram_total_bytes: {}\n", hardware.ram_total_bytes));
     for device in &hardware.devices {
         out.push_str(&format!(
@@ -1505,9 +1508,10 @@ fn render_profile_json(hardware: &HardwareProfile) -> String {
         .collect();
 
     format!(
-        "{{\n  \"hardware_fingerprint\": {},\n  \"cpu_cores_physical\": {},\n  \"ram_total_bytes\": {},\n  \"devices\": [{}]\n}}\n",
+        "{{\n  \"hardware_fingerprint\": {},\n  \"cpu_cores_physical\": {},\n  \"cpu_simd\": {},\n  \"ram_total_bytes\": {},\n  \"devices\": [{}]\n}}\n",
         quote(&hardware.fingerprint()),
         hardware.cpu_cores_physical,
+        quote(vipera_backend_cpu::simd_level()),
         hardware.ram_total_bytes,
         if devices.is_empty() {
             String::new()
@@ -1733,6 +1737,7 @@ mod tests {
         for key in [
             "hardware_fingerprint",
             "cpu_cores_physical",
+            "cpu_simd",
             "ram_total_bytes",
             "devices",
             "kind",
@@ -1763,6 +1768,20 @@ mod tests {
         assert!(text.starts_with("hardware_fingerprint: hw_"));
         assert!(text.contains("device: cuda NVIDIA GeForce RTX 3060"));
         assert!(text.contains("device_driver: 560.35"));
+    }
+
+    #[test]
+    fn profile_reports_the_simd_level_the_engine_will_run() {
+        let level = vipera_backend_cpu::simd_level();
+        assert!(
+            matches!(
+                level,
+                "avx512-vnni" | "vnni256" | "avx2" | "neon" | "scalar"
+            ),
+            "unexpected level {level}"
+        );
+        assert!(render_profile_text(&machine()).contains(&format!("cpu_simd: {level}\n")));
+        assert!(render_profile_json(&machine()).contains(&format!("\"cpu_simd\": \"{level}\"")));
     }
 
     #[test]

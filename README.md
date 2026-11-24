@@ -137,9 +137,11 @@ curl -s localhost:8080/v1/chat/completions \
   read and the speculative draft is off; `--kv-type q8_0` and `VIPERA_ATTN_WINDOW` are refused with
   the reason instead of being ignored.
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
-  scalar reference.
-- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8` default on — A1): the decode row-kernel path packs
-  8 rows as the ggml `block_q4_Kx8` and dots with `vpdpbusd` — step −34.8%, decode +53%.
+  scalar reference. `vipera profile` prints the level the engine will use (`cpu_simd`: `avx512-vnni`,
+  `vnni256`, `avx2`, `neon` or `scalar`), so a mixed fleet can see which host fell back.
+- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8`, default off per ADR-006 — `=1` turns it on): the
+  decode row-kernel path packs 8 rows as the ggml `block_q4_Kx8` and dots with `vpdpbusd` — step
+  −34.8%, decode +53%. It changes the activation granularity, which is why it is not the default.
 - **W1a tiled-band activation** (`VIPERA_TILED_A`, default off): the prefill tiled band reads one
   scale per 256-value block (`TiledActivation`, `fill_rows_batch`) plus 16 raw-`x` sums per block.
 - **Prefill-sparse attention** (`VIPERA_PREFILL_SPARSE`, default off) and **RefineKV**
@@ -226,6 +228,14 @@ docs/benchmarks/              the surveys the plan was written from
 - **Parity checks**: the continuation test compares against a usage recording of llama.cpp checked
   into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
   `LLAMA_SERVER` at a `llama-server` binary to compare against a live one instead.
+- **Hardware floor**: the AVX-512 VNNI kernels are the fast path, and a CPU without them is
+  correct but slower. Measured 2026-11-24 on the reference machine, same prompt and threads, the
+  AVX2-only arm (`VIPERA_NO_VNNI=1`, `pmaddubsw`) ran prefill at **27.7 vs 170.0 tok/s** (4096
+  tokens; 29.2 vs 216.2 at 512) and decode at **21.5 vs 25.3 tok/s** — a 6–7× prefill gap and −15%
+  decode. The tiled layout matters on its own: with VNNI but `VIPERA_TILED=0` prefill measured
+  46.9/51.6 tok/s. Greedy output is identical across the levels on a short prompt (32 tokens), but
+  a long prefill sums in a different order, so a token can differ at temperature 0; the same build
+  on the same machine is deterministic. Ledger: `docs/benchmarks.md`, 2026-11-24.
 - **Activation precision**: Q4_K activations are multiplied as `i8` by default, so outputs agree
   with the `f32` path on the checked prompts but are not bit-identical to it; `VIPERA_Q4K_F32=1`
   runs Q4_K with `f32` activations, and its greedy continuation on the checked prompt is pinned by
