@@ -435,4 +435,121 @@ mod tests {
         assert_eq!(value.get("b").and_then(Json::as_u32), None);
         assert_eq!(value.get("c").and_then(Json::as_u32), Some(3));
     }
+
+    #[test]
+    fn malformed_and_oversized_payloads_do_not_panic_envelope_paths() {
+        fn envelope(code: &str, message: &str) -> String {
+            format!(
+                r#"{{"error":{{"message":{},"type":"invalid_request_error","code":{}}}}}"#,
+                quote(message),
+                quote(code)
+            )
+        }
+
+        let large_string = "x".repeat(256 * 1024);
+        let large_payload = format!(r#"{{"model":"{}","stream":false}}"#, large_string);
+        let oversized_unterminated = format!("\"{}", "a".repeat(256 * 1024));
+        let oversized_number = "1".repeat(256 * 1024);
+        let oversized_bad_escape = format!("\"\\{}\"", "x".repeat(64 * 1024));
+        let deep_object = format!("{}\"x\"{}", "{\"a\":".repeat(80), "}".repeat(80));
+        let deep_array = "[".repeat(80) + &"]".repeat(80);
+        let large_array = format!(
+            "[{}]",
+            std::iter::repeat_n("1", 50_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let cases: Vec<String> = vec![
+            String::new(),
+            "{".into(),
+            "}".into(),
+            "[".into(),
+            "\"unterminated".into(),
+            "nul".into(),
+            "tru".into(),
+            "fals".into(),
+            "{\"a\":}".into(),
+            "{\"a\" 1}".into(),
+            "[1,]".into(),
+            "{\"a\":1,}".into(),
+            "{\"a\":1} extra".into(),
+            "-".into(),
+            "1e".into(),
+            "1E+".into(),
+            "1.".into(),
+            "01".into(),
+            "+1".into(),
+            "NaN".into(),
+            "Infinity".into(),
+            "-Infinity".into(),
+            "\"\\uD800\"".into(),
+            "\"\\uDC00\"".into(),
+            "\"\\uD800\\uD800\"".into(),
+            "\"\\uD800\\n\"".into(),
+            "\"\\u00\"".into(),
+            "\"\\q\"".into(),
+            format!("\"\\u{:04x}\"", 0xDFFFu32),
+            oversized_unterminated,
+            oversized_number,
+            oversized_bad_escape,
+            deep_object,
+            deep_array,
+            large_array,
+            large_payload.clone(),
+        ];
+
+        for body in &cases {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Json::parse(body)));
+            assert!(result.is_ok(), "parse panicked for len={}", body.len());
+            let result = result.unwrap();
+            if let Err(err) = result {
+                let error_body = envelope("invalid_request", &err);
+                let parsed = Json::parse(&error_body).expect("error envelope must be valid JSON");
+                assert_eq!(
+                    parsed
+                        .get("error")
+                        .and_then(|e| e.get("type"))
+                        .and_then(Json::as_str),
+                    Some("invalid_request_error")
+                );
+                assert_eq!(
+                    parsed
+                        .get("error")
+                        .and_then(|e| e.get("code"))
+                        .and_then(Json::as_str),
+                    Some("invalid_request")
+                );
+            }
+        }
+
+        let hostile_messages = [
+            String::new(),
+            "plain".into(),
+            "line\nbreak\tand\rcontrols\u{0001}".into(),
+            "quote \" and slash \\".into(),
+            large_string.clone(),
+            "\"}{\"injected\":\"value".into(),
+        ];
+        for message in hostile_messages {
+            let err_env = envelope("invalid_request", &message);
+            let parsed = Json::parse(&err_env).expect("error envelope must parse");
+            assert_eq!(
+                parsed
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Json::as_str),
+                Some(message.as_str())
+            );
+
+            let ok_env = format!(r#"{{"ok":true,"echo":{}}}"#, quote(&message));
+            let parsed = Json::parse(&ok_env).expect("success envelope must parse");
+            assert_eq!(parsed.get("ok").and_then(Json::as_bool), Some(true));
+            assert_eq!(
+                parsed.get("echo").and_then(Json::as_str),
+                Some(message.as_str())
+            );
+        }
+    }
 }
