@@ -1138,6 +1138,126 @@
 - [ ] `test-regression` — Regression (baseline) — Freebuff
 - [ ] `test-coverage` — Coverage (unit, integration) — Freebuff
 
+### P91 — MODEL FAMILY (thêm)
+- [ ] `fam-llama` — Llama family (2, 3, 4, Llama 4) — Freebuff
+- [ ] `fam-qwen` — Qwen family (1, 2, 3, MoE) — OpenCode
+- [ ] `fam-mistral` — Mistral family (7B, Instruct, Large) — Freebuff
+- [ ] `fam-gemma` — Gemma family (2, 3, 2b, 7b) — Freebuff
+- [ ] `fam-phi` — Phi family (mini, 3, 4) — OpenCode
+- [ ] `fam-command` — Command family (R, R+) — Freebuff
+- [ ] `fam-olmo` — OLMo family (1, 2, OLMoE) — Freebuff
+- [ ] `fam-deepseek` — DeepSeek family (V3, R1) — OpenCode
+- [ ] `fam-mixtral` — Mixtral family (8x7B, 8x22B) — OpenCode
+- [ ] `fam-falcon` — Falcon family (7B, 40B, 180B) — Freebuff
+
+### P92 — TASK + APPLICATION (thêm)
+- [ ] `task-chat` — Chat (multi-turn, context) — Freebuff
+- [ ] `task-completion` — Completion (single, batch) — Freebuff
+- [ ] `task-summary` — Summary (extractive, abstractive) — Freebuff
+- [ ] `task-translate` — Translation (multi-lingual) — Freebuff
+- [ ] `task-classify` — Classification (label, multi-class) — Freebuff
+- [ ] `task-extract` — Extraction (NER, RE, fact) — Freebuff
+- [ ] `task-generate` — Generation (text, code, image) — OpenCode
+- [ ] `task-qna` — Q&A (open, closed, multi-hop) — Freebuff
+- [ ] `task-reason` — Reasoning (logical, causal) — OpenCode
+- [ ] `task-plan` — Planning (goal, step, execute) — OpenCode
+
+### P93 — DOMAIN + VERTICAL (thêm)
+- [ ] `domain-medical` — Medical (diagnosis, drug, EHR) — Freebuff
+- [ ] `domain-legal` — Legal (contract, case, statute) — Freebuff
+- [ ] `domain-finance` — Finance (risk, portfolio, trading) — Freebuff
+- [ ] `domain-science` — Science (paper, experiment, formula) — Freebuff
+- [ ] `domain-engineering` — Engineering (CAD, FEA, code) — Freebuff
+- [ ] `domain-education` — Education (tutor, quiz, grade) — Freebuff
+- [ ] `domain-retail` — Retail (recommend, forecast, inventory) — Freebuff
+- [ ] `domain-manufacturing` — Manufacturing (predictive, quality) — Freebuff
+- [ ] `domain-logistics` — Logistics (routing, tracking, forecast) — Freebuff
+- [ ] `domain-gaming` — Gaming (NPC, bot, content) — Freebuff
+
+### P94 — DATA FORMAT (thêm)
+- [ ] `fmt-gguf` — GGUF (v2, v3) — Freebuff
+- [ ] `fmt-safetensors` — Safetensors (HF) — Freebuff
+- [ ] `fmt-onnx` — ONNX (model, graph) — OpenCode
+- [ ] `fmt-pytorch` — PyTorch (.pt, .bin) — OpenCode
+- [ ] `fmt-jax` — JAX (.flax, .jnp) — OpenCode
+- [ ] `fmt-tf` — TensorFlow (.pb, .tflite) — OpenCode
+- [ ] `fmt-coreml` — CoreML (.mlmodel) — Freebuff
+- [ ] `fmt-tensorrt` — TensorRT (.engine) — OpenCode
+- [ ] `fmt-openvino` — OpenVINO (.xml, .bin) — OpenCode
+- [ ] `fmt-custom` — Custom (binary, proprietary) — Freebuff
+
+### P95 — INFER MODE (thêm)
+- [ ] `mode-single` — Single (1 request) — Freebuff
+- [ ] `mode-batch` — Batch (N requests) — Freebuff
+- [ ] `mode-stream` — Stream (token-by-token) — Freebuff
+- [ ] `mode-async` — Async (fire-and-forget) — Freebuff
+- [ ] `mode-priority` — Priority (VIP first) — Freebuff
+- [ ] `mode-slo` — SLO (latency target) — OpenCode
+- [ ] `mode-cost` — Cost (optimize $/query) — OpenCode
+- [ ] `mode-quality` — Quality (best answer) — OpenCode
+- [ ] `mode-mixed` — Mixed (auto-select) — OpenCode
+- [ ] `mode-custom` — Custom (user-defined) — Freebuff
+
+### P96 — GPU BACKEND (thêm)
+- [ ] `gpu-cuda` — CUDA (NVIDIA) — OpenCode
+- [ ] `gpu-hip` — HIP/ROCm (AMD) — OpenCode
+- [ ] `gpu-oneapi` — oneAPI/SYCL (Intel) — OpenCode
+- [ ] `gpu-metal` — Metal (Apple) — Freebuff
+- [ ] `gpu-vulkan` — Vulkan (cross-platform) — Freebuff
+- [ ] `gpu-opencl` — OpenCL (generic) — Freebuff
+- [ ] `gpu-webgpu` — WebGPU (browser) — OpenCode
+- [ ] `gpu-tpu` — TPU (Google) — OpenCode
+- [ ] `gpu-npu` — NPU (Intel, Apple) — OpenCode
+- [ ] `gpu-multi` — Multi-GPU (tensor, pipeline) — OpenCode
+
+### P97 — CPU OPT (thêm)
+- [ ] `cpu-avx2` — AVX2 (256-bit) — OpenCode
+- [ ] `cpu-avx512` — AVX-512 (512-bit) — OpenCode
+- [ ] `cpu-vnni` — VNNI (INT8 GEMM) — OpenCode
+- [ ] `cpu-amx` — AMX (INT8/INT16, Intel) — OpenCode
+- [ ] `cpu-neon` — NEON (ARM) — Freebuff
+- [ ] `cpu-rvv` — RISC-V Vector — OpenCode
+- [ ] `cpu-sse` — SSE2 (128-bit) — Freebuff
+- [ ] `cpu-fma` — FMA (FMA instruction) — OpenCode
+- [ ] `cpu-math` — Math (libm, SIMD) — OpenCode
+- [ ] `cpu-thread` — Thread (rayon, std) — Freebuff
+
+### P98 — MEMORY OPT (thêm)
+- [ ] `mem-mmap` — Memory-map (file, disk) — Freebuff
+- [ ] `mem-pool` — Pool (preallocate, reuse) — Freebuff
+- [ ] `mem-arena` — Arena (large, contiguous) — Freebuff
+- [ ] `mem-slab` — Slab (small, same-size) — Freebuff
+- [ ] `mem-bump` — Bump (fast, no free) — Freebuff
+- [ ] `mem-arena` — Arena (per-request) — Freebuff
+- [ ] `mem-gc` — GC (reference, tracing) — Freebuff
+- [ ] `mem-no` — No-alloc (stack, static) — OpenCode
+- [ ] `mem-cache` — Cache (L1, L2, L3) — OpenCode
+- [ ] `mem-bandwidth` — Bandwidth (HBM, DDR) — OpenCode
+
+### P99 — NETWORK + DISTRIBUTED (thêm)
+- [ ] `net-tcp` — TCP (socket, stream) — Freebuff
+- [ ] `net-udp` — UDP (datagram, fast) — Freebuff
+- [ ] `net-grpc` — gRPC (protobuf, streaming) — OpenCode
+- [ ] `net-http` — HTTP/2 (REST, gRPC) — Freebuff
+- [ ] `net-websocket` — WebSocket (real-time) — Freebuff
+- [ ] `net-mqtt` — MQTT (IoT, low-power) — Freebuff
+- [ ] `net-amqp` — AMQP (message, queue) — Freebuff
+- [ ] `net-kafka` — Kafka (stream, log) — Freebuff
+- [ ] `net-rpc` — RPC (NNG, ZeroMQ) — OpenCode
+- [ ] `net-cluster` — Cluster (etcd, Raft) — OpenCode
+
+### P100 — FUTURE + FRONTIER (thêm)
+- [ ] `future-1m` — 1M context (ring, paged) — OpenCode
+- [ ] `future-10m` — 10M context (distributed) — OpenCode
+- [ ] `future-multimodal` — Multi-modal (image, audio, video, 3D) — OpenCode
+- [ ] `future-world` — World model (physics, simulation) — OpenCode
+- [ ] `future-robotics` — Robotics (vision, control, RL) — OpenCode
+- [ ] `future-science` — AI for science (material, drug, protein) — OpenCode
+- [ ] `future-math` — AI for math (theorem, proof) — OpenCode
+- [ ] `future-alignment` — Alignment (safety, value, control) — OpenCode
+- [ ] `future-scaling` — Scaling law (compute, data, model) — OpenCode
+- [ ] `future-agentic` — Agentic (autonomous, multi-agent) — OpenCode
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -1148,11 +1268,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **911 tasks** (P0-P90) × 1 cycle = **3644 contributions**
-> 911 × 2 cycles = **7288 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 911 × 3 cycles = **10932 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
+> **1011 tasks** (P0-P100) × 1 cycle = **4044 contributions**
+> 1011 × 2 cycles = **8088 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 1011 × 3 cycles = **12132 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 1 cycle trong 24h → 3644 contributions (vượt 1000 rule)**
+**Gợi ý: 1 cycle trong 24h → 4044 contributions (vượt 1000 rule, 4x)**
 
 ## LỆNH CHẠY
 
