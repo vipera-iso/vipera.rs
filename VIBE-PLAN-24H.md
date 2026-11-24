@@ -238,6 +238,66 @@
 - [ ] `dev-fuzz` — Fuzz mode (random inputs, crash detection) — Freebuff
 - [ ] `dev-bench-cli` — `vipera bench` command (prefill + decode + compare) — Freebuff
 
+### P16 — MULTI-MODAL + AUDIO (thêm)
+- [ ] `mm-vit-encoder` — ViT encoder for CLIP/SigLIP (vision tokens) — OpenCode
+- [ ] `mm-projector` — Vision → LLM projector (linear + MLP) — OpenCode
+- [ ] `mm-llava` — LLaVA-style vision LLM support — OpenCode
+- [ ] `mm-florence` — Florence-2 / Florence-3 support — OpenCode
+- [ ] `mm-whisper` — Whisper ASR (audio → text) — OpenCode
+- [ ] `mm-whisper-large` — Whisper-large-v3 (16 languages) — OpenCode
+- [ ] `mm-tts` — Text-to-speech (Piper, Coqui TTS) — Freebuff
+- [ ] `mm-speech-to-text` — Speech recognition endpoint — Freebuff
+- [ ] `mm-image-gen` — Image generation (SDXL, FLUX) — OpenCode
+- [ ] `mm-image-edit` — Image editing (inpainting, outpainting) — OpenCode
+
+### P17 — MOE + DEEP (thêm)
+- [ ] `moe-mixtral` — Mixtral 8x7B support (8 experts, top-2) — OpenCode
+- [ ] `moe-dbae` — DBAE (Dual Block Attention Expert) — OpenCode
+- [ ] `moe-llama4` — Llama 4 MoE support (expert routing) — OpenCode
+- [ ] `moe-glm` — GLM-130B MoE support — OpenCode
+- [ ] `moe-mpt` — MPT-30B MoE support — OpenCode
+- [ ] `moe-phi-moe` — Phi-3 MoE support (8x1.6B experts) — OpenCode
+- [ ] `moe-expert-merge` — Expert merging (combine 2 experts) — OpenCode
+- [ ] `moe-expert-prune` — Expert pruning (remove least-used) — OpenCode
+- [ ] `moe-dynamic-topk` — Dynamic top-k selection (per token) — OpenCode
+- [ ] `moe-load-balance` — Load balancing (expert utilization) — Freebuff
+
+### P18 — SPECULATIVE + DRAFT (thêm)
+- [ ] `spec-ngram` — N-gram draft (no model, pure cache) — Freebuff
+- [ ] `spec-eagle` — EAGLE (efficient speculative decoding) — OpenCode
+- [ ] `spec-eagle2` — EAGLE-2 (multi-token prediction) — OpenCode
+- [ ] `spec-lookahead` — Lookahead decoding (parallel draft) — OpenCode
+- [ ] `spec-draft-verify` — Draft model verify (small model draft) — OpenCode
+- [ ] `spec-rejection` — Rejection sampling (quality control) — OpenCode
+- [ ] `spec-multi-seq` — Multi-sequence draft (batch draft) — OpenCode
+- [ ] `spec-adaptive` — Adaptive speculation (learn which tokens to draft) — OpenCode
+- [ ] `spec-batch-verify` — Batch verify (verify N drafts at once) — OpenCode
+- [ ] `spec-fallback` — Fallback to greedy if draft fails — Freebuff
+
+### P19 — QUANTIZATION + COMPRESSION (thêm)
+- [ ] `quant-gptq-int4` — GPTQ 4-bit (per-channel) — OpenCode
+- [ ] `quant-awq-int4` — AWQ 4-bit (activation-aware) — OpenCode
+- [ ] `quant-gptv` — GPTV (VQ-VAE based) — OpenCode
+- [ ] `quant-squeeze` — SqueezeLLM (1-bit + outliers) — OpenCode
+- [ ] `quant-lomni` — LOMNI (1-bit quantization) — OpenCode
+- [ ] `quant-mxfp8` — MXFP8 (microscaling FP8) — OpenCode
+- [ ] `quant-blockfp16` — Block-FP16 (per-block scale) — OpenCode
+- [ ] `quant-mix-quant` — Mixed quantization (per-layer bit) — OpenCode
+- [ ] `quant-prune` — Weight pruning (magnitude + structure) — OpenCode
+- [ ] `quant-distill` — Knowledge distillation (compress model) — OpenCode
+
+### P20 — DISTRIBUTED + CLUSTER (thêm)
+- [ ] `dist-tensor-parallel` — Tensor parallel (2-8 GPUs) — OpenCode
+- [ ] `dist-pipeline-parallel` — Pipeline parallel (stage split) — OpenCode
+- [ ] `dist-sequence-parallel` — Sequence parallel (long context) — OpenCode
+- [ ] `dist-expert-parallel` — Expert parallel (MoE across GPUs) — OpenCode
+- [ ] `dist-data-parallel` — Data parallel (replicate, sync grads) — OpenCode
+- [ ] `dist-node` — Multi-node (NVIDIA NVLink, InfiniBand) — OpenCode
+- [ ] `dist-ring` — Ring attention (infinite context) — OpenCode
+- [ ] `dist-llm-cluster` — LLM cluster manager (K8s) — Freebuff
+- [ ] `dist-auto-shard` — Auto-shard (model > 1 GPU) — OpenCode
+- [ ] `dist-checkpoint` — Checkpoint/resume (distributed state) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
