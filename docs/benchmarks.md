@@ -4658,3 +4658,39 @@ cùng 8 thread, chạy trong cùng phiên. `N` tính bằng `vipera tokenize` (`
 lại; README nay ghi đúng bảng này. Decode 33.9 ms/step chia theo phase: q4k 19.86 (59%), q6k 11.59
 (34%), attention 2.12 (6%) — chênh lệch so với llama chưa quy cho phase nào, đó là câu mở của phiên
 sau. Máy không throttled trong phiên này: llama.cpp đo lại lúc đầu và lúc cuối lệch <2%.
+
+## Chẩn đoán khoảng cách decode 0.79× — phase nào, và có phải regression không — 2026-11-24
+
+**Câu hỏi:** decode 33.9 ms/step so với llama.cpp 26.9 ms. Đây có phải do nhánh này (RoPE scaling,
+`prefill_chunk`, TriAttention WIP) làm chậm đi không, và 6–7 ms đó nằm ở phase nào?
+
+**Không phải regression của nhánh.** Dựng `origin/main` (7b61555) trong worktree và đo xen kẽ, cùng
+file, cùng 8 thread, 200 token, `PROFILE`:
+
+| | step | q4k | q6k | attention |
+|---|---:|---:|---:|---:|
+| `origin/main`, vòng 1 | 32.75 ms | 19.41 | 11.35 | 1.66 |
+| nhánh, vòng 1 | 33.15 ms | 19.65 | 11.69 | 1.48 |
+| `origin/main`, vòng 2 | 33.46 ms | 19.79 | 11.69 | 1.64 |
+| nhánh, vòng 2 | 33.51 ms | 19.77 | 11.78 | 1.62 |
+
+Hai bên trùng nhau trong nhiễu (±0.5 ms). Số 29.95 ms ghi ngày 2026-11-22 không tái hiện được trên
+*main* hôm nay, nên đó là trạng thái máy, không phải thay đổi code.
+
+**6.3 ms nằm ở đâu.** Đổi phase ra băng thông (Q4_K 625 MB, Q6_K 191 MB theo `docs/benchmarks.md`):
+
+| phase | ms/step | GB/s | trần máy ~43 GB/s |
+|---|---:|---:|---:|
+| Q4_K (14 tensor) | 19.75 | 31.6 | 73% |
+| Q6_K (output, 151936×1536) | 11.72 | **16.3** | **38%** |
+| attention | 1.6 | — | — |
+
+Nếu llama.cpp chạy Q4_K ở cùng tốc độ ~31 GB/s (nó cùng đọc 625 MB), thì 26.9 − 19.8 − 1.6 ≈ **5.5 ms
+cho Q6_K của nó**, tức ~35 GB/s. Vậy gần như toàn bộ khoảng cách decode là **output projection Q6_K**,
+không phải Q4_K, không phải attention. Đây khớp với một ghi chú cũ (`CONSTRAINTS.md`: `output` Q6_K
+5.2 ms/call = 36.5 GB/s) — con số 5.2 ms từng đạt được, nay cùng tensor đo 11.7 ms.
+
+**Giả thuyết phiên sau (đặt ngưỡng trước):** kernel Q6_K của decode (B=1 qua `dot_batch`) đang unpack
+6-bit chậm gấp đôi phần đọc; nếu một A/B cùng shape không kéo q6k xuống ≥2 ms/step thì bỏ. Trước khi
+viết kernel, đo lại 5.2 ms/call ngày trước bằng đúng bench đó, vì nếu con số cũ đo trên đường khác
+(tiled thay vì row) thì "regression" chỉ là so sai đường.

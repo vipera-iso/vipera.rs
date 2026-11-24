@@ -219,7 +219,10 @@ docs/benchmarks/              the surveys the plan was written from
   (29.5 vs 37.2 tok/s, 33.9 vs 26.9 ms/step). An earlier table reported both as level; its vipera
   numbers summed `PROFILE` running averages, which undercounts by ~11%, and that claim is withdrawn.
   The 4096 residual is attention growing with the history (6% of the first chunk at 1k, 41% of a 4k
-  chunk) rather than batch width, and the decode gap is not attributed to one phase yet.
+  chunk) rather than batch width. The decode gap is the **Q6_K output projection**: 11.7 of the
+  33.9 ms/step at 16.3 GB/s, against 31.6 GB/s for the Q4_K tensors and ~35 GB/s inferred for
+  llama.cpp's same projection; `origin/main` and this branch measure the same step (33.1 vs 33.3 ms),
+  so it is not a regression from this branch (ledger, 2026-11-24).
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
 - **Server**: TLS needs a certificate. An ACME client exists but is not in the default build:
