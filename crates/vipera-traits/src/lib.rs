@@ -388,6 +388,13 @@ impl Default for Fnv1a64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fnv1a64_of_an_empty_slice_is_the_offset_basis() {
+        let mut hash = Fnv1a64::new();
+        hash.write(&[]);
+        assert_eq!(hash.finish(), Fnv1a64::default().finish());
+    }
+
     fn machine(free: u64) -> HardwareProfile {
         HardwareProfile {
             cpu_cores_physical: 8,
@@ -428,6 +435,18 @@ mod tests {
         });
         reversed.devices.push(two.devices[1].clone());
         assert_eq!(two.fingerprint(), reversed.fingerprint());
+    }
+
+    #[test]
+    fn a_machine_without_devices_still_fingerprints() {
+        let bare = HardwareProfile {
+            cpu_cores_physical: 4,
+            ram_total_bytes: 8,
+            devices: Vec::new(),
+        };
+        assert_eq!(bare.device(DeviceKind::Cuda), None);
+        assert_eq!(bare.device(DeviceKind::Cpu), None);
+        assert!(bare.fingerprint().starts_with("hw_"));
     }
 
     struct Inert;
@@ -499,6 +518,47 @@ mod tests {
             ],
             ["inert"; 4]
         );
+    }
+
+    #[test]
+    fn empty_algorithm_inputs_stay_empty() {
+        let compression: &dyn KvCompression = &Inert;
+        let mut bytes = Vec::new();
+        assert_eq!(compression.compress(&[], &mut bytes), 0);
+        let mut values = vec![0.0_f32; 4];
+        assert_eq!(compression.decompress(&[], &mut values), 0);
+
+        let speculative: &dyn SpeculativeDecoder = &Inert;
+        let mut drafts = Vec::new();
+        speculative.draft(&[], 0, &mut drafts);
+        assert!(drafts.is_empty());
+
+        let offloader: &dyn MoeOffloader = &Inert;
+        let mut experts = Vec::new();
+        offloader.select_experts(&[], 0, &mut experts);
+        assert!(experts.is_empty());
+    }
+
+    #[test]
+    fn a_sparse_policy_with_zero_retained_context_writes_nothing() {
+        let sparse: &dyn SparseAttention = &Inert;
+        let mut positions = Vec::new();
+        sparse.positions(0, 0, &mut positions);
+        assert!(positions.is_empty());
+
+        let every_other: &dyn SparseAttention = &EveryOther;
+        let mut every_other_positions = Vec::new();
+        every_other.positions(0, 0, &mut every_other_positions);
+        assert!(every_other_positions.is_empty());
+    }
+
+    #[test]
+    fn sparse_positions_written_are_all_below_the_context() {
+        let sparse: &dyn SparseAttention = &Inert;
+        let mut positions = Vec::new();
+        sparse.positions(2, 4, &mut positions);
+        assert_eq!(positions, vec![0, 1, 2, 3]);
+        assert!(positions.iter().all(|&position| position < 4));
     }
 
     /// A sparse policy with a name of its own, so a slot mix-up is observable.
