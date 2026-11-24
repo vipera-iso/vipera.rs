@@ -2088,6 +2088,39 @@ fn fast_softmax_enabled() -> bool {
 /// per-head kernels. Sizes the stack arrays below.
 const MAX_SHARED_GROUP: usize = 16;
 
+/// Whether the streaming decode attention keeps a query-specific top-N selection of the history
+/// instead of attending every row (RefineKV, arXiv 2611.28171, "small query-specific subsets can
+/// accurately approximate full attention"). Off unless `VIPERA_KV_REFINEKV` is set to `1`,
+/// `true`, `on` or `yes`. Read once.
+fn kv_refinekv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_KV_REFINEKV").map_or(false, |value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+/// The per-head selection budget of the RefineKV port, read from `VIPERA_KV_REFINEKV_N`.
+/// `0` means "auto": `min(positions, max(32, positions / 4))`.
+fn kv_refinekv_budget(positions: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let configured = N.get_or_init(|| {
+        std::env::var("VIPERA_KV_REFINEKV_N")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    if *configured == 0 {
+        positions.min(positions.div_ceil(4).max(32))
+    } else {
+        (*configured).min(positions)
+    }
+}
+
 /// Causal grouped-query attention read straight from the KV blocks.
 ///
 /// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
@@ -2295,11 +2328,59 @@ fn attention_streaming_heads(
         Ok(())
     })?;
 
+    // RefineKV selection (arXiv 2611.28171): per head, keep the top-`N` positions by score
+    // and drop the rest from the softmax and the value sum. With nothing to drop the arms are
+    // the same as [`attention_streaming`].
+    let refine = kv_refinekv_enabled() && positions > 0;
+    let refine_n = kv_refinekv_budget(positions);
+    let mut refinekv_mask = Vec::new();
+    let mut refinekv_selected = Vec::new();
+    let mut refinekv_counts = Vec::new();
+    if refine {
+        refinekv_mask = vec![0u8; count * positions];
+        refinekv_selected.resize(count * refine_n, u32::MAX);
+        refinekv_counts.resize(count, 0);
+        let mut chosen: Vec<(f32, usize)> = Vec::with_capacity(positions);
+        for local in 0..count {
+            chosen.clear();
+            chosen.extend(
+                scores[local * positions..(local + 1) * positions]
+                    .iter()
+                    .enumerate()
+                    .map(|(position, score)| (score.to_owned(), position)),
+            );
+            chosen.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            chosen.truncate(refine_n);
+            chosen.sort_by_key(|(_, position)| *position);
+            for (slot, (_, position)) in chosen.iter().enumerate() {
+                refinekv_selected[local * refine_n + slot] = *position as u32;
+                refinekv_mask[local * positions + *position] = 1;
+            }
+            refinekv_counts[local] = chosen.len() as u32;
+        }
+    }
+
     // Softmax per head, summed in increasing position order.
     let fast_softmax = fast_softmax_enabled();
     for local in 0..count {
-        let best = head_state[local];
         let window = &mut scores[local * positions..(local + 1) * positions];
+        if refine {
+            // Unselected positions leave the window: their weight becomes 0 and pass 2 skips them.
+            for (position, score) in window.iter_mut().enumerate() {
+                if refinekv_mask[local * positions + position] == 0 {
+                    *score = f32::NEG_INFINITY;
+                }
+            }
+            let best = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0_f32;
+            for score in window.iter_mut() {
+                *score = (*score - best).exp();
+                total += *score;
+            }
+            head_state[local] = 1.0 / total;
+            continue;
+        }
+        let best = head_state[local];
         let total = if fast_softmax {
             crate::simd::exp_sum_shifted(window, best)
         } else {
@@ -2315,7 +2396,7 @@ fn attention_streaming_heads(
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
     out[..count * head_dim].fill(0.0);
-    if shared {
+    if shared && !refine {
         let mut value_bases = [0_usize; crate::simd::GROUP_ROWS];
         let mut value_positions = [0_usize; crate::simd::GROUP_ROWS];
         let mut pending = 0;
@@ -2357,7 +2438,7 @@ fn attention_streaming_heads(
     // Eight positions at a time keeps each head's accumulator in registers between positions, so the
     // targets are loaded and stored once per eight rows instead of once per row. Per element the
     // additions still run in increasing position order, so the result is the per-row kernel's bits.
-    if whole && in_place && !sequential && group <= 8 {
+    if whole && in_place && !sequential && group <= 8 && !refine {
         const BATCH: usize = 8;
         let mut bases = [0usize; BATCH];
         let mut at_positions = [0usize; BATCH];
@@ -2405,6 +2486,19 @@ fn attention_streaming_heads(
         return Ok(());
     }
     kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+        // RefineKV: if no head selects this position, skip decoding the row too.
+        if refine {
+            let mut selected = false;
+            for head in heads.clone() {
+                if refinekv_mask[(head - heads.start) * positions + position] == 1 {
+                    selected = true;
+                    break;
+                }
+            }
+            if !selected {
+                return Ok(());
+            }
+        }
         let v_base = kv.value_row(order, base, layer_bytes);
         if !in_place {
             kv.layout
@@ -2413,7 +2507,7 @@ fn attention_streaming_heads(
         for kv_head in 0..shape.kv_heads {
             let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
             let packed = (v_base + kv_head * head_dim * 2)..;
-            if whole && in_place {
+            if whole && in_place && !refine {
                 let first = kv_head * group;
                 let mut weights = [0.0_f32; 16];
                 for (member, weight) in weights[..group].iter_mut().enumerate() {
@@ -2434,6 +2528,9 @@ fn attention_streaming_heads(
                     continue;
                 }
                 let local = head - heads.start;
+                if refine && refinekv_mask[local * positions + position] == 0 {
+                    continue;
+                }
                 let weight = scores[local * positions + position] * head_state[local];
                 let target = &mut out[local * head_dim..(local + 1) * head_dim];
                 if in_place {

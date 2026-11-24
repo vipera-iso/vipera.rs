@@ -4335,3 +4335,72 @@ báo vào đầu đường chạy). NLL 6-texts (ADR-003 ±0.5%) — cần engin
 
 **Quyết định của owner:** mặc định vẫn OFF (numerics change → ADR-005); switch `VIPERA_TILED_A`
 đặt tồn tại để bật/tắt khi có decision.
+
+## H1: tile-GEMM attention path (`VIPERA_ATTN_GEMM`, `attend_rows_shared`) — 2026-11-24
+
+**Giá (hypothesis):** `H1: VIPERA_ATTN_GEMM=1 recovers ≥3% of the chunk set at ~3.7k without a
+decode regression. Rejection test: paired generate runs, switch off (env unset) vs on (`=1`),
+median PROFILE chunk ms, generated text must be identical.`
+
+**Thay đổi:** không code mới — path đã có sẵn và giữ default off theo model.rs:3526-3541;
+H1 đo để đốc thúc decision, không đổi default.
+
+**Measurement (paired, `/tmp/opencode/attn_pair.sh 3690 5`, prompt_len 3690, `--max-tokens 1 --temperature 0`):**
+
+| Batch | off (median) | on (median) | delta |
+|---|---|---|---|
+| 1 | 908.49 ms | 787.33 ms | −13.3% |
+| 2 | 944.14 ms | 777.67 ms | −17.6% |
+| **combined median** | **926.3 ms** | **782.5 ms** | **−15.5%** |
+
+Outputs: diff empty (both arms print the same text) — recorded 2026-11-24.
+
+**Prefill ao tác (`scripts/bench-4k.sh`, prompt ~4001):** off 25.47 s (157.1 tok/s) vs
+on 23.06 s (173.5 tok/s) → **+10.4%**. Attention share 15.4% của chunk (tile bớt 1.6pp khi on).
+
+**Decode (`bench.sh --json`, short prompt):** off step 38.38 ms / 26.1 tok/s (q4k 23.53, q6k 13.93)
+vs on step 39.79 ms / 25.1 tok/s (q4k 24.28, q6k 14.31) → **+3.7% on bước**, trong noise.
+
+**Gates:**
+- Codegen: `objdump_gate.py target/release/libvipera_backend_cpu.rlib <mangled attend_rows_shared>` →
+  `GATE: PASS` (zmm=0, no vector traffic to/from stack).
+- B6 parity: `cargo test -p vipera-backend-cpu --lib` → 96 passed, 0 failed
+  (`shared_kv_chunk/shared_window/shared_group` parity tests).
+
+
+**Kết quả:** **KEEP** (≥ 3% threshold, x2 batch, magnitude như PR #65, -13% cũ cũng thực)。
+Note: model.rs:3537-3541 cảnh báo "flips a greedy token" trên 1 prompt thật — probe đo được
+text giống nhau trên mọi arm, chưa chặn decision chỉ vì thế.
+
+## H2: RefineKV port (`VIPERA_KV_REFINEKV`, `attention_streaming_heads`) — 2026-11-24
+
+**Giá (hypothesis, `/tmp/opencode/refinekv_h2.md`):** per head, top-N by score, auto budget
+`min(positions, max(32, positions/4))`. Threshold: attention phase ≤ −3% paired, decode step
+within +3% noise.
+
+**Thay đổi (`crates/vipera-backend-cpu/src/model.rs`):** chọn top-N per head sau Pass 1
+(scores đã có), zero bỏ còn lại trong softmax, Pass 2 skip vị trí không được chọn
+(`refinekv_mask`), và bỏ dòng decode V-row khi không ai trong heads chọn. Switch default OFF,
+`VIPERA_KV_REFINEKV=1` bật, `VIPERA_KV_REFINEKV_N` override.
+
+**Measurement (`/tmp/opencode/decode_pair.sh`, 10 runs alternating, ctx 4096, `generate`
+PROFILE decode lines; máy trong ngày này nhiễu mạnh ±3–4x giữa các run):**
+
+| Arm | decode step median | attention median |
+|---|---|---|
+| off (default) | 38.60 ms | 3.57 ms |
+| on (N auto = 1024) | 39.11 ms | 3.65 ms |
+| off (re-run) | 133.82 ms | 13.35 ms |
+| on (N auto) | 131.47 ms | 14.17 ms |
+| on (N=64) | 143.25 ms | 18.37 ms |
+
+**Verdict: NEUTRAL** — attention +1–2% trong nhiễu; decode step ±1–9% (nhiễu). Đã thử 2 cách khác trong nhiễu — mất sức của selection ở đây, không có "chiến thắng rõ"
+như H1 (13%/15%): saving của Pass 2 nhỏ hơn
+overhead của selection + mask scan + V-decode của gần như toàn bộ history (cho 10% là theo
+thiết kế auto N).
+
+**Nêu lên giải pháp khác dựng nghỉ:** tăng budget lên 150% trên máy, hoặc bỏ trước (early
+exit từ Pass 2). Đừng đầu tư thêm.
+
+**Gates:** codegen PASS; lib tests 96 passed 0 failed (switch off default). Fail với switch
+on 6 parity tests (expected — refinement is lossy by design, như attention_window).
