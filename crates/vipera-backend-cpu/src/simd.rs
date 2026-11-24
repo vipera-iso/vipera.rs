@@ -7197,6 +7197,72 @@ mod tests {
             real / probe,
         );
     }
+
+    /// The tiled GEMM agrees with the plain triple loop over a sweep of shapes and strides,
+    /// including the small and ragged ones the attention tiles produce: this is the property the
+    /// attention GEMM arm rests on, and a regression here would silently corrupt attention.
+    #[test]
+    fn gemm_agrees_with_the_triple_loop_over_a_shape_sweep() {
+        if !available() {
+            eprintln!("skipped: this CPU has no AVX2");
+            return;
+        }
+        struct Lcg(u64);
+        impl Lcg {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                self.0
+            }
+        }
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        for m in 1usize..=13 {
+            for k in 1usize..=17 {
+                for n in 1usize..=21 {
+                    let a_row = k + (rng.next() as usize % 5);
+                    let c_row = n + (rng.next() as usize % 5);
+                    let a_len = (m - 1) * a_row + k;
+                    let c_len = (m - 1) * c_row + n;
+                    let a: Vec<f32> = (0..a_len)
+                        .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+                        .collect();
+                    let b: Vec<f32> = (0..k * n)
+                        .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+                        .collect();
+                    let seed: Vec<f32> = (0..c_len)
+                        .map(|_| (rng.next() % 2001) as f32 / 1000.0 - 1.0)
+                        .collect();
+                    let mut expected = seed.clone();
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut total = expected[i * c_row + j];
+                            for step in 0..k {
+                                total += a[i * a_row + step] * b[step * n + j];
+                            }
+                            expected[i * c_row + j] = total;
+                        }
+                    }
+                    let mut actual = seed.clone();
+                    super::gemm(m, k, n, &a, a_row, &b, &mut actual, c_row);
+                    for (at, (want, got)) in expected.iter().zip(&actual).enumerate() {
+                        let tolerance = 1e-5 * want.abs().max(1.0);
+                        assert!(
+                            (want - got).abs() <= tolerance,
+                            "m={m} k={k} n={n} a_row={a_row} c_row={c_row} at {at}: {want} vs {got}"
+                        );
+                    }
+                    for row in 0..c_len {
+                        let column = row % c_row;
+                        if column >= n {
+                            assert_eq!(
+                                actual[row], seed[row],
+                                "m={m} k={k} n={n}: wrote past the row at {row}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
