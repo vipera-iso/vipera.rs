@@ -107,7 +107,7 @@ impl ViperaError {
 impl fmt::Display for ViperaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "{e}"),
+            Self::Io(e) => write!(f, "I/O error: {}", e.kind()),
             Self::Parse { offset, message } => {
                 write!(f, "invalid model at byte {offset}: {message}")
             }
