@@ -1392,11 +1392,6 @@ impl ForwardPass for CpuBackend {
         self.run(context)
     }
 
-    /// Prefault the backend's scratch at engine start (see [`CpuBackend::warmup`]).
-    fn warmup(&mut self) {
-        self.warmup();
-    }
-
     fn logits_batch(
         &mut self,
         batch: &mut BatchContext<'_, '_>,
