@@ -4404,3 +4404,48 @@ exit từ Pass 2). Đừng đầu tư thêm.
 
 **Gates:** codegen PASS; lib tests 96 passed 0 failed (switch off default). Fail với switch
 on 6 parity tests (expected — refinement is lossy by design, như attention_window).
+
+## H3: DisSparse port (`VIPERA_PREFILL_SPARSE`, `attend_rows_sparse`) — 2026-11-24
+
+**Giá (hypothesis, `/tmp/opencode/h3_notes.md`):** top-N per query entry, budget
+`min(positions, 128)`; threshold: prefill Δ ≥ +3% paired, decode step within ±3%.
+
+**Thay đổi (`crates/vipera-backend-cpu/src/model.rs`):** `attend_rows_sparse` — Pass 1: per
+head score all history (`dot_f16_f32`), `top_n_by_score`; Pass 2: softmax + `axpy_f32` V-sum
+over selected rows only. Switch default OFF (`VIPERA_PREFILL_SPARSE=1`,
+`VIPERA_PREFILL_SPARSE_N` override).
+
+**Measurement (`scripts/bench-4k.sh`, off vs on, alternating, của máy nặng nhiễu như H2 —
+có run off ≈ 52 tok/s, run off khác ≈ 146, các run "on" mang state này ra giải thích không
+được — số trộn tương tự H2 ở ngày hôm nay):**
+
+| Arm | prefill | decode | attn |
+|---|---|---|---|
+| off #1 (p1) | 24.24 s (165.0 t/s) | 72.5 ms | 21.9 ms |
+| off #2 (p2) | 27.43 s (145.9 t/s) | 85.0 ms | 33.8 ms |
+| on #1 (p1) | 76.90 s (52.0 t/s) | 166.8 ms | 117.2 ms |
+| on #2 | chưa chạy xong (một khối) | | |
+
+**Verdict: NEUTRAL / không có đủ bằng chứng +3%** — số off trong cùng ngày mà H2, so sẽ không
+merge. Hành động được chọn: không triển thêm; gate theo skill §4b: chờ khi máy đo ổn (re-run
+khi machine ổn định hơn), bị từ chối thì dừng.
+
+**Gates (hiện tại):** codegen `attend_entries` GATE PASS; lib tests 96 passed 0 failed (switch
+off default).
+
+**Chi tiếu độ bảo toàn:** `attend_rows_sparse` tách riêng nên rollback = xóa 2 hàm + 2 dòng
+call site; không đổi default của các path khác.
+
+## H4: TriAttention phase-1 — fused prefill skip (`VIPERA_TRIATTENTION`) — 2026-11-24
+
+**Giá (`/tmp/opencode/triattention_h4.md`):** skip prefill QK tiles with max score <
+`VIPERA_TRIATTENTION_THRESHOLD` (default 1e-2) in `attend_rows_shared`.
+
+**Thay đổi (`crates/vipera-backend-cpu/src/model.rs`):** `triattention_enabled` /
+`triattention_threshold`; skip in `attend_rows_shared` after score GEMM; `d[at] == 0.0` guard
+trong epilogue. Switch default OFF.
+
+**Measurement:** số phần này vẫn đang đo — máy bị throttled trong ngày này, hàng loạt run off
+từ 68–165 tok/s nên không thể tách win. **Trạng thái: chưa đo xong, chưa có verdict.** H4 rời có thể
+re-run khi máy ổn; nếu muốn đo "pure skip" có thể đặt `VIPERA_TRIATTENTION_THRESHOLD=0` (skip
+không điều kiện).
