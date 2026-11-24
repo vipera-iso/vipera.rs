@@ -9,6 +9,7 @@ license.workspace = true
 vipera-errors.workspace = true
 vipera-sampler.workspace = true
 vipera-traits.workspace = true
+vipera-algo-keepkv = { path = "../vipera-algo-keepkv" }
 
 [lints]
 workspace = true

@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use vipera_algo_keepkv::{CacheGeometry, KeepKv};
 use vipera_errors::ViperaError;
 
 /// Tokens per block. 16 is the paged-attention default and keeps waste under one block per sequence.
@@ -60,6 +61,11 @@ pub struct KvConfig {
     pub blocks: u64,
     /// The ring a windowed cache maps its context onto, when it is one.
     pub ring: Option<Ring>,
+    /// The retention policy a trim would apply, when one is configured.
+    ///
+    /// Off by default. [`KvConfig::for_run`] reads it from `VIPERA_KEEPKV_BUDGET_KB`; the policy
+    /// decides which positions survive, not which blocks are freed (see [`KvCache::trim`]).
+    pub keepkv: Option<KeepKv>,
 }
 
 impl KvConfig {
@@ -99,6 +105,7 @@ impl KvConfig {
             tokens_per_block,
             blocks,
             ring: None,
+            keepkv: None,
         };
         if config.total_bytes().is_none() {
             return Err(ViperaError::invalid_argument(
@@ -186,7 +193,7 @@ impl KvConfig {
         let budget = context_tokens
             .checked_mul(bytes_per_token)
             .ok_or_else(|| ViperaError::invalid_argument("context is too large for this model"))?;
-        match window {
+        let config = match window {
             Some((tokens, sinks)) if context_tokens > tokens + sinks + PREFILL_HEADROOM => {
                 Self::ring(
                     bytes_per_token,
@@ -195,10 +202,17 @@ impl KvConfig {
                     tokens,
                     sinks,
                     sequences,
-                )
+                )?
             }
-            Some(_) | None => Self::from_bytes(budget, bytes_per_token, tokens_per_block),
-        }
+            Some(_) | None => Self::from_bytes(budget, bytes_per_token, tokens_per_block)?,
+        };
+        Ok(config.with_keepkv(KeepKv::from_env()))
+    }
+
+    /// The same geometry with a retention policy attached.
+    pub const fn with_keepkv(mut self, keepkv: Option<KeepKv>) -> Self {
+        self.keepkv = keepkv;
+        self
     }
 
     /// Bytes a block occupies.
@@ -535,6 +549,28 @@ impl KvCache {
         }
     }
 
+    /// Which positions a trim keeps: the policy's choice, or the newest the cache can address.
+    ///
+    /// With a policy this is [`KeepKv::retain`] over this cache's geometry and `scores`. Without
+    /// one it drops the oldest positions and keeps the last [`KvConfig::capacity_tokens`], which is
+    /// what a cache with nothing to score by can do. The result is sorted by index.
+    ///
+    /// The table is deliberately left alone. Evicting a position only works if every later query
+    /// stops reading it, and the attention kernel reads a block without asking whether the
+    /// position was kept; freeing blocks here would hand live K/V to the next sequence. The
+    /// decision is exposed so a caller with a retained-set mask can apply it.
+    pub fn trim(&self, scores: &[f32]) -> Vec<usize> {
+        match self.config.keepkv {
+            Some(policy) => policy.retain(self, scores),
+            None => {
+                let capacity = usize::try_from(self.config.capacity_tokens())
+                    .unwrap_or(usize::MAX)
+                    .min(scores.len());
+                (scores.len() - capacity..scores.len()).collect()
+            }
+        }
+    }
+
     /// Release every block a sequence owns, parked or not. Returns the number of blocks freed.
     pub fn release(&mut self, sequence: u64) -> u64 {
         let mut table = match self.tables.remove(&sequence) {
@@ -558,6 +594,16 @@ impl KvCache {
             self.free.push(block);
         }
         freed
+    }
+}
+
+impl CacheGeometry for KvCache {
+    fn bytes_per_token(&self) -> u64 {
+        self.config.bytes_per_token
+    }
+
+    fn tokens_per_block(&self) -> u64 {
+        self.config.tokens_per_block
     }
 }
 
@@ -898,5 +944,29 @@ mod tests {
         assert!(cache.is_parked(3));
         assert!(cache.is_parked(PARKED_LIMIT as u64 + 2));
         assert_eq!(cache.parked_blocks(), PARKED_LIMIT as u64);
+    }
+
+    #[test]
+    fn a_trim_without_a_policy_keeps_the_newest_entries_the_cache_can_address() {
+        // Eight 256-byte blocks of four positions: 32 addressable positions.
+        let cache = cache(8);
+        let kept = cache.trim(&[0.0; 100]);
+        assert_eq!(kept.len(), 32);
+        assert_eq!(kept.first(), Some(&68));
+        assert_eq!(kept.last(), Some(&99));
+        // Nothing is freed: the decision is the caller's to apply.
+        assert_eq!(cache.used_blocks(), 0);
+    }
+
+    #[test]
+    fn a_trim_with_a_policy_keeps_the_highest_scores_within_the_blocked_budget() {
+        let config = KvConfig::new(64, 4, 8)
+            .expect("geometry")
+            .with_keepkv(Some(KeepKv::new(512, 4)));
+        let cache = KvCache::new(config).expect("cache");
+        assert_eq!(cache.config().keepkv, Some(KeepKv::new(512, 4)));
+        let scores: Vec<f32> = (0..100).map(|index| index as f32).collect();
+        // 512 bytes is two 256-byte blocks, which hold eight positions.
+        assert_eq!(cache.trim(&scores), (92..100).collect::<Vec<_>>());
     }
 }

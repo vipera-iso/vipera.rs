@@ -1077,6 +1077,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vipera-algo-keepkv"
+version = "0.1.0"
+
+[[package]]
 name = "vipera-backend-cpu"
 version = "0.1.0"
 dependencies = [
@@ -1118,6 +1122,7 @@ version = "0.1.0"
 name = "vipera-runtime"
 version = "0.1.0"
 dependencies = [
+ "vipera-algo-keepkv",
  "vipera-errors",
  "vipera-sampler",
  "vipera-traits",
