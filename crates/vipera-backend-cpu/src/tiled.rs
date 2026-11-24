@@ -27,6 +27,22 @@ pub(crate) fn tiled_enabled() -> bool {
     !std::env::var("VIPERA_TILED").is_ok_and(|value| value == "0")
 }
 
+/// Whether the W-1a tiled-band activation is on: `VIPERA_TILED_A` (off by default).
+///
+/// W-1a changes the activation's arithmetic — the band reads one scale per 256-value block
+/// instead of the per-32 scales of `QuantizedX` — so the engine's numbers move (the NLL gates
+/// in `docs/benchmarks.md` + the ADR the plan expects). It is the default-off switch it should
+/// have: flipping the default needs the gates' green light, not a perf PR.
+pub(crate) fn tiled_a_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VIPERA_TILED_A").ok().is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
 /// Whether the scalar tiled path for `F32`/`F16` weights is requested.
 ///
 /// That path dequantizes into a scalar tile and was only ever a diagnostic: it stays behind

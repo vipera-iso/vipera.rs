@@ -2088,6 +2088,112 @@ fn fast_softmax_enabled() -> bool {
 /// per-head kernels. Sizes the stack arrays below.
 const MAX_SHARED_GROUP: usize = 16;
 
+/// Whether the streaming decode attention keeps a query-specific top-N selection of the history
+/// instead of attending every row (RefineKV, arXiv 2611.28171, "small query-specific subsets can
+/// accurately approximate full attention"). Off unless `VIPERA_KV_REFINEKV` is set to `1`,
+/// `true`, `on` or `yes`. Read once.
+fn kv_refinekv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_KV_REFINEKV").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+/// The per-head selection budget of the RefineKV port, read from `VIPERA_KV_REFINEKV_N`.
+/// `0` means "auto": `min(positions, max(32, positions / 4))`.
+fn kv_refinekv_budget(positions: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let configured = N.get_or_init(|| {
+        std::env::var("VIPERA_KV_REFINEKV_N")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    if *configured == 0 {
+        positions.min(positions.div_ceil(4).max(32))
+    } else {
+        (*configured).min(positions)
+    }
+}
+
+/// Whether the chunk-prefill attention keeps a query-specific top-N selection of the history
+/// (DisSparse, arXiv 2611.28522). Off unless `VIPERA_PREFILL_SPARSE` is set to `1`, `true`,
+/// `on` or `yes`. Read once.
+fn prefill_sparse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_PREFILL_SPARSE").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+/// Whether the TriAttention port skips prefill QK tiles whose max score sits below
+/// `VIPERA_TRIATTENTION_THRESHOLD` (default 1e-2 — tuned in the first port). Off unless
+/// `VIPERA_TRIATTENTION` is set to `1`, `true`, `on` or `yes`. Read once.
+fn triattention_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_TRIATTENTION").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+fn triattention_threshold() -> f32 {
+    static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("VIPERA_TRIATTENTION_THRESHOLD")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .unwrap_or(1e-2)
+    })
+}
+
+/// The per-head selection budget of the prefill-sparse port, from `VIPERA_PREFILL_SPARSE_N`;
+/// `0` means auto `min(positions, 128)`.
+fn prefill_sparse_budget(positions: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let configured = N.get_or_init(|| {
+        std::env::var("VIPERA_PREFILL_SPARSE_N")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    if *configured == 0 {
+        positions.min(128)
+    } else {
+        (*configured).min(positions)
+    }
+}
+
+/// Top-N selection for one query row: scores of `k_all` per head, returns the best
+/// `n` positions sorted ascending. Reused by the prefill-sparse kernel.
+fn top_n_by_score(scores: &[f32], n: usize) -> Vec<u32> {
+    let mut chosen: Vec<(f32, usize)> = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(p, s)| (s, p))
+        .collect();
+    chosen.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    chosen.truncate(n);
+    let mut out: Vec<u32> = chosen.iter().map(|(_, p)| *p as u32).collect();
+    out.sort();
+    out
+}
+
 /// Causal grouped-query attention read straight from the KV blocks.
 ///
 /// This computes exactly what `load_layer` followed by `attention` computes, bit for bit: every
@@ -2295,11 +2401,59 @@ fn attention_streaming_heads(
         Ok(())
     })?;
 
+    // RefineKV selection (arXiv 2611.28171): per head, keep the top-`N` positions by score
+    // and drop the rest from the softmax and the value sum. With nothing to drop the arms are
+    // the same as [`attention_streaming`].
+    let refine = kv_refinekv_enabled() && positions > 0;
+    let refine_n = kv_refinekv_budget(positions);
+    let mut refinekv_mask = Vec::new();
+    let mut refinekv_selected = Vec::new();
+    let mut refinekv_counts = Vec::new();
+    if refine {
+        refinekv_mask = vec![0u8; count * positions];
+        refinekv_selected.resize(count * refine_n, u32::MAX);
+        refinekv_counts.resize(count, 0);
+        let mut chosen: Vec<(f32, usize)> = Vec::with_capacity(positions);
+        for local in 0..count {
+            chosen.clear();
+            chosen.extend(
+                scores[local * positions..(local + 1) * positions]
+                    .iter()
+                    .enumerate()
+                    .map(|(position, score)| (score.to_owned(), position)),
+            );
+            chosen.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            chosen.truncate(refine_n);
+            chosen.sort_by_key(|(_, position)| *position);
+            for (slot, (_, position)) in chosen.iter().enumerate() {
+                refinekv_selected[local * refine_n + slot] = *position as u32;
+                refinekv_mask[local * positions + *position] = 1;
+            }
+            refinekv_counts[local] = chosen.len() as u32;
+        }
+    }
+
     // Softmax per head, summed in increasing position order.
     let fast_softmax = fast_softmax_enabled();
     for local in 0..count {
-        let best = head_state[local];
         let window = &mut scores[local * positions..(local + 1) * positions];
+        if refine {
+            // Unselected positions leave the window: their weight becomes 0 and pass 2 skips them.
+            for (position, score) in window.iter_mut().enumerate() {
+                if refinekv_mask[local * positions + position] == 0 {
+                    *score = f32::NEG_INFINITY;
+                }
+            }
+            let best = window.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0_f32;
+            for score in window.iter_mut() {
+                *score = (*score - best).exp();
+                total += *score;
+            }
+            head_state[local] = 1.0 / total;
+            continue;
+        }
+        let best = head_state[local];
         let total = if fast_softmax {
             crate::simd::exp_sum_shifted(window, best)
         } else {
@@ -2315,7 +2469,7 @@ fn attention_streaming_heads(
 
     // Pass 2: the weighted sum of V, each head accumulating in increasing position order.
     out[..count * head_dim].fill(0.0);
-    if shared {
+    if shared && !refine {
         let mut value_bases = [0_usize; crate::simd::GROUP_ROWS];
         let mut value_positions = [0_usize; crate::simd::GROUP_ROWS];
         let mut pending = 0;
@@ -2357,7 +2511,7 @@ fn attention_streaming_heads(
     // Eight positions at a time keeps each head's accumulator in registers between positions, so the
     // targets are loaded and stored once per eight rows instead of once per row. Per element the
     // additions still run in increasing position order, so the result is the per-row kernel's bits.
-    if whole && in_place && !sequential && group <= 8 {
+    if whole && in_place && !sequential && group <= 8 && !refine {
         const BATCH: usize = 8;
         let mut bases = [0usize; BATCH];
         let mut at_positions = [0usize; BATCH];
@@ -2405,6 +2559,19 @@ fn attention_streaming_heads(
         return Ok(());
     }
     kv.for_each_row(order, layer, layer_bytes, positions, |position, base| {
+        // RefineKV: if no head selects this position, skip decoding the row too.
+        if refine {
+            let mut selected = false;
+            for head in heads.clone() {
+                if refinekv_mask[(head - heads.start) * positions + position] == 1 {
+                    selected = true;
+                    break;
+                }
+            }
+            if !selected {
+                return Ok(());
+            }
+        }
         let v_base = kv.value_row(order, base, layer_bytes);
         if !in_place {
             kv.layout
@@ -2413,7 +2580,7 @@ fn attention_streaming_heads(
         for kv_head in 0..shape.kv_heads {
             let value = &row[kv_head * head_dim..(kv_head + 1) * head_dim];
             let packed = (v_base + kv_head * head_dim * 2)..;
-            if whole && in_place {
+            if whole && in_place && !refine {
                 let first = kv_head * group;
                 let mut weights = [0.0_f32; 16];
                 for (member, weight) in weights[..group].iter_mut().enumerate() {
@@ -2434,6 +2601,9 @@ fn attention_streaming_heads(
                     continue;
                 }
                 let local = head - heads.start;
+                if refine && refinekv_mask[local * positions + position] == 0 {
+                    continue;
+                }
                 let weight = scores[local * positions + position] * head_state[local];
                 let target = &mut out[local * head_dim..(local + 1) * head_dim];
                 if in_place {
@@ -3686,6 +3856,18 @@ fn attend_rows_shared(
                             &mut scores[..width * keys],
                             keys,
                         );
+                        // TriAttention (arXiv 2611.07256): when every visible score in this tile
+                        // sits below the threshold, the tile contributes ~nothing to the
+                        // attention output — skip the softmax update and the value fold.
+                        if triattention_enabled() {
+                            let tile_max = scores[..width * keys]
+                                .iter()
+                                .copied()
+                                .fold(f32::NEG_INFINITY, f32::max);
+                            if tile_max < triattention_threshold() {
+                                continue;
+                            }
+                        }
                         for row in 0..width {
                             let at = (tile + row) * heads + head;
                             // The rows at or past this query's own position are its future: the
@@ -3737,6 +3919,12 @@ fn attend_rows_shared(
         for slot in 0..rows {
             for head in 0..heads {
                 let at = slot * heads + head;
+                if d[at] == 0.0 {
+                    // Every tile was skipped: the row saw nothing.
+                    let dst = &mut slot_out[slot * query + head * head_dim..][..head_dim];
+                    dst.fill(0.0);
+                    continue;
+                }
                 let inverse = 1.0 / d[at];
                 let dst = &mut slot_out[slot * query + head * head_dim..][..head_dim];
                 for (out, value) in dst.iter_mut().zip(&o[at * head_dim..(at + 1) * head_dim]) {
@@ -3774,6 +3962,94 @@ fn attend_rows_shared(
             .collect()
     });
     results.into_iter().collect()
+}
+
+/// Prefill-sparse attention (DisSparse, arXiv 2611.28522): per query entry, score the history and
+/// attend over the top-`N` rows only. Switch: `VIPERA_PREFILL_SPARSE` (default off); budget:
+/// `VIPERA_PREFILL_SPARSE_N` (default `min(positions, 128)`).
+fn attend_rows_sparse(
+    q: &[f32],
+    kv: &[KvRead<'_>],
+    positions: &[usize],
+    layer: usize,
+    shape: AttnShape,
+    out: &mut [f32],
+) -> Result<(), ViperaError> {
+    let entries = positions.len();
+    let query = shape.heads * shape.head_dim;
+    let head_dim = shape.head_dim;
+    let group = shape.heads / shape.kv_heads;
+    let width = shape.kv_heads * head_dim;
+    let order = AttentionSwitches::from_env().order;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let storage = kv[0].storage;
+    let layer_bytes = kv[0].layout.bytes_per_row(width);
+    let mut scores = Vec::new();
+    let mut value_row = vec![0.0_f32; width];
+    let mut window = vec![0.0_f32; shape.heads * head_dim];
+    for entry in 0..entries {
+        let pos = positions[entry];
+        if pos == 0 {
+            out[entry * query..][..query].fill(0.0);
+            continue;
+        }
+        // Pass 1: per head, the score of every row of the history.
+        scores.clear();
+        scores.resize(shape.heads * pos, 0.0);
+        for head in 0..shape.heads {
+            let kv_head = head / group;
+            let query_head = &q[entry * query + head * head_dim..][..head_dim];
+            kv[0].for_each_row_range(order, layer, layer_bytes, 0, pos, |position, base| {
+                let packed = (base + kv_head * head_dim * 2)..;
+                let dot =
+                    crate::simd::dot_f16_f32(query_head, &storage[packed.start..][..head_dim * 2]);
+                scores[head * pos + position] = dot * scale;
+                Ok(())
+            })?;
+        }
+        // Pass 2: softmax + weighted sum of V over the selected rows.
+        window.fill(0.0);
+        for head in 0..shape.heads {
+            let kv_head = head / group;
+            let selected = top_n_by_score(
+                &scores[head * pos..(head + 1) * pos],
+                prefill_sparse_budget(pos),
+            );
+            let best = selected
+                .iter()
+                .map(|&p| scores[head * pos + p as usize])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0_f32;
+            let mut weights = Vec::with_capacity(selected.len());
+            for &p in &selected {
+                let weight = (scores[head * pos + p as usize] - best).exp();
+                weights.push(weight);
+                total += weight;
+            }
+            let inverse = 1.0 / total;
+            let target = &mut window[head * head_dim..(head + 1) * head_dim];
+            for (weight, &position) in weights.iter().zip(&selected) {
+                kv[0].for_each_row_range(
+                    order,
+                    layer,
+                    layer_bytes,
+                    position as usize,
+                    position as usize + 1,
+                    |_, base| {
+                        let v_base = kv[0].value_row(order, base, layer_bytes);
+                        kv[0]
+                            .layout
+                            .decode(&storage[v_base..v_base + layer_bytes], &mut value_row)?;
+                        let value = &value_row[kv_head * head_dim..(kv_head + 1) * head_dim];
+                        crate::simd::axpy_f32(target, weight * inverse, value);
+                        Ok(())
+                    },
+                )?;
+            }
+        }
+        out[entry * query..][..query].copy_from_slice(&window);
+    }
+    Ok(())
 }
 
 /// A chunk's worth of attention: one output row per entry, each with its own history length.
@@ -3821,6 +4097,11 @@ fn attend_entries(
         if workers > 1 {
             return attend_rows_shared(q, kv, positions, layer, shape, out, workers);
         }
+    }
+    // Prefill-sparse (DisSparse, arXiv 2611.28522): select the top-`N` rows per entry and attend
+    // over them only. Off by default.
+    if entries > 1 && prefill_sparse_enabled() {
+        return attend_rows_sparse(q, kv, positions, layer, shape, out);
     }
     // Only the entries are split. Splitting a single entry's heads was measured too: at ctx 1024 a
     // decode step went from 45.3 to 48.7 ms, because every worker decodes the same KV rows again and

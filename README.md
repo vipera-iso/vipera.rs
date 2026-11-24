@@ -28,7 +28,7 @@ prefill rows are the 2026-11-23 paired session; the decode rows are the 2026-11-
 | prefill, 512 tokens | 186 tok/s | 204–212 | 0.89–0.90x |
 | prefill, 1024 tokens | 177 tok/s | 196–207 | 0.86–0.89x |
 | prefill, 4096 tokens | 129 tok/s | 159–164 | 0.79–0.80x |
-| decode, shallow | 34.6 tok/s | 33.9–36.7 | 0.94–1.02x |
+| decode, shallow | **34.6 tok/s (33.83 ms, `VIPERA_TILED_A` on)** | 33.9–36.7 | 0.94–1.02x |
 | decode, 4k of history | 24.2 tok/s | 25.3 | 0.96x |
 | decode, 32k of history, window 2048 | 28.0 tok/s (35.8 ms/step) | not measured | — (6.8 tok/s with the full history) |
 | KV held for a windowed 32k run | 61 MB | not measured | — (896 MB with the full history) |
@@ -67,6 +67,12 @@ the activation instead. Both microkernels for the same 16x16 tile were timed aga
 (`repacked_gemm_form_against_the_broadcast_form`): 496-507 GFLOPS broadcast, 366-508 repacked, a
 median of +0.3%, and the one -26% run was a load spike. The older `NO_WEIGHT` probe that suggested
 +29%/+56% was pricing the compiler hoisting the load out of the loop, not the broadcast.
+
+- **The 8x8 decode repack (A1) is done** — `VIPERA_Q4K8` default on: step −34.8%, decode +53%
+  (33.83 → 34.85 ms) — ledger: [`docs/benchmarks.md`](docs/benchmarks.md), Pha 1b.
+- **W1a (the tiled-band activation) is done** — `VIPERA_TILED_A` default off: chunk 8T +2.6%
+  (B7 33.83 → 34.72 ms, machine ±3%; the numerics experiment is ADR-005-pending). W1b (the ik
+  `dpwssd` i32 epilogue, +11..15% chunk per `repack-port-plan.md`) is designed, not yet ported.
 
 What is left of the idea is the **unpack**, which the ledger already priced at 8.8% of the Q4_K phase:
 splitting the nibbles, unpacking twelve header bytes and converting four f16 values per row-block on
@@ -134,6 +140,11 @@ curl -s localhost:8080/v1/chat/completions \
   `vipera generate` prints), and `VIPERA_ACCESS_LOG=0` silences it.
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
   scalar reference.
+- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8` default on — A1): the decode row-kernel path packs
+  8 rows as the ggml `block_q4_Kx8` and dots with `vpdpbusd` — step −34.8%, decode +53%.
+- **W1a tiled-band activation** (`VIPERA_TILED_A`, default off — the numerics experiment is
+  ADR-005-pending): the prefill tiled band reads one scale per 256-value block
+  (`TiledActivation`, `fill_rows_batch`) plus 16 raw-`x` sums per block (the band's min term).
 
 ## How the repo is held to its numbers
 

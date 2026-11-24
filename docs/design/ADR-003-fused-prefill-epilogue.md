@@ -85,6 +85,15 @@ hai arm đều tái lập từng chữ số:
 | ggml bind | 2444 | 2.637364 | 2.639467 | **+0.00210** |
 | ADR-001 mở đầu | 1492 | 3.324126 | 3.324727 | **+0.00060** |
 | ADR-003 mục 2 | 1494 | 3.581916 | 3.582051 | **+0.00014** |
+| ADR-001, 60 dòng đầu (2026-11-23) | 1504 | 3.1906 | 3.1876 | **−0.00300** |
+
+Dòng cuối đo lại ngày 2026-11-23 trên cây `perf/q4k-repack-8x8`, mỗi arm chạy hai lần và **tái lập
+từng chữ số** (off 3.1906 / fused 3.1876, perplexity 24.3027 / 24.2306). Nó lặp lại đúng kết luận của
+bảng: delta từng văn bản nằm ở mức 0.003 nats (±0.1%), đổi dấu tuỳ văn bản, không có xu hướng.
+
+**Bẫy khi chạy A/B:** `tiled_fma_enabled` đọc `var_os(..).is_some()`, nên `VIPERA_Q4K_FMA_EPI=0`
+vẫn **bật** fused. Arm default phải chạy bằng `env -u VIPERA_Q4K_FMA_EPI`, nếu không cả hai arm là
+cùng một cấu hình và phép đo cho ra hai số giống hệt nhau (đã xảy ra trong lần đo đầu của mục này).
 
 Trung bình **−0.000224 nats/token**, tức **−0.007%**; hai văn bản tốt lên, ba xấu đi, và không văn
 bản nào lệch quá 0.003 nats (0.1%). Perplexity đổi 16.888 → 16.834 trên văn bản đầu. Ở độ phân giải
@@ -105,6 +114,28 @@ là tiêu chí trung tính còn đo được trong repo. Test `q4k_tiled_error_a
 Worst case y hệt (cùng một giá trị, đến từ việc lượng tử hoá chứ không từ epilogue), sai số trung
 bình **giảm** — đúng như lý thuyết: một lần làm tròn thay vì hai thì không tệ đi.
 
+### 2.5 Epilogue là đòn bẩy duy nhất còn lại của prefill
+
+Gap prefill một luồng so với llama.cpp (67.0 vs 87.53 tok/s) đã được chia pha (1 thread,
+`VIPERA_PROFILE_STEP=1`, chunk 128 token; `docs/benchmarks.md` 2026-11-23):
+
+| pha | % chunk | GFLOPS |
+|---|---:|---:|
+| q4k | 79% | 202 |
+| q6k | 16% | 179 |
+| attention | 4% | — |
+| cả prefill | 100% | 188 (llama: 229) |
+
+Band tách khỏi engine ở B=128 đạt 218 GFLOPS, nên pha q4k trong engine đã ở 93% kernel của nó —
+phần còn lấy được không nằm ở plumbing. Kernel dot của llama.cpp là AVX2 256-bit (`vpmaddubsw`,
+0 `zmm`) và tốn nhiều lệnh/MAC hơn band của ta, tức không có kernel nào bên đó để port thêm. Cả hai
+engine chạy 4.0 GHz, và gap decode một luồng (1.34x) bằng gap prefill (1.32x), nên nó không đến từ
+cách chia chunk.
+
+Hệ quả cho quyết định ở mục 5: trong 22% epilogue của pha q4k, bản fused lấy lại 8.6% thời gian
+chunk — mức duy nhất vượt ngưỡng 3%. Q6_K cùng bệnh (17.6% kernel) nhưng chỉ là 2.8% chunk, dưới
+ngưỡng; câu 2 ở mục 11 giữ nguyên là câu hỏi về switch, không phải về lợi ích.
+
 ## 3. Cái ADR này KHÔNG nói
 
 - **Không** nói fused cho output tốt hơn. Nó chỉ nói fused không tệ hơn về mặt số học so với row
@@ -114,7 +145,9 @@ bình **giảm** — đúng như lý thuyết: một lần làm tròn thay vì h
   (`SharedTile::fill_entries`), không qua nhánh transpose, nên transpose chỉ có nghĩa nếu port cả
   `fill_entries` — đó là thay đổi riêng, đo riêng.
 - **Không** nói gì về Q6_K tiled (`q6k_matvec_tiled_range`). Nó đối xứng nhưng có epilogue khác và
-  chiếm 18% chunk; đo riêng.
+  chiếm 18% chunk; đo riêng. Đã đo (2026-11-23): epilogue của nó là **17.6%** kernel (`1.176x` khi gấp
+  lại), tức ~3% chunk, và weight unpack chỉ 4.8% (`1.048x`) — nên một switch Q6_K là phần thêm ~1% chunk
+  vào cùng quyết định này, không đáng một thay đổi riêng.
 
 ## 4. Options
 
@@ -199,5 +232,9 @@ row, không đụng `SharedTile`.
 1. `vipera score` đã có; bao nhiêu văn bản và độ dài nào là đủ để tiêu chí 5 có ý nghĩa (một file
    ~1000 token cho ±0.1% NLL, nhưng không thấy được khác biệt hành vi)?
 2. Có nên gộp luôn phần Q6_K nếu nó cho cùng tỉ lệ, để chỉ có một switch cho "epilogue fused"?
+   Trả lời một nửa: tỉ lệ không cùng — 17.6% so với 21-23% của Q4_K, và phần Q6_K là 2.8% chunk
+   (16% chunk × 17.6% kernel, mục 2.5), tức dưới ngưỡng 3%: chỉ đáng làm nếu làm chung một lần với
+   switch của Q4_K, không đáng làm riêng. Còn lại là quyết định: gộp cho gọn switch, hay để nguyên vì
+   lợi ích dưới ngưỡng.
 3. Owner và ngày hết hạn của cam kết "default off" — nếu 6 tháng nữa không ai đo, giữ nguyên hay
    xoá switch để khỏi mang code chết?

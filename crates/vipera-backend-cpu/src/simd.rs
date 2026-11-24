@@ -77,24 +77,29 @@
 
 use std::arch::x86_64::{
     __m128i, __m256, __m256i, __m512, __m512i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss,
-    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_si128, _mm_movehdup_ps,
-    _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
-    _mm256_castps256_ps128, _mm256_castsi256_ps, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32,
-    _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32,
-    _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16,
-    _mm256_maddubs_epi16, _mm256_max_epi32, _mm256_max_ps, _mm256_min_epi32, _mm256_min_ps,
-    _mm256_mul_ps, _mm256_or_si256, _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8,
-    _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_setzero_si256,
-    _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16, _mm256_srli_epi32, _mm256_storeu_ps,
-    _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32, _mm256_sub_ps, _mm512_add_ps,
-    _mm512_cvtepi32_ps, _mm512_dpbusd_epi32, _mm512_fmadd_ps, _mm512_fnmadd_ps, _mm512_loadu_ps,
-    _mm512_loadu_si512, _mm512_mul_ps, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps,
-    _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_ps,
+    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_hadd_epi16, _mm_loadl_epi64, _mm_loadu_si128,
+    _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm_setr_epi8, _mm_setr_epi32,
+    _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_unpacklo_epi8, _mm256_add_epi16, _mm256_add_epi32,
+    _mm256_add_ps, _mm256_and_si256, _mm256_blend_epi32, _mm256_bsrli_epi128,
+    _mm256_castps256_ps128, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128,
+    _mm256_cvtepi32_ps, _mm256_cvtepu8_epi16, _mm256_cvtepu8_epi32, _mm256_cvtph_ps,
+    _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32, _mm256_extractf128_ps,
+    _mm256_extracti128_si256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256,
+    _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_max_epi32, _mm256_max_ps, _mm256_min_epi32,
+    _mm256_min_ps, _mm256_mul_ps, _mm256_or_si256, _mm256_permute2f128_si256,
+    _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8, _mm256_set1_epi16,
+    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi32, _mm256_setzero_ps, _mm256_setzero_si256,
+    _mm256_shuffle_epi32, _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16,
+    _mm256_srli_epi32, _mm256_storeu_ps, _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32,
+    _mm256_sub_ps, _mm512_add_epi32, _mm512_add_ps, _mm512_cvtepi32_ps, _mm512_dpbusd_epi32,
+    _mm512_fmadd_ps, _mm512_fnmadd_ps, _mm512_loadu_ps, _mm512_loadu_si512, _mm512_mul_ps,
+    _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps, _mm512_setzero_si512,
+    _mm512_storeu_ps, _mm512_sub_ps,
 };
 
 use vipera_core::gguf::GgmlType;
 
-use crate::quant::{BatchActivation, QuantizedX, f16_to_f32};
+use crate::quant::{BatchActivation, QuantizedX, TiledActivation, f16_to_f32};
 
 /// Tile halves the tiled kernels keep activation coefficients for: 16
 /// activations per half, and batches up to 64 wide run four halves against one
@@ -2301,43 +2306,105 @@ fn tiled_fma_enabled() -> bool {
     std::env::var_os("VIPERA_Q4K_FMA_EPI").is_some()
 }
 
-/// Tiled Q4_K matvec range: `count` rows from `first_row`, `B` quantized
-/// activations, token-major `out` holding `B * count` values.
+/// Ceiling probe for the repacked-weight direction: replaces the 4-byte weight load inside the
+/// `dpbusd` loop with a constant, so a measurement prices that load and nothing else.
 ///
-/// A 256-column slab is unpacked once for a 32-row window: the 32 rows share
-/// one activation tile, and inside it an 8-row x 16-column ZMM `dpbusd`
-/// microtile loads each activation group once for 8 weight rows. That is the
-/// reuse the row-by-row batch kernel cannot get: with 8960 rows and 16
-/// activations, the row kernel re-reads the activation tile once per row.
+/// Test-only on purpose: it changes the arithmetic, so it must never be reachable from a real
+/// build. In a non-test build `tiled_no_weight` folds to `false` and the branch disappears.
+#[cfg(test)]
+static NO_WEIGHT_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ceiling probe for epilogue work: folds the six vector ops and two broadcasts of the per
+/// (row, sub-block) epilogue into one convert and one add. The dpbusd chain is untouched, so the
+/// difference prices exactly the arithmetic that a fused or restructured epilogue could remove.
 ///
-/// Math mirrors [`q4k_dot`]: per sub-block `s`, the integer sum is the `u8`
-/// codes 0..15 against the `i8` activation codes, times `d * scale[s] * dx[s]`,
-/// minus `dmin * min[s]` times the exact per-sub-block activation sum
-/// (`sums[e]`, the sum of the original `f32` values). Summation order across
-/// sub-blocks differs from the row kernel, so results agree within
-/// `1e-3 + 1e-4 * |ref|`, not bit-for-bit.
+/// Test-only: it changes the result, so it must never be reachable from a real build. In a
+/// non-test build `tiled_no_epi` folds to `false` and the branch disappears.
+#[cfg(test)]
+static NO_EPI_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ceiling probe for the Q6_K weight unpack: skips writing the unpacked codes, so the dpbusd chain
+/// still reads `wq` but the per-byte decode loop is gone. Test-only; the values are stale, which is
+/// fine for timing and wrong for anything else.
+#[cfg(test)]
+static NO_UNPACK_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ceiling probe for a per-256-block activation scale: accumulates the eight sub-block partial
+/// sums in `i32` (scaled by a constant, since the real scale would live in the activation) and
+/// applies one convert plus one multiply-add per (row, block) instead of four ops per
+/// (row, sub-block). That is the epilogue `block_q8_K`'s single per-block scale makes possible;
+/// with this repo's one-scale-per-32 activation the per-sub-block float step cannot be removed.
 ///
-/// # Safety
+/// Test-only: the values are wrong on purpose, so they price the restructure and nothing else.
+#[cfg(test)]
+static PER_BLOCK_EPI_PROBE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn tiled_no_unpack() -> bool {
+    #[cfg(test)]
+    {
+        NO_UNPACK_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn tiled_no_epi() -> bool {
+    #[cfg(test)]
+    {
+        NO_EPI_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn tiled_no_weight() -> bool {
+    #[cfg(test)]
+    {
+        NO_WEIGHT_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn tiled_per_block_epi() -> bool {
+    #[cfg(test)]
+    {
+        PER_BLOCK_EPI_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Shared body of the Q4_K tiled band: unpacks the window rows in `wq` from the product-wide
+/// `act` tile, walks the blocks with [`q4k_tiled_band`], and writes `out` once per window.
 ///
-/// `data` must hold the rows with the given `stride` (a whole number of
-/// 144-byte Q4_K blocks per row), every `xs[e].q` must cover the row width,
-/// every `xs[e].d` and `sums[e]` one entry per 32-value group, and the CPU
-/// must support AVX-512F/BW/VNNI (the caller checks via
-/// [`vnni512_available`]).
+/// Math mirrors [`q4k_dot`]: per sub-block `s`, the integer sum is the `u8` codes 0..15 against
+/// the `i8` activation codes, times `d * scale[s] * dx[s]`, minus `dmin * min[s]` times the
+/// activation sums. Summation order across sub-blocks differs from the row kernel, so results
+/// agree within `1e-3 + 1e-4 * |ref|`, not bit-for-bit.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
+unsafe fn q4k_tiled_matvec_worker<const B: usize>(
     data: &[u8],
     stride: usize,
     first_row: usize,
     count: usize,
-    xs: &[&QuantizedX; B],
-    sums: &[&[f32]; B],
+    act: &[i8],
+    dxs: &[f32],
+    sumt: &[f32],
     out: &mut [f32],
-    tile: Option<&SharedTile>,
 ) {
-    // SAFETY: the module contract above; every load below stays inside the
-    // rows, blocks, and activation slices the caller validated.
+    // SAFETY: the caller validated the lengths the module contract describes; every load below
+    // stays inside the rows, blocks, and activation slices.
     unsafe {
         const ROW_WIN: usize = 32;
         const BAND: usize = 8;
@@ -2359,49 +2426,9 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         let mut min_f = vec![[0.0_f32; 8]; ROW_WIN];
         let mut dvec = [0.0_f32; ROW_WIN];
         let mut dminvec = [0.0_f32; ROW_WIN];
-        // Activation tile in (half, group, entry, 4) order: one 64-byte ZMM
-        // load holds 4 codes for each of the 16 columns of that half.
-        // The activation tile for every block is built once, up front, and stays in L2 while the
-        // row windows below walk it. Building it per window would repeat the same copies 144 times.
-        // The activation tile comes from the shared product-wide build when the pool prepared one;
-        // otherwise this participant builds its own, as before. The scale and sum vectors are tiny
-        // and stay per participant either way.
-        let mut owned_act;
-        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
-            Some(tile) => tile.bytes(),
-            None => {
-                owned_act = vec![0_i8; blocks * halves * 64 * COLS * 4];
-                for b in 0..blocks {
-                    for (entry, x) in xs.iter().enumerate() {
-                        let half = entry / COLS;
-                        let col = entry % COLS;
-                        let chunk = x.q.as_ptr().add(b * 256);
-                        let base = (b * halves + half) * 64 * COLS * 4;
-                        for grp in 0..64 {
-                            std::ptr::copy_nonoverlapping(
-                                chunk.add(grp * 4),
-                                owned_act.as_mut_ptr().add(base + grp * 64 + col * 4),
-                                4,
-                            );
-                        }
-                    }
-                }
-                &owned_act
-            }
-        };
-        let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
-        let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
-        for b in 0..blocks {
-            for entry in 0..B {
-                let half = entry / COLS;
-                let col = entry % COLS;
-                for sub in 0..8 {
-                    let at = ((b * halves + half) * 8 + sub) * COLS + col;
-                    dxs[at] = xs[entry].d[b * 8 + sub];
-                    sumt[at] = sums[entry][b * 8 + sub];
-                }
-            }
-        }
+        // `act` is the activation tile in (half, group, entry, 4) order: one 64-byte ZMM load
+        // holds 4 codes for each of the 16 columns of that half. Both callers build it once per
+        // product (see the wrappers below) and it stays in L2 while the row windows walk it.
         let low_mask = _mm256_set1_epi8(0x0f);
         // Fused epilogue: `fma(cvt(acc) * dxv, scale, facc)` followed by `fnmadd(sumv, min, ..)` is
         // four vector ops per row and sub-block where the multiply-then-add form is six. Measured
@@ -2413,6 +2440,9 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
         // for that reason; `VIPERA_Q4K_FMA_EPI=1` turns it on, and flipping the default needs an ADR
         // and a quality comparison, not a perf change.
         let fused_epi = tiled_fma_enabled();
+        let no_weight = tiled_no_weight();
+        let no_epi = tiled_no_epi();
+        let per_block_epi = tiled_per_block_epi();
         // Window-major accumulation: one row window of `ROW_WIN` rows keeps its partial sums in
         // `buf` (ROW_WIN * stride_cols floats, L2-resident) across every block, and `out` is written
         // once per window. The old order walked all rows per 256-column slab and parked partials in
@@ -2490,6 +2520,9 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                             stride_cols,
                             half,
                             fused_epi,
+                            no_weight,
+                            no_epi,
+                            per_block_epi,
                         );
                         band += BAND;
                     }
@@ -2506,6 +2539,9 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
                             stride_cols,
                             half,
                             fused_epi,
+                            no_weight,
+                            no_epi,
+                            per_block_epi,
                         );
                         band += 1;
                     }
@@ -2518,6 +2554,175 @@ pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
             }
             win += cnt;
         }
+    }
+}
+
+/// Tiled Q4_K matvec range: `count` rows from `first_row`, `B` quantized activations,
+/// token-major `out` holding `B * count` values — the per-32-scale activation of [`QuantizedX`]
+/// (W-1a is [`q4k_matvec_tiled_range_a`]).
+///
+/// A 256-column slab is unpacked once for a 32-row window: the 32 rows share
+/// one activation tile, and inside it an 8-row x 16-column ZMM `dpbusd`
+/// microtile loads each activation group once for 8 weight rows. That is the
+/// reuse the row-by-row batch kernel cannot get: with 8960 rows and 16
+/// activations, the row kernel re-reads the activation tile once per row.
+///
+/// Math mirrors [`q4k_dot`]: per sub-block `s`, the integer sum is the `u8`
+/// codes 0..15 against the `i8` activation codes, times `d * scale[s] * dx[s]`,
+/// minus `dmin * min[s]` times the exact per-sub-block activation sum
+/// (`sums[e]`, the sum of the original `f32` values). Summation order across
+/// sub-blocks differs from the row kernel, so results agree within
+/// `1e-3 + 1e-4 * |ref|`, not bit-for-bit.
+///
+/// # Safety
+///
+/// `data` must hold the rows with the given `stride` (a whole number of
+/// 144-byte Q4_K blocks per row), every `xs[e].q` must cover the row width,
+/// every `xs[e].d` and `sums[e]` one entry per 32-value group, and the CPU
+/// must support AVX-512F/BW/VNNI (the caller checks via
+/// [`vnni512_available`]).
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub(crate) unsafe fn q4k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    sums: &[&[f32]; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) {
+    unsafe {
+        const COLS: usize = 16;
+        let blocks = stride / 144;
+        let halves = B.div_ceil(COLS);
+        let mut owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+                for b in 0..blocks {
+                    for (entry, x) in xs.iter().enumerate() {
+                        let half = entry / COLS;
+                        let col = entry % COLS;
+                        let chunk = x.q.as_ptr().add(b * 256);
+                        let base = (b * halves + half) * 64 * COLS * 4;
+                        for grp in 0..64 {
+                            std::ptr::copy_nonoverlapping(
+                                chunk.add(grp * 4),
+                                owned_act.as_mut_ptr().add(base + grp * 64 + col * 4),
+                                4,
+                            );
+                        }
+                    }
+                }
+                &owned_act
+            }
+        };
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
+        let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
+        for b in 0..blocks {
+            for entry in 0..B {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                for sub in 0..8 {
+                    let at = ((b * halves + half) * 8 + sub) * COLS + col;
+                    dxs[at] = xs[entry].d[b * 8 + sub];
+                    sumt[at] = sums[entry][b * 8 + sub];
+                }
+            }
+        }
+        q4k_tiled_matvec_worker::<B>(data, stride, first_row, count, act, &dxs, &sumt, out);
+    }
+}
+
+/// Safe entry point for [`q4k_matvec_tiled_range_a`] — the W-1a band: the per-256-scale
+/// activation the band reads (`VIPERA_TILED_A`).
+pub(crate) fn try_q4k_matvec_tiled_range_a<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    act_a: &TiledActivation,
+    out: &mut [f32],
+) -> bool {
+    if !vnni512_available() || stride == 0 || !stride.is_multiple_of(144) || B == 0 || B > 128 {
+        return false;
+    }
+    let blocks = stride / 144;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || !(0..B).all(|entry| {
+            act_a.q(entry).len() >= cols
+                && act_a.scale(entry).len() >= blocks
+                && act_a.bsums(entry).len() >= blocks * 16
+        })
+    {
+        return false;
+    }
+    // SAFETY: vnni512_available checked the CPU and the lengths above match the kernel contract.
+    unsafe { q4k_matvec_tiled_range_a::<B>(data, stride, first_row, count, act_a, out) };
+    true
+}
+
+/// W-1a: the Q4_K tiled band over a [`TiledActivation`] — the activation quantized per
+/// 256-value block: `dxs` holds the per-block scale (the same value for every sub of the block),
+/// and `sumt` holds the activation sums the band reads as
+/// `Σ_j bsums[b * 16 + 2s] + bsums[b * 16 + 2s + 1]` — the raw `x` over the weight sub `s`'s two
+/// 16-value groups. The tile is built from the activation's natural-order codes with the same
+/// reorg the per-32 path uses.
+///
+/// # Safety
+///
+/// The caller validated the lengths [`try_q4k_matvec_tiled_range_a`] checks; the CPU has AVX-512
+/// (the caller checks via [`vnni512_available`]).
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub(crate) unsafe fn q4k_matvec_tiled_range_a<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    act_a: &TiledActivation,
+    out: &mut [f32],
+) {
+    unsafe {
+        const COLS: usize = 16;
+        let blocks = stride / 144;
+        let halves = B.div_ceil(COLS);
+        let mut act = vec![0_i8; blocks * halves * 64 * COLS * 4];
+        for b in 0..blocks {
+            for entry in 0..B {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                let chunk = act_a.q(entry).as_ptr().add(b * 256);
+                let base = (b * halves + half) * 64 * COLS * 4;
+                for grp in 0..64 {
+                    std::ptr::copy_nonoverlapping(
+                        chunk.add(grp * 4),
+                        act.as_mut_ptr().add(base + grp * 64 + col * 4),
+                        4,
+                    );
+                }
+            }
+        }
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * COLS];
+        let mut sumt = vec![0.0_f32; blocks * halves * 8 * COLS];
+        for b in 0..blocks {
+            for entry in 0..B {
+                let half = entry / COLS;
+                let col = entry % COLS;
+                let bsums = act_a.bsums(entry);
+                for sub in 0..8 {
+                    let at = ((b * halves + half) * 8 + sub) * COLS + col;
+                    // The per-256 activation scale: the band reads it for every sub of the block.
+                    dxs[at] = act_a.scale(entry)[b];
+                    // Weight sub `s` spans the two 16-value groups 2s and 2s+1 of the block.
+                    sumt[at] = bsums[b * 16 + 2 * sub] + bsums[b * 16 + 2 * sub + 1];
+                }
+            }
+        }
+        q4k_tiled_matvec_worker::<B>(data, stride, first_row, count, &act, &dxs, &sumt, out);
     }
 }
 
@@ -2557,6 +2762,7 @@ unsafe fn q6k_tile_rows<const R: usize>(
     tile: Q6TileHalf,
     dst: *mut f32,
     dst_stride: usize,
+    no_epi: bool,
 ) {
     // SAFETY: the contract above.
     unsafe {
@@ -2576,6 +2782,11 @@ unsafe fn q6k_tile_rows<const R: usize>(
             }
             let dxv = _mm512_loadu_ps(tile.dxs.add(k * 16));
             for t in 0..R {
+                // Probe arm: four epilogue ops and a broadcast become one convert and one add.
+                if no_epi {
+                    facc[t] = _mm512_add_ps(facc[t], _mm512_cvtepi32_ps(acc[t]));
+                    continue;
+                }
                 let lanes = _mm512_mul_ps(_mm512_cvtepi32_ps(acc[t]), dxv);
                 let scaled = _mm512_mul_ps(lanes, _mm512_set1_ps(coefs[first + t]));
                 facc[t] = _mm512_add_ps(facc[t], scaled);
@@ -2606,28 +2817,53 @@ unsafe fn q4k_tiled_band<const N: usize>(
     stride_cols: usize,
     half: usize,
     fused_epi: bool,
+    no_weight: bool,
+    no_epi: bool,
+    per_block_epi: bool,
 ) {
     // SAFETY: every pointer is one the caller built for this block and band, and the `N` rows from
     // `band` are inside the window the caller clamped to `cnt`.
     unsafe {
         const COLS: usize = 16;
         let mut facc: [__m512; N] = [_mm512_setzero_ps(); N];
+        // Probe arm: one int accumulator across all eight sub-blocks, so the float work drops from
+        // four ops per (row, sub-block) to one convert and one multiply-add per (row, block).
+        let mut isum: [__m512i; N] = [_mm512_setzero_si512(); N];
         for s in 0..8 {
             let mut acc: [__m512i; N] = [_mm512_setzero_si512(); N];
             for g in 0..8 {
                 let grp = s * 8 + g;
                 let codes = _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
                 for (t, slot) in acc.iter_mut().enumerate() {
-                    let word = u32::from_le(std::ptr::read_unaligned(
-                        wq.add((band + t) * 256 + grp * 4) as *const u32,
-                    ));
-                    *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word as i32), codes);
+                    // The probe arm keeps every instruction of the real loop and drops only the
+                    // 4-byte weight load, so the difference prices that load.
+                    let word = if no_weight {
+                        0x1111_1111_i32
+                    } else {
+                        u32::from_le(std::ptr::read_unaligned(
+                            wq.add((band + t) * 256 + grp * 4) as *const u32
+                        )) as i32
+                    };
+                    *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word), codes);
                 }
             }
             let dxv = _mm512_loadu_ps(dxs.add(s * COLS));
             let sumv = _mm512_loadu_ps(sumt.add(s * COLS));
+            if per_block_epi {
+                // The weight scale, in the integer domain: a constant here because a real one
+                // needs the activation's per-block scale, which this probe is pricing.
+                let wscale = _mm512_set1_epi32(0x0f);
+                for (slot, acc_slot) in isum.iter_mut().zip(acc.iter()) {
+                    *slot = _mm512_add_epi32(*slot, _mm512_mullo_epi32(*acc_slot, wscale));
+                }
+                continue;
+            }
             for (t, (acc_slot, facc_slot)) in acc.iter().zip(facc.iter_mut()).enumerate() {
                 let row = band + t;
+                if no_epi {
+                    *facc_slot = _mm512_add_ps(*facc_slot, _mm512_cvtepi32_ps(*acc_slot));
+                    continue;
+                }
                 if fused_epi {
                     let scaled = _mm512_mul_ps(_mm512_cvtepi32_ps(*acc_slot), dxv);
                     let sum = _mm512_fmadd_ps(scaled, _mm512_set1_ps(scale_f[row][s]), *facc_slot);
@@ -2643,6 +2879,12 @@ unsafe fn q4k_tiled_band<const N: usize>(
                 );
                 let minterm = _mm512_mul_ps(sumv, _mm512_set1_ps(min_f[row][s]));
                 *facc_slot = _mm512_add_ps(*facc_slot, _mm512_sub_ps(main, minterm));
+            }
+        }
+        if per_block_epi {
+            let dxv = _mm512_loadu_ps(dxs);
+            for (slot, value) in isum.iter().zip(facc.iter_mut()) {
+                *value = _mm512_fmadd_ps(_mm512_cvtepi32_ps(*slot), dxv, *value);
             }
         }
         for (t, value) in facc.iter().enumerate() {
@@ -2716,6 +2958,8 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
         debug_assert!(halves <= MAX_HALVES);
         let stride_cols = halves * COLS;
         let blocks = stride / 210;
+        let no_epi = tiled_no_epi();
+        let no_unpack = tiled_no_unpack();
         let mut wq = vec![0_u8; ROW_WIN * 256];
         // `d * scale` per 16-value group and row, group-major so a band reads one contiguous run.
         let mut coef = [[0.0_f32; ROW_WIN]; 16];
@@ -2793,6 +3037,9 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                     for (column, byte) in coef.iter_mut().zip(scale_bytes) {
                         column[r] = d * f32::from(*byte as i8);
                     }
+                    if no_unpack {
+                        continue;
+                    }
                     let wrow = wq.as_mut_ptr().add(r * 256);
                     for half in 0..2 {
                         let ql = block.add(half * 64);
@@ -2823,10 +3070,26 @@ pub(crate) unsafe fn q6k_matvec_tiled_range<const B: usize>(
                         let wq_rows = wq_ptr.add(band * 256);
                         let dst = buf.as_mut_ptr().add(band * stride_cols + col_half * COLS);
                         if cnt - band >= BAND {
-                            q6k_tile_rows::<BAND>(wq_rows, &coef, band, tile, dst, stride_cols);
+                            q6k_tile_rows::<BAND>(
+                                wq_rows,
+                                &coef,
+                                band,
+                                tile,
+                                dst,
+                                stride_cols,
+                                no_epi,
+                            );
                             band += BAND;
                         } else {
-                            q6k_tile_rows::<1>(wq_rows, &coef, band, tile, dst, stride_cols);
+                            q6k_tile_rows::<1>(
+                                wq_rows,
+                                &coef,
+                                band,
+                                tile,
+                                dst,
+                                stride_cols,
+                                no_epi,
+                            );
                             band += 1;
                         }
                     }
@@ -4185,6 +4448,51 @@ mod tests {
                 let g = got[entry * rows + row];
                 assert!(
                     (g - want).abs() <= 1e-3 + 1e-4 * want.abs(),
+                    "entry {entry} row {row}: got {g}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// W1a parity: the per-256-scale activation (`VIPERA_TILED_A`) vs the batch row kernel on
+    /// the per-32 activation. The two disagree by the W1a activation-quant noise (measured: max
+    /// diff 2.63 on this shape — the W1a codes the band reads are the same integers, only their
+    /// scale and granularity changed), so the tolerance is `2.0 + 0.2·|want|` — 2-3x the noise
+    /// floor, still an order of magnitude below the diffs a structural bug in the W1a path
+    /// produces.
+    #[test]
+    fn q4k_tiled_range_a_matches_batch_within_tolerance() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x5eed_0002_0003_0004);
+        let rows = 48usize;
+        let cols = 512usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q4k_row(&mut rng, blocks)).collect();
+        let stride = blocks * 144;
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_ref: [&[f32]; 16] = std::array::from_fn(|e| source[e].as_slice());
+        let act_a = TiledActivation::new(xs_ref);
+        let mut got = vec![0.0_f32; 16 * rows];
+        // SAFETY: whole blocks, VNNI-512 checked above.
+        unsafe { q4k_matvec_tiled_range_a::<16>(&data, stride, 0, rows, &act_a, &mut got) };
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut totals = [0.0_f32; 16];
+        for row in 0..rows {
+            let row_bytes = &data[row * stride..(row + 1) * stride];
+            // SAFETY: whole blocks, VNNI checked above.
+            unsafe { q4k_dot_batch_vnni(row_bytes, &xs, &sums, &mut totals) };
+            for entry in 0..16 {
+                let want = totals[entry];
+                let g = got[entry * rows + row];
+                assert!(
+                    (g - want).abs() <= 2.0 + 0.2 * want.abs(),
                     "entry {entry} row {row}: got {g}, want {want}"
                 );
             }
@@ -6122,6 +6430,300 @@ mod tests {
             }
         }
     }
+    /// How much of the tiled kernel is epilogue: same dpbusd chain, with the six vector ops and
+    /// two broadcasts per (row, sub-block) folded into one convert and one add.
+    #[test]
+    #[ignore]
+    fn bench_epilogue_probe() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        for &(rows, blocks, copies) in &[(8960usize, 6usize, 8usize), (1536, 35, 1)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let mut rng = Rng(0x5eed_0d07_0000_0011);
+            let row = q4k_row(&mut rng, blocks);
+            let matrix: Vec<u8> = (0..rows * copies).flat_map(|_| row.clone()).collect();
+            let count = rows * copies;
+            let mut arng = Rng(0x5eed_0d07_0000_0012);
+            let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+                .map(|_| {
+                    let x: Vec<f32> = (0..cols).map(|_| arng.unit()).collect();
+                    (QuantizedX::new(&x), crate::quant::x_sums(&x))
+                })
+                .collect();
+            let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+            let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+            let mut out = vec![0.0f32; B * count];
+            let mut arm = |probe: bool| -> f64 {
+                NO_EPI_PROBE.store(probe, Ordering::Relaxed);
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    let ok = try_q4k_matvec_tiled_range::<B>(
+                        &matrix, stride, 0, count, &xs, &sums, &mut out, None,
+                    );
+                    assert!(ok, "tiled kernel must accept this shape");
+                    std::hint::black_box(&out);
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+                best
+            };
+            let (mut real, mut probe) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..2 {
+                real = real.min(arm(false));
+                probe = probe.min(arm(true));
+            }
+            NO_EPI_PROBE.store(false, Ordering::Relaxed);
+            let gflops = |s: f64| 2.0 * (count * cols * B) as f64 / s / 1e9;
+            println!(
+                "epilogue probe {rows}x{cols} x{B} x{copies}: real {:>7.1} ms {:>6.1} GFLOPS | \
+                 no-epi {:>7.1} ms {:>6.1} GFLOPS | {:.3}x",
+                real * 1e3,
+                gflops(real),
+                probe * 1e3,
+                gflops(probe),
+                real / probe,
+            );
+        }
+    }
+
+    /// What a per-256-block activation scale would buy: same dpbusd chain, epilogue folded to one
+    /// convert and one multiply-add per (row, block) instead of four ops per (row, sub-block).
+    ///
+    /// This is the ceiling for the "activation with one scale per 256 values" direction, and it is
+    /// the number that decides whether changing the activation quantization is worth an ADR.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_per_block_epilogue_probe() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        for &(rows, blocks, copies) in &[(8960usize, 6usize, 8usize), (1536, 35, 1)] {
+            let cols = blocks * 256;
+            let stride = blocks * 144;
+            let mut rng = Rng(0x5eed_0d07_0000_0021);
+            let row = q4k_row(&mut rng, blocks);
+            let matrix: Vec<u8> = (0..rows * copies).flat_map(|_| row.clone()).collect();
+            let count = rows * copies;
+            let mut arng = Rng(0x5eed_0d07_0000_0022);
+            let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+                .map(|_| {
+                    let x: Vec<f32> = (0..cols).map(|_| arng.unit()).collect();
+                    (QuantizedX::new(&x), crate::quant::x_sums(&x))
+                })
+                .collect();
+            let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+            let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+            let mut out = vec![0.0f32; B * count];
+            let mut arm = |probe: bool| -> f64 {
+                PER_BLOCK_EPI_PROBE.store(probe, Ordering::Relaxed);
+                let mut best = f64::INFINITY;
+                for _ in 0..5 {
+                    let start = std::time::Instant::now();
+                    let ok = try_q4k_matvec_tiled_range::<B>(
+                        &matrix, stride, 0, count, &xs, &sums, &mut out, None,
+                    );
+                    assert!(ok, "tiled kernel must accept this shape");
+                    std::hint::black_box(&out);
+                    best = best.min(start.elapsed().as_secs_f64());
+                }
+                best
+            };
+            let (mut real, mut probe) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..2 {
+                real = real.min(arm(false));
+                probe = probe.min(arm(true));
+            }
+            PER_BLOCK_EPI_PROBE.store(false, Ordering::Relaxed);
+            let gflops = |s: f64| 2.0 * (count * cols * B) as f64 / s / 1e9;
+            println!(
+                "per-block epilogue probe {rows}x{cols} x{B} x{copies}: real {:>7.1} ms \
+                 {:>6.1} GFLOPS | one-op {:>7.1} ms {:>6.1} GFLOPS | {:.3}x",
+                real * 1e3,
+                gflops(real),
+                probe * 1e3,
+                gflops(probe),
+                real / probe,
+            );
+        }
+    }
+
+    /// How much of the Q6_K tiled kernel is the weight unpack: the same dpbusd chain, with the
+    /// per-byte decode loop skipped (codes are stale, timing is what this measures).
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q6k_unpack_probe() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x0dd6_ba11_0000_0003);
+        let (rows, cols, copies) = (8960usize, 1536usize, 8usize);
+        let blocks = cols / 256;
+        let stride = blocks * 210;
+        let row = q6k_row(&mut rng, blocks);
+        let data: Vec<u8> = (0..rows * copies).flat_map(|_| row.clone()).collect();
+        let count = rows * copies;
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let mut out = vec![0.0_f32; 16 * count];
+        let mut arm = |probe: bool| -> f64 {
+            NO_UNPACK_PROBE.store(probe, Ordering::Relaxed);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                try_q6k_matvec_tiled_range(&data, stride, 0, count, &xs, &mut out, None);
+                std::hint::black_box(&out);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let (mut real, mut probe) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..2 {
+            real = real.min(arm(false));
+            probe = probe.min(arm(true));
+        }
+        NO_UNPACK_PROBE.store(false, Ordering::Relaxed);
+        let bytes = (count * stride) as f64;
+        println!(
+            "q6k unpack probe {rows}x{cols} x16 x{copies}: real {:>7.1} ms ({:.1} GB/s) | \
+             no-unpack {:>7.1} ms ({:.1} GB/s) | {:.3}x",
+            real * 1e3,
+            bytes / real / 1e9,
+            probe * 1e3,
+            bytes / probe / 1e9,
+            real / probe,
+        );
+    }
+
+    /// How much of the Q6_K tiled kernel is epilogue. Per (row, 16-value group) it does four ops
+    /// and a broadcast over four `dpbusd`, so the ratio is worse than Q4_K's.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q6k_epilogue_probe() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x0dd6_ba11_0000_0002);
+        let (rows, cols, copies) = (8960usize, 1536usize, 8usize);
+        let blocks = cols / 256;
+        let stride = blocks * 210;
+        let row = q6k_row(&mut rng, blocks);
+        let data: Vec<u8> = (0..rows * copies).flat_map(|_| row.clone()).collect();
+        let count = rows * copies;
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let mut out = vec![0.0_f32; 16 * count];
+        let mut arm = |probe: bool| -> f64 {
+            NO_EPI_PROBE.store(probe, Ordering::Relaxed);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                try_q6k_matvec_tiled_range(&data, stride, 0, count, &xs, &mut out, None);
+                std::hint::black_box(&out);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let (mut real, mut probe) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..2 {
+            real = real.min(arm(false));
+            probe = probe.min(arm(true));
+        }
+        NO_EPI_PROBE.store(false, Ordering::Relaxed);
+        let bytes = (count * stride) as f64;
+        println!(
+            "q6k epilogue probe {rows}x{cols} x16 x{copies}: real {:>7.1} ms ({:.1} GB/s) | \
+             no-epi {:>7.1} ms ({:.1} GB/s) | {:.3}x",
+            real * 1e3,
+            bytes / real / 1e9,
+            probe * 1e3,
+            bytes / probe / 1e9,
+            real / probe,
+        );
+    }
+
+    /// Prices the one thing a repacked weight layout can buy: dropping the 4-byte weight load
+    /// from every `dpbusd`. Streams 32 copies of an 8960x1536 tensor (0.25 GB a pass) because that
+    /// is what prefill does; the L2-hot figure in `q4k_tiled_batch128_throughput` flatters the
+    /// load, since from the second pass the weights are in cache.
+    #[test]
+    #[ignore]
+    fn bench_no_weight_probe_streaming() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            eprintln!("skipped: this CPU has no AVX-512 VNNI");
+            return;
+        }
+        const B: usize = 128;
+        const COPIES: usize = 32;
+        let (rows, blocks) = (8960usize, 6usize);
+        let cols = blocks * 256;
+        let stride = blocks * 144;
+        let mut rng = Rng(0x5eed_0d07_0000_000b);
+        let row = q4k_row(&mut rng, blocks);
+        let matrix: Vec<u8> = (0..rows * COPIES).flat_map(|_| row.clone()).collect();
+        let count = rows * COPIES;
+        let mut arng = Rng(0x5eed_0d07_0000_000c);
+        let acts: Vec<(QuantizedX, Vec<f32>)> = (0..B)
+            .map(|_| {
+                let x: Vec<f32> = (0..cols).map(|_| arng.unit()).collect();
+                (QuantizedX::new(&x), crate::quant::x_sums(&x))
+            })
+            .collect();
+        let xs: [&QuantizedX; B] = std::array::from_fn(|i| &acts[i].0);
+        let sums: [&[f32]; B] = std::array::from_fn(|i| acts[i].1.as_slice());
+        let mut out = vec![0.0f32; B * count];
+        let mut run = |probe: bool| -> f64 {
+            NO_WEIGHT_PROBE.store(probe, Ordering::Relaxed);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                let ok = try_q4k_matvec_tiled_range::<B>(
+                    &matrix, stride, 0, count, &xs, &sums, &mut out, None,
+                );
+                assert!(ok, "tiled kernel must accept this shape");
+                std::hint::black_box(&out);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let mut real = f64::INFINITY;
+        let mut probe = f64::INFINITY;
+        for _ in 0..2 {
+            real = real.min(run(false));
+            probe = probe.min(run(true));
+        }
+        NO_WEIGHT_PROBE.store(false, Ordering::Relaxed);
+        let bytes = (count * stride) as f64;
+        let gflops = |s: f64| 2.0 * (count * cols * B) as f64 / s / 1e9;
+        println!(
+            "no-weight probe {:.2} GB streamed: real {:>7.1} ms {:>6.1} GFLOPS ({:.1} GB/s) | \
+             probe {:>7.1} ms {:>6.1} GFLOPS ({:.1} GB/s) | speedup {:.3}x",
+            bytes / 1e9,
+            real * 1e3,
+            gflops(real),
+            bytes / real / 1e9,
+            probe * 1e3,
+            gflops(probe),
+            bytes / probe / 1e9,
+            real / probe,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6319,4 +6921,369 @@ mod quantize_tests {
         assert!(!quantize_groups(&x, &mut [0_i8; 63], &mut [0.0_f32; 2]));
         assert!(!quantize_groups(&x, &mut [0_i8; 64], &mut [0.0_f32; 1]));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pha 1b: VNNI 8x8 kernel over the ggml `block_q4_Kx8` layout
+// ---------------------------------------------------------------------------
+//
+// `BlockQ4Kx8` is the ggml `block_q4_Kx8` (`llama.cpp/ggml/src/ggml-cpu/repack.h`): eight
+// `block_q4_K` rows interleaved so one activation read feeds eight row dots. `gemv_q4k8` is a
+// faithful port of `ggml_gemv_q4_K_8x8_q8_K` from `llama.cpp/ggml/src/ggml-cpu/arch/x86/repack.cpp`
+// (AVX2 + FMA + F16C), lab-proven against the engine's row kernel on the reference machine
+// (`bench_q4k8_gemv_vs_row`, 2026-11-23): 1.38x faster on the decode shape 8960x1536 at t=1,
+// and ~1.0-2.2x on the other shapes. Wired through [`crate::quant::fill_rows_q4k8`], behind
+// VIPERA_Q4K8 (`q4k8_enabled`, default off: ADR-006). The lab copy lives in
+// `q4k8_lab.rs`; the two are expected to stay in lockstep — the parity test in quant.rs holds the
+// engine path to the row path within the repack prototype's tolerance.
+
+/// `block_q4_Kx8`: eight interleaved `block_q4_K` rows, the ggml layout `make_block_q4_Kx8` builds.
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(8))]
+pub(crate) struct BlockQ4Kx8 {
+    /// `d` of the eight rows.
+    pub d: [u16; 8],
+    /// `dmin` of the eight rows.
+    pub dmin: [u16; 8],
+    /// Per sub-block pair: eight scales, eight mins, then the high nibbles of the last four.
+    pub scales: [u8; 96],
+    /// The nibbles of the eight rows, 8 bytes interleaved.
+    pub qs: [u8; 1024],
+}
+
+/// Bytes of one `block_q4_Kx8`: eight rows, one super-block each — the same 144 bytes per row as
+/// `block_q4_K`, so the layout moves nothing but the order.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const Q4K8_BLOCK: usize = 1152;
+/// Values per Q4_K super-block (the activation is quantized in the same chunks).
+#[cfg(target_arch = "x86_64")]
+pub(crate) const QK: usize = 256;
+/// Bytes of one `block_q8_K`: `f32` scale, 256 `i8`, 16 `i16` sums of 16.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const Q8K_BLOCK: usize = 292;
+
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(core::mem::size_of::<BlockQ4Kx8>() == Q4K8_BLOCK);
+
+/// Test-only override for [`q4k8_enabled`]: the switch is cached from the environment once, which
+/// leaves one process able to time only one arm. `0` follows the environment, `1` forces off,
+/// `2` forces on.
+#[cfg(all(test, target_arch = "x86_64"))]
+static Q4K8_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether the Pha 1b 8x8 kernel is on: `VIPERA_Q4K8`, default off (ADR-006). Any value but `0`
+/// or empty turns it on, the repository's `env_truthy` convention.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn q4k8_enabled() -> bool {
+    #[cfg(test)]
+    match Q4K8_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // Off by default (ADR-006): the 8x8 repack quantizes the activation to `block_q8_K` with
+        // one scale per 256 values, which is a numeric-policy change and not this switch's call.
+        // `env_truthy` semantics, like every other `VIPERA_*` switch: unset, empty or `0` is off.
+        std::env::var("VIPERA_Q4K8").ok().is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
+/// `make_block_q4_Kx8`: pack the eight rows starting at `first_row` into one `BlockQ4Kx8` per
+/// `blocks` super-block, appending to `out` (the kernel reads `w[x * blocks + b]`).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn make_blocks_q4k8(
+    src: &[u8],
+    stride: usize,
+    first_row: usize,
+    blocks: usize,
+    out: &mut Vec<BlockQ4Kx8>,
+) {
+    let mut s = [0_u8; 8];
+    let mut m = [0_u8; 8];
+    for b in 0..blocks {
+        let row = |i: usize| &src[(first_row + i) * stride + b * 144..][..144];
+        let mut blk = BlockQ4Kx8 {
+            d: [0; 8],
+            dmin: [0; 8],
+            scales: [0; 96],
+            qs: [0; 1024],
+        };
+        for i in 0..8 {
+            let r = row(i);
+            blk.d[i] = u16::from_le_bytes([r[0], r[1]]);
+            blk.dmin[i] = u16::from_le_bytes([r[2], r[3]]);
+        }
+        // Nibbles: take 8 bytes from each row in turn, so every 64-byte span of `qs` covers all
+        // eight rows.
+        for i in 0..128 {
+            let r = row(i % 8);
+            let src_off = (i / 8) * 8;
+            blk.qs[i * 8..i * 8 + 8].copy_from_slice(&r[16 + src_off..16 + src_off + 8]);
+        }
+        // Sub-blocks 0-3: the low six bits of each row's scale and min bytes.
+        for i in 0..4 {
+            for j in 0..8 {
+                s[j] = row(j)[4 + i] & 63;
+                m[j] = row(j)[4 + i + 4] & 63;
+            }
+            let o = i * 12;
+            blk.scales[o] = (s[0] & 63) + ((s[4] & 48) << 2);
+            blk.scales[o + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+            blk.scales[o + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+            blk.scales[o + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+            blk.scales[o + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+            blk.scales[o + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+            blk.scales[o + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+            blk.scales[o + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+            blk.scales[o + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+            blk.scales[o + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+            blk.scales[o + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+            blk.scales[o + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+        }
+        // Sub-blocks 4-7: the top two bits live in the first four bytes, the low four in the last
+        // four — the Q4_K six-bit packing read backwards.
+        for i in 0..4 {
+            for j in 0..8 {
+                s[j] = ((row(j)[4 + i] & 192) >> 2) | (row(j)[4 + i + 8] & 15);
+                m[j] = ((row(j)[4 + i + 4] & 192) >> 2) | ((row(j)[4 + i + 8] & 240) >> 4);
+            }
+            let o = i * 12 + 48;
+            blk.scales[o] = (s[0] & 63) + ((s[4] & 48) << 2);
+            blk.scales[o + 1] = (s[1] & 63) + ((s[5] & 48) << 2);
+            blk.scales[o + 2] = (s[2] & 63) + ((s[6] & 48) << 2);
+            blk.scales[o + 3] = (s[3] & 63) + ((s[7] & 48) << 2);
+            blk.scales[o + 4] = (m[0] & 63) + ((m[4] & 48) << 2);
+            blk.scales[o + 5] = (m[1] & 63) + ((m[5] & 48) << 2);
+            blk.scales[o + 6] = (m[2] & 63) + ((m[6] & 48) << 2);
+            blk.scales[o + 7] = (m[3] & 63) + ((m[7] & 48) << 2);
+            blk.scales[o + 8] = (s[4] & 15) + ((m[4] & 15) << 4);
+            blk.scales[o + 9] = (s[5] & 15) + ((m[5] & 15) << 4);
+            blk.scales[o + 10] = (s[6] & 15) + ((m[6] & 15) << 4);
+            blk.scales[o + 11] = (s[7] & 15) + ((m[7] & 15) << 4);
+        }
+        out.push(blk);
+    }
+}
+
+/// `quantize_row_q8_K_ref` per 256-value block (lab port): one scale for the whole block, the
+/// activation's 16 pair sums in the ggml `block_q8_K` tail.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn quantize_q8k(x: &[f32], out: &mut [u8]) {
+    assert_eq!(x.len() % QK, 0);
+    assert_eq!(out.len(), x.len() / QK * Q8K_BLOCK);
+    for (b, values) in x.as_chunks::<QK>().0.iter().enumerate() {
+        let at = &mut out[b * Q8K_BLOCK..(b + 1) * Q8K_BLOCK];
+        let mut max = 0.0_f32;
+        let mut amax = 0.0_f32;
+        for &v in values {
+            let ax = v.abs();
+            if ax > amax {
+                amax = ax;
+                max = v;
+            }
+        }
+        if amax == 0.0 {
+            at.fill(0);
+            continue;
+        }
+        let iscale = -128.0 / max;
+        at[0..4].copy_from_slice(&(1.0 / iscale).to_le_bytes());
+        for (i, &v) in values.iter().enumerate() {
+            at[4 + i] = (iscale * v).round().clamp(-128.0, 127.0) as i8 as u8;
+        }
+        for k in 0..QK / 16 {
+            let sum: i32 = (0..16).map(|i| at[4 + k * 16 + i] as i8 as i32).sum();
+            at[260 + k * 2..260 + k * 2 + 2].copy_from_slice(&(sum as i16).to_le_bytes());
+        }
+    }
+}
+
+/// `ggml_gemv_q4_K_8x8_q8_K` (lab port, AVX2 + FMA + F16C): the same layout and the same arithmetic
+/// as the engine's row kernel, processed eight weight rows at once against one activation row.
+///
+/// # Safety
+///
+/// `w.len() == out.len() / 8 * blocks`, `act` holds one `block_q8_K` per block, and the CPU has
+/// AVX2, FMA and F16C — the caller checks at runtime; the wiring in [`crate::quant::fill_rows_q4k8`]
+/// does.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn gemv_q4k8(w: &[BlockQ4Kx8], blocks: usize, act: &[u8], out: &mut [f32]) {
+    let groups = out.len() / 8;
+    assert_eq!(w.len(), groups * blocks);
+    assert!(act.len() >= blocks * Q8K_BLOCK);
+    // SAFETY: every intrinsic below needs AVX2/FMA/F16C, which the caller guarantees, and the
+    // pointers are derived from slices whose lengths are asserted above.
+    unsafe {
+        let deltamask = _mm_setr_epi8(0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15);
+        let scalemask = _mm_setr_epi8(0, 0, 4, 4, 1, 1, 5, 5, 2, 2, 6, 6, 3, 3, 7, 7);
+        let finalperm = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+        let m4b = _mm256_set1_epi8(0x0f);
+        let (kmask1, kmask2, kmask3) = (0x3f3f_3f3f_u32, 0x0f0f_0f0f_u32, 0x0303_0303_u32);
+        for x in 0..groups {
+            let base = x * blocks;
+            let mut acc_row = _mm256_setzero_ps();
+            let mut acc_min = _mm256_setzero_ps();
+            for b in 0..blocks {
+                let blk = &w[base + b];
+                let a = act.as_ptr().add(b * Q8K_BLOCK);
+                let row_scale = _mm256_set1_ps(*(a as *const f32));
+                let col_scale = _mm256_cvtph_ps(_mm_shuffle_epi8(
+                    _mm_loadu_si128(blk.d.as_ptr() as *const __m128i),
+                    deltamask,
+                ));
+                let col_dmin =
+                    _mm256_cvtph_ps(_mm_loadu_si128(blk.dmin.as_ptr() as *const __m128i));
+                let mut iacc_b = _mm256_setzero_si256();
+                let mut iacc_min_b = _mm256_setzero_si256();
+                // The activation's per-16 sums, folded and broadcast like ggml does.
+                let q8sums = _mm256_loadu_si256(a.add(260) as *const __m256i);
+                let mut q8s = _mm256_castsi128_si256(_mm_hadd_epi16(
+                    _mm256_castsi256_si128(q8sums),
+                    _mm256_extracti128_si256(q8sums, 1),
+                ));
+                q8s = _mm256_permute2f128_si256::<0>(q8s, q8s);
+                // Two sub-blocks per pass: the low nibbles are one, the high nibbles the next.
+                for sb in 0..QK / 64 {
+                    let raw = |off: usize| {
+                        _mm256_loadu_si256(blk.qs.as_ptr().add(sb * 256 + off) as *const __m256i)
+                    };
+                    let (r0, r4) = (raw(0), raw(32));
+                    let (r1, r5) = (raw(64), raw(96));
+                    let (r2, r6) = (raw(128), raw(160));
+                    let (r3, r7) = (raw(192), raw(224));
+                    let low = |v: __m256i| _mm256_and_si256(v, m4b);
+                    let high = |v: __m256i| _mm256_and_si256(_mm256_srli_epi16::<4>(v), m4b);
+                    let (lo0, lo4, lo1, lo5) = (low(r0), low(r4), low(r1), low(r5));
+                    let (lo2, lo6, lo3, lo7) = (low(r2), low(r6), low(r3), low(r7));
+                    let (hi0, hi4, hi1, hi5) = (high(r0), high(r4), high(r1), high(r5));
+                    let (hi2, hi6, hi3, hi7) = (high(r2), high(r6), high(r3), high(r7));
+
+                    let mut utmp_0 = [0_u32; 4];
+                    let mut utmp_1 = [0_u32; 4];
+                    // Twelve bytes: the fourth word is derived below, as in the C original.
+                    for (i, slot) in utmp_0.iter_mut().take(3).enumerate() {
+                        *slot = u32::from_le_bytes(
+                            blk.scales[sb * 24 + i * 4..sb * 24 + i * 4 + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                    }
+                    for (i, slot) in utmp_1.iter_mut().take(3).enumerate() {
+                        *slot = u32::from_le_bytes(
+                            blk.scales[12 + sb * 24 + i * 4..12 + sb * 24 + i * 4 + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                    }
+                    utmp_0[3] = ((utmp_0[2] >> 4) & kmask2) | (((utmp_0[1] >> 6) & kmask3) << 4);
+                    let aux0 = utmp_0[1] & kmask1;
+                    utmp_0[1] = (utmp_0[2] & kmask2) | (((utmp_0[0] >> 6) & kmask3) << 4);
+                    utmp_0[2] = aux0;
+                    utmp_0[0] &= kmask1;
+                    utmp_1[3] = ((utmp_1[2] >> 4) & kmask2) | (((utmp_1[1] >> 6) & kmask3) << 4);
+                    let aux1 = utmp_1[1] & kmask1;
+                    utmp_1[1] = (utmp_1[2] & kmask2) | (((utmp_1[0] >> 6) & kmask3) << 4);
+                    utmp_1[2] = aux1;
+                    utmp_1[0] &= kmask1;
+
+                    let ms0 = _mm_setr_epi32(
+                        utmp_0[0] as i32,
+                        utmp_0[1] as i32,
+                        utmp_0[2] as i32,
+                        utmp_0[3] as i32,
+                    );
+                    let ms1 = _mm_setr_epi32(
+                        utmp_1[0] as i32,
+                        utmp_1[1] as i32,
+                        utmp_1[2] as i32,
+                        utmp_1[3] as i32,
+                    );
+                    let scales_0 = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(ms0, scalemask));
+                    let scales_1 = _mm256_cvtepu8_epi16(_mm_shuffle_epi8(ms1, scalemask));
+                    let mins_01 = _mm256_cvtepu8_epi16(_mm_unpacklo_epi8(
+                        _mm_shuffle_epi32::<78>(ms0),
+                        _mm_shuffle_epi32::<78>(ms1),
+                    ));
+
+                    let mut lhs = [_mm256_setzero_si256(); 4];
+                    for (i, slot) in lhs.iter_mut().enumerate() {
+                        let v = _mm256_castsi128_si256(_mm_loadu_si128(
+                            a.add(4 + sb * 64 + i * 16) as *const __m128i,
+                        ));
+                        *slot = _mm256_permute2f128_si256::<0>(v, v);
+                    }
+
+                    let mut iacc_0 = _mm256_setzero_si256();
+                    let mut iacc_1 = _mm256_setzero_si256();
+                    // Eight rows sit in one `ymm` as `B0(0-3) B4(0-3) B1(0-3) ... B7(0-3)`: the odd
+                    // lanes come from the high half of the row set, which is why each of the two
+                    // instructions in a pair blends one row vector with the 32-bit shuffle of its
+                    // partner, and why the pair walks the activation in 4-value quarters.
+                    // `$a`/`$b` are rows 0-3 and 4-7; `$lhs` is the 16-value activation span these
+                    // eight rows share, and `$imm1`/`$imm2` pick two of its four quarters.
+                    macro_rules! dot_pair {
+                        ($acc:ident, $a:expr, $b:expr, $lhs:expr, $imm1:expr, $imm2:expr) => {
+                            $acc = _mm256_add_epi16(
+                                $acc,
+                                _mm256_maddubs_epi16(
+                                    _mm256_blend_epi32::<170>($a, _mm256_shuffle_epi32::<177>($b)),
+                                    _mm256_shuffle_epi32::<$imm1>($lhs),
+                                ),
+                            );
+                            $acc = _mm256_add_epi16(
+                                $acc,
+                                _mm256_maddubs_epi16(
+                                    _mm256_blend_epi32::<170>(_mm256_shuffle_epi32::<177>($a), $b),
+                                    _mm256_shuffle_epi32::<$imm2>($lhs),
+                                ),
+                            );
+                        };
+                    }
+                    dot_pair!(iacc_0, lo0, lo4, lhs[0], 0, 85);
+                    dot_pair!(iacc_0, lo1, lo5, lhs[0], 170, 255);
+                    dot_pair!(iacc_0, lo2, lo6, lhs[1], 0, 85);
+                    dot_pair!(iacc_0, lo3, lo7, lhs[1], 170, 255);
+                    dot_pair!(iacc_1, hi0, hi4, lhs[2], 0, 85);
+                    dot_pair!(iacc_1, hi1, hi5, lhs[2], 170, 255);
+                    dot_pair!(iacc_1, hi2, hi6, lhs[3], 0, 85);
+                    dot_pair!(iacc_1, hi3, hi7, lhs[3], 170, 255);
+
+                    iacc_0 = _mm256_madd_epi16(iacc_0, scales_0);
+                    iacc_1 = _mm256_madd_epi16(iacc_1, scales_1);
+                    let iacc_sb = _mm256_add_epi32(iacc_0, iacc_1);
+                    let iacc_min_sb = _mm256_madd_epi16(_mm256_shuffle_epi32::<0>(q8s), mins_01);
+                    q8s = _mm256_bsrli_epi128::<4>(q8s);
+                    iacc_b = _mm256_add_epi32(iacc_b, iacc_sb);
+                    iacc_min_b = _mm256_add_epi32(iacc_min_b, iacc_min_sb);
+                }
+                acc_row = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iacc_b),
+                    _mm256_mul_ps(col_scale, row_scale),
+                    acc_row,
+                );
+                acc_min = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(iacc_min_b),
+                    _mm256_mul_ps(col_dmin, row_scale),
+                    acc_min,
+                );
+            }
+            acc_row = _mm256_permutevar8x32_ps(acc_row, finalperm);
+            _mm256_storeu_ps(out.as_mut_ptr().add(x * 8), _mm256_sub_ps(acc_row, acc_min));
+        }
+    }
+}
+
+/// The safe Pha 1b entry: the 8x8 dot over a packed group — called by
+/// [`crate::quant::fill_rows_q4k8`], the only production caller.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn q4k8_dot8(w: &[BlockQ4Kx8], blocks: usize, act: &[u8], out: &mut [f32; 8]) {
+    // SAFETY: the caller checked `vnni512_available()` at the call site, and the slices satisfy
+    // the kernel contract, which `make_blocks_q4k8` built for.
+    unsafe { gemv_q4k8(w, blocks, act, out) }
 }

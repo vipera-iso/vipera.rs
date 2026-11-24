@@ -269,6 +269,80 @@ impl QuantizedX {
     }
 }
 
+/// The W-1a tiled-band activation (`VIPERA_TILED_A`, `docs/design/repack-port-plan.md`, W-1a): the
+/// activation the band quantizes **per 256-value block** — one `f32` scale per block instead of
+/// the per-32 scales of [`QuantizedX`] — plus the block's 16 raw-`x` sums the band's minimum term
+/// reads (ik `block_q8_K`-style `bsums`). The integer codes are the same values the band's
+/// `dpbusd` has always multiplied; only their scale and granularity changed, so the band itself
+/// is unchanged — W-1a is a numerics change (hence the default-off switch), not a speed one.
+///
+/// Built per product by [`TiledActivation::new`]; consumed by
+/// [`crate::simd::q4k_matvec_tiled_range_a`].
+pub(crate) struct TiledActivation {
+    /// Per entry: the activation's codes, `blocks * 256` values in natural order.
+    q: Vec<Vec<i8>>,
+    /// Per entry: one scale per block.
+    scale: Vec<Vec<f32>>,
+    /// Per entry: `blocks * 16` sums — group `j` of block `b` is the raw `x` over
+    /// `[b * 256 + 16j, b * 256 + 16(j + 1))`.
+    bsums: Vec<Vec<f32>>,
+}
+
+impl TiledActivation {
+    /// Quantize every entry of `x`: per block, `scale = max|x| / 127` and
+    /// `codes = round(x / scale)` (the `QuantizedX::quantize_group` definition with 256-value
+    /// granularity), and the block's 16 `bsums` — `Σ raw x` over each 16-value group.
+    pub(crate) fn new<const B: usize>(x: [&[f32]; B]) -> Self {
+        let mut q = Vec::with_capacity(x.len());
+        let mut scale = Vec::with_capacity(x.len());
+        let mut bsums = Vec::with_capacity(x.len());
+        for values in x {
+            let mut codes = Vec::with_capacity(values.len());
+            let mut block_scales = Vec::with_capacity(values.len() / 256);
+            let mut sums = Vec::with_capacity(values.len() / 16);
+            for chunk in values.as_chunks::<256>().0 {
+                let largest = chunk
+                    .iter()
+                    .fold(0.0_f32, |acc, value| acc.max(value.abs()));
+                let block_scale = if largest == 0.0 { 0.0 } else { largest / 127.0 };
+                block_scales.push(block_scale);
+                for value in chunk {
+                    let code = if block_scale == 0.0 {
+                        0
+                    } else {
+                        (value / block_scale).round().clamp(-127.0, 127.0) as i8
+                    };
+                    codes.push(code);
+                }
+                for group in 0..16 {
+                    let sum: f32 = chunk[group * 16..(group + 1) * 16].iter().sum();
+                    sums.push(sum);
+                }
+            }
+            q.push(codes);
+            scale.push(block_scales);
+            bsums.push(sums);
+        }
+        Self { q, scale, bsums }
+    }
+
+    /// The entry's codes, `blocks * 256` values in natural order.
+    pub(crate) fn q(&self, entry: usize) -> &[i8] {
+        &self.q[entry]
+    }
+
+    /// The entry's per-block scales, one per 256 values.
+    pub(crate) fn scale(&self, entry: usize) -> &[f32] {
+        &self.scale[entry]
+    }
+
+    /// The entry's per-block sums: `bsums[entry][block * 16 + group]` — the raw `x` over the
+    /// group's 16 values, the exact `f32` values the band's minimum term reads.
+    pub(crate) fn bsums(&self, entry: usize) -> &[f32] {
+        &self.bsums[entry]
+    }
+}
+
 /// Dot product of one Q4_K row with `x`.
 pub(crate) fn q4k_dot(row: &[u8], x: &[f32], sums: &[f32]) -> f32 {
     let mut sum = 0.0_f32;
@@ -1080,10 +1154,102 @@ pub(crate) fn fill_rows(
     activation: Activation<'_>,
     out: &mut [f32],
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if ty == GgmlType::Q4K
+        && !exact_dot_requested()
+        && crate::simd::q4k8_enabled()
+        && crate::simd::vnni512_available()
+    {
+        fill_rows_q4k8(data, stride, first_row, activation, out);
+        return;
+    }
     for (offset, slot) in out.iter_mut().enumerate() {
         let start = (first_row + offset) * stride;
         *slot = dot(ty, &data[start..start + stride], activation);
     }
+}
+
+/// [`fill_rows`] for Q4_K with the Pha 1b 8x8 kernel (`VIPERA_Q4K8`, default off).
+///
+/// Eight rows per call: pack them with [`crate::simd::make_blocks_q4k8`], quantize the activation
+/// to the lab `block_q8_K` format with [`crate::simd::quantize_q8k`], and dot with
+/// [`crate::simd::q4k8_dot8`] — the path lab-proven faster than the row kernel on the reference
+/// machine (`bench_q4k8_gemv_vs_row`, 2026-11-23).
+///
+/// Groups are formed on the **absolute** row index (`rows 8g..8g+8`), never on this call's own
+/// offsets, and a group that is only partly inside `out` is still computed from its aligned start.
+/// That is what keeps a row's value a function of the row and the activation alone: the threaded
+/// `matvec` hands a worker `rows/threads` rows and the pool hands its workers a different split, so
+/// grouping at offset 0 would give the same row two different answers — and the two paths are
+/// required to agree (`a_pooled_matvec_matches_the_spawned_one`). Only the trailing rows of the
+/// matrix, when its row count is not a multiple of eight, keep the row kernel's result.
+#[cfg(target_arch = "x86_64")]
+fn fill_rows_q4k8(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    activation: Activation<'_>,
+    out: &mut [f32],
+) {
+    let end_row = first_row + out.len();
+    let row = fill_rows_q4k8_groups(data, stride, first_row, out.len(), &[activation.x], out);
+    for absolute in row..end_row {
+        let start = absolute * stride;
+        out[absolute - first_row] = dot(GgmlType::Q4K, &data[start..start + stride], activation);
+    }
+}
+
+/// Compute every whole 8-row group touching `[first_row, first_row + count)` for `B` activations,
+/// writing `out[entry * count + offset]`, and return the absolute row from which nothing was
+/// written.
+///
+/// Groups are formed on the **absolute** row index (`rows 8g..8g+8`), never on this call's own
+/// offsets, and a group only partly inside the range is still computed from its aligned start.
+/// That is what keeps a row's value a function of the row and the activation alone: the threaded
+/// `matvec` hands a worker `rows/threads` rows and the pool hands its workers a different split, so
+/// grouping at offset 0 would give the same row two different answers — and the two paths are
+/// required to agree (`a_pooled_matvec_matches_the_spawned_one`), as are a batch and the same
+/// sequences decoded alone.
+#[cfg(target_arch = "x86_64")]
+fn fill_rows_q4k8_groups<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&[f32]; B],
+    out: &mut [f32],
+) -> usize {
+    let blocks = stride / 144;
+    // Rows this slice of `data` can read; a group is only computed whole when all eight fit.
+    let readable_rows = data.len() / stride;
+    let per_entry = blocks * crate::simd::Q8K_BLOCK;
+    let mut act = vec![0_u8; B * per_entry];
+    for (entry, x) in xs.iter().enumerate() {
+        crate::simd::quantize_q8k(x, &mut act[entry * per_entry..][..per_entry]);
+    }
+    let mut packed: Vec<crate::simd::BlockQ4Kx8> = Vec::with_capacity(blocks);
+    let mut values = [0.0_f32; 8];
+    let end_row = first_row + count;
+    let mut row = first_row;
+    while row < end_row {
+        let group_start = row / 8 * 8;
+        if group_start + 8 > readable_rows {
+            break;
+        }
+        packed.clear();
+        crate::simd::make_blocks_q4k8(data, stride, group_start, blocks, &mut packed);
+        let first = row.max(group_start);
+        let last = end_row.min(group_start + 8);
+        for entry in 0..B {
+            let at = entry * per_entry;
+            crate::simd::q4k8_dot8(&packed, blocks, &act[at..at + per_entry], &mut values);
+            for absolute in first..last {
+                out[entry * count + absolute - first_row] = values[absolute - group_start];
+            }
+        }
+        row = group_start + 8;
+    }
+    row
 }
 
 /// Fill `B * rows` results, reading each row once for all `B` activations.
@@ -1115,6 +1281,19 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         && crate::simd::vnni512_available()
         && (crate::tiled::TILE_MIN_BATCH..=128).contains(&B)
     {
+        if ty == GgmlType::Q4K {
+            // W-1a: the band's activation is quantized per 256 values (`VIPERA_TILED_A`, default
+            // off — this changes the engine's numbers, so flipping the default is an ADR call).
+            let tiled_a = crate::tiled::tiled_a_enabled()
+                .then(|| crate::quant::TiledActivation::new(*activation.x()));
+            if let Some(tiled_a) = tiled_a
+                && crate::simd::try_q4k_matvec_tiled_range_a::<B>(
+                    data, stride, first_row, count, &tiled_a, out,
+                )
+            {
+                return;
+            }
+        }
         if ty == GgmlType::Q4K
             && let Some(xs) = activation.quantized()
             && crate::simd::try_q4k_matvec_tiled_range(
@@ -1138,6 +1317,28 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         {
             return;
         }
+    }
+    // The Q4_K 8x8 kernel, for every width the tiled path above did not take. It has to be every
+    // width, not just the one `matvec` takes: the pool runs a batch of one exactly like a batch of
+    // three, and a sequence decoded alone must return the same bits batched
+    // (`a_batched_step_matches_every_sequence_run_alone`). One pack per group serves all `B`
+    // entries, so the weights are still read once.
+    #[cfg(target_arch = "x86_64")]
+    if ty == GgmlType::Q4K
+        && !exact_dot_requested()
+        && crate::simd::q4k8_enabled()
+        && crate::simd::vnni512_available()
+    {
+        let row = fill_rows_q4k8_groups(data, stride, first_row, count, &activation.x, out);
+        let mut values = [0.0_f32; B];
+        for offset in row - first_row..count {
+            let start = (first_row + offset) * stride;
+            dot_batch(ty, &data[start..start + stride], activation, &mut values);
+            for (entry, value) in values.iter().enumerate() {
+                out[entry * count + offset] = *value;
+            }
+        }
+        return;
     }
     // No gap-blocked prefetch here: a `_MM_HINT_T0` four rows ahead made a 200 MB stream slower,
     // not faster (31.5 against 40.3 GB/s at eight threads), because the hardware streamer already
@@ -1977,5 +2178,134 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// The Pha 1b 8x8 kernel (`simd::q4k8_dot8`, wired into `fill_rows_q4k8`) must agree with the
+    /// lab's original kernel over the same packed weights and the same activation: the port is
+    /// correct when the wired kernel matches `q4k8_lab::gemv_q4k8_generic` within the repack
+    /// prototype's tolerance (`packed_dot_matches_scalar_q4k_within_tolerance`).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k8_wire_matches_lab_kernel_within_tolerance() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+            fn byte(&mut self) -> u8 {
+                (self.next() >> 24) as u8
+            }
+            fn unit(&mut self) -> f32 {
+                (self.next() % 10_000) as f32 / 5_000.0 - 1.0
+            }
+            fn half(&mut self, low: f32, high: f32) -> [u8; 2] {
+                let v = low + (high - low) * ((self.next() % 1_000) as f32 / 1_000.0);
+                f32_to_f16(v).to_le_bytes()
+            }
+        }
+        fn q4k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
+            let mut row = Vec::with_capacity(blocks * 144);
+            for _ in 0..blocks {
+                row.extend_from_slice(&rng.half(0.001, 0.06));
+                row.extend_from_slice(&rng.half(0.0, 0.02));
+                for _ in 0..12 {
+                    row.push(rng.byte());
+                }
+                for _ in 0..128 {
+                    row.push(rng.byte());
+                }
+            }
+            row
+        }
+
+        let mut rng = Rng(0x9a7b_0001);
+        let cols = 512;
+        let rows: Vec<Vec<u8>> = (0..8).map(|_| q4k_row(&mut rng, cols / 256)).collect();
+        let data: Vec<u8> = rows.concat();
+        let stride = row_bytes(GgmlType::Q4K, cols).unwrap();
+        let blocks = stride / 144;
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let mut act = vec![0_u8; blocks * crate::simd::Q8K_BLOCK];
+        crate::simd::quantize_q8k(&x, &mut act);
+
+        // Reference: the lab's original kernel over the lab's own pack of the same rows.
+        let packed_lab = crate::q4k8_lab::pack_q4k8(&data, 8, blocks);
+        let mut out_ref = vec![0.0_f32; 8];
+        crate::q4k8_lab::gemv_q4k8_generic(&packed_lab, blocks, &act, &mut out_ref);
+
+        // Wired: the simd port of the same kernel over the engine's packer.
+        let mut packed: Vec<crate::simd::BlockQ4Kx8> = Vec::new();
+        crate::simd::make_blocks_q4k8(&data, stride, 0, blocks, &mut packed);
+        let mut out8 = [0.0_f32; 8];
+        crate::simd::q4k8_dot8(&packed, blocks, &act, &mut out8);
+
+        for (i, (got, want)) in out8.iter().zip(out_ref.iter()).enumerate() {
+            let tol = 1e-3 + 1e-4 * want.abs();
+            assert!(
+                (got - want).abs() <= tol,
+                "row {i}: 8x8 {got} vs lab generic {want}"
+            );
+        }
+    }
+
+    /// A row's value must not depend on where a thread split put it: the spawned path and the pool
+    /// cut the same tensor differently, so an 8-row group formed from this call's own offsets gives
+    /// one row two answers. Twenty rows (not a multiple of eight) also keeps the trailing rows on
+    /// the row kernel in every split.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k_rows_do_not_depend_on_the_call_split() {
+        if !crate::simd::vnni512_available() || !crate::simd::q4k8_enabled() {
+            return;
+        }
+        const ROWS: usize = 20;
+        const COLS: usize = 512;
+        let stride = row_bytes(GgmlType::Q4K, COLS).expect("stride");
+        let blocks = stride / 144;
+        let mut data = vec![0u8; stride * ROWS];
+        for row in 0..ROWS {
+            for block in 0..blocks {
+                let at = row * stride + block * 144;
+                // Finite half scales, so a mismatch cannot hide behind a NaN.
+                data[at..at + 2].copy_from_slice(&f16(0.02 + row as f32 * 0.001));
+                data[at + 2..at + 4].copy_from_slice(&f16(0.01));
+                for i in 0..12 {
+                    data[at + 4 + i] = ((row * 7 + block * 3 + i) % 251) as u8;
+                }
+                for i in 0..128 {
+                    data[at + 16 + i] = ((row * 13 + block * 5 + i * 3) % 251) as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..COLS).map(|at| ((at % 13) as f32 - 6.0) / 7.0).collect();
+        let xq = QuantizedX::new(&x);
+        let sums = x_sums(&x);
+        let activation = Activation {
+            x: &x,
+            sums: &sums,
+            q: Some(&xq),
+        };
+
+        let mut whole = vec![0.0_f32; ROWS];
+        fill_rows(GgmlType::Q4K, &data, stride, 0, activation, &mut whole);
+
+        let mut split = vec![0.0_f32; ROWS];
+        for (first_row, end_row) in [(0, 3), (3, 11), (11, 20)] {
+            fill_rows(
+                GgmlType::Q4K,
+                &data,
+                stride,
+                first_row,
+                activation,
+                &mut split[first_row..end_row],
+            );
+        }
+        assert_eq!(
+            split, whole,
+            "a row must not change when the split moves its group boundary"
+        );
     }
 }
