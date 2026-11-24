@@ -156,6 +156,88 @@
 - [ ] `examples-openai-client` — Example: OpenAI client (curl + Python) — Freebuff
 - [ ] `examples-bench-compare` — Example: benchmark compare (vipera vs llama.cpp) — Freebuff
 
+### P9 — BENCHMARK + BENCH (thêm)
+- [ ] `bench-prefill-sweep` — Prefill sweep (128→32k, 8 sizes, chart) — OpenCode
+- [ ] `bench-decode-sweep` — Decode sweep (32→1024 tokens, chart) — OpenCode
+- [ ] `bench-llama-compare` — Auto-compare vs llama-bench (script) — Freebuff
+- [ ] `bench-cuda-vs-cpu` — GPU vs CPU benchmark (same model, same ctx) — OpenCode
+- [ ] `bench-moe-throughput` — MoE model throughput (expert cache on/off) — OpenCode
+- [ ] `bench-kv-quant` — KV quantization (f16 vs Q8_0 vs Q4_0) — Freebuff
+- [ ] `bench-quant-accuracy` — Quantization accuracy (PPL on WikiText) — Freebuff
+- [ ] `bench-regression-gate` — CI gate: fail if tok/s drops >5% — Freebuff
+- [ ] `bench-report-gen` — Auto-generate benchmark report (Markdown + HTML) — Freebuff
+- [ ] `bench-multi-model` — Batch benchmark (5 models, one report) — OpenCode
+
+### P10 — MODEL FEATURES (thêm)
+- [ ] `model-embedding` — Text embedding endpoint (/embeddings) — Freebuff
+- [ ] `model-classifier` — Text classifier endpoint (logits → label) — Freebuff
+- [ ] `model-rerank` — Rerank endpoint (query + docs → scores) — Freebuff
+- [ ] `model-rag` — RAG pipeline (chunk + embed + retrieve + generate) — OpenCode
+- [ ] `model-agent-loop` — Agent loop (tool calling, multi-step) — OpenCode
+- [ ] `model-fine-tune` — LoRA fine-tuning (train on CPU, 1 epoch) — OpenCode
+- [ ] `model-quant-calibrate` — Quantization calibration (run N samples, pick scale) — Freebuff
+- [ ] `model-safetensors` — Safetensors format support (in addition to GGUF) — OpenCode
+- [ ] `model-onnx` — ONNX export + inference (optional) — OpenCode
+- [ ] `model-hf-download` — HuggingFace model download + convert to GGUF — Freebuff
+
+### P11 — SERVER FEATURES (thêm)
+- [ ] `server-tls-cert` — TLS certificate management (self-signed + ACME) — Freebuff
+- [ ] `server-webhook` — Webhook endpoint (trigger generation on HTTP POST) — Freebuff
+- [ ] `server-websocket` — WebSocket streaming (real-time token stream) — Freebuff
+- [ ] `server-grpc` — gRPC alternative to REST (protobuf) — OpenCode
+- [ ] `server-graphql` — GraphQL endpoint (query-based generation) — Freebuff
+- [ ] `server-async` — Async request queue (priority + fair scheduling) — OpenCode
+- [ ] `server-multi-model` — Multi-model serving (load N models, route by name) — OpenCode
+- [ ] `server-a/b-test` — A/B test endpoint (route to model A or B by weight) — Freebuff
+- [ ] `server-otel` — OpenTelemetry metrics + traces (exporter) — Freebuff
+- [ ] `server-prometheus` — Prometheus /metrics endpoint (Gauge, Counter, Histogram) — Freebuff
+
+### P12 — OPTIMIZATION (thêm)
+- [ ] `opt-channel-last` — Channel-last tensor layout (better cache) — OpenCode
+- [ ] `opt-vectorize-loop` — Manual loop vectorization (unroll + align) — OpenCode
+- [ ] `opt-prefetch` — Software prefetch hints (prefetchr, AVX-512) — OpenCode
+- [ ] `opt-tile-size` — Tile size autotuning (runtime search) — OpenCode
+- [ ] `opt-fp16-math` — FP16 math on AVX-512 (FMA) — OpenCode
+- [ ] `opt-int8-gemm` — INT8 GEMM (DQ8_0, Q8_0) — OpenCode
+- [ ] `opt-sparse-gemm` — Sparse GEMM (skip zero weights) — OpenCode
+- [ ] `opt-winograd` — Winograd convolution for ViT (if multimodal) — OpenCode
+- [ ] `opt-mem-pool` — Memory pool allocator (no per-token malloc) — Freebuff
+- [ ] `opt-thread-pool` — Thread pool with work stealing (rayon-like) — Freebuff
+
+### P13 — INTEGRATION (thêm)
+- [ ] `int-python-bindings` — Python bindings (PyO3, vipera-py) — OpenCode
+- [ ] `int-node-bindings` — Node.js bindings (napi-rs, vipera-node) — Freebuff
+- [ ] `int-go-bindings` — Go bindings (cgo, vipera-go) — Freebuff
+- [ ] `int-jni` — Java JNI bindings (Android) — Freebuff
+- [ ] `int-swift` — Swift bindings (iOS/macOS) — Freebuff
+- [ ] `int-c-api` — C API (for C/C++ callers) — Freebuff
+- [ ] `int-docker` — Docker image (CPU + CUDA variants) — Freebuff
+- [ ] `int-k8s` — Kubernetes deployment (Helm chart + operator) — Freebuff
+- [ ] `int-cloud` — Cloud deployment (AWS Sagemaker, GCP Vertex, Azure ML) — OpenCode
+- [ ] `int-edge` — Edge deployment (Raspberry Pi, Jetson) — Freebuff
+
+### P14 — SAFETY + COMPLIANCE (thêm)
+- [ ] `safety-rlhf` — RLHF / DPO alignment (train safety) — OpenCode
+- [ ] `safety-guard` — Guard model (filter toxic outputs) — Freebuff
+- [ ] `safety-audit` — Model audit (bias, hallucination detection) — OpenCode
+- [ ] `safety-redteam` — Red-team testing suite (prompt injection) — Freebuff
+- [ ] `compliance-gdpr` — GDPR compliance (data deletion, export) — Freebuff
+- [ ] `compliance-audit-log` — Audit log (who queried what, when) — Freebuff
+- [ ] `compliance-pii` — PII detection + redaction in outputs — Freebuff
+- [ ] `compliance-logging` — Structured logging for compliance (immutable) — Freebuff
+
+### P15 — DEVELOPER EXPERIENCE (thêm)
+- [ ] `dev-mcp-server` — MCP server for Claude/other agents — Freebuff
+- [ ] `dev-cli-chat` — CLI chat mode (interactive, multi-turn) — Freebuff
+- [ ] `dev-ide-plugin` — IDE plugin (VS Code, IntelliJ) — Freebuff
+- [ ] `dev-web-ui` — Web UI (React, chat + streaming) — Freebuff
+- [ ] `dev-tui-chat` — TUI chat (ratatui, streaming) — Freebuff
+- [ ] `dev-debug` — Debug mode (step through layers, inspect tensors) — OpenCode
+- [ ] `dev-profile` — Profile mode (per-layer timing, memory heatmap) — OpenCode
+- [ ] `dev-replay` — Replay mode (reproduce a specific generation) — Freebuff
+- [ ] `dev-fuzz` — Fuzz mode (random inputs, crash detection) — Freebuff
+- [ ] `dev-bench-cli` — `vipera bench` command (prefill + decode + compare) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -166,9 +248,12 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **93 tasks** (P0-P8) × 1 cycle = **372 contributions**
-> 93 × 3 cycles = **1116 contributions** → đạt 1000 rule trong **48h (2 ngày)**
-> 93 × 5 cycles = **1860 contributions** → đạt 2000 rule trong **5 ngày**
+> **161 tasks** (P0-P15) × 1 cycle = **644 contributions**
+> 161 × 3 cycles = **483 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 161 × 5 cycles = **805 contributions** → đạt 1000 rule trong **3 ngày** ✓
+> 161 × 7 cycles = **1127 contributions** → đạt 1000 rule trong **4 ngày** ✓
+
+**Gợi ý: 3 cycles trong 48h → 483 contributions (an toàn cho 1000 rule)**
 
 ## LỆNH CHẠY
 
