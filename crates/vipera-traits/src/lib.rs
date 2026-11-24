@@ -3,7 +3,8 @@
 //! Three groups so far: how the engine learns what hardware it is running on, what a sampling
 //! strategy has to look like so a build can list the ones it has, and the four algorithm slots a
 //! build fills at startup — KV compression, sparse attention, speculative decoding and MoE
-//! offloading. Backend and tensor traits arrive with the backends themselves, so this crate stays
+//! offloading — the registry that lists what a build has, and the plan that picks from it.
+//! Backend and tensor traits arrive with the backends themselves, so this crate stays
 //! small on purpose. Every trait here is object safe, and the implementations live in their own
 //! crates, which `vipera-core` never depends on.
 
@@ -175,6 +176,180 @@ pub trait MoeOffloader: Send + Sync {
     fn select_experts(&self, router_logits: &[f32], capacity: usize, out: &mut Vec<u32>);
 }
 
+/// The algorithm implementations a build has, one list per slot.
+///
+/// A registry says what exists; an [`AlgorithmPlan`] says what to run. Keeping the two apart is
+/// what makes a name checkable before any work starts: a plan resolves against the registry once,
+/// and a name this build does not have fails there instead of leaving a stage quietly on its
+/// identity strategy. Everything here is keyed on the name an implementation reports — the same
+/// string the pipeline prints — so a log line and a flag cannot disagree about what ran.
+#[derive(Clone, Copy)]
+pub struct AlgorithmRegistry {
+    compression: &'static [&'static dyn KvCompression],
+    sparse: &'static [&'static dyn SparseAttention],
+    speculative: &'static [&'static dyn SpeculativeDecoder],
+    offloading: &'static [&'static dyn MoeOffloader],
+}
+
+impl fmt::Debug for AlgorithmRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.names()).finish()
+    }
+}
+
+impl AlgorithmRegistry {
+    /// Wrap the build's lists.
+    ///
+    /// The lists are `'static` because every entry is a shared value that lives for the process;
+    /// that is also what lets a resolved plan hand the engine a `&'static dyn` policy.
+    pub const fn new(
+        compression: &'static [&'static dyn KvCompression],
+        sparse: &'static [&'static dyn SparseAttention],
+        speculative: &'static [&'static dyn SpeculativeDecoder],
+        offloading: &'static [&'static dyn MoeOffloader],
+    ) -> Self {
+        Self {
+            compression,
+            sparse,
+            speculative,
+            offloading,
+        }
+    }
+
+    /// The KV compression named `name`, or `None` if this build has none by that name.
+    pub fn compression(&self, name: &str) -> Option<&'static dyn KvCompression> {
+        self.compression
+            .iter()
+            .copied()
+            .find(|entry| entry.name() == name)
+    }
+
+    /// The sparse-attention policy named `name`, or `None`.
+    pub fn sparse(&self, name: &str) -> Option<&'static dyn SparseAttention> {
+        self.sparse
+            .iter()
+            .copied()
+            .find(|entry| entry.name() == name)
+    }
+
+    /// The speculative decoder named `name`, or `None`.
+    pub fn speculative(&self, name: &str) -> Option<&'static dyn SpeculativeDecoder> {
+        self.speculative
+            .iter()
+            .copied()
+            .find(|entry| entry.name() == name)
+    }
+
+    /// The MoE offloader named `name`, or `None`.
+    pub fn offloading(&self, name: &str) -> Option<&'static dyn MoeOffloader> {
+        self.offloading
+            .iter()
+            .copied()
+            .find(|entry| entry.name() == name)
+    }
+
+    /// Every name in the registry, slot by slot, in list order.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        let compression = self.compression.iter().map(|entry| entry.name());
+        let sparse = self.sparse.iter().map(|entry| entry.name());
+        let speculative = self.speculative.iter().map(|entry| entry.name());
+        let offloading = self.offloading.iter().map(|entry| entry.name());
+        compression
+            .chain(sparse)
+            .chain(speculative)
+            .chain(offloading)
+    }
+
+    /// Resolve `plan` against this registry.
+    ///
+    /// A plan that names something this build does not have fails whole: every slot is looked up
+    /// before any policy is returned, so a caller never acts on half a plan.
+    pub fn plan(&self, plan: &AlgorithmPlan) -> Result<PlannedAlgorithms, MissingAlgorithm> {
+        Ok(PlannedAlgorithms {
+            compression: resolve(plan.compression, "compression", |name| {
+                self.compression(name)
+            })?,
+            sparse: resolve(plan.sparse, "sparse", |name| self.sparse(name))?,
+            speculative: resolve(plan.speculative, "speculative", |name| {
+                self.speculative(name)
+            })?,
+            offloading: resolve(plan.offloading, "offloading", |name| self.offloading(name))?,
+        })
+    }
+}
+
+/// Look up one planned slot, naming the slot and the missing name when the build lacks it.
+fn resolve<T: ?Sized>(
+    name: Option<&'static str>,
+    slot: &'static str,
+    lookup: impl Fn(&str) -> Option<&'static T>,
+) -> Result<Option<&'static T>, MissingAlgorithm> {
+    match name {
+        Some(name) => lookup(name)
+            .map(Some)
+            .ok_or(MissingAlgorithm { slot, name }),
+        None => Ok(None),
+    }
+}
+
+/// Which implementations a build was asked to run, by the names a registry lists.
+///
+/// Fields are names rather than references so a plan can be built from configuration — a flag, a
+/// file, a default — before the registry that has to satisfy it is in hand. `None` asks for the
+/// slot's identity strategy, which is what a build without an algorithm does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlgorithmPlan {
+    /// [`KvCompression`] to run in the compress stage.
+    pub compression: Option<&'static str>,
+    /// [`SparseAttention`] to run in the sparse stage.
+    pub sparse: Option<&'static str>,
+    /// [`SpeculativeDecoder`] to run in the speculative stage.
+    pub speculative: Option<&'static str>,
+    /// [`MoeOffloader`] to consult about which experts stay resident.
+    pub offloading: Option<&'static str>,
+}
+
+/// A plan resolved against a registry: every slot it named is now a policy.
+#[derive(Clone, Copy)]
+pub struct PlannedAlgorithms {
+    /// The compression policy to run, if the plan named one.
+    pub compression: Option<&'static dyn KvCompression>,
+    /// The sparse-attention policy to run, if the plan named one.
+    pub sparse: Option<&'static dyn SparseAttention>,
+    /// The speculative decoder to run, if the plan named one.
+    pub speculative: Option<&'static dyn SpeculativeDecoder>,
+    /// The MoE offloader to run, if the plan named one.
+    pub offloading: Option<&'static dyn MoeOffloader>,
+}
+
+impl fmt::Debug for PlannedAlgorithms {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlannedAlgorithms")
+            .field("compression", &self.compression.map(|policy| policy.name()))
+            .field("sparse", &self.sparse.map(|policy| policy.name()))
+            .field("speculative", &self.speculative.map(|policy| policy.name()))
+            .field("offloading", &self.offloading.map(|policy| policy.name()))
+            .finish()
+    }
+}
+
+/// A plan named an implementation the build does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingAlgorithm {
+    /// Slot the name was looked up in: `compression`, `sparse`, `speculative`, or `offloading`.
+    pub slot: &'static str,
+    /// The name the plan asked for.
+    pub name: &'static str,
+}
+
+impl fmt::Display for MissingAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no {} algorithm named '{}'", self.slot, self.name)
+    }
+}
+
+impl std::error::Error for MissingAlgorithm {}
+
 /// FNV-1a, 64-bit: small, deterministic, dependency-free.
 ///
 /// This identifies content. It is not a cryptographic digest.
@@ -324,6 +499,88 @@ mod tests {
             ],
             ["inert"; 4]
         );
+    }
+
+    /// A sparse policy with a name of its own, so a slot mix-up is observable.
+    struct EveryOther;
+
+    impl SparseAttention for EveryOther {
+        fn name(&self) -> &'static str {
+            "every-other"
+        }
+
+        fn positions(&self, _query: u32, context: u32, out: &mut Vec<u32>) {
+            out.extend((0..context).step_by(2));
+        }
+    }
+
+    static ONLY_SPARSE: [&dyn SparseAttention; 1] = [&EveryOther];
+
+    fn sparse_registry() -> AlgorithmRegistry {
+        AlgorithmRegistry::new(&[], &ONLY_SPARSE, &[], &[])
+    }
+
+    #[test]
+    fn a_registry_finds_an_algorithm_in_its_own_slot() {
+        let registry = sparse_registry();
+        assert_eq!(
+            registry.sparse("every-other").map(|policy| policy.name()),
+            Some("every-other")
+        );
+        // The same name in another slot is a different question, and the answer is no.
+        assert!(registry.compression("every-other").is_none());
+        assert_eq!(registry.names().collect::<Vec<_>>(), ["every-other"]);
+    }
+
+    #[test]
+    fn a_plan_resolves_each_slot_it_names() {
+        let planned = sparse_registry()
+            .plan(&AlgorithmPlan {
+                sparse: Some("every-other"),
+                ..AlgorithmPlan::default()
+            })
+            .expect("the plan names what this build has");
+        assert_eq!(
+            planned.sparse.map(|policy| policy.name()),
+            Some("every-other")
+        );
+        assert!(planned.compression.is_none());
+        assert!(planned.speculative.is_none());
+        assert!(planned.offloading.is_none());
+    }
+
+    #[test]
+    fn an_empty_plan_resolves_to_no_policies() {
+        let planned = sparse_registry()
+            .plan(&AlgorithmPlan::default())
+            .expect("an empty plan asks for nothing");
+        assert!(planned.sparse.is_none());
+        assert!(planned.compression.is_none());
+    }
+
+    #[test]
+    fn a_plan_naming_an_absent_algorithm_says_which_slot_and_name() {
+        let missing = sparse_registry()
+            .plan(&AlgorithmPlan {
+                sparse: Some("absorbed"),
+                ..AlgorithmPlan::default()
+            })
+            .expect_err("this build has no such sparse policy");
+        assert_eq!(missing.slot, "sparse");
+        assert_eq!(missing.name, "absorbed");
+        assert_eq!(missing.to_string(), "no sparse algorithm named 'absorbed'");
+    }
+
+    #[test]
+    fn a_plan_is_checked_whole_before_any_slot_resolves() {
+        let missing = sparse_registry()
+            .plan(&AlgorithmPlan {
+                sparse: Some("every-other"),
+                offloading: Some("moe"),
+                ..AlgorithmPlan::default()
+            })
+            .expect_err("the offloading name is absent even though sparse resolves");
+        assert_eq!(missing.slot, "offloading");
     }
 
     #[test]
