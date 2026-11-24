@@ -778,6 +778,186 @@
 - [ ] `green-target` — Target (net-zero, SBTi) — Freebuff
 - [ ] `green-audit` — Audit (sustainability, impact) — Freebuff
 
+### P61 — PROMPT + CONTEXT ENGINEERING (thêm)
+- [ ] `prompt-template` — Prompt template (Jinja, mustache) — Freebuff
+- [ ] `prompt-chain` — Prompt chain (CoT, ReAct, self-ask) — Freebuff
+- [ ] `prompt-fewshot` — Few-shot (example, in-context) — Freebuff
+- [ ] `prompt-system` — System prompt (role, constraint) — Freebuff
+- [ ] `prompt-context` — Context window (manage, compress) — OpenCode
+- [ ] `prompt-rag` — RAG prompt (retrieve + generate) — Freebuff
+- [ ] `prompt-tool` — Tool prompt (function, API) — Freebuff
+- [ ] `prompt-multiturn` — Multi-turn (dialog, memory) — Freebuff
+- [ ] `prompt-eval` — Prompt eval (score, rank) — Freebuff
+- [ ] `prompt-optimize` — Prompt optimize (search, evolve) — OpenCode
+
+### P62 — CONTEXT + MEMORY (thêm)
+- [ ] `ctx-short` — Short-term (session, turn) — Freebuff
+- [ ] `ctx-long` — Long-term (persistent, vector) — Freebuff
+- [ ] `ctx-episodic` — Episodic (event, timeline) — Freebuff
+- [ ] `ctx-semantic` — Semantic (concept, relation) — Freebuff
+- [ ] `ctx-procedural` — Procedural (skill, workflow) — Freebuff
+- [ ] `ctx-working` — Working (current, active) — Freebuff
+- [ ] `ctx-compress` — Compress (summarize, truncate) — OpenCode
+- [ ] `ctx-retrieve` — Retrieve (search, relevance) — Freebuff
+- [ ] `ctx-update` — Update (incremental, decay) — Freebuff
+- [ ] `ctx-audit` — Audit (access, modify) — Freebuff
+
+### P63 — TOOL + ACTION (thêm)
+- [ ] `tool-search` — Search (web, local, vector) — Freebuff
+- [ ] `tool-code` — Code (exec, test, lint) — OpenCode
+- [ ] `tool-file` — File (read, write, edit) — Freebuff
+- [ ] `tool-api` — API (REST, gRPC, GraphQL) — Freebuff
+- [ ] `tool-db` — Database (SQL, NoSQL, vector) — Freebuff
+- [ ] `tool-browser` — Browser (navigate, interact) — Freebuff
+- [ ] `tool-shell` — Shell (exec, pipe, process) — Freebuff
+- [ ] `tool-vision` — Vision (OCR, detection) — OpenCode
+- [ ] `tool-audio` — Audio (TTS, STT) — Freebuff
+- [ ] `tool-custom` — Custom (plugin, extension) — Freebuff
+
+### P64 — PLANNING + REASONING (thêm)
+- [ ] `plan-decompose` — Decompose (task, subtask) — OpenCode
+- [ ] `plan-sequence` — Sequence (order, dependency) — OpenCode
+- [ ] `plan-parallel` — Parallel (independent, concurrent) — OpenCode
+- [ ] `plan-adaptive` — Adaptive (feedback, replan) — OpenCode
+- [ ] `plan-goal` — Goal (hierarchy, constraint) — OpenCode
+- [ ] `plan-search` — Search (BFS, DFS, A*) — OpenCode
+- [ ] `plan-optimize` — Optimize (cost, time, resource) — OpenCode
+- [ ] `plan-risk` — Risk (failure, mitigation) — OpenCode
+- [ ] `plan-checkpoint` — Checkpoint (save, resume) — OpenCode
+- [ ] `plan-rollback` — Rollback (undo, revert) — OpenCode
+
+### P65 — VERIFICATION + EVAL (thêm)
+- [ ] `eval-accuracy` — Accuracy (task, domain) — Freebuff
+- [ ] `eval-calibration` — Calibration (confidence, probability) — Freebuff
+- [ ] `eval-robustness` — Robustness (noise, perturbation) — Freebuff
+- [ ] `eval-fairness` — Fairness (bias, disparity) — Freebuff
+- [ ] `eval-safety` — Safety (toxicity, jailbreak) — Freebuff
+- [ ] `eval-efficiency` — Efficiency (FLOP, memory, time) — Freebuff
+- [ ] `eval-usability` — Usability (UX, satisfaction) — Freebuff
+- [ ] `eval-reproducibility` — Reproducibility (seed, version) — Freebuff
+- [ ] `eval-generalization` — Generalization (out-of-domain) — Freebuff
+- [ ] `eval-interpretability` — Interpretability (explain, reason) — Freebuff
+
+### P66 — SECURITY + PRIVACY (thêm)
+- [ ] `sec-input` — Input (validate, sanitize) — Freebuff
+- [ ] `sec-output` — Output (filter, log) — Freebuff
+- [ ] `sec-auth` — Auth (API key, JWT, OAuth2) — Freebuff
+- [ ] `sec-tls` — TLS (cert, pin, rotate) — Freebuff
+- [ ] `sec-audit` — Audit (log, report) — Freebuff
+- [ ] `sec-privacy` — Privacy (PII, GDPR, CCPA) — Freebuff
+- [ ] `sec-encryption` — Encryption (data, model) — Freebuff
+- [ ] `sec-isolation` — Isolation (sandbox, namespace) — Freebuff
+- [ ] `sec-supply` — Supply chain (SBOM, reproducible) — Freebuff
+- [ ] `sec-resilience` — Resilience (DDoS, injection) — Freebuff
+
+### P67 — COST + EFFICIENCY (thêm)
+- [ ] `cost-token` — Token (input, output) — Freebuff
+- [ ] `cost-cache` — Cache (hit, miss, invalidation) — Freebuff
+- [ ] `cost-quant` — Quantize (4-bit, 8-bit, 16-bit) — OpenCode
+- [ ] `cost-prune` — Prune (weight, neuron) — OpenCode
+- [ ] `cost-distill` — Distill (large → small) — OpenCode
+- [ ] `cost-batch` — Batch (size, throughput) — Freebuff
+- [ ] `cost-spec` — Speculative (draft, verify) — OpenCode
+- [ ] `cost-moe` — MoE (expert, routing) — OpenCode
+- [ ] `cost-long` — Long context (KV, compress) — OpenCode
+- [ ] `cost-edge` — Edge (mobile, embedded) — Freebuff
+
+### P68 — QUALITY + RELIABILITY (thêm)
+- [ ] `qual-code` — Code (test, lint, review) — Freebuff
+- [ ] `qual-data` — Data (clean, validate, version) — Freebuff
+- [ ] `qual-model` — Model (eval, monitor, update) — Freebuff
+- [ ] `qual-pipeline` — Pipeline (CI/CD, deploy) — Freebuff
+- [ ] `qual-observability` — Observability (metric, log, trace) — Freebuff
+- [ ] `qual-resilience` — Resilience (failover, retry) — Freebuff
+- [ ] `qual-performance` — Performance (latency, throughput) — Freebuff
+- [ ] `qual-availability` — Availability (uptime, SLO) — Freebuff
+- [ ] `qual-compatibility` — Compatibility (version, platform) — Freebuff
+- [ ] `qual-documentation` — Documentation (API, user, dev) — Freebuff
+
+### P69 — INNOVATION + FUTURE (thêm)
+- [ ] `innov-architecture` — Architecture (Mamba, RWKV, Hyena) — OpenCode
+- [ ] `innov-quant` — Quantization (1-bit, 2-bit, mixed) — OpenCode
+- [ ] `innov-spec` — Speculative (EAGLE, MTP, DFlash) — OpenCode
+- [ ] `innov-moe` — MoE (expert choice, dynamic) — OpenCode
+- [ ] `innov-long` — Long context (1M, 10M) — OpenCode
+- [ ] `innov-multimodal` — Multi-modal (image, audio, video) — OpenCode
+- [ ] `innov-world` — World model (physics, simulation) — OpenCode
+- [ ] `innov-robotics` — Robotics (vision, control) — OpenCode
+- [ ] `innov-science` — AI for science (material, drug) — OpenCode
+- [ ] `innov-alignment` — Alignment (safety, value, control) — OpenCode
+
+### P70 — COMMUNITY + ECOSYSTEM (thêm)
+- [ ] `eco-open-source` — Open source (repo, license, CI) — Freebuff
+- [ ] `eco-contribution` — Contribution (code, doc, test) — Freebuff
+- [ ] `eco-issue` — Issue (report, triage, fix) — Freebuff
+- [ ] `eco-pr` — Pull request (review, merge) — Freebuff
+- [ ] `eco-release` — Release (tag, changelog, artifact) — Freebuff
+- [ ] `eco-docs` — Docs (wiki, tutorial, example) — Freebuff
+- [ ] `eco-community` — Community (forum, Discord, Slack) — Freebuff
+- [ ] `eco-hackathon` — Hackathon (challenge, prize) — Freebuff
+- [ ] `eco-partner` — Partner (integrate, collab) — Freebuff
+- [ ] `eco-adoption` — Adoption (user, org, industry) — Freebuff
+
+### P71 — LEGACY + COMPAT (thêm)
+- [ ] `compat-llama` — llama.cpp (GGUF, format) — Freebuff
+- [ ] `compat-openai` — OpenAI (API, SDK) — Freebuff
+- [ ] `compat-hf` — HuggingFace (transformers, PEFT) — Freebuff
+- [ ] `compat-pytorch` — PyTorch (model, tensor) — OpenCode
+- [ ] `compat-jax` — JAX (model, kernel) — OpenCode
+- [ ] `compat-tf` — TensorFlow (model, graph) — OpenCode
+- [ ] `compat-onnx` — ONNX (model, runtime) — OpenCode
+- [ ] `compat-tensorrt` — TensorRT (model, engine) — OpenCode
+- [ ] `compat-openvino` — OpenVINO (model, plugin) — OpenCode
+- [ ] `compat-coreml` — CoreML (model, compile) — Freebuff
+
+### P72 — BENCHMARK + COMPETITION (thêm)
+- [ ] `comp-llama` — vs llama.cpp (speed, quality) — Freebuff
+- [ ] `comp-vllm` — vs vLLM (throughput, memory) — Freebuff
+- [ ] `comp-tgi` — vs TGI (latency, cost) — Freebuff
+- [ ] `comp-ctransformers` — vs ctransformers (portability) — Freebuff
+- [ ] `comp-mxfp` — vs mxfloat (quant, speed) — Freebuff
+- [ ] `comp-gpt4all` — vs GPT4All (easy, local) — Freebuff
+- [ ] `comp-gptengineer` — vs GPT4 (quality, cost) — Freebuff
+- [ ] `comp-claude` — vs Claude (safety, alignment) — Freebuff
+- [ ] `comp-gemini` — vs Gemini (multi-modal, long) — Freebuff
+- [ ] `comp-llama4` — vs Llama 4 (MoE, size) — Freebuff
+
+### P73 — CUSTOMER + SUPPORT (thêm)
+- [ ] `cust-onboard` — Onboard (install, first run) — Freebuff
+- [ ] `cust-docs` — Docs (guide, tutorial, FAQ) — Freebuff
+- [ ] `cust-forum` — Forum (Q&A, help, share) — Freebuff
+- [ ] `cust-discord` — Discord (chat, community) — Freebuff
+- [ ] `cust-slack` — Slack (team, enterprise) — Freebuff
+- [ ] `cust-email` — Email (support, update) — Freebuff
+- [ ] `cust-ticket` — Ticket (report, track, resolve) — Freebuff
+- [ ] `cust-feedback` — Feedback (survey, NPS) — Freebuff
+- [ ] `cust-roadmap` — Roadmap (feature, priority) — Freebuff
+- [ ] `cust-sla` — SLA (response, resolution) — Freebuff
+
+### P74 — METRICS + DASHBOARD (thêm)
+- [ ] `dash-realtime` — Real-time (live, stream) — Freebuff
+- [ ] `dash-history` — History (trend, seasonality) — Freebuff
+- [ ] `dash-compare` — Compare (model, quant, prompt) — Freebuff
+- [ ] `dash-alert` — Alert (threshold, anomaly) — Freebuff
+- [ ] `dash-report` — Report (daily, weekly, monthly) — Freebuff
+- [ ] `dash-export` — Export (CSV, JSON, PDF) — Freebuff
+- [ ] `dash-share` — Share (link, embed) — Freebuff
+- [ ] `dash-custom` — Custom (widget, panel) — Freebuff
+- [ ] `dash-drill` — Drill-down (detail, root cause) — Freebuff
+- [ ] `dash-embed` — Embed (web, app) — Freebuff
+
+### P75 — TESTING + QA (thêm)
+- [ ] `qa-unit` — Unit (kernel, module) — Freebuff
+- [ ] `qa-integration` — Integration (API, pipeline) — Freebuff
+- [ ] `qa-e2e` — E2E (full flow) — Freebuff
+- [ ] `qa-load` — Load (10k req/min) — Freebuff
+- [ ] `qa-stress` — Stress (overload, failover) — Freebuff
+- [ ] `qa-soak` — Soak (24h, memory leak) — Freebuff
+- [ ] `qa-fuzz` — Fuzz (random, crash) — Freebuff
+- [ ] `qa-a/b` — A/B (model, prompt) — Freebuff
+- [ ] `qa-regression` — Regression (baseline, compare) — Freebuff
+- [ ] `qa-coverage` — Coverage (unit, integration, e2e) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -788,11 +968,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **611 tasks** (P0-P60) × 1 cycle = **2444 contributions**
-> 611 × 2 cycles = **4888 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 611 × 3 cycles = **7332 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
+> **761 tasks** (P0-P75) × 1 cycle = **3044 contributions**
+> 761 × 2 cycles = **6088 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 761 × 3 cycles = **9132 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 1 cycle trong 24h → 2444 contributions (vượt 1000 rule)**
+**Gợi ý: 1 cycle trong 24h → 3044 contributions (vượt 1000 rule)**
 
 ## LỆNH CHẠY
 
