@@ -419,25 +419,25 @@ struct Layer {
 /// One flat buffer per stage, token-major: entry `e`'s row of width `w` starts at `e * w`. Reusing
 /// them for the life of the model keeps a decode step free of allocation.
 #[derive(Debug)]
-struct BatchScratch {
-    x: Vec<f32>,
-    h: Vec<f32>,
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    attn: Vec<f32>,
+pub(crate) struct BatchScratch {
+    pub(crate) x: Vec<f32>,
+    pub(crate) h: Vec<f32>,
+    pub(crate) q: Vec<f32>,
+    pub(crate) k: Vec<f32>,
+    pub(crate) v: Vec<f32>,
+    pub(crate) attn: Vec<f32>,
     /// Shared rather than borrowed: a fused product hands its worker the gate rows, and a job
     /// travels with the pool's lifetime, which is longer than this scratch's borrow.
-    gate: std::sync::Arc<[f32]>,
-    up: Vec<f32>,
+    pub(crate) gate: std::sync::Arc<[f32]>,
+    pub(crate) up: Vec<f32>,
     /// The last entry's logits: the only row a prefill chunk or a single decode step asks for.
-    logits: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
     /// One logits row per entry, for the callers that want every row (`logits_batch`,
     /// `logits_range`). Empty until the first such call: a 128-row buffer is
     /// `MAX_BATCH * vocab * 4` bytes (77.8 MB for a 151,936-token vocabulary), and the chunked
     /// prefill path never looks past the last row.
-    logits_each: Vec<f32>,
-    attn_scratch: AttnScratch,
+    pub(crate) logits_each: Vec<f32>,
+    pub(crate) attn_scratch: AttnScratch,
 }
 
 impl BatchScratch {
@@ -471,17 +471,19 @@ pub struct CpuBackend {
     output: Tensor,
     output_norm: Vec<f32>,
     layers: Vec<Layer>,
-    x: Vec<f32>,
-    h: Vec<f32>,
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    attn: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    attn_scratch: AttnScratch,
-    logits: Vec<f32>,
-    batch: BatchScratch,
+    /// Residual-stream scratch; private to the model, `pub(crate)` so [`super::engine`] can
+    /// prefault it.
+    pub(crate) x: Vec<f32>,
+    pub(crate) h: Vec<f32>,
+    pub(crate) q: Vec<f32>,
+    pub(crate) k: Vec<f32>,
+    pub(crate) v: Vec<f32>,
+    pub(crate) attn: Vec<f32>,
+    pub(crate) gate: Vec<f32>,
+    pub(crate) up: Vec<f32>,
+    pub(crate) attn_scratch: AttnScratch,
+    pub(crate) logits: Vec<f32>,
+    pub(crate) batch: BatchScratch,
     /// Set while a prompt chunk runs through the batch path, so the profile can tell a chunk from a
     /// decode step. Only meaningful when the phase timers are on.
     chunk_pass: bool,
@@ -2017,18 +2019,18 @@ fn attention_heads(
 
 /// Working memory for [`attention_streaming`], kept between calls so a token allocates nothing.
 #[derive(Debug, Default)]
-struct AttnScratch {
+pub(crate) struct AttnScratch {
     /// `heads * positions` scores, head-major.
-    scores: Vec<f32>,
+    pub(crate) scores: Vec<f32>,
     /// One decoded K or V row, `kv_heads * head_dim` values.
-    row: Vec<f32>,
+    pub(crate) row: Vec<f32>,
     /// Per head: the running maximum, then its softmax normalizer.
-    head_state: Vec<f32>,
+    pub(crate) head_state: Vec<f32>,
     /// The whole layer decoded to `f32`, for [`attend`]'s short-history path. Empty until a rule
     /// with fewer than [`STREAMING_MIN_POSITIONS`] positions runs.
-    k_all: Vec<f32>,
+    pub(crate) k_all: Vec<f32>,
     /// The matching V rows. Same lifecycle as [`Self::k_all`].
-    v_all: Vec<f32>,
+    pub(crate) v_all: Vec<f32>,
 }
 
 /// Below this many positions, [`attend`] decodes the layer once and uses the buffered kernel;
@@ -3914,6 +3916,11 @@ fn one_kv_for_all(kv: &[KvRead<'_>]) -> bool {
 /// quarters of the K/V reads and paid for them by touching every block accumulator once per
 /// position instead of once per sixteen, which the V fold dominates. The row blocking is what makes
 /// the sharing pay.
+///
+/// The masked tail of a short row is skipped: a tile's walk runs to the longest `seen` in it, and
+/// the GEMMs, the row decode and the softmax run only to `fold`, the farthest position any row
+/// actually sees (`visible` is each row's own `n_valid`). A tile with no visible row at all stops
+/// the walk: `seen` only grows, so nothing later is visible either.
 fn attend_rows_shared(
     q: &[f32],
     kv: &[KvRead<'_>],
@@ -3984,12 +3991,26 @@ fn attend_rows_shared(
                         },
                     )?;
                     let keys = pending;
-                    for row in 0..keys {
+                    // The farthest position any row of the tile sees in this key range — the
+                    // `n_valid` of the skip: rows past it are masked for every row, and the GEMMs
+                    // below walk to `fold` instead of the full tile. A row's `visible` here is its
+                    // per-row length, so `fold` is the longest of the run.
+                    let mut fold = 0;
+                    for row in 0..width {
+                        let seen = positions[first + tile + row];
+                        fold = fold.max(keys.min(seen.saturating_sub(start)));
+                    }
+                    if fold == 0 {
+                        // Every row is masked past this range. Positions only grow along a chunk,
+                        // so no later range of the walk is visible either.
+                        break;
+                    }
+                    for row in 0..fold {
                         let base = key_bases[row] + kv_head * head_dim * 2;
                         crate::simd::f16_row_to_f32_strided(
                             &storage[base..][..head_dim * 2],
                             &mut keys_f32[row..],
-                            keys,
+                            fold,
                         );
                         let value = kv[0].value_row(order, key_bases[row], layer_bytes)
                             + kv_head * head_dim * 2;
@@ -4001,22 +4022,22 @@ fn attend_rows_shared(
                     for head in head_first..head_last {
                         // The GEMM accumulates into its output, and the previous head's weights are
                         // still in the tile.
-                        scores[..width * keys].fill(0.0);
+                        scores[..width * fold].fill(0.0);
                         crate::simd::gemm(
                             width,
                             head_dim,
-                            keys,
+                            fold,
                             &q[(first + tile) * query + head * head_dim..],
                             query,
-                            &keys_f32[..head_dim * keys],
-                            &mut scores[..width * keys],
-                            keys,
+                            &keys_f32[..head_dim * fold],
+                            &mut scores[..width * fold],
+                            fold,
                         );
                         // TriAttention (arXiv 2611.07256): when every visible score in this tile
                         // sits below the threshold, the tile contributes ~nothing to the
                         // attention output — skip the softmax update and the value fold.
                         if triattention_enabled() {
-                            let tile_max = scores[..width * keys]
+                            let tile_max = scores[..width * fold]
                                 .iter()
                                 .copied()
                                 .fold(f32::NEG_INFINITY, f32::max);
@@ -4030,7 +4051,7 @@ fn attend_rows_shared(
                             // tile is a prefix of what it may see, so the visible rows are a slice.
                             let seen = positions[first + tile + row];
                             let visible = keys.min(seen.saturating_sub(start));
-                            let weights = &mut scores[row * keys..][..keys];
+                            let weights = &mut scores[row * fold..][..fold];
                             for weight in &mut weights[visible..] {
                                 *weight = 0.0;
                             }
@@ -4056,13 +4077,16 @@ fn attend_rows_shared(
                             m[at] = largest;
                             d[at] += crate::simd::exp_sum_shifted(&mut weights[..visible], largest);
                         }
+                        // The value GEMM: every row folds the tile's V rows at its softmax
+                        // weights. It walks to `fold`: a row's scores past its visible length are
+                        // zero, so folding the masked region adds nothing.
                         crate::simd::gemm(
                             width,
-                            keys,
+                            fold,
                             head_dim,
-                            &scores[..width * keys],
-                            keys,
-                            &values_f32[..keys * head_dim],
+                            &scores[..width * fold],
+                            fold,
+                            &values_f32[..fold * head_dim],
                             &mut o[tile * query + head * head_dim..],
                             query,
                         );
@@ -5730,6 +5754,98 @@ mod tests {
             .map(|(one, many)| (one - many).abs())
             .fold(0.0_f32, f32::max);
         assert!(worst < 1e-5, "row sharing moved an output by {worst}");
+    }
+
+    /// The row-sharing kernel skips the masked tail of short rows: the same answer as the
+    /// per-entry reference on every row, and a row that sees nothing reads as zeros. `positions`
+    /// is variable — the walk runs to the longest row and the short ones are masked past their
+    /// own length.
+    #[test]
+    fn qblock_rows_shared_skips_the_masked_tail_of_short_rows() {
+        let shape = AttnShape {
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+        let query = shape.heads * shape.head_dim;
+        let entries = 7usize;
+        let first = 300usize;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..(first + entries).div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::F16,
+            shape,
+            tokens_per_block,
+            &table,
+            first + entries,
+        );
+        let bytes_per_token = 2 * 2 * KvLayout::F16.bytes_per_row(shape.kv_heads * shape.head_dim);
+        let kv = KvView {
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            bytes_per_token,
+            layout: KvLayout::F16,
+        };
+        let q: Vec<f32> = (0..entries * query)
+            .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.07)
+            .collect();
+        // Variable lengths, including one row that sees nothing: the tile's walk is to the last
+        // row, and every shorter row is masked past its own length.
+        let positions: Vec<usize> = vec![4, 11, 0, 27, 9, 19, 40];
+
+        // One call per entry, as a chunk does it today: `positions[entry]` is the row's length.
+        let mut expected = vec![0.0_f32; entries * query];
+        for entry in 0..entries {
+            let read = KvRead::of(&kv);
+            let mut scratch = AttnScratch::default();
+            attend_entry(
+                AttentionCall {
+                    q: &q[entry * query..][..query],
+                    kv: &read,
+                    layer: 0,
+                    positions: positions[entry],
+                    shape,
+                    heads: 0..shape.heads,
+                    out: &mut expected[entry * query..][..query],
+                },
+                &mut scratch,
+            )
+            .expect("one entry");
+        }
+        // Sanity: the case must produce nonzero values somewhere, or it proves nothing.
+        assert!(
+            expected.iter().any(|value| value.abs() > 1e-3),
+            "the case produced only zeros"
+        );
+
+        let reads: Vec<KvRead<'_>> = (0..entries).map(|_| KvRead::of(&kv)).collect();
+        let mut shared = vec![0.0_f32; entries * query];
+        attend_rows_shared(&q, &reads, &positions, 0, shape, &mut shared, 1).expect("shared");
+
+        // Every row matches the reference: the valid prefix of a short row is the reference
+        // answer, and the masked tail adds nothing.
+        let worst = expected
+            .iter()
+            .zip(&shared)
+            .map(|(one, many)| (one - many).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 1e-5, "row sharing moved an output by {worst}");
+
+        // The row that sees nothing reads as zeros on both paths.
+        assert!(
+            shared[2 * query..][..query]
+                .iter()
+                .all(|value| *value == 0.0),
+            "the entry that saw nothing did not read as zeros"
+        );
+        assert!(
+            expected[2 * query..][..query]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
     }
 
     fn order_for_test() -> RowOrder {
