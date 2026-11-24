@@ -67,4 +67,30 @@ mod tests {
         assert!(!window.is_lossy_at(2052));
         assert!(window.is_lossy_at(2053));
     }
+
+    #[test]
+    fn zero_length_window_is_lossy_past_sinks() {
+        // With 0 tokens and 4 sinks, positions > 4 are lossy
+        let window = Window {
+            tokens: 0,
+            sinks: 4,
+        };
+        assert!(!window.is_lossy_at(4)); // exactly at the boundary
+        assert!(window.is_lossy_at(5)); // past the boundary
+        assert!(!window.is_lossy_at(0)); // before the boundary
+        assert!(!window.is_lossy_at(1)); // before the boundary
+    }
+
+    #[test]
+    fn single_token_window_is_lossy_past_sinks() {
+        // With 1 token and 4 sinks, positions > 5 are lossy
+        let window = Window {
+            tokens: 1,
+            sinks: 4,
+        };
+        assert!(!window.is_lossy_at(5)); // exactly at the boundary (1 + 4)
+        assert!(window.is_lossy_at(6)); // past the boundary
+        assert!(!window.is_lossy_at(4)); // before the boundary
+        assert!(!window.is_lossy_at(3)); // before the boundary
+    }
 }
