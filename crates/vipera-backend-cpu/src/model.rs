@@ -1652,6 +1652,11 @@ struct KvView<'a> {
 impl KvView<'_> {
     /// The physical block `position` lives in, and how far into it `position` is.
     fn token_in_block(&self, position: usize) -> Result<(usize, usize), ViperaError> {
+        if self.tokens_per_block == 0 {
+            return Err(ViperaError::invalid_argument(
+                "a KV block must hold at least one token",
+            ));
+        }
         let block = *self
             .table
             .get(position / self.tokens_per_block)
@@ -1672,7 +1677,7 @@ impl KvView<'_> {
         v: &[f32],
     ) -> Result<(), ViperaError> {
         let layer_bytes = self.layout.bytes_per_row(shape.kv_heads * shape.head_dim);
-        let per_block = self.tokens_per_block.max(1);
+        let per_block = self.tokens_per_block;
         let (block_start, in_block) = self.token_in_block(position)?;
         let RowWalk {
             k: base,
@@ -1826,7 +1831,12 @@ fn for_each_row_range(
     end: usize,
     mut visit: impl FnMut(usize, usize) -> Result<(), ViperaError>,
 ) -> Result<(), ViperaError> {
-    let per_block = tokens_per_block.max(1);
+    if tokens_per_block == 0 {
+        return Err(ViperaError::invalid_argument(
+            "a KV block must hold at least one token",
+        ));
+    }
+    let per_block = tokens_per_block;
     let mut position = start.min(end);
     while position < end {
         let block = *table
@@ -1878,7 +1888,12 @@ fn load_layer(
     // Positions inside one block are a fixed distance apart, so the block table is consulted once
     // per block instead of once per position: at 1024 positions that was a division and a
     // bounds-checked lookup for every row of every layer.
-    let per_block = tokens_per_block.max(1);
+    if tokens_per_block == 0 {
+        return Err(ViperaError::invalid_argument(
+            "a KV block must hold at least one token",
+        ));
+    }
+    let per_block = tokens_per_block;
     let order = RowOrder::from_env();
     let mut position = 0;
     while position < positions {
@@ -2472,6 +2487,10 @@ fn attention_streaming_heads(
         && !sequential;
     let shared = share && in_place && group <= MAX_SHARED_GROUP;
     let count = heads.end - heads.start;
+    if positions == 0 {
+        out[..count * head_dim].fill(0.0);
+        return Ok(());
+    }
     scores.clear();
     scores.resize(count * positions, 0.0);
     row.clear();
@@ -8035,5 +8054,24 @@ mod tests {
             }
         }
         best.0 as u32
+    }
+
+    #[test]
+    fn kv_write_rejects_a_zero_width_block() {
+        let shape = AttnShape {
+            heads: 1,
+            kv_heads: 1,
+            head_dim: 2,
+        };
+        let mut storage = vec![0u8; 8];
+        let table = [0u32];
+        let mut kv = KvView {
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block: 0,
+            bytes_per_token: 8,
+            layout: KvLayout::F16,
+        };
+        assert!(kv.write(0, 0, shape, &[1.0, 2.0], &[3.0, 4.0]).is_err());
     }
 }
