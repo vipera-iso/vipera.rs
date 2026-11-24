@@ -634,6 +634,150 @@
 - [ ] `frontier-alignment` — Alignment (safety, value) — OpenCode
 - [ ] `frontier-scaling` — Scaling law (compute, data, model) — OpenCode
 
+### P49 — AUTOMATION + WORKFLOW (thêm)
+- [ ] `auto-pipeline` — Data pipeline (ingest → transform → serve) — Freebuff
+- [ ] `auto-feature` — Feature store (compute, version, lineage) — Freebuff
+- [ ] `auto-model` — Auto-model (select, tune, deploy) — Freebuff
+- [ ] `auto-eval` — Auto-eval (benchmark, regression) — Freebuff
+- [ ] `auto-rollback` — Auto-rollback (model, config) — Freebuff
+- [ ] `auto-scale` — Auto-scale (CPU, GPU, memory) — Freebuff
+- [ ] `auto-update` — Auto-update (model, dependency) — Freebuff
+- [ ] `auto-failover` — Auto-failover (node, region) — Freebuff
+- [ ] `auto-heal` — Auto-heal (detect, diagnose, fix) — Freebuff
+- [ ] `auto-learn` — Auto-learn (online, incremental) — Freebuff
+
+### P50 — VISUALIZATION + INSIGHT (thêm)
+- [ ] `viz-attention` — Attention map (heatmap, flow) — Freebuff
+- [ ] `viz-activation` — Activation map (layer, neuron) — Freebuff
+- [ ] `viz-gradient` — Gradient flow (backprop) — Freebuff
+- [ ] `viz-loss` — Loss curve (train, val) — Freebuff
+- [ ] `viz-perf` — Perf profile (CPU, GPU, memory) — Freebuff
+- [ ] `viz-data` — Data viz (distribution, correlation) — Freebuff
+- [ ] `viz-model` — Model viz (architecture, weight) — Freebuff
+- [ ] `viz-compare` — Compare (model, quant, prompt) — Freebuff
+- [ ] `viz-debug` — Debug viz (step, inspect) — Freebuff
+- [ ] `viz-report` — Report (auto, HTML, PDF) — Freebuff
+
+### P51 — AUTONOMOUS SYSTEMS (thêm)
+- [ ] `auto-scheduler` — Auto-scheduler (task, resource) — Freebuff
+- [ ] `auto-router` — Auto-router (model, endpoint) — Freebuff
+- [ ] `auto-balancer` — Auto-balancer (load, priority) — Freebuff
+- [ ] `auto-monitor` — Auto-monitor (metric, alert) — Freebuff
+- [ ] `auto-heal` — Auto-heal (failover, retry) — Freebuff
+- [ ] `auto-learn` — Auto-learn (online, adaptive) — Freebuff
+- [ ] `auto-optimize` — Auto-optimize (hyperparam, resource) — Freebuff
+- [ ] `auto-secure` — Auto-secure (scan, patch) — Freebuff
+- [ ] `auto-comply` — Auto-comply (policy, rule) — Freebuff
+- [ ] `auto-improve` — Auto-improve (feedback, iterate) — Freebuff
+
+### P52 — METRICS + KPI (thêm)
+- [ ] `kpi-latency` — Latency (p50, p95, p99) — Freebuff
+- [ ] `kpi-throughput` — Throughput (req/sec, token/sec) — Freebuff
+- [ ] `kpi-accuracy` — Accuracy (task, domain) — Freebuff
+- [ ] `kpi-efficiency` — Efficiency (FLOP/token, W/token) — Freebuff
+- [ ] `kpi-cost` — Cost ($/token, $/query) — Freebuff
+- [ ] `kpi-satisfaction` — Satisfaction (user, rating) — Freebuff
+- [ ] `kpi-reliability` — Reliability (uptime, error rate) — Freebuff
+- [ ] `kpi-fairness` — Fairness (bias, disparity) — Freebuff
+- [ ] `kpi-safety` — Safety (toxicity, jailbreak) — Freebuff
+- [ ] `kpi-impact` — Impact (social, environmental) — Freebuff
+
+### P53 — GOVERNANCE + POLICY (thêm)
+- [ ] `gov-model` — Model governance (version, audit) — Freebuff
+- [ ] `gov-data` — Data governance (quality, access) — Freebuff
+- [ ] `gov-prompt` — Prompt governance (template, policy) — Freebuff
+- [ ] `gov-output` — Output governance (filter, log) — Freebuff
+- [ ] `gov-access` — Access governance (role, scope) — Freebuff
+- [ ] `gov-audit` — Audit governance (log, report) — Freebuff
+- [ ] `gov-policy` — Policy governance (rule, enforce) — Freebuff
+- [ ] `gov-compliance` — Compliance governance (regulation) — Freebuff
+- [ ] `gov-risk` — Risk governance (assess, mitigate) — Freebuff
+- [ ] `gov-ethics` — Ethics governance (value, principle) — Freebuff
+
+### P54 — EXPERIMENT + A/B (thêm)
+- [ ] `exp-design` — Experiment design (hypothesis, variant) — Freebuff
+- [ ] `exp-sample` — Sample size (power, significance) — Freebuff
+- [ ] `exp-random` — Randomize (user, request) — Freebuff
+- [ ] `exp-track` — Track (metric, segment) — Freebuff
+- [ ] `exp-analyze` — Analyze (statistical, causal) — Freebuff
+- [ ] `exp-report` — Report (result, insight) — Freebuff
+- [ ] `exp-deploy` — Deploy (winner, rollout) — Freebuff
+- [ ] `exp-iterate` — Iterate (learn, improve) — Freebuff
+- [ ] `exp-multi` — Multi-armed bandit (exploration) — Freebuff
+- [ ] `exp-offline` — Offline eval (dataset, replay) — Freebuff
+
+### P55 — OPS + RUNBOOK (thêm)
+- [ ] `runbook-deploy` — Deploy (build, test, release) — Freebuff
+- [ ] `runbook-rollback` — Rollback (version, config) — Freebuff
+- [ ] `runbook-failover` — Failover (node, region) — Freebuff
+- [ ] `runbook-scale` — Scale (up, down, out) — Freebuff
+- [ ] `runbook-update` — Update (model, patch) — Freebuff
+- [ ] `runbook-backup` — Backup (snapshot, restore) — Freebuff
+- [ ] `runbook-migrate` — Migrate (data, model) — Freebuff
+- [ ] `runbook-disaster` — Disaster recovery (RTO, RPO) — Freebuff
+- [ ] `runbook-incident` — Incident (detect, respond, resolve) — Freebuff
+- [ ] `runbook-postmortem` — Post-mortem (root cause, action) — Freebuff
+
+### P56 — LLM SPECIFIC (thêm)
+- [ ] `llm-prompt` — Prompt engineering (template, chain) — Freebuff
+- [ ] `llm-chain` — Chain (ReAct, CoT, self-ask) — Freebuff
+- [ ] `llm-tool` — Tool use (function, API) — Freebuff
+- [ ] `llm-memory` — Memory (short-term, long-term) — Freebuff
+- [ ] `llm-agent` — Agent (plan, act, observe) — Freebuff
+- [ ] `llm-rag` — RAG (retrieve, augment) — Freebuff
+- [ ] `llm-finetune` — Fine-tune (LoRA, QLoRA) — Freebuff
+- [ ] `llm-eval` — Eval (MMLU, GSM8K, HumanEval) — Freebuff
+- [ ] `llm-safe` — Safety (jailbreak, toxicity) — Freebuff
+- [ ] `llm-cost` — Cost (token, query, cache) — Freebuff
+
+### P57 — BENCHMARK + LEADERBOARD (thêm)
+- [ ] `bench-mmlu` — MMLU (57 subjects) — Freebuff
+- [ ] `bench-gsm8k` — GSM8K (math, grade school) — Freebuff
+- [ ] `bench-humaneval` — HumanEval (code, Python) — Freebuff
+- [ ] `bench-math` — Math (GSM8K, MATH) — Freebuff
+- [ ] `bench-code` — Code (HumanEval, MBPP) — Freebuff
+- [ ] `bench-chat` — Chat (MT-Bench, Alpaca) — Freebuff
+- [ ] `bench-long` — Long context (128k, 1M) — Freebuff
+- [ ] `bench-multimodal` — Multi-modal (MMMU, MMBench) — Freebuff
+- [ ] `bench-agentic` — Agentic (SWE-bench, AgentBench) — Freebuff
+- [ ] `bench-custom` — Custom (domain, task) — Freebuff
+
+### P58 — SAFETY + RED TEAM (thêm)
+- [ ] `safety-jailbreak` — Jailbreak (prompt injection) — Freebuff
+- [ ] `safety-toxicity` — Toxicity (hate, violence) — Freebuff
+- [ ] `safety-hallucination` — Hallucination (fact-check) — Freebuff
+- [ ] `safety-bias` — Bias (gender, race, political) — Freebuff
+- [ ] `safety-privacy` — Privacy (PII, data leak) — Freebuff
+- [ ] `safety-redteam` — Red team (attack, defense) — Freebuff
+- [ ] `safety-audit` — Audit (model, system) — Freebuff
+- [ ] `safety-report` — Report (finding, fix) — Freebuff
+- [ ] `safety-monitor` — Monitor (continuous, real-time) — Freebuff
+- [ ] `safety-train` — Train (safety, alignment) — Freebuff
+
+### P59 — COST + FINOPS (thêm)
+- [ ] `cost-track` — Track (per model, per user) — Freebuff
+- [ ] `cost-forecast` — Forecast (trend, seasonality) — Freebuff
+- [ ] `cost-optimize` — Optimize (cache, quant) — Freebuff
+- [ ] `cost-budget` — Budget (cap, alert) — Freebuff
+- [ ] `cost-charge` — Charge (usage, invoice) — Freebuff
+- [ ] `cost-report` — Report (team, project) — Freebuff
+- [ ] `cost-compare` — Compare (provider, model) — Freebuff
+- [ ] `cost-roi` — ROI (value, cost) — Freebuff
+- [ ] `cost-savings` — Savings (automate, optimize) — Freebuff
+- [ ] `cost-sustainability` — Sustainability (carbon, energy) — Freebuff
+
+### P60 — SUSTAINABILITY + GREEN AI (thêm)
+- [ ] `green-carbon` — Carbon (per query, per model) — Freebuff
+- [ ] `green-energy` — Energy (per token, per GPU) — Freebuff
+- [ ] `green-water` — Water (cooling, data center) — Freebuff
+- [ ] `green-waste` — Waste (e-waste, hardware) — Freebuff
+- [ ] `green-reuse` — Reuse (model, data) — Freebuff
+- [ ] `green-efficient` — Efficient (smaller, faster) — Freebuff
+- [ ] `green-offset` — Offset (carbon, tree) — Freebuff
+- [ ] `green-report` — Report (ESG, sustainability) — Freebuff
+- [ ] `green-target` — Target (net-zero, SBTi) — Freebuff
+- [ ] `green-audit` — Audit (sustainability, impact) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -644,11 +788,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **491 tasks** (P0-P48) × 1 cycle = **1964 contributions**
-> 491 × 2 cycles = **3928 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 491 × 3 cycles = **5892 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
+> **611 tasks** (P0-P60) × 1 cycle = **2444 contributions**
+> 611 × 2 cycles = **4888 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 611 × 3 cycles = **7332 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 1 cycle trong 24h → 1964 contributions (vượt 1000 rule)**
+**Gợi ý: 1 cycle trong 24h → 2444 contributions (vượt 1000 rule)**
 
 ## LỆNH CHẠY
 
