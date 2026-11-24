@@ -31,20 +31,24 @@ that lost.
 
 | | vipera | llama.cpp, same machine | vipera / llama.cpp |
 |---|---:|---:|---:|
-| prefill, 128 tokens | 226 tok/s | 218 | 1.04x |
-| prefill, 512 tokens | 210 tok/s | 210 | 1.00x |
-| prefill, 1024 tokens | 198 tok/s | 198 | 1.00x |
-| prefill, 4096 tokens | 162 tok/s | 157 | 1.03x |
-| decode, shallow | 34.6 tok/s (33.83 ms, `VIPERA_TILED_A` on) | 33.9–36.7 | 0.94–1.02x |
+| prefill, 128 tokens | 233 tok/s | 229 | 1.01x |
+| prefill, 512 tokens | 221 tok/s | 222 | 0.99x |
+| prefill, 1024 tokens | 203 tok/s | 210 | 0.97x |
+| prefill, 4096 tokens | 145 tok/s | 166 | 0.87x |
+| decode, shallow | 29.5 tok/s (33.9 ms/step) | 37.2 | 0.79x |
 | decode, 4k of history | 24.2 tok/s | 25.3 | 0.96x |
 | decode, 32k of history, window 2048 | 28.0 tok/s (35.8 ms/step) | not measured | — (6.8 tok/s with the full history) |
 | KV held for a windowed 32k run | 61 MB | not measured | — (896 MB with the full history) |
 
-Prefill is level with llama.cpp to +4% across those four lengths, re-measured on 2026-11-24 after an
-earlier table showed a 20–21% deficit at 4096; decode is level, and llama.cpp's remaining edge is at
-depth (0.96x at 4k of history). Prefill cost is not batch width: the matvecs cost the same per chunk
-at 4k as at 1k, while attention grows with the history, from 6% of the first chunk to 41% of a 4k
-one.
+Prefill is level at 128 and 512 tokens (1.01x and 0.99x), 3% behind at 1024 and **13% behind at
+4096**; decode is **21% behind** at shallow depth. Those five rows (128 through shallow decode) were
+measured in one session on 2026-11-24, vipera from its own chunk/step clock and llama.cpp from
+`llama-bench`, so they are comparable; the 4k and 32k rows are older.
+An earlier version of this table had prefill level at 4096 and decode at parity: those vipera figures
+came from summing `PROFILE` running averages, which undercounts by ~11% (the ledger's measurement
+note and its "corrected method" section explain it), and the claim is withdrawn. Prefill cost is not
+batch width: the matvecs cost the same per chunk at 4k as at 1k, while attention grows with the
+history, from 6% of the first chunk to 41% of a 4k one.
 
 Against the hardware rather than another engine: the Q4_K and Q6_K kernels stream weights at
 29–30 GB/s (68–70% of the 43 GB/s this machine can read at all), and the output projection reaches
@@ -52,8 +56,7 @@ Against the hardware rather than another engine: the Q4_K and Q6_K kernels strea
 
 ### Repacking the weights, and what it is worth
 
-llama.cpp's prefill is measured here at 217–227 tok/s (512 tokens), against an engine that measured
-172 in that session and 210 in the 2026-11-24 re-measurement, and ik_llama.cpp at 268.7 / 199.4
+llama.cpp's prefill is measured here at 217–227 tok/s (512 tokens), against anengine that measured 172 in that session and 221 in the 2026-11-24 re-measurement, and ik_llama.cpp at 268.7 / 199.4
 tok/s at 512 / 4096 tokens against 209.6 / 140.3.
 
 - **Ubatch is not it.** Running ik_llama.cpp at `-ub 128`, 256 and 512 moves it by 3–8%, not 15–20%.
@@ -210,12 +213,13 @@ docs/benchmarks/              the surveys the plan was written from
   prefill is one position per weight read), no sliding window (a ring table is refused), no
   speculative draft (it reads through `logits_range`, which the device backend does not implement),
   and `verify` reports host memory only.
-- **Prefill**: re-measured 2026-11-24, the engine is level with llama.cpp to +4% at every length
-  from 128 to 4096 tokens; the 20–21% deficit at 4096 an earlier table recorded is not reproduced.
-  Decode is level too, with llama.cpp up to 4–6% ahead at depth (4k of history). What moved prefill
-  is not attributed to one switch — the A/B for that has not been run — and the residual cost is
-  attention growing with the history (6% of the first chunk at 1k, 41% of a 4k chunk) rather than
-  batch width.
+- **Prefill and decode against llama.cpp**: measured in one session on 2026-11-24 (vipera's own
+  chunk/step clocks, `llama-bench` for the reference), prefill is level at 128 and 512 tokens
+  (1.01x, 0.99x), 0.97x at 1024 and **0.87x at 4096**; decode at shallow depth is **0.79x**
+  (29.5 vs 37.2 tok/s, 33.9 vs 26.9 ms/step). An earlier table reported both as level; its vipera
+  numbers summed `PROFILE` running averages, which undercounts by ~11%, and that claim is withdrawn.
+  The 4096 residual is attention growing with the history (6% of the first chunk at 1k, 41% of a 4k
+  chunk) rather than batch width, and the decode gap is not attributed to one phase yet.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
 - **Server**: TLS needs a certificate. An ACME client exists but is not in the default build:

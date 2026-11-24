@@ -4479,7 +4479,10 @@ vipera 160.15 tok/s, llama.cpp 157.41 tok/s at `-p 4101`, same ordering as below
 | 1024 | 197.6 (196.3–201.1) | 197.7 (195.7–198.4) | 1.00 |
 | 4096 | 162.4 (160.0–173.6) | 157.2 (156.0–157.9) | 1.03 |
 
-**Verdict: prefill is level with llama.cpp to +4%, not 20–21% behind.** The old 4096 figure is not
+**Sửa 2026-11-24 (sau đó):** các số vipera trong bảng này cộng trung bình luỹ tiến của `PROFILE`
+nên cao hơn ~11%; xem mục "Prefill/decode wall-clock đối chiếu llama.cpp, cùng phiên" ở cuối file.
+
+**Verdict (bản cũ, đã rút lại): prefill is level with llama.cpp to +4%, not 20–21% behind.** The old 4096 figure is not
 reproduced; the ratio, not the absolute tok/s, is the row that settles it.
 
 **Machine state is the caveat.** An earlier sweep one hour before this one measured llama.cpp at
@@ -4628,3 +4631,30 @@ Hai bản đầu của mục này sai số, cả hai vì cách đo chứ không 
 Từ nay: tổng prefill/decode lấy **wall-clock** (trừ hằng số nạp model đo riêng); `PROFILE` chỉ dùng
 cho *tỉ lệ % trong một pass cùng width*; trước mỗi sweep ghi `md5sum target/release/vipera` và build
 lại nếu source vừa đổi.
+
+## Prefill/decode wall-clock đối chiếu llama.cpp, cùng phiên — 2026-11-24 (phương pháp sửa)
+
+**Vì sao có mục này:** mục "Prefill re-measured" ở trên cộng các dòng `PROFILE chunk N X ms`, mà `X`
+là trung bình luỹ tiến qua N pass — không phải tổng. Cùng engine, cùng model, hôm nay tổng đúng của
+prefill 4096 là 28.31 s (144.7 tok/s) trong khi cách cộng cũ cho 162.4 tok/s; sai ~11%, đủ để biến
+"0.87×" thành "1.03×". Số llama.cpp cũng đã dịch (157.2 → 165.5 tok/s), nên bảng dưới đo lại cả hai
+bên trong cùng một phiên.
+
+**Phương pháp.** Thời gian engine = trung bình của dòng `PROFILE chunk` **cuối** × số pass (đã đối
+chiếu wall: 28.31 s engine + 0.54 s nạp = 28.85 s wall); decode = trung bình dòng `PROFILE decode`
+cuối (khớp marginal wall 33.6 ms). llama.cpp: `llama-bench -p N -n 64 -r 2 -t 8`, cùng file GGUF,
+cùng 8 thread, chạy trong cùng phiên. `N` tính bằng `vipera tokenize` (`"the" + " the" × (N−1)`).
+
+| prompt tokens | vipera tok/s | llama.cpp tok/s | vipera / llama.cpp |
+|---|---:|---:|---:|
+| 128 | 232.6 (230.5–234.7) | 229.2 | 1.01 |
+| 512 | 220.7 | 222.2 | 0.99 |
+| 1024 | 203.2 (201.2–205.1) | 210.5 | 0.97 |
+| 4096 | 144.7 | 165.5 | **0.87** |
+| decode 64 (bước) | 29.5 tok/s (33.9 ms) | 37.2 tok/s (26.9 ms) | **0.79** |
+
+**Verdict:** prefill ngang llama.cpp ở 128/512, kém 3% ở 1024 và **13% ở 4096**; decode **kém 21%**
+ở độ sâu nông. Claim "level with llama.cpp to +4%" trong README cũ dựa trên cách cộng sai và được rút
+lại; README nay ghi đúng bảng này. Decode 33.9 ms/step chia theo phase: q4k 19.86 (59%), q6k 11.59
+(34%), attention 2.12 (6%) — chênh lệch so với llama chưa quy cho phase nào, đó là câu mở của phiên
+sau. Máy không throttled trong phiên này: llama.cpp đo lại lúc đầu và lúc cuối lệch <2%.
