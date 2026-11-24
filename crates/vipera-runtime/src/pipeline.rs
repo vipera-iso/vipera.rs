@@ -273,6 +273,37 @@ impl RequestLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vipera_traits::{AlgorithmPlan, AlgorithmRegistry, KvCompression, SparseAttention};
+
+    /// A no-op KV compression implementation with a name, for testing registry lookups.
+    struct InertCompression;
+
+    impl KvCompression for InertCompression {
+        fn name(&self) -> &'static str {
+            "inert-compress"
+        }
+
+        fn compress(&self, _block: &[f32], _out: &mut Vec<u8>) -> usize {
+            0
+        }
+
+        fn decompress(&self, _compressed: &[u8], _out: &mut [f32]) -> usize {
+            0
+        }
+    }
+
+    /// A no-op sparse attention policy with a name, for testing registry lookups.
+    struct InertSparse;
+
+    impl SparseAttention for InertSparse {
+        fn name(&self) -> &'static str {
+            "inert-sparse"
+        }
+
+        fn positions(&self, _query: u32, _context: u32, out: &mut Vec<u32>) {
+            out.extend(0.._context);
+        }
+    }
 
     #[test]
     fn stages_keep_a_stable_order_and_names() {
@@ -326,5 +357,86 @@ mod tests {
         }
         assert!(json.contains("\"finish\":\"length\""));
         assert!(!json.contains('\n'));
+    }
+
+    #[test]
+    fn registry_finds_algorithm_by_name_in_own_slot() {
+        let registry = AlgorithmRegistry::new(&[&InertCompression], &[&InertSparse], &[], &[]);
+        // Compression named "inert-compress" is findable in its own slot.
+        assert_eq!(
+            registry
+                .compression("inert-compress")
+                .map(|policy| policy.name()),
+            Some("inert-compress")
+        );
+        // The same name in another slot is a different question, and the answer is no.
+        assert!(registry.sparse("inert-compress").is_none());
+        // Names spans all slots in order.
+        assert_eq!(
+            registry.names().collect::<Vec<_>>(),
+            vec!["inert-compress", "inert-sparse"]
+        );
+    }
+
+    #[test]
+    fn a_plan_resolves_each_slot_it_names() {
+        let registry = AlgorithmRegistry::new(&[&InertCompression], &[&InertSparse], &[], &[]);
+        let planned = registry
+            .plan(&AlgorithmPlan {
+                compression: Some("inert-compress"),
+                sparse: Some("inert-sparse"),
+                ..AlgorithmPlan::default()
+            })
+            .expect("the plan names what this build has");
+        assert_eq!(
+            planned.compression.map(|policy| policy.name()),
+            Some("inert-compress")
+        );
+        assert_eq!(
+            planned.sparse.map(|policy| policy.name()),
+            Some("inert-sparse")
+        );
+        assert!(planned.speculative.is_none());
+        assert!(planned.offloading.is_none());
+    }
+
+    #[test]
+    fn an_empty_plan_resolves_to_no_policies() {
+        let registry = AlgorithmRegistry::new(&[&InertCompression], &[&InertSparse], &[], &[]);
+        let planned = registry
+            .plan(&AlgorithmPlan::default())
+            .expect("an empty plan asks for nothing");
+        assert!(planned.compression.is_none());
+        assert!(planned.sparse.is_none());
+    }
+
+    #[test]
+    fn a_plan_naming_an_absent_algorithm_says_which_slot_and_name() {
+        let registry = AlgorithmRegistry::new(&[&InertCompression], &[&InertSparse], &[], &[]);
+        let missing = registry
+            .plan(&AlgorithmPlan {
+                compression: Some("nonexistent"),
+                ..AlgorithmPlan::default()
+            })
+            .expect_err("this build has no such compression policy");
+        assert_eq!(missing.slot, "compression");
+        assert_eq!(missing.name, "nonexistent");
+        assert_eq!(
+            missing.to_string(),
+            "no compression algorithm named 'nonexistent'"
+        );
+    }
+
+    #[test]
+    fn a_plan_is_checked_whole_before_any_slot_resolves() {
+        let registry = AlgorithmRegistry::new(&[&InertCompression], &[&InertSparse], &[], &[]);
+        let missing = registry
+            .plan(&AlgorithmPlan {
+                compression: Some("inert-compress"),
+                offloading: Some("moe"),
+                ..AlgorithmPlan::default()
+            })
+            .expect_err("the offloading name is absent even though compression resolves");
+        assert_eq!(missing.slot, "offloading");
     }
 }
