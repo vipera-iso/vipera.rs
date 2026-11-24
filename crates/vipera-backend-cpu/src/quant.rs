@@ -1306,6 +1306,18 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     tile: Option<&crate::simd::SharedTile>,
 ) {
     let count = out.len() / B;
+    // VIPERA_Q8R16: the 16-row-interleaved Q8_0 activation repack (default off). Q8_0 is the one
+    // format here that still multiplies `f32` activations — Q4_K and Q6_K already run an integer
+    // activation through their row and tiled kernels — so it is the only place the repack can
+    // replace a kernel. Each weight row is read once for sixteen activation rows, and `i32`
+    // arithmetic replaces sixteen separate `f32` dots. The activation is quantized to one scale
+    // per 32 values, so the numbers move: `VIPERA_EXACT_DOT` keeps it off too, and a chunk that is
+    // not a whole number of 16-row groups at least 32 wide stays on the row kernel.
+    if crate::simd::q8r16_applies_for(ty, B, crate::simd::q8r16_enabled()) && !exact_dot_requested()
+    {
+        crate::simd::fill_rows_q8r16(data, stride, first_row, count, &activation.x, out);
+        return;
+    }
     // Integer tiled path, the prefill default: on an AVX-512 VNNI CPU a Q4_K
     // batch reuses one activation tile across 32 weight rows (8-row bands
     // inside). Measured on the reference machine at B=16 it cuts a prefill

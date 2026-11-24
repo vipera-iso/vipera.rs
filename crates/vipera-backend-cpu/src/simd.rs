@@ -7971,6 +7971,407 @@ pub(crate) fn q6k_repack_dot(repack: &Q6KRepacked, row: usize, xq: &QuantizedX) 
     }
 }
 
+// ---------------------------------------------------------------------------
+// VIPERA_Q8R16: 16-row-interleaved Q8_0 activation repack for prefill batches
+// ---------------------------------------------------------------------------
+//
+// The ik_llama.cpp `Q8_0_R16` idea, ported as a layout rather than as code: when a prompt chunk
+// is at least 32 rows wide, pack each sixteen-row group of activation rows into one Q8_0 block
+// set whose sixteen scales are contiguous (64 bytes, one load) and whose codes are transposed, so
+// one 16-byte code load holds a single value position across the sixteen rows instead of one
+// row's 32 values. One pass over a weight row then produces sixteen outputs.
+//
+// What this repository has matters here. The CPU backend reads F32, F16, Q8_0, Q4_K and Q6_K
+// weights; `Q4_0` and `Q5_0` are refused by name (`quant::row_bytes`), so the three formats the
+// reference selects R16 for map onto the one this backend has: Q8_0. Q4_K and Q6_K already
+// multiply an integer activation through AVX2/VNNI and already share one weight pass across `B`
+// rows, so the repack has nothing to add there.
+//
+// Q8_0 is the one format left on the f32 batch dot (`try_dot_batch` returns `false` for it), and
+// that dot is scalar: 32 float multiplies per row. Packing the activation to `i8` and dotting in
+// `i32` puts the sixteen rows in sixteen lanes, so the row loop becomes one widening load and one
+// multiply-add per value position instead of sixteen separate float dots. Whether that is faster
+// on the shapes this repository runs is what `bench_q8r16_against_f32_batch` measures; the switch
+// stays off until a number says otherwise.
+//
+// The activation is quantized to one scale per 32 values, so this is a numeric-policy change: the
+// tokens differ from the f32 path. Hence `VIPERA_Q8R16`, default off, like `VIPERA_Q4K8` and
+// `VIPERA_Q6K_IQK`.
+
+/// Rows in one repacked group: the `R16` of the reference layout.
+pub(crate) const Q8R16_ROWS: usize = 16;
+
+/// Shortest chunk the repack is used for: the reference picks its activation type at `nrc_y >= 32`.
+pub(crate) const Q8R16_MIN_ROWS: usize = 32;
+
+/// Whether the batch should take the repack: the switch on, a Q8_0 weight matrix, and a chunk of
+/// whole 16-row groups at least [`Q8R16_MIN_ROWS`] wide.
+///
+/// Separate from [`q8r16_enabled`] so the rule is testable without touching the process
+/// environment, which is cached in a `OnceLock`.
+pub(crate) fn q8r16_applies_for(ty: GgmlType, batch: usize, enabled: bool) -> bool {
+    enabled && ty == GgmlType::Q8_0 && batch >= Q8R16_MIN_ROWS && batch.is_multiple_of(Q8R16_ROWS)
+}
+
+/// Whether the 16-row-interleaved Q8_0 activation repack is on: `VIPERA_Q8R16`, default off.
+/// Any value but `0` or empty turns it on, the repository's `env_truthy` convention.
+pub(crate) fn q8r16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VIPERA_Q8R16").ok().is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && value != "0"
+        })
+    })
+}
+
+/// The activation side of one prefill chunk, packed sixteen rows at a time.
+///
+/// Layout, per (16-row group, 32-value group): sixteen `f32` scales (`64` bytes, one load) and
+/// sixteen blocks of 32 codes stored position-major — `codes[k * 16 + r]` is position `k` of row
+/// `r`. That is the whole point: a 16-byte load of `q` is one position across the group's rows,
+/// not one row's sixteen positions.
+pub(crate) struct Q8R16 {
+    /// 32-value groups per row (`cols / 32`): one scale and 32 codes each.
+    groups_per_row: usize,
+    /// `d[(group * groups_per_row + bg) * 16 + r]`.
+    d: Vec<f32>,
+    /// `q[(group * groups_per_row + bg) * 512 + k * 16 + r]`.
+    q: Vec<i8>,
+}
+
+/// Quantize `xs` and lay them out sixteen rows at a time. `xs` must be a whole number of
+/// 16-row groups and every entry must have the same length.
+fn pack_q8r16(xs: &[&[f32]]) -> Q8R16 {
+    let groups_per_row = xs.first().map_or(0, |x| x.len() / 32);
+    let rows = xs.len();
+    debug_assert!(
+        rows.is_multiple_of(Q8R16_ROWS),
+        "a partial group has no layout"
+    );
+    let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+    let mut d = vec![0.0_f32; rows * groups_per_row];
+    let mut q = vec![0_i8; rows * groups_per_row * 32];
+    for (group, entries) in quantized.as_chunks::<Q8R16_ROWS>().0.iter().enumerate() {
+        for (r, xq) in entries.iter().enumerate() {
+            for (bg, (scale, codes)) in xq.d.iter().zip(xq.q.as_chunks::<32>().0).enumerate() {
+                let base = (group * groups_per_row + bg) * Q8R16_ROWS;
+                d[base + r] = *scale;
+                for (k, code) in codes.iter().enumerate() {
+                    q[base * 32 + k * Q8R16_ROWS + r] = *code;
+                }
+            }
+        }
+    }
+    Q8R16 {
+        groups_per_row,
+        d,
+        q,
+    }
+}
+
+/// Dot one Q8_0 weight row against sixteen packed activation rows: `out[r]` is row `r` of
+/// `group`'s dot with `row`.
+///
+/// The integer side is exact (`|sum| <= 32 * 127 * 127`, far inside `i32`), so `sum as f32` is
+/// exact too, and the float side is one multiply per 32-value group — the arithmetic a per-row
+/// `i8` dot performs, in the same order, which is why the tests hold it to the bit.
+fn q8r16_dot_q8_0(row: &[u8], act: &Q8R16, group: usize, out: &mut [f32; Q8R16_ROWS]) {
+    debug_assert_eq!(
+        row.len(),
+        act.groups_per_row * 34,
+        "row and activation disagree"
+    );
+    let mut total = [0.0_f32; Q8R16_ROWS];
+    for (bg, block) in row.as_chunks::<34>().0.iter().enumerate() {
+        let dw = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let codes = &block[2..34];
+        let base = (group * act.groups_per_row + bg) * Q8R16_ROWS;
+        let scales = &act.d[base..base + Q8R16_ROWS];
+        let packed = &act.q[base * 32..base * 32 + 32 * Q8R16_ROWS];
+        let mut sum = [0_i32; Q8R16_ROWS];
+        for (k, weight) in codes.iter().enumerate() {
+            let weight = i32::from(*weight as i8);
+            let position = &packed[k * Q8R16_ROWS..k * Q8R16_ROWS + Q8R16_ROWS];
+            for (slot, code) in sum.iter_mut().zip(position) {
+                *slot += weight * i32::from(*code);
+            }
+        }
+        for ((total, scale), sum) in total.iter_mut().zip(scales).zip(sum) {
+            *total += (dw * scale) * sum as f32;
+        }
+    }
+    *out = total;
+}
+
+/// Fill `out` (token-major, `xs.len() * count` values) with the Q8_0 rows
+/// `first_row .. first_row + count` against the packed `xs`.
+///
+/// One weight row is read once for all sixteen rows of a group; groups are independent, so the
+/// result of a row does not depend on where the batch was split.
+pub(crate) fn fill_rows_q8r16(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&[f32]],
+    out: &mut [f32],
+) {
+    debug_assert!(
+        xs.len().is_multiple_of(Q8R16_ROWS),
+        "a partial group has no layout"
+    );
+    let act = pack_q8r16(xs);
+    let mut values = [0.0_f32; Q8R16_ROWS];
+    for offset in 0..count {
+        let start = (first_row + offset) * stride;
+        let row = &data[start..start + stride];
+        for group in 0..xs.len() / Q8R16_ROWS {
+            q8r16_dot_q8_0(row, &act, group, &mut values);
+            for (r, value) in values.iter().enumerate() {
+                out[(group * Q8R16_ROWS + r) * count + offset] = *value;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod q8r16_tests {
+    use super::*;
+    use crate::quant::OwnedActivation;
+
+    /// Deterministic values, so a failure is reproducible without a fixture file.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn unit(&mut self) -> f32 {
+            ((self.next() >> 40) as f32 / (1_u64 << 24) as f32 - 0.5) * 4.0
+        }
+    }
+
+    fn q8_0_matrix(rng: &mut Lcg, rows: usize, groups: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(rows * groups * 34);
+        for _ in 0..rows {
+            for _ in 0..groups {
+                let scale = 0.001 + (rng.next() % 97) as f32 / 10_000.0;
+                data.extend_from_slice(&crate::quant::f32_to_f16(scale).to_le_bytes());
+                for _ in 0..32 {
+                    data.push((rng.next() >> 33) as u8);
+                }
+            }
+        }
+        data
+    }
+
+    fn activations(rng: &mut Lcg, rows: usize, cols: usize) -> Vec<Vec<f32>> {
+        (0..rows)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect()
+    }
+
+    /// The per-row `i8` dot the repack has to reproduce, written the way the kernel's arithmetic
+    /// is ordered: integer sum per 32-value group, then `(d * dx) * sum`.
+    fn row_q8_dot(row: &[u8], xq: &QuantizedX) -> f32 {
+        let mut total = 0.0_f32;
+        for (bg, block) in row.as_chunks::<34>().0.iter().enumerate() {
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let mut sum = 0_i32;
+            for (weight, code) in block[2..34].iter().zip(&xq.q[bg * 32..bg * 32 + 32]) {
+                sum += i32::from(*weight as i8) * i32::from(*code);
+            }
+            total += (d * xq.d[bg]) * sum as f32;
+        }
+        total
+    }
+
+    #[test]
+    fn q8r16_puts_sixteen_scales_and_one_position_per_sixteen_bytes() {
+        let groups = 2;
+        let mut rng = Lcg(0x5eed_0d16_0000_0001);
+        let xs = activations(&mut rng, 32, groups * 32);
+        let borrows: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+        let act = pack_q8r16(&borrows);
+        assert_eq!(act.groups_per_row, groups);
+        assert_eq!(
+            act.d.len(),
+            2 * groups * Q8R16_ROWS,
+            "one scale per row, group"
+        );
+        assert_eq!(act.q.len(), 2 * groups * Q8R16_ROWS * 32);
+        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+        for group in 0..2 {
+            for bg in 0..groups {
+                let base = (group * groups + bg) * Q8R16_ROWS;
+                let scales = &act.d[base..base + Q8R16_ROWS];
+                for (r, scale) in scales.iter().enumerate() {
+                    let entry = group * Q8R16_ROWS + r;
+                    assert_eq!(scale.to_bits(), quantized[entry].d[bg].to_bits());
+                }
+                let packed = &act.q[base * 32..base * 32 + 32 * Q8R16_ROWS];
+                for (k, position) in packed.as_chunks::<Q8R16_ROWS>().0.iter().enumerate() {
+                    for (r, code) in position.iter().enumerate() {
+                        let entry = group * Q8R16_ROWS + r;
+                        assert_eq!(*code, quantized[entry].q[bg * 32 + k]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q8r16_dot_is_bit_identical_to_each_row_alone() {
+        let groups = 6;
+        let stride = groups * 34;
+        let mut rng = Lcg(0x5eed_0d16_0000_0002);
+        let xs = activations(&mut rng, 32, groups * 32);
+        let borrows: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+        let act = pack_q8r16(&borrows);
+        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+        let data = q8_0_matrix(&mut rng, 7, groups);
+        for row in 0..7 {
+            let bytes = &data[row * stride..][..stride];
+            for group in 0..2 {
+                let mut values = [0.0_f32; Q8R16_ROWS];
+                q8r16_dot_q8_0(bytes, &act, group, &mut values);
+                for (r, value) in values.iter().enumerate() {
+                    let entry = group * Q8R16_ROWS + r;
+                    let expected = row_q8_dot(bytes, &quantized[entry]);
+                    assert_eq!(
+                        value.to_bits(),
+                        expected.to_bits(),
+                        "row {row} group {group} entry {entry}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q8r16_fill_writes_every_row_of_every_entry() {
+        let groups = 3;
+        let stride = groups * 34;
+        let rows = 5;
+        let mut rng = Lcg(0x5eed_0d16_0000_0003);
+        let xs = activations(&mut rng, 32, groups * 32);
+        let borrows: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+        let data = q8_0_matrix(&mut rng, rows, groups);
+        let mut out = vec![0.0_f32; 32 * rows];
+        fill_rows_q8r16(&data, stride, 0, rows, &borrows, &mut out);
+        for entry in 0..32 {
+            let xq = QuantizedX::new(&xs[entry]);
+            for row in 0..rows {
+                let expected = row_q8_dot(&data[row * stride..][..stride], &xq);
+                assert_eq!(
+                    out[entry * rows + row].to_bits(),
+                    expected.to_bits(),
+                    "entry {entry} row {row}"
+                );
+            }
+        }
+        // The path this replaces, on the same data: close, because the only difference is the
+        // activation's quantization error (half a step of one 32-value group).
+        let owned: [OwnedActivation; 32] =
+            std::array::from_fn(|entry| OwnedActivation::new(GgmlType::Q8_0, &xs[entry]));
+        let batch = BatchActivation::new(&owned);
+        let mut reference = vec![0.0_f32; 32 * rows];
+        crate::quant::fill_rows_batch::<32>(
+            GgmlType::Q8_0,
+            &data,
+            stride,
+            0,
+            &batch,
+            &mut reference,
+            None,
+        );
+        for (fast, slow) in out.iter().zip(&reference) {
+            let tolerance = slow.abs() * 0.02 + 1.0;
+            assert!(
+                (fast - slow).abs() <= tolerance,
+                "repack {fast} vs f32 {slow}"
+            );
+        }
+    }
+
+    #[test]
+    fn q8r16_applies_only_to_wide_q8_0_chunks_in_whole_sixteen_row_groups() {
+        assert!(q8r16_applies_for(GgmlType::Q8_0, 32, true));
+        assert!(q8r16_applies_for(GgmlType::Q8_0, 48, true));
+        assert!(
+            !q8r16_applies_for(GgmlType::Q8_0, 16, true),
+            "the reference starts at 32 rows"
+        );
+        assert!(
+            !q8r16_applies_for(GgmlType::Q8_0, 40, true),
+            "a partial 16-row group stays on the row kernel"
+        );
+        assert!(
+            !q8r16_applies_for(GgmlType::Q4K, 32, true),
+            "Q4_K already multiplies an integer activation"
+        );
+        assert!(
+            !q8r16_applies_for(GgmlType::Q8_0, 32, false),
+            "the switch is off by default"
+        );
+    }
+
+    /// The measurement the switch waits on: the f32 batch dot against the repack, one pass over a
+    /// gate-shaped Q8_0 matrix with a 32-row chunk. Not a correctness check, so `#[ignore]`d.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q8r16_against_f32_batch() {
+        let cols = 1536;
+        let rows = 8960;
+        let groups = cols / 32;
+        let stride = groups * 34;
+        let mut rng = Lcg(0x5eed_0d16_0000_0004);
+        let data = q8_0_matrix(&mut rng, rows, groups);
+        let xs = activations(&mut rng, 32, cols);
+        let borrows: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+        let owned: [OwnedActivation; 32] =
+            std::array::from_fn(|entry| OwnedActivation::new(GgmlType::Q8_0, &xs[entry]));
+        let batch = BatchActivation::new(&owned);
+        let mut out = vec![0.0_f32; rows * 32];
+        let bytes = (rows * stride) as f64 / 1e9;
+        let mut best_f32 = f64::MAX;
+        let mut best_r16 = f64::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            crate::quant::fill_rows_batch::<32>(
+                GgmlType::Q8_0,
+                &data,
+                stride,
+                0,
+                &batch,
+                &mut out,
+                None,
+            );
+            best_f32 = best_f32.min(start.elapsed().as_secs_f64());
+            let start = std::time::Instant::now();
+            fill_rows_q8r16(&data, stride, 0, rows, &borrows, &mut out);
+            best_r16 = best_r16.min(start.elapsed().as_secs_f64());
+        }
+        println!("q8_0 {rows}x{cols}, 32-row chunk, {bytes:.2} GB of weights");
+        println!(
+            "f32 batch row kernel: {:>7.1} ms  {:>5.1} GB/s",
+            best_f32 * 1e3,
+            bytes / best_f32
+        );
+        println!(
+            "q8r16 repack        : {:>7.1} ms  {:>5.1} GB/s  ({:+.1}%)",
+            best_r16 * 1e3,
+            bytes / best_r16,
+            (best_f32 / best_r16 - 1.0) * 100.0
+        );
+    }
+}
+
 #[cfg(test)]
 mod q6k_repack_tests {
     use super::*;
