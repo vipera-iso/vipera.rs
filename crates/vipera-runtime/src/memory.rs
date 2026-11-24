@@ -141,4 +141,56 @@ mod tests {
             assert!(peak > 0);
         }
     }
+
+    #[test]
+    fn checked_arithmetic_overflow_in_load_is_rejected() {
+        // Test that WeightBuffer::load rejects cases where offset + len would overflow u64.
+        let path = std::env::temp_dir().join("vipera-runtime-weights-overflow.bin");
+        // Write a small file so that offset + len > file_len triggers truncation,
+        // but the primary test is that checked_add overflow is caught.
+        std::fs::write(&path, [0u8; 16]).unwrap();
+
+        // offset = 1, len = u64::MAX would overflow checked_add
+        let result = WeightBuffer::load(&path, 1, u64::MAX);
+        // This should fail because checked_add(1, u64::MAX) overflows
+        assert!(
+            result.is_err(),
+            "Expected overflow error for offset=1, len=u64::MAX"
+        );
+
+        // offset = 0, len = u64::MAX: checked_add(0, u64::MAX) = Some(u64::MAX),
+        // but the file is only 16 bytes, so end > file_len should trigger truncation
+        let result2 = WeightBuffer::load(&path, 0, u64::MAX);
+        assert!(
+            result2.is_err(),
+            "Expected error for offset=0, len=u64::MAX with small file"
+        );
+        let err_msg = result2.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("truncated") || err_msg.contains("overflows"),
+            "Expected truncation or overflow error, got: {}",
+            err_msg
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn checked_arithmetic_zero_len_load() {
+        // Test that loading with len = 0 behaves sensibly.
+        let path = std::env::temp_dir().join("vipera-runtime-weights-zero.bin");
+        std::fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+
+        // len = 0: usize::try_from(0) = Ok(0), checked_add(offset, 0) = Some(offset),
+        // file size comparison: end = offset > 0 (for non-zero offset) or end = 0 for offset=0
+        let result = WeightBuffer::load(&path, 0, 0);
+        // This may succeed or fail depending on whether the code allows 0-length loads.
+        // The test just verifies it doesn't panic or crash.
+        // If it succeeds, the buffer should be empty.
+        if let Ok(weights) = result {
+            assert_eq!(weights.len(), 0);
+        }
+        // If it fails, that's also acceptable - the error should be a valid error type.
+        let _ = std::fs::remove_file(&path);
+    }
 }
