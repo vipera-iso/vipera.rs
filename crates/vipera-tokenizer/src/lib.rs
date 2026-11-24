@@ -339,3 +339,322 @@ impl Tokenizer {
         Ok(position + 1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vipera_conformance::{GgufBuilder, MetaValue};
+    use vipera_core::gguf::GgufFile;
+
+    struct VocabSpec {
+        tokens: Vec<String>,
+        scores: Option<Vec<f32>>,
+        types: Option<Vec<i32>>,
+        merges: Option<Vec<String>>,
+        model: Option<String>,
+        pre: Option<String>,
+    }
+
+    fn build(spec: VocabSpec) -> Tokenizer {
+        let mut builder = GgufBuilder::minimal();
+        builder.metadata.push((
+            "tokenizer.ggml.tokens".to_owned(),
+            MetaValue::StrArray(spec.tokens),
+        ));
+        if let Some(scores) = spec.scores {
+            builder.metadata.push((
+                "tokenizer.ggml.scores".to_owned(),
+                MetaValue::F32Array(scores),
+            ));
+        }
+        if let Some(types) = spec.types {
+            builder.metadata.push((
+                "tokenizer.ggml.token_type".to_owned(),
+                MetaValue::I32Array(types),
+            ));
+        }
+        if let Some(merges) = spec.merges {
+            builder.metadata.push((
+                "tokenizer.ggml.merges".to_owned(),
+                MetaValue::StrArray(merges),
+            ));
+        }
+        if let Some(model) = spec.model {
+            builder
+                .metadata
+                .push(("tokenizer.ggml.model".to_owned(), MetaValue::Str(model)));
+        }
+        if let Some(pre) = spec.pre {
+            builder
+                .metadata
+                .push(("tokenizer.ggml.pre".to_owned(), MetaValue::Str(pre)));
+        }
+        let file = GgufFile::parse(&builder.build()).expect("fixture parses");
+        Tokenizer::from_gguf(&file).expect("vocabulary loads")
+    }
+
+    fn greedy_ascii() -> Tokenizer {
+        build(VocabSpec {
+            tokens: ["a", "b", "ab", " "]
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect(),
+            scores: None,
+            types: None,
+            merges: None,
+            model: None,
+            pre: None,
+        })
+    }
+
+    fn unigram_ascii() -> Tokenizer {
+        build(VocabSpec {
+            tokens: ["a", "b", "ab", " ", "<unk>"]
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect(),
+            scores: Some(vec![0.0, 0.0, 1.0, 0.0, -10.0]),
+            types: Some(vec![1, 1, 1, 1, 2]),
+            merges: None,
+            model: None,
+            pre: None,
+        })
+    }
+
+    fn byte_bpe() -> Tokenizer {
+        // Minimal byte-level BPE vocab: byte tokens for all bytes plus a few merges.
+        let mut tokens: Vec<String> = Vec::new();
+        let mut types: Vec<i32> = Vec::new();
+        // Add byte tokens <0x00>..=<0xFF> as byte type (6)
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+        }
+        // Add some printable mapped tokens used by GPT-2 byte encoder.
+        // The BPE encoder maps bytes to chars via its alphabet; those chars become pieces.
+        // For a simple test, include single-char pieces for 'a','b',' ' in the byte alphabet.
+        // We can instead rely on byte fallback tokens? BPE encoder looks up pieces in vocab by the
+        // mapped string form; if not found, it errors. So we need the mapped pieces.
+        // Easier: build from the actual alphabet by adding all single-char mapped pieces.
+        let mut merges = Vec::new();
+        // Use build helper by constructing via real vocab: easier to just make a BPE tokenizer
+        // with tokens for the byte-alphabet chars. But we need to know the mapping.
+        // Simpler approach: add tokens for common chars as they appear in GPT2 alphabet.
+        // 'a' -> 'a', 'b' -> 'b', space -> Ġ (U+0120)
+        tokens.push("a".to_owned());
+        types.push(1);
+        tokens.push("b".to_owned());
+        types.push(1);
+        tokens.push("\u{0120}".to_owned()); // space in GPT2 alphabet
+        types.push(1);
+        merges.push("a b".to_owned());
+        tokens.push("ab".to_owned());
+        types.push(1);
+
+        build(VocabSpec {
+            tokens,
+            scores: None,
+            types: Some(types),
+            merges: Some(merges),
+            model: Some("gpt2".to_owned()),
+            pre: Some("qwen2".to_owned()),
+        })
+    }
+
+    #[test]
+    fn empty_input_encode_decode_greedy() {
+        let tok = greedy_ascii();
+        assert_eq!(tok.encode("").unwrap(), Vec::<u32>::new());
+        assert_eq!(tok.decode(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn empty_input_encode_decode_unigram() {
+        let tok = unigram_ascii();
+        assert_eq!(tok.encode("").unwrap(), Vec::<u32>::new());
+        assert_eq!(tok.decode(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn empty_input_encode_decode_bpe() {
+        let tok = byte_bpe();
+        assert_eq!(tok.encode("").unwrap(), Vec::<u32>::new());
+        assert_eq!(tok.decode(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn utf8_multibyte_greedy_with_byte_fallback() {
+        // Greedy tokenizer with byte tokens should handle multi-byte UTF-8 via fallback.
+        let mut tokens: Vec<String> = vec!["a".to_owned()];
+        let mut types: Vec<i32> = vec![1];
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+        }
+        let tok = build(VocabSpec {
+            tokens,
+            scores: None,
+            types: Some(types),
+            merges: None,
+            model: None,
+            pre: None,
+        });
+        // 'é' is U+00E9, UTF-8 C3 A9 - 2 bytes
+        let ids = tok.encode("aé").unwrap();
+        assert_eq!(tok.decode(&ids).unwrap(), "aé");
+        // 3-byte char: '中' E4 B8 AD
+        let ids = tok.encode("中").unwrap();
+        assert_eq!(tok.decode(&ids).unwrap(), "中");
+        // 4-byte char: '😀' F0 9F 98 80
+        let ids = tok.encode("😀").unwrap();
+        assert_eq!(tok.decode(&ids).unwrap(), "😀");
+    }
+
+    #[test]
+    fn utf8_multibyte_unigram_with_byte_fallback() {
+        // No unknown token: unigram falls back to greedy, which uses byte tokens.
+        let mut tokens: Vec<String> = vec!["a".to_owned()];
+        let mut types: Vec<i32> = vec![1];
+        let mut scores: Vec<f32> = vec![0.0];
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+            scores.push(-10.0);
+        }
+        let tok = build(VocabSpec {
+            tokens,
+            scores: Some(scores),
+            types: Some(types),
+            merges: None,
+            model: None,
+            pre: None,
+        });
+        for text in ["é", "aéz", "中", "中文", "😀", "a😀b", "é😀中"] {
+            let ids = tok.encode(text).unwrap();
+            let decoded = tok.decode(&ids).unwrap();
+            assert_eq!(decoded, text, "round trip failed for {text:?}");
+        }
+    }
+
+    #[test]
+    fn utf8_multibyte_unigram_with_unknown_token_does_not_panic() {
+        let tok = build(VocabSpec {
+            tokens: vec!["a".to_owned(), "<unk>".to_owned()],
+            scores: Some(vec![0.0, -1.0]),
+            types: Some(vec![1, 2]),
+            merges: None,
+            model: None,
+            pre: None,
+        });
+        for text in ["é", "中", "😀", "aé中😀b"] {
+            let ids = tok.encode(text).unwrap();
+            let decoded = tok.decode(&ids).unwrap();
+            assert!(!decoded.is_empty() || text.is_empty());
+            let _ = (ids, decoded);
+        }
+    }
+
+    #[test]
+    fn utf8_boundaries_with_special_tokens() {
+        let tok = build(VocabSpec {
+            tokens: ["a", "<|end|>", "é"]
+                .iter()
+                .map(|p| (*p).to_owned())
+                .collect(),
+            scores: None,
+            types: Some(vec![1, 3, 1]),
+            merges: None,
+            model: None,
+            pre: None,
+        });
+        let ids = tok.encode("a<|end|>é").unwrap();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(tok.decode(&ids).unwrap(), "aé");
+
+        // Multi-byte UTF-8 adjacent to special
+        let ids = tok.encode("é<|end|>a").unwrap();
+        assert_eq!(ids, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn utf8_only_multibyte_string_greedy() {
+        // All chars are multi-byte, none in vocab except byte fallback
+        let mut tokens: Vec<String> = Vec::new();
+        let mut types: Vec<i32> = Vec::new();
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+        }
+        let tok = build(VocabSpec {
+            tokens,
+            scores: None,
+            types: Some(types),
+            merges: None,
+            model: None,
+            pre: None,
+        });
+        let text = "café naïve — 日本語";
+        let ids = tok.encode(text).unwrap();
+        assert_eq!(tok.decode(&ids).unwrap(), text);
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_inputs() {
+        let tok = greedy_ascii();
+        assert!(tok.encode("").unwrap().is_empty());
+        let ids = tok.encode(" ").unwrap();
+        let _ = tok.decode(&ids).unwrap();
+    }
+
+    #[test]
+    fn utf8_bpe_multibyte_does_not_panic() {
+        let tok = byte_bpe();
+        for text in ["é", "中", "😀", "aé", "café"] {
+            let result = tok.encode(text);
+            if let Ok(ids) = result {
+                let _ = tok.decode(&ids);
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_multibyte_at_boundaries_with_word_markers() {
+        let mut tokens: Vec<String> = vec!["▁".to_owned(), "▁a".to_owned()];
+        let mut types: Vec<i32> = vec![1, 1];
+        let mut scores: Vec<f32> = vec![-1.0, -1.0];
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+            scores.push(-10.0);
+        }
+        let tok = build(VocabSpec {
+            tokens,
+            scores: Some(scores),
+            types: Some(types),
+            merges: None,
+            model: Some("llama".to_owned()),
+            pre: None,
+        });
+        for text in ["é", "a é", "é a", "中文 test", "😀!"] {
+            let result = tok.encode(text);
+            if let Ok(ids) = result {
+                let _ = tok.decode(&ids);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_segments_around_special_tokens() {
+        let tok = build(VocabSpec {
+            tokens: ["<|a|>", "<|b|>"].iter().map(|p| (*p).to_owned()).collect(),
+            scores: None,
+            types: Some(vec![3, 3]),
+            merges: None,
+            model: None,
+            pre: None,
+        });
+        assert_eq!(tok.encode("<|a|>").unwrap(), vec![0]);
+        assert_eq!(tok.encode("<|a|><|b|>").unwrap(), vec![0, 1]);
+        assert_eq!(tok.encode("<|b|><|a|><|b|>").unwrap(), vec![1, 0, 1]);
+    }
+}
