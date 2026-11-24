@@ -228,7 +228,14 @@ impl Strategy for Temperature {
 
         weights.truncate(cut.unwrap_or(weights.len()));
 
-        let threshold = request.min_p * weights[0].1;
+        // `min_p` must cut the head against the best weight that survives the top-p cut, not the
+        // candidate head it started from: a cut can drop the head, and indexing the head would
+        // panic on the result.
+        let threshold = request.min_p
+            * weights
+                .iter()
+                .map(|(_, weight)| *weight)
+                .fold(0.0f32, f32::max);
         weights.retain(|(_, weight)| *weight >= threshold);
 
         let mass: f32 = weights.iter().map(|(_, weight)| *weight).sum();
@@ -310,7 +317,14 @@ impl Strategy for Topp {
 
         weights.truncate(cut.unwrap_or(weights.len()));
 
-        let threshold = request.min_p * weights[0].1;
+        // `min_p` must cut the head against the best weight that survives the top-p cut, not the
+        // candidate head it started from: a cut can drop the head, and indexing the head would
+        // panic on the result.
+        let threshold = request.min_p
+            * weights
+                .iter()
+                .map(|(_, weight)| *weight)
+                .fold(0.0f32, f32::max);
         weights.retain(|(_, weight)| *weight >= threshold);
 
         let mass: f32 = weights.iter().map(|(_, weight)| *weight).sum();
@@ -1030,6 +1044,26 @@ mod tests {
         let mut s = sampler(1.0, 0, 1.0, 0.0, 1.0);
         assert!(s.sample(&[], &[]).is_err());
         assert!(s.sample(&[f32::NAN, f32::NEG_INFINITY], &[]).is_err());
+    }
+
+    #[test]
+    fn empty_or_nan_logits_slice_never_panics() {
+        for temperature in [0.0, 0.8] {
+            let mut s = sampler(temperature, 40, 0.95, 0.05, 1.0);
+            assert!(s.sample(&[], &[]).is_err(), "temp={temperature}");
+            assert!(
+                s.sample(&[f32::NAN, f32::NAN, f32::NAN], &[]).is_err(),
+                "temp={temperature}"
+            );
+            assert!(
+                s.sample_with_logprob(&[], &[]).is_err(),
+                "temp={temperature}"
+            );
+            assert!(
+                s.sample_with_details(&[f32::NAN], &[], 2).is_err(),
+                "temp={temperature}"
+            );
+        }
     }
 
     #[test]
