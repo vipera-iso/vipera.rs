@@ -1,8 +1,11 @@
 //! Contracts shared across crates.
 //!
-//! Two so far: how the engine learns what hardware it is running on, and what a sampling strategy
-//! has to look like so a build can list the ones it has. Backend and tensor traits arrive with the
-//! backends themselves, so this crate stays small on purpose.
+//! Three groups so far: how the engine learns what hardware it is running on, what a sampling
+//! strategy has to look like so a build can list the ones it has, and the four algorithm slots a
+//! build fills at startup — KV compression, sparse attention, speculative decoding and MoE
+//! offloading. Backend and tensor traits arrive with the backends themselves, so this crate stays
+//! small on purpose. Every trait here is object safe, and the implementations live in their own
+//! crates, which `vipera-core` never depends on.
 
 #![warn(missing_docs)]
 
@@ -102,6 +105,76 @@ pub trait HardwareProbe {
     fn profile(&self) -> HardwareProfile;
 }
 
+/// A strategy that compresses retained KV cache content before a compute pass.
+///
+/// The runtime already has a `compress` stage and reports 0 µs in it; a build that registers an
+/// algorithm here is what fills it. Implementations own their math and their buffers, take shared
+/// references only, and are `Send + Sync` like a [`Sampler`] because the engine holds one per
+/// process rather than one per turn.
+pub trait KvCompression: Send + Sync {
+    /// The name the runtime reports this algorithm under.
+    fn name(&self) -> &'static str;
+
+    /// Compress one block of cache values into `out`, returning the bytes appended.
+    ///
+    /// `0` means the block was left as it was: an algorithm that only wins on part of its input
+    /// says so per block instead of failing the pass, and the caller stores the raw values instead.
+    fn compress(&self, block: &[f32], out: &mut Vec<u8>) -> usize;
+
+    /// Restore a block written by [`KvCompression::compress`] into `out`.
+    ///
+    /// Returns the number of values written, which is short of `out.len()` when the block was
+    /// stored uncompressed. The trait fixes no byte layout: only the algorithm that wrote a block
+    /// reads it back.
+    fn decompress(&self, compressed: &[u8], out: &mut [f32]) -> usize;
+}
+
+/// A policy that chooses which earlier positions a query is computed against.
+///
+/// The `sparse` stage uses it to shrink the attention batch; returning fewer positions is the whole
+/// point, and returning all of them is the valid policy the runtime runs today.
+pub trait SparseAttention: Send + Sync {
+    /// The name the runtime reports this policy under.
+    fn name(&self) -> &'static str;
+
+    /// Positions `query` attends to, appended to `out` in ascending order.
+    ///
+    /// `query` is the position being computed and `context` the number of positions retained, so a
+    /// policy can depend on how far into the sequence it is without being handed the sequence
+    /// itself. Every position written must be below `context`.
+    fn positions(&self, query: u32, context: u32, out: &mut Vec<u32>);
+}
+
+/// A policy that proposes draft tokens for the `speculative` stage to verify.
+///
+/// The draft is only a guess: correctness stays with the verifier, which accepts a prefix of the
+/// proposal and recomputes the rest, so a policy here trades acceptance rate for latency and never
+/// changes what the model would have produced.
+pub trait SpeculativeDecoder: Send + Sync {
+    /// The name the runtime reports this policy under.
+    fn name(&self) -> &'static str;
+
+    /// Up to `count` tokens to try after `context`, appended to `out` in generation order.
+    ///
+    /// Proposing nothing is a valid answer: a build with no draft model registers a decoder that
+    /// does exactly that, and the stage then costs nothing.
+    fn draft(&self, context: &[u32], count: usize, out: &mut Vec<u32>);
+}
+
+/// A policy that decides which experts of a mixture-of-experts layer stay resident.
+///
+/// Offloading moves expert weights out of device memory between passes; this trait only says which
+/// ones the next pass needs, so the policy can be swapped without the runtime knowing how the move
+/// itself happens.
+pub trait MoeOffloader: Send + Sync {
+    /// The name the runtime reports this policy under.
+    fn name(&self) -> &'static str;
+
+    /// Indices of the experts `router_logits` selects, at most `capacity` of them, appended to
+    /// `out` in the order they should be fetched.
+    fn select_experts(&self, router_logits: &[f32], capacity: usize, out: &mut Vec<u32>);
+}
+
 /// FNV-1a, 64-bit: small, deterministic, dependency-free.
 ///
 /// This identifies content. It is not a cryptographic digest.
@@ -180,6 +253,77 @@ mod tests {
         });
         reversed.devices.push(two.devices[1].clone());
         assert_eq!(two.fingerprint(), reversed.fingerprint());
+    }
+
+    struct Inert;
+
+    impl KvCompression for Inert {
+        fn name(&self) -> &'static str {
+            "inert"
+        }
+
+        fn compress(&self, _block: &[f32], _out: &mut Vec<u8>) -> usize {
+            0
+        }
+
+        fn decompress(&self, _compressed: &[u8], _out: &mut [f32]) -> usize {
+            0
+        }
+    }
+
+    impl SparseAttention for Inert {
+        fn name(&self) -> &'static str {
+            "inert"
+        }
+
+        fn positions(&self, _query: u32, context: u32, out: &mut Vec<u32>) {
+            out.extend(0..context);
+        }
+    }
+
+    impl SpeculativeDecoder for Inert {
+        fn name(&self) -> &'static str {
+            "inert"
+        }
+
+        fn draft(&self, _context: &[u32], _count: usize, _out: &mut Vec<u32>) {}
+    }
+
+    impl MoeOffloader for Inert {
+        fn name(&self) -> &'static str {
+            "inert"
+        }
+
+        fn select_experts(&self, _router_logits: &[f32], _capacity: usize, _out: &mut Vec<u32>) {}
+    }
+
+    #[test]
+    fn the_algorithm_traits_can_be_used_as_trait_objects() {
+        let compression: &dyn KvCompression = &Inert;
+        let sparse: &dyn SparseAttention = &Inert;
+        let speculative: &dyn SpeculativeDecoder = &Inert;
+        let offloader: &dyn MoeOffloader = &Inert;
+
+        let mut bytes = Vec::new();
+        assert_eq!(compression.compress(&[1.0, 2.0], &mut bytes), 0);
+        let mut positions = Vec::new();
+        sparse.positions(3, 3, &mut positions);
+        assert_eq!(positions, vec![0, 1, 2]);
+        let mut drafts = Vec::new();
+        speculative.draft(&[1, 2], 4, &mut drafts);
+        assert!(drafts.is_empty());
+        let mut experts = Vec::new();
+        offloader.select_experts(&[0.5], 1, &mut experts);
+        assert!(experts.is_empty());
+        assert_eq!(
+            [
+                compression.name(),
+                sparse.name(),
+                speculative.name(),
+                offloader.name()
+            ],
+            ["inert"; 4]
+        );
     }
 
     #[test]

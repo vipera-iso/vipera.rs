@@ -1275,6 +1275,27 @@ pub(crate) fn fill_rows_batch<const B: usize>(
     // column-parallel 512-bit port measured 6.95 vs 11.87 GB/s), because the
     // sixteen-entry tile wastes fifteen lanes but the 512-bit form is
     // double-pumped on this CPU.
+    // The 256-bit band, for a CPU with AVX2 and no 512-bit VNNI tile: same reuse, half the columns
+    // per register. It returns false when the 512-bit tile is available, so the two never fight
+    // over the same batch.
+    #[cfg(target_arch = "x86_64")]
+    if !exact_dot_requested()
+        && crate::tiled::tiled_enabled()
+        && ty == GgmlType::Q4K
+        && (crate::tiled::TILE_MIN_BATCH..=128).contains(&B)
+        && let Some(xs) = activation.quantized()
+        && crate::simd::try_q4k_matvec_tiled_range_ymm(
+            data,
+            stride,
+            first_row,
+            count,
+            xs,
+            activation.sums(),
+            out,
+        )
+    {
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if !exact_dot_requested()
         && crate::tiled::tiled_enabled()

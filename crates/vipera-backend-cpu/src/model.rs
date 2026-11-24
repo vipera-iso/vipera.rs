@@ -18,7 +18,7 @@ use vipera_errors::ViperaError;
 use vipera_runtime::{BatchContext, BatchEntry, ForwardContext, ForwardPass};
 
 use crate::pool::Pool;
-use crate::quant::{self, Fusion, f16_to_f32, f32_to_f16};
+use crate::quant::{self, Fusion, f32_to_f16};
 
 /// The most sequences one batched step computes at once.
 ///
@@ -28,6 +28,40 @@ use crate::quant::{self, Fusion, f16_to_f32, f32_to_f16};
 /// llama.cpp tiled mul_mat paper's first step — for a few extra megabytes of scratch. The kernels
 /// spill registers at 16 but the weight read saved dominates on prefill.
 const MAX_BATCH: usize = 128;
+
+/// Positions one prompt chunk computes, which is [`MAX_BATCH`] except where a narrower chunk is
+/// faster.
+///
+/// On a CPU without the 512-bit VNNI tile, the Q4_K prefill falls back to the row kernel, whose
+/// per-row activation working set is `chunk × 288` bytes — 36 KB at 128, over the 32 KB L1D, so the
+/// same activation bytes are re-fetched for every row. A 32-wide chunk keeps it at 9 KB and
+/// measured 9.1% less prefill time on that arm (4096 tokens: 139.55/140.17 s against
+/// 155.18/152.66 s; 512: 16.33/16.50 s against 18.05/18.06 s), while the tiled arm is 14.9%
+/// *slower* that narrow (30.58/30.66 s against 35.13 s), so the cap is conditional on the level.
+/// `VIPERA_PREFILL_CHUNK=N` overrides it for an A/B in one binary, rounded down to a multiple of
+/// eight and clamped to `[8, MAX_BATCH]`.
+fn prefill_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        let requested = std::env::var_os("VIPERA_PREFILL_CHUNK").and_then(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        });
+        prefill_chunk_from(requested, crate::simd::vnni512_available())
+    })
+}
+
+/// [`prefill_chunk`]'s rule without the process-wide cache, so the two branches are testable on one
+/// machine: a requested width wins, rounded down to a multiple of eight and clamped; otherwise the
+/// tiled level keeps `MAX_BATCH` and every other level takes 32.
+fn prefill_chunk_from(requested: Option<usize>, tiled: bool) -> usize {
+    match requested {
+        Some(value) => (value & !7).clamp(8, MAX_BATCH),
+        None if tiled => MAX_BATCH,
+        None => 32,
+    }
+}
 
 /// The numbers a forward pass needs, read from the file rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,6 +84,94 @@ pub struct ModelConfig {
     pub rms_eps: f32,
     /// Rotary base frequency.
     pub rope_base: f32,
+    /// Context extension of the rotary table (`rope.scaling.*`); [`RopeScaling::NONE`] unless the
+    /// file declares one.
+    pub rope_scaling: RopeScaling,
+}
+
+/// Which context-extension rule reshapes the rotary frequencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeScalingKind {
+    /// The plain table: `position * base^(-2i/d)`.
+    None,
+    /// Position interpolation: every angle is divided by the factor.
+    Linear,
+    /// YaRN: high-frequency pairs keep their angle, low-frequency pairs are interpolated, the
+    /// ones between blend on a ramp, and cos/sin carry a magnitude correction.
+    Yarn,
+}
+
+/// The `rope.scaling.*` metadata of a model, with llama.cpp's defaults for what a file leaves out.
+///
+/// The formulas follow ggml's `rope_yarn` and `ggml_rope_yarn_corr_dims`, so a model extended past
+/// its training length rotates the way the reference engine rotates it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RopeScaling {
+    /// The rule in force.
+    pub kind: RopeScalingKind,
+    /// `rope.scaling.factor`: how many times longer than the training context the model is run.
+    pub factor: f32,
+    /// `rope.scaling.original_context_length`, or the training context when the file omits it.
+    pub original_context: usize,
+    /// `rope.scaling.attn_factor`: a multiplier on cos and sin, `1.0` unless the file sets it.
+    pub attn_factor: f32,
+    /// `rope.scaling.yarn_beta_fast`, `32.0` by default.
+    pub beta_fast: f32,
+    /// `rope.scaling.yarn_beta_slow`, `1.0` by default.
+    pub beta_slow: f32,
+}
+
+impl RopeScaling {
+    /// No scaling: the table every model without `rope.scaling.*` already uses, bit for bit.
+    pub const NONE: Self = Self {
+        kind: RopeScalingKind::None,
+        factor: 1.0,
+        original_context: 0,
+        attn_factor: 1.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+    };
+
+    /// The pair-index range `[low, high]` over which YaRN ramps from extrapolation to
+    /// interpolation (`ggml_rope_yarn_corr_dims`).
+    fn correction_range(&self, head_dim: usize, base: f32) -> [f32; 2] {
+        let dim = |rotations: f32| {
+            head_dim as f32
+                * (self.original_context as f32 / (rotations * 2.0 * std::f32::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let start = dim(self.beta_fast).floor();
+        let end = dim(self.beta_slow).ceil();
+        [start.max(0.0), end.min(head_dim as f32 - 1.0)]
+    }
+
+    /// `(sin, cos)` of pair `index` at `position`, with the magnitude correction applied.
+    fn rotation(
+        &self,
+        position: usize,
+        index: usize,
+        head_dim: usize,
+        base: f32,
+        corr: [f32; 2],
+    ) -> (f32, f32) {
+        let exponent = 2.0 * index as f32 / head_dim as f32;
+        let extrapolated = position as f32 * (1.0 / base.powf(exponent));
+        let freq_scale = 1.0 / self.factor;
+        let interpolated = freq_scale * extrapolated;
+        let mut magnitude = self.attn_factor;
+        let theta = match self.kind {
+            RopeScalingKind::None => extrapolated,
+            RopeScalingKind::Linear => interpolated,
+            RopeScalingKind::Yarn => {
+                let y = (index as f32 - corr[0]) / (corr[1] - corr[0]).max(0.001);
+                let mix = 1.0 - y.clamp(0.0, 1.0);
+                magnitude *= 1.0 + 0.1 * (1.0 / freq_scale).ln();
+                interpolated * (1.0 - mix) + extrapolated * mix
+            }
+        };
+        let (sin, cos) = theta.sin_cos();
+        (sin * magnitude, cos * magnitude)
+    }
 }
 
 impl ModelConfig {
@@ -148,22 +270,7 @@ impl KvLayout {
                         "a q8_0 KV row needs a whole number of 32-value blocks",
                     ));
                 }
-                for (block, chunk) in destination
-                    .as_chunks_mut::<34>()
-                    .0
-                    .iter_mut()
-                    .zip(values.as_chunks::<32>().0)
-                {
-                    let largest = chunk
-                        .iter()
-                        .fold(0.0_f32, |max, value| max.max(value.abs()));
-                    let scale = if largest == 0.0 { 0.0 } else { largest / 127.0 };
-                    block[..2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
-                    let inverse = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-                    for (slot, value) in block[2..].iter_mut().zip(chunk) {
-                        *slot = (value * inverse).round().clamp(-127.0, 127.0) as i8 as u8;
-                    }
-                }
+                crate::compress::encode_q8_0(values, destination);
                 Ok(())
             }
         }
@@ -181,17 +288,7 @@ impl KvLayout {
                         "a q8_0 KV row needs a whole number of 32-value blocks",
                     ));
                 }
-                for (chunk, block) in values
-                    .as_chunks_mut::<32>()
-                    .0
-                    .iter_mut()
-                    .zip(source.as_chunks::<34>().0)
-                {
-                    let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-                    for (value, quantized) in chunk.iter_mut().zip(&block[2..]) {
-                        *value = scale * f32::from(*quantized as i8);
-                    }
-                }
+                crate::compress::decode_q8_0(source, values);
                 Ok(())
             }
         }
@@ -531,10 +628,15 @@ impl CpuBackend {
         // by position so the KV it writes is in place before the position that reads it. Handing the
         // chunk to that path turns `n` reads of 1.117 GB into `ceil(n / 8)`.
         if context.new_tokens.len() > 1 {
-            // The batch path records the pass itself, so this one does not.
+            // The batch path records the passes itself, so this one does not. The flag stays set for
+            // every piece the chunk is split into and is cleared when the prompt is done: taking it
+            // per call made the first piece a chunk and the rest decode steps, which understated
+            // the chunk time and polluted the decode average.
             let _ = pass;
             self.chunk_pass = true;
-            return self.run_positions(context);
+            let result = self.run_positions(context);
+            self.chunk_pass = false;
+            return result;
         }
         if context.new_tokens.is_empty() {
             return Err(ViperaError::invalid_argument(
@@ -646,13 +748,21 @@ impl CpuBackend {
                     crate::profile::note(crate::profile::Phase::Proj, at);
 
                     let at = crate::profile::stamp();
-                    rope(q, position, shape.heads, shape.head_dim, config.rope_base);
+                    rope(
+                        q,
+                        position,
+                        shape.heads,
+                        shape.head_dim,
+                        config.rope_base,
+                        &config.rope_scaling,
+                    );
                     rope(
                         k,
                         position,
                         shape.kv_heads,
                         shape.head_dim,
                         config.rope_base,
+                        &config.rope_scaling,
                     );
                     crate::profile::note(crate::profile::Phase::Rope, at);
                     let at = crate::profile::stamp();
@@ -704,7 +814,7 @@ impl CpuBackend {
         let mut logits = Vec::new();
         let mut start = 0;
         while start < tokens.len() {
-            let end = (start + MAX_BATCH).min(tokens.len());
+            let end = (start + prefill_chunk()).min(tokens.len());
             let mut entries: Vec<BatchEntry<'_>> = (start..end)
                 .map(|index| BatchEntry {
                     tokens: context.tokens,
@@ -893,7 +1003,7 @@ impl CpuBackend {
                 "a KV block must hold at least one token",
             ));
         }
-        let pass = crate::profile::begin(std::mem::take(&mut self.chunk_pass));
+        let pass = crate::profile::begin(self.chunk_pass);
         let config = self.config;
         let mut positions = [0_usize; B];
         let mut tokens = [0_u32; B];
@@ -970,7 +1080,14 @@ impl CpuBackend {
             // the position alone, so the tables are built once here and shared by all 28 layers.
             let rope_angles: Vec<RopeAngles> = positions
                 .iter()
-                .map(|position| RopeAngles::new(*position, shape.head_dim, config.rope_base))
+                .map(|position| {
+                    RopeAngles::scaled(
+                        *position,
+                        shape.head_dim,
+                        config.rope_base,
+                        &config.rope_scaling,
+                    )
+                })
                 .collect();
 
             for (index, layer) in layers.iter().enumerate() {
@@ -1397,6 +1514,45 @@ impl ModelConfig {
             vocab,
             rms_eps: f32_of("attention.layer_norm_rms_epsilon", 1e-6),
             rope_base: f32_of("rope.freq_base", 10_000.0),
+            rope_scaling: {
+                let kind = file
+                    .metadata
+                    .get(&key("rope.scaling.type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("none");
+                let kind = match kind {
+                    "none" => RopeScalingKind::None,
+                    "linear" => RopeScalingKind::Linear,
+                    "yarn" => RopeScalingKind::Yarn,
+                    other => {
+                        return Err(ViperaError::unsupported(format!(
+                            "{architecture}.rope.scaling.type is \"{other}\"; the CPU backend \
+                             implements none, linear and yarn, and ignoring the rule would rotate \
+                             every long position wrongly"
+                        )));
+                    }
+                };
+                if kind == RopeScalingKind::None {
+                    RopeScaling::NONE
+                } else {
+                    let factor = f32_of("rope.scaling.factor", 1.0);
+                    if !factor.is_finite() || factor <= 0.0 {
+                        return Err(ViperaError::unsupported(format!(
+                            "{architecture}.rope.scaling.factor is {factor}, which cannot scale a rotary table"
+                        )));
+                    }
+                    RopeScaling {
+                        kind,
+                        factor,
+                        original_context: u64_of("rope.scaling.original_context_length")
+                            .or_else(|| u64_of("context_length"))
+                            .unwrap_or(0),
+                        attn_factor: f32_of("rope.scaling.attn_factor", 1.0),
+                        beta_fast: f32_of("rope.scaling.yarn_beta_fast", 32.0),
+                        beta_slow: f32_of("rope.scaling.yarn_beta_slow", 1.0),
+                    }
+                }
+            },
         })
     }
 }
@@ -4549,26 +4705,57 @@ struct RopeAngles {
     pairs: [(f32, f32); 64],
     /// Whether `pairs` holds every index, i.e. `head_dim / 2 <= 64`.
     tabled: bool,
+    /// The context-extension rule; [`RopeScaling::NONE`] takes the original formula unchanged.
+    scaling: RopeScaling,
+    /// YaRN's ramp bounds, computed once per table rather than once per pair.
+    correction: [f32; 2],
 }
 
 impl RopeAngles {
+    #[cfg(test)]
     fn new(position: usize, head_dim: usize, base: f32) -> Self {
+        Self::scaled(position, head_dim, base, &RopeScaling::NONE)
+    }
+
+    fn scaled(position: usize, head_dim: usize, base: f32, scaling: &RopeScaling) -> Self {
         let half = head_dim / 2;
+        let correction = if scaling.kind == RopeScalingKind::Yarn {
+            scaling.correction_range(head_dim, base)
+        } else {
+            [0.0, 0.0]
+        };
         let mut angles = Self {
             position,
             head_dim,
             base,
             pairs: [(0.0, 0.0); 64],
             tabled: half <= 64,
+            scaling: *scaling,
+            correction,
         };
         if angles.tabled {
-            for (index, slot) in angles.pairs.iter_mut().enumerate().take(half) {
-                let exponent = 2.0 * index as f32 / head_dim as f32;
-                let inv = 1.0 / base.powf(exponent);
-                *slot = (position as f32 * inv).sin_cos();
+            for index in 0..half {
+                angles.pairs[index] = angles.compute(index);
             }
         }
         angles
+    }
+
+    /// `(sin, cos)` of pair `index`: the original expression when there is no scaling, so a model
+    /// without `rope.scaling.*` rotates bit for bit as it did.
+    fn compute(&self, index: usize) -> (f32, f32) {
+        if self.scaling.kind == RopeScalingKind::None && self.scaling.attn_factor == 1.0 {
+            let exponent = 2.0 * index as f32 / self.head_dim as f32;
+            let inv = 1.0 / self.base.powf(exponent);
+            return (self.position as f32 * inv).sin_cos();
+        }
+        self.scaling.rotation(
+            self.position,
+            index,
+            self.head_dim,
+            self.base,
+            self.correction,
+        )
     }
 
     /// The `(sin, cos)` of pair `index`, computed on the fly for a width the table does not cover.
@@ -4576,9 +4763,7 @@ impl RopeAngles {
         if self.tabled {
             return self.pairs[index];
         }
-        let exponent = 2.0 * index as f32 / self.head_dim as f32;
-        let inv = 1.0 / self.base.powf(exponent);
-        (self.position as f32 * inv).sin_cos()
+        self.compute(index)
     }
 }
 
@@ -4613,10 +4798,17 @@ fn rope_with(vector: &mut [f32], angles: &RopeAngles, heads: usize, head_dim: us
 }
 
 /// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
-fn rope(vector: &mut [f32], position: usize, heads: usize, head_dim: usize, base: f32) {
+fn rope(
+    vector: &mut [f32],
+    position: usize,
+    heads: usize,
+    head_dim: usize,
+    base: f32,
+    scaling: &RopeScaling,
+) {
     rope_with(
         vector,
-        &RopeAngles::new(position, head_dim, base),
+        &RopeAngles::scaled(position, head_dim, base, scaling),
         heads,
         head_dim,
     )
@@ -4824,6 +5016,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_prefill_chunk_is_max_batch_only_on_the_tiled_level() {
+        // The tiled kernel wants a wide chunk; the row fallback measured faster at 32.
+        assert_eq!(prefill_chunk_from(None, true), MAX_BATCH);
+        assert_eq!(prefill_chunk_from(None, false), 32);
+        // An override wins, rounds down to a multiple of eight, and stays inside the kernel's
+        // dispatch widths: 100 -> 96, 3 -> 8, 4096 -> MAX_BATCH.
+        assert_eq!(prefill_chunk_from(Some(100), true), 96);
+        assert_eq!(prefill_chunk_from(Some(3), false), 8);
+        assert_eq!(prefill_chunk_from(Some(4096), true), MAX_BATCH);
+        assert_eq!(prefill_chunk_from(Some(32), true), 32);
+    }
+
+    #[test]
     fn rms_norm_matches_the_definition() {
         let mut out = [0.0; 2];
         rms_norm(&[3.0, 4.0], &[1.0, 1.0], 0.0, &mut out);
@@ -4948,8 +5153,22 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..layers {
             for token in 0..tokens {
-                rope(&mut q, token, heads, head_dim, 1_000_000.0);
-                rope(&mut k, token, kv_heads, head_dim, 1_000_000.0);
+                rope(
+                    &mut q,
+                    token,
+                    heads,
+                    head_dim,
+                    1_000_000.0,
+                    &RopeScaling::NONE,
+                );
+                rope(
+                    &mut k,
+                    token,
+                    kv_heads,
+                    head_dim,
+                    1_000_000.0,
+                    &RopeScaling::NONE,
+                );
             }
         }
         let rope_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -5011,14 +5230,218 @@ mod tests {
         );
     }
 
+    /// An independent f64 transcription of ggml's `rope_yarn` for one pair, so the f32 table is
+    /// held to the formula and not to itself.
+    fn yarn_reference(
+        scaling: &RopeScaling,
+        position: usize,
+        index: usize,
+        head_dim: usize,
+        base: f64,
+    ) -> (f64, f64) {
+        let corr_dim = |rotations: f64| {
+            head_dim as f64
+                * (scaling.original_context as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = corr_dim(f64::from(scaling.beta_fast)).floor().max(0.0);
+        let high = corr_dim(f64::from(scaling.beta_slow))
+            .ceil()
+            .min(head_dim as f64 - 1.0);
+        let extrapolated = position as f64 * base.powf(-2.0 * index as f64 / head_dim as f64);
+        let freq_scale = 1.0 / f64::from(scaling.factor);
+        let interpolated = freq_scale * extrapolated;
+        let mut magnitude = f64::from(scaling.attn_factor);
+        let theta = match scaling.kind {
+            RopeScalingKind::None => extrapolated,
+            RopeScalingKind::Linear => interpolated,
+            RopeScalingKind::Yarn => {
+                let ramp = ((index as f64 - low) / (high - low).max(0.001)).clamp(0.0, 1.0);
+                let mix = 1.0 - ramp;
+                magnitude *= 1.0 + 0.1 * (1.0 / freq_scale).ln();
+                interpolated * (1.0 - mix) + extrapolated * mix
+            }
+        };
+        (theta.sin() * magnitude, theta.cos() * magnitude)
+    }
+
+    #[test]
+    fn rope_without_scaling_is_bit_identical_to_the_original_table() {
+        for head_dim in [64_usize, 128, 256] {
+            for position in [0_usize, 1, 17, 1023, 4096] {
+                let table = RopeAngles::scaled(position, head_dim, 1_000_000.0, &RopeScaling::NONE);
+                for index in 0..head_dim / 2 {
+                    let exponent = 2.0 * index as f32 / head_dim as f32;
+                    let inv = 1.0 / 1_000_000.0_f32.powf(exponent);
+                    let (sin, cos) = (position as f32 * inv).sin_cos();
+                    let (got_sin, got_cos) = table.at(index);
+                    assert_eq!(
+                        got_sin.to_bits(),
+                        sin.to_bits(),
+                        "sin {head_dim}/{position}/{index}"
+                    );
+                    assert_eq!(
+                        got_cos.to_bits(),
+                        cos.to_bits(),
+                        "cos {head_dim}/{position}/{index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yarn_correction_range_matches_the_published_llama2_values() {
+        // The YaRN reference gives (20, 46) for head width 128, base 10000, 4096 trained positions.
+        let scaling = RopeScaling {
+            kind: RopeScalingKind::Yarn,
+            factor: 4.0,
+            original_context: 4096,
+            ..RopeScaling::NONE
+        };
+        assert_eq!(scaling.correction_range(128, 10_000.0), [20.0, 46.0]);
+    }
+
+    #[test]
+    fn linear_and_yarn_scaling_follow_the_ggml_formula() {
+        let cases = [
+            (RopeScalingKind::Linear, 4.0_f32, 32_768_usize, 1.0_f32),
+            (RopeScalingKind::Yarn, 4.0, 32_768, 1.0),
+            (RopeScalingKind::Yarn, 8.0, 4096, 1.0),
+            (RopeScalingKind::Yarn, 2.0, 4096, 0.9),
+        ];
+        for (kind, factor, original_context, attn_factor) in cases {
+            let scaling = RopeScaling {
+                kind,
+                factor,
+                original_context,
+                attn_factor,
+                ..RopeScaling::NONE
+            };
+            for head_dim in [64_usize, 128] {
+                for position in [0_usize, 1, 7, 100, 1000] {
+                    let table = RopeAngles::scaled(position, head_dim, 1_000_000.0, &scaling);
+                    for index in 0..head_dim / 2 {
+                        let (sin, cos) = table.at(index);
+                        let (want_sin, want_cos) =
+                            yarn_reference(&scaling, position, index, head_dim, 1_000_000.0);
+                        assert!(
+                            (f64::from(sin) - want_sin).abs() < 5e-4
+                                && (f64::from(cos) - want_cos).abs() < 5e-4,
+                            "{kind:?} f{factor} d{head_dim} pos{position} pair{index}: \
+                             got ({sin}, {cos}), want ({want_sin}, {want_cos})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yarn_keeps_fast_pairs_interpolates_slow_ones_and_scales_the_magnitude() {
+        let scaling = RopeScaling {
+            kind: RopeScalingKind::Yarn,
+            factor: 4.0,
+            original_context: 4096,
+            ..RopeScaling::NONE
+        };
+        let (head_dim, base, position) = (128_usize, 10_000.0_f32, 900_usize);
+        let yarn = RopeAngles::scaled(position, head_dim, base, &scaling);
+        let plain = RopeAngles::scaled(position, head_dim, base, &RopeScaling::NONE);
+        let magnitude = 1.0 + 0.1 * 4.0_f32.ln();
+        // Pair 0 is far below the ramp: the angle is the extrapolated one, only the magnitude moves.
+        let (sin, cos) = yarn.at(0);
+        let (plain_sin, plain_cos) = plain.at(0);
+        assert!((sin - plain_sin * magnitude).abs() < 1e-5);
+        assert!((cos - plain_cos * magnitude).abs() < 1e-5);
+        // The last pair is far above it: the angle is the position-interpolated one, a quarter of it.
+        let last = head_dim / 2 - 1;
+        let inv = 1.0 / base.powf(2.0 * last as f32 / head_dim as f32);
+        let (want_sin, want_cos) = (position as f32 * inv / 4.0).sin_cos();
+        let (sin, cos) = yarn.at(last);
+        assert!((sin - want_sin * magnitude).abs() < 1e-5);
+        assert!((cos - want_cos * magnitude).abs() < 1e-5);
+    }
+
+    /// A GGUF v3 file carrying the five keys `ModelConfig::from_gguf` reads, one F32
+    /// `token_embd.weight` so the vocabulary can be read, and the `rope.scaling.type` asked for.
+    fn synthetic_qwen2(rope_type: &str) -> Vec<u8> {
+        fn push_string(out: &mut Vec<u8>, text: &str) {
+            out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            out.extend_from_slice(text.as_bytes());
+        }
+        fn push_u32_key(out: &mut Vec<u8>, key: &str, value: u32) {
+            push_string(out, key);
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut metadata = Vec::new();
+        push_string(&mut metadata, "general.architecture");
+        metadata.extend_from_slice(&8u32.to_le_bytes());
+        push_string(&mut metadata, "qwen2");
+        for (key, value) in [
+            ("qwen2.block_count", 1),
+            ("qwen2.embedding_length", 8),
+            ("qwen2.attention.head_count", 2),
+            ("qwen2.feed_forward_length", 16),
+        ] {
+            push_u32_key(&mut metadata, key, value);
+        }
+        push_string(&mut metadata, "qwen2.rope.scaling.type");
+        metadata.extend_from_slice(&8u32.to_le_bytes());
+        push_string(&mut metadata, rope_type);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        // One architecture key, four shape keys, and the rotary rule.
+        out.extend_from_slice(&6u64.to_le_bytes());
+        out.extend_from_slice(&metadata);
+        // `token_embd.weight`: F32, dims [4, 8], so the vocabulary reads as 8.
+        push_string(&mut out, "token_embd.weight");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&4u64.to_le_bytes());
+        out.extend_from_slice(&8u64.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u64.to_le_bytes());
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        out.extend_from_slice(&[0u8; 128]);
+        out
+    }
+
+    #[test]
+    fn an_unsupported_rope_scaling_type_is_refused_by_name() {
+        let yarn = GgufFile::parse(&synthetic_qwen2("yarn")).expect("the synthetic file parses");
+        assert_eq!(
+            ModelConfig::from_gguf(&yarn)
+                .expect("yarn is implemented")
+                .rope_scaling
+                .kind,
+            RopeScalingKind::Yarn
+        );
+
+        let unsupported =
+            GgufFile::parse(&synthetic_qwen2("longrope")).expect("the synthetic file parses");
+        let message = ModelConfig::from_gguf(&unsupported)
+            .expect_err("longrope is not implemented")
+            .to_string();
+        for needle in ["rope.scaling.type", "longrope", "linear", "yarn"] {
+            assert!(message.contains(needle), "{needle} missing from {message}");
+        }
+    }
+
     #[test]
     fn rope_rotates_a_pair_by_the_position_angle() {
         let mut vector = [1.0, 0.0];
-        rope(&mut vector, 1, 1, 2, 1.0);
+        rope(&mut vector, 1, 1, 2, 1.0, &RopeScaling::NONE);
         assert!((vector[0] - 1.0_f32.cos()).abs() < 1e-6);
         assert!((vector[1] - 1.0_f32.sin()).abs() < 1e-6);
         let mut at_zero = [2.0, 5.0];
-        rope(&mut at_zero, 0, 1, 2, 10_000.0);
+        rope(&mut at_zero, 0, 1, 2, 10_000.0, &RopeScaling::NONE);
         assert_eq!(at_zero, [2.0, 5.0], "position zero is the identity");
     }
 
@@ -6446,6 +6869,7 @@ mod tests {
             vocab: 8,
             rms_eps: 1e-6,
             rope_base: 10_000.0,
+            rope_scaling: RopeScaling::NONE,
         };
         assert_eq!(config.kv_layout(68).expect("q8_0"), KvLayout::Q8_0);
         assert_eq!(config.kv_layout(128).expect("f16"), KvLayout::F16);

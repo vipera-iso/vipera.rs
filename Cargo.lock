@@ -1066,6 +1066,7 @@ version = "0.1.0"
 dependencies = [
  "rustls",
  "vipera-backend-cpu",
+ "vipera-backend-gpu",
  "vipera-core",
  "vipera-errors",
  "vipera-runtime",
@@ -1119,6 +1120,7 @@ version = "0.1.0"
 dependencies = [
  "vipera-errors",
  "vipera-sampler",
+ "vipera-traits",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod bus;
+pub mod compress;
 pub mod model;
 mod pool;
 pub mod profile;
@@ -43,5 +44,37 @@ pub(crate) mod simd {
 }
 pub(crate) mod tiled;
 
+pub use compress::Q8Kv;
 pub use model::{CpuBackend, ModelConfig};
 pub use quant::{dequantize, f16_to_f32, f32_to_f16, matvec, read_row, row_bytes};
+
+/// The fastest dot-product level this process can use, by name.
+///
+/// One of `avx512-vnni`, `vnni256`, `avx2` (x86-64), `neon` (aarch64), or `scalar`. The level is
+/// what the runtime feature checks found — and `VIPERA_NO_VNNI` lowers it, because the checks
+/// honour that switch — so a deployment can read this to see which machine fell back. It is not
+/// an exact statement of the kernel a given tensor takes: `VIPERA_TILED`, `VIPERA_Q4K8` and
+/// `VIPERA_EXACT_DOT` still choose between paths inside a level, and the Q4_K prefill tile is
+/// only reached at `avx512-vnni` (a batch below `TILE_MIN_BATCH` keeps the row kernel).
+pub fn simd_level() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd::vnni512_available() {
+            "avx512-vnni"
+        } else if simd::vnni_available() {
+            "vnni256"
+        } else if simd::available() {
+            "avx2"
+        } else {
+            "scalar"
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "neon"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "scalar"
+    }
+}

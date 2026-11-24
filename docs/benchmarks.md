@@ -4449,3 +4449,322 @@ trong epilogue. Switch default OFF.
 từ 68–165 tok/s nên không thể tách win. **Trạng thái: chưa đo xong, chưa có verdict.** H4 rời có thể
 re-run khi máy ổn; nếu muốn đo "pure skip" có thể đặt `VIPERA_TRIATTENTION_THRESHOLD=0` (skip
 không điều kiện).
+<<<<<<< HEAD
+
+## Prefill re-measured, 128 / 512 / 1024 / 4096, against llama.cpp — 2026-11-24
+
+**Why:** the README table of 2026-11-15 claimed llama.cpp was ahead at every prompt length (3–4% at
+128 tokens, 20–21% at 4096). Re-measured on the machine above, same model (`qwen2.5-1.5b-instruct-q4_k_m.gguf`),
+llama.cpp `e574a17` (build 466), `VIPERA_THREADS=8` and `-t 8`, f16 KV, default switches.
+
+**Method.** The prompt is exactly `N` tokens: `"the" + " the" × (N−1)`, counted with
+`vipera tokenize --json` before running (128/512/1024/4096 all exact). Prefill time is the sum of the
+`PROFILE chunk` lines — the engine's own 128-token chunks — and `tok/s = N / that`:
+
+```bash
+VIPERA_THREADS=8 VIPERA_PROFILE_STEP=1 ./target/release/vipera generate \
+  ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  --prompt "$(python3 -c 'print("the"+" the"*4095)')" --max-tokens 1 --ctx 4096 --temperature 0
+llama-bench -m ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf -p N -n 0 -r 3 -t 8
+```
+
+Four rounds per length, the order alternating (vipera first on odd rounds, llama.cpp first on even),
+median reported with the range. A prose prompt (`"The quick brown fox…" × 410`, 4101 tokens) was
+measured once as a check that the repeated-token prompt is not doing the work for the engine:
+vipera 160.15 tok/s, llama.cpp 157.41 tok/s at `-p 4101`, same ordering as below.
+
+| prompt tokens | vipera tok/s (range) | llama.cpp tok/s (range) | vipera / llama.cpp |
+|---|---:|---:|---:|
+| 128 | 225.9 (224.9–227.4) | 217.6 (215.4–221.3) | 1.04 |
+| 512 | 209.8 (206.5–213.3) | 209.9 (208.5–212.3) | 1.00 |
+| 1024 | 197.6 (196.3–201.1) | 197.7 (195.7–198.4) | 1.00 |
+| 4096 | 162.4 (160.0–173.6) | 157.2 (156.0–157.9) | 1.03 |
+
+**Sửa 2026-11-24 (sau đó):** các số vipera trong bảng này cộng trung bình luỹ tiến của `PROFILE`
+nên cao hơn ~11%; xem mục "Prefill/decode wall-clock đối chiếu llama.cpp, cùng phiên" ở cuối file.
+
+**Verdict (bản cũ, đã rút lại): prefill is level with llama.cpp to +4%, not 20–21% behind.** The old 4096 figure is not
+reproduced; the ratio, not the absolute tok/s, is the row that settles it.
+
+**Machine state is the caveat.** An earlier sweep one hour before this one measured llama.cpp at
+178.8 tok/s on `pp128` and vipera at 194.8, against 217.6 / 225.9 here — the same binaries, the same
+commands, ~18% apart. That is the throttled state the H2–H4 sections describe, and it is why only
+the within-sweep ratios are quoted and the earlier sweep is not a ledger row. Do not compare a
+number from this table with a number from a table measured on a different day without re-running
+both arms.
+
+**Not attribution.** This section does not separate which change closed the gap: no single lever was
+switched off against it. `VIPERA_ATTN_GEMM` (H1) is default off and therefore not the cause; the
+candidates are defaults that landed between the 2026-11-15 table and today. A lever claim needs its
+own A/B, in one process, per the recipe above.
+
+**Harness check, same day.** `prefill_vs_decode` (backend called directly, whole prompt in one
+`ForwardContext`) measured 218.6 tok/s at n=128 and 205.9 at n=512; `prefill_long_prompt` measured
+192.8 at 1024 and **132.8 at 4096**. The 4096 number is the harness, not the engine: one 4096-token
+context is slower than 32 chunks of 128 on this machine, which is why the engine-level command above
+is the one quoted. Keep quoting the CLI for end-to-end prefill and the harness for kernel changes.
+
+
+## RoPE scaling (linear, YaRN) từ metadata GGUF — 2026-11-24
+
+**Giá:** không có giá tốc độ — đây là tính năng cho ngữ cảnh dài, không phải tối ưu. Điều kiện duy
+nhất: model không khai báo `rope.scaling.*` thì đường chạy phải giống cũ **từng bit**.
+
+**Thay đổi (`crates/vipera-backend-cpu/src/model.rs`):** `RopeScaling` (`none`/`linear`/`yarn`) đọc
+từ `{arch}.rope.scaling.{type,factor,original_context_length,attn_factor,yarn_beta_fast,
+yarn_beta_slow}`, mặc định theo llama.cpp (`original_context_length` rơi về `context_length`,
+`beta_fast = 32`, `beta_slow = 1`, `attn_factor = 1`). Công thức theo ggml `rope_yarn` và
+`ggml_rope_yarn_corr_dims`. Kiểu lạ (ví dụ `longrope`) bị từ chối bằng tên thay vì quay sai góc;
+`factor <= 0` cũng bị từ chối. `RopeAngles::scaled` dựng bảng một lần cho mỗi vị trí như trước;
+`RopeScaling::NONE` đi đúng biểu thức cũ. Backend GPU từ chối model có scaling (chỉ có bảng thường).
+
+**Test (`cargo test -p vipera-backend-cpu --lib`, 96 -> 100 passed):**
+- `rope_without_scaling_is_bit_identical_to_the_original_table` — `to_bits` bằng nhau với biểu thức cũ.
+- `yarn_correction_range_matches_the_published_llama2_values` — (20, 46) cho head 128, base 10000, 4096.
+- `linear_and_yarn_scaling_follow_the_ggml_formula` — so với bản chép độc lập bằng f64, 4 cấu hình.
+- `yarn_keeps_fast_pairs_interpolates_slow_ones_and_scales_the_magnitude`.
+
+**Gate:** `scripts/gate.sh fmt lint test` xanh.
+
+### Logits đối chiếu llama.cpp — cùng ngày
+
+**File tham chiếu, dựng lại được:** Qwen2.5-1.5B Q4_K_M cộng ba khoá metadata, không sửa weight nào
+(offset tensor là tương đối so với đầu data section, nên chèn metadata chỉ dịch chỗ bắt đầu):
+
+```bash
+scripts/gguf_set_metadata.py ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  /tmp/qwen2.5-1.5b-yarn.gguf \
+  qwen2.rope.scaling.type=str:yarn qwen2.rope.scaling.factor=f32:4.0 \
+  qwen2.rope.scaling.original_context_length=u32:32768
+# 1117320736 -> 1117320896 bytes, +3 keys; chạy lại ra file giống hệt từng byte
+```
+
+llama.cpp `e574a17` (build 466) đọc đúng file đó và in `rope scaling = yarn`, `freq_scale_train =
+0.25`, `n_ctx_orig_yarn = 32768` — hai bên cùng một phép biến đổi, không phải một bên bỏ qua metadata.
+
+**Lệnh:** `scripts/logits-dump.sh <file> <ids...>` cho top-16 logits của vị trí cuối (dumper nay tự đặt
+`n_ctx`/`n_batch` theo độ dài chuỗi và in `arch`), rồi
+
+```bash
+VIPERA_TEST_MODEL=/tmp/qwen2.5-1.5b-yarn.gguf VIPERA_REFERENCE_LOGITS=/tmp/yarn-logits.json \
+  cargo test -p vipera-backend-cpu --release --test logits_reference -- --ignored scaled --nocapture
+```
+
+| chuỗi | argmax | top-16 lệch tối đa | đối chứng model không scaling, cùng chuỗi |
+|---|---:|---:|---:|
+| 64 token | giống (34208) | **0.357** | 0.333 |
+| 6001 token | giống (576) | **0.566** | 0.194 |
+
+**Đọc số:** cùng argmax, top-8 có đủ mặt ở cả hai độ dài, nên ramp và hệ số magnitude đúng — sai ramp
+hoặc thiếu `1 + 0.1·ln(factor)` sẽ đổi argmax chứ không đổi 0.3. Phần lệch thêm so với đối chứng là cấu
+trúc bảng: llama.cpp nhân `theta_scale` luỹ tiến từng cặp, vipera luỹ thừa cơ số theo từng cặp; tại vị
+trí 6000 cặp 6 hai cách lệch **6.7e-4 rad**, rồi bị khuếch đại bởi `mscale = 1.1386` (q·k ×1.30) qua 28
+lớp. Vì vậy test giữ ngưỡng 0.3 cho qwen3 và dùng ngưỡng riêng 0.75 cho model scaling ở ngữ cảnh dài,
+giá trị ghi kèm trong test.
+
+**GPU:** `generate --backend cuda` từ chối cả `yarn` và `longrope` trên GTX 1650 với thông báo nêu tên
+rule; model không khai báo scaling vẫn chạy và ra đúng continuation như CPU.
+
+**Không kiểm được:** đây vẫn là metadata YaRN gắn lên model train ở 32768 vị trí, không phải model
+được train/convert với YaRN thật, nên chưa có kết luận perplexity ở ngữ cảnh dài; muốn thế cần một GGUF
+YaRN native và `scripts/logits-dump.sh` chạy ở đúng độ dài đó.
+
+## Bậc dispatch và trần fallback (portability trên CPU không VNNI) — 2026-11-24
+
+**Câu hỏi:** engine "tổng quát cho các thiết bị phần cứng khác nhau" tới đâu? Máy này có AVX-512
+VNNI nên đường nhanh luôn chạy; cần biết máy không có nó trả giá bao nhiêu, và trả giá vì *layout
+tiled* hay vì *độ rộng vector*.
+
+**Phương pháp.** Wall-clock cả tiến trình, trừ hằng số nạp model đo riêng (`--prompt "Hi"
+--max-tokens 1`): **0.56 s**, như nhau ở hai nhánh. Prefill 512/4096 token (`" the"` lặp), greedy,
+`--max-tokens 1`, `VIPERA_THREADS=8`, `--ctx 4096`; decode = `(wall_64 − 0.56)/63`. Sweep xen kẽ hai
+chiều, hai lần mỗi nhánh, và mọi arm chạy trên **cùng một binary** (xem "Bài học đo": hai bản trước
+của mục này đo nhầm binary).
+
+| bậc | cờ | prefill 512 | prefill 4096 | decode |
+|---|---|---:|---:|---:|
+| `avx512-vnni` (tiled + dpbusd zmm) | — | **204.8** tok/s (3.05/3.08 s) | **142.6** tok/s (29.02/29.55 s) | **31.0** tok/s (32.2 ms/step) |
+| `vnni256` (row kernel, dpbusd ymm) | `VIPERA_TILED=0` | — | 44.9 tok/s (91.80 s) | — |
+| `avx2` + band 256-bit (mặc định) | `VIPERA_NO_VNNI=1` | **92.6** tok/s (6.08/6.09 s) | **79.5** tok/s (51.37/54.77 s) | 21.0 tok/s (47.5 ms/step) |
+| `avx2` kernel hàng | `VIPERA_NO_VNNI=1 VIPERA_TILED=0` | 31.6 tok/s (16.80/16.68 s) | 30.0 tok/s (137.00 s) | 21.0 tok/s |
+
+Tỉ lệ (sau khi có band 256-bit, mục cuối file): prefill **2.21×** ở 512 và **1.82×** ở 4096; decode
+**1.47×** (−32%). Trước band, nhánh AVX2 là 6.3×/4.9×; band cắt 2.9×/2.7× so với kernel hàng. Bỏ tile
+(vẫn còn VNNI 256-bit) mất **3.2×** so với đường zmm — đó là phần width+cột, phần còn lại của khoảng
+cách cũ là layout mà band đã lấp.
+
+**Đọc số:** quá nửa khoảng cách prefill trên máy không VNNI là **layout tiled** (một lần unpack weight
+cho 16 activation), không phải độ rộng 512-bit — nên nếu port thì port layout. Decode chỉ mất 32% vì
+batch = 1 không đi qua tile; prefill mới là chỗ hỏng. 512 nhanh hơn 4096 ở cả hai nhánh (204.8 vs
+142.6): attention lớn dần theo độ sâu, khớp mục prefill ở trên.
+
+### Lever giữ lại: chunk hẹp chỉ ở nhánh không VNNI (9%, `prefill_chunk`)
+
+Kernel hàng đọc activation của **mỗi hàng** với working set `chunk × 288` byte (256 code + 8 scale):
+36 KB ở chunk 128, vượt L1D 32 KB; 9 KB ở chunk 32. Đo trong cùng một binary bằng
+`VIPERA_PREFILL_CHUNK` (mới), sweep xen kẽ:
+
+| nhánh | chunk 128 | chunk 32 | tỉ lệ |
+|---|---:|---:|---:|
+| `avx512-vnni`, 4096 | 30.58 / 30.66 s | 35.13 s | **+14.9% (tệ hơn)** |
+| `avx2`, 4096 | 155.18 / 152.66 s | 139.55 / 140.17 s | **−9.1%** |
+| `avx2`, 512 | 18.05 / 18.06 s | 16.33 / 16.50 s | **−9.1%** |
+
+Nên `prefill_chunk()` giữ `MAX_BATCH` (128) khi có tile và dùng 32 khi không; `VIPERA_PREFILL_CHUNK`
+ghi đè để A/B. Bit-identity: 8 token greedy từ prompt 530 token ra **md5 giống nhau** giữa chunk 32 và
+128 trên nhánh AVX2 (`4862c0fc…`), vì chunk chỉ chia vị trí chứ không đổi phép tính của từng hàng.
+Nhánh VNNI **không** bị đổi số.
+
+**Tính ổn định — cùng prompt, khác bậc:** prompt ngắn (10 token), 32 token greedy: giống hệt từng
+byte giữa `avx512-vnni` và `avx2`. Prompt 530 token: lệch ngay token đầu, vì prefill cộng theo thứ tự
+khác (`q4k_tiled_matvec_worker`: sai khác ≤ `1e-3 + 1e-4·|ref|`), đủ đổi một token gần tie. Vậy
+"deterministic" chỉ hứa trong *một* bậc dispatch trên *một* máy.
+
+### Bài học đo — `PROFILE` in trung bình luỹ tiến, và binary phải đúng bản đang định đo
+
+Hai bản đầu của mục này sai số, cả hai vì cách đo chứ không vì engine:
+
+1. **Cộng các dòng `PROFILE ... N X ms`.** `X` là trung bình của N pass (`finish_pass` chia `steps`),
+   không phải thời gian từng pass; khi một chunk bị chia nhiều `run_batch` thì dòng đó chỉ tính một
+   phần. Một thí nghiệm hạ `MAX_BATCH` 128 → 32 đọc ra "622 tok/s" (3.7×) từ `PROFILE` trong khi
+   wall-clock là **32.7 s so với 29.5 s** — chậm hơn, con số 3.7× không tồn tại.
+2. **Đo bằng binary cũ.** Sau khi sửa `MAX_BATCH` về 128, lần sweep kế tiếp chạy `target/release` vẫn
+   là bản build 32 (chỉ `gate.sh` sau đó mới rebuild), nên bảng "128" khi đó thật ra là 32: prefill
+   4096 ra 33.3 s thay vì 29.0 s, và tỉ lệ bị báo thành 4.1× thay vì 4.9×.
+
+Từ nay: tổng prefill/decode lấy **wall-clock** (trừ hằng số nạp model đo riêng) hoặc cộng cột
+`this pass` của `PROFILE`; trước mỗi sweep ghi `md5sum target/release/vipera` và build lại nếu source
+vừa đổi. Hai lỗi gốc ở trên đã được sửa trong code — xem mục cuối file.
+
+## Prefill/decode wall-clock đối chiếu llama.cpp, cùng phiên — 2026-11-24 (phương pháp sửa)
+
+**Vì sao có mục này:** mục "Prefill re-measured" ở trên cộng các dòng `PROFILE chunk N X ms`, mà `X`
+là trung bình luỹ tiến qua N pass — không phải tổng. Cùng engine, cùng model, hôm nay tổng đúng của
+prefill 4096 là 28.31 s (144.7 tok/s) trong khi cách cộng cũ cho 162.4 tok/s; sai ~11%, đủ để biến
+"0.87×" thành "1.03×". Số llama.cpp cũng đã dịch (157.2 → 165.5 tok/s), nên bảng dưới đo lại cả hai
+bên trong cùng một phiên.
+
+**Phương pháp.** Thời gian engine = trung bình của dòng `PROFILE chunk` **cuối** × số pass (đã đối
+chiếu wall: 28.31 s engine + 0.54 s nạp = 28.85 s wall); decode = trung bình dòng `PROFILE decode`
+cuối (khớp marginal wall 33.6 ms). llama.cpp: `llama-bench -p N -n 64 -r 2 -t 8`, cùng file GGUF,
+cùng 8 thread, chạy trong cùng phiên. `N` tính bằng `vipera tokenize` (`"the" + " the" × (N−1)`).
+
+| prompt tokens | vipera tok/s | llama.cpp tok/s | vipera / llama.cpp |
+|---|---:|---:|---:|
+| 128 | 232.6 (230.5–234.7) | 229.2 | 1.01 |
+| 512 | 220.7 | 222.2 | 0.99 |
+| 1024 | 203.2 (201.2–205.1) | 210.5 | 0.97 |
+| 4096 | 144.7 | 165.5 | **0.87** |
+| decode 64 (bước) | 29.5 tok/s (33.9 ms) | 37.2 tok/s (26.9 ms) | **0.79** |
+
+**Verdict:** prefill ngang llama.cpp ở 128/512, kém 3% ở 1024 và **13% ở 4096**; decode **kém 21%**
+ở độ sâu nông. Claim "level with llama.cpp to +4%" trong README cũ dựa trên cách cộng sai và được rút
+lại; README nay ghi đúng bảng này. Decode 33.9 ms/step chia theo phase: q4k 19.86 (59%), q6k 11.59
+(34%), attention 2.12 (6%) — chênh lệch so với llama chưa quy cho phase nào, đó là câu mở của phiên
+sau. Máy không throttled trong phiên này: llama.cpp đo lại lúc đầu và lúc cuối lệch <2%.
+
+## Chẩn đoán khoảng cách decode 0.79× — phase nào, và có phải regression không — 2026-11-24
+
+**Câu hỏi:** decode 33.9 ms/step so với llama.cpp 26.9 ms. Đây có phải do nhánh này (RoPE scaling,
+`prefill_chunk`, TriAttention WIP) làm chậm đi không, và 6–7 ms đó nằm ở phase nào?
+
+**Không phải regression của nhánh.** Dựng `origin/main` (7b61555) trong worktree và đo xen kẽ, cùng
+file, cùng 8 thread, 200 token, `PROFILE`:
+
+| | step | q4k | q6k | attention |
+|---|---:|---:|---:|---:|
+| `origin/main`, vòng 1 | 32.75 ms | 19.41 | 11.35 | 1.66 |
+| nhánh, vòng 1 | 33.15 ms | 19.65 | 11.69 | 1.48 |
+| `origin/main`, vòng 2 | 33.46 ms | 19.79 | 11.69 | 1.64 |
+| nhánh, vòng 2 | 33.51 ms | 19.77 | 11.78 | 1.62 |
+
+Hai bên trùng nhau trong nhiễu (±0.5 ms). Số 29.95 ms ghi ngày 2026-11-22 không tái hiện được trên
+*main* hôm nay, nên đó là trạng thái máy, không phải thay đổi code.
+
+**6.3 ms nằm ở đâu.** Đổi phase ra băng thông (Q4_K 625 MB, Q6_K 191 MB theo `docs/benchmarks.md`):
+
+| phase | ms/step | GB/s | trần máy ~43 GB/s |
+|---|---:|---:|---:|
+| Q4_K (14 tensor) | 19.75 | 31.6 | 73% |
+| Q6_K (output, 151936×1536) | 11.72 | **16.3** | **38%** |
+| attention | 1.6 | — | — |
+
+Nếu llama.cpp chạy Q4_K ở cùng tốc độ ~31 GB/s (nó cùng đọc 625 MB), thì 26.9 − 19.8 − 1.6 ≈ **5.5 ms
+cho Q6_K của nó**, tức ~35 GB/s. Vậy gần như toàn bộ khoảng cách decode là **output projection Q6_K**,
+không phải Q4_K, không phải attention. Đây khớp với một ghi chú cũ (`CONSTRAINTS.md`: `output` Q6_K
+5.2 ms/call = 36.5 GB/s) — con số 5.2 ms từng đạt được, nay cùng tensor đo 11.7 ms.
+
+**Giả thuyết phiên sau (đặt ngưỡng trước):** kernel Q6_K của decode (B=1 qua `dot_batch`) đang unpack
+6-bit chậm gấp đôi phần đọc; nếu một A/B cùng shape không kéo q6k xuống ≥2 ms/step thì bỏ. Trước khi
+viết kernel, đo lại 5.2 ms/call ngày trước bằng đúng bench đó, vì nếu con số cũ đo trên đường khác
+(tiled thay vì row) thì "regression" chỉ là so sai đường.
+
+## Band tiled 256-bit (AVX2) cho Q4_K prefill — 2026-11-24
+
+**Giả thuyết (đặt trước):** máy không AVX-512 VNNI chạy kernel hàng; cùng layout tiled như bản zmm
+nhưng 8 cột/`ymm` và `vpmaddubsw`+`vpmaddwd` thay `vpdpbusd` sẽ cắt phần lớn khoảng 4.9× ở prefill.
+Giữ nếu prefill ≥10% nhanh hơn; dưới thì bỏ.
+
+**Code:** `q4k_matvec_tiled_ymm` + `q4k_tiled_band_ymm::<N>` (`N` = 4 hàng/band thay vì 8: AVX2 chỉ
+có 16 thanh ghi), dùng chung `ROW_WIN` 32 và cùng thứ tự epilogue float như bản zmm. Chọn ở
+`fill_rows_batch` khi `available() && !vnni512_available()`; `VIPERA_TILED_AVX2=0` tắt, `VIPERA_TILED=0`
+quay về kernel hàng. Integer sums chính xác nên band cho cùng phép tính như tile zmm; khác biệt duy
+nhất là số cột mỗi thanh ghi.
+
+**Codegen gate** (`scripts/objdump_gate.py … q4k_tiled_band_ymm --dot-op vpmaddubsw`):
+`zmm=0`, `vector rsp st=0 ld=0`, `branches=9`, dot 148 instr với `vpmaddubsw=32 vpmaddwd=32
+vpaddd=28 vpbroadcastd=32` — **GATE: PASS**.
+
+**Parity:** test mới `the_256_bit_band_matches_the_row_kernel_and_ignores_the_window_split`: 9 hàng
+(2 band 4 + tail 1), 4 activation, sai khác ≤ `1e-3 + 1e-4·|ref|` so với `q4k_dot`; gọi lại với biên
+chia 5 hàng cho **cùng bit** ở các hàng chồng lấn (giá trị của một hàng không phụ thuộc cửa sổ).
+
+**Đo** (cùng binary, xen kẽ, 4096/512 token, wall − 0.56 s nạp; `VIPERA_NO_VNNI=1` để band chạy trên
+máy này):
+
+| | kernel hàng (`TILED=0`) | band 256-bit | tỉ lệ |
+|---|---:|---:|---:|
+| prefill 512 | 31.6 tok/s (16.80/16.68 s) | **92.6 tok/s** (6.08/6.09 s) | **2.93×** |
+| prefill 4096 | 30.0 tok/s (134.83/138.07/137.00 s) | **79.5 tok/s** (51.37/54.77 s) | **2.65×** |
+
+So với đường tiled 512-bit (204.8 / 144.7 tok/s), khoảng cách của nhánh AVX2 thu từ **4.9× xuống
+1.82×** ở 4096 và từ 6.3× xuống **2.21×** ở 512. Decode không đổi (band chỉ chạy ở batch ≥
+`TILE_MIN_BATCH`).
+
+**End-to-end:** prompt 530 token, 8 token greedy — band và kernel hàng ra **cùng văn bản**
+(`4862c0fc…`); đường zmm khác (`83583642…`) vì nhánh `NO_VNNI` cũng đổi kernel Q6_K, không phải vì
+band. Đây là hành vi numeric-policy giống tile zmm, không phải bit-identity với nó trên mọi prompt.
+
+**Verdict: giữ** (2.65–2.93×, vượt ngưỡng 10% rất xa). Điều bất ngờ: nút cổ chai của kernel hàng
+không phải độ rộng lệnh — `pmaddubsw` chỉ bằng nửa `vpdpbusd` mỗi lệnh — mà là việc mỗi hàng đọc lại
+activation và trả epilogue riêng; layout tiled hoá ra đáng giá hơn cả phần width.
+
+## `PROFILE`: in thời gian từng pass, và mảnh bị tính nhầm thành decode — 2026-11-24
+
+**Lỗi 1 (số liệu):** dòng `PROFILE chunk N X ms` chỉ có trung bình luỹ tiến, không có thời gian của
+pass vừa xong, nên không có cách nào lấy tổng từ output — cộng các trung bình là sai (xem "Bài học
+đo" ở trên, nơi cách này làm prefill 4096 báo 162.4 thay vì 144.7 tok/s).
+
+**Lỗi 2 (phân loại):** `run_batch_n` gọi `begin(std::mem::take(&mut self.chunk_pass))`, nên **mảnh
+đầu tiên** của một prompt chunk được tính là chunk, các mảnh sau bị tính là decode: tổng chunk thấp
+hơn thực tế theo đúng số mảnh, và trung bình decode bị làm bẩn bởi công việc prefill. Với
+`VIPERA_PREFILL_CHUNK=32` (4 mảnh/chunk), 4096 token cho 32 dòng chunk + **96 dòng decode** và tổng
+chunk chỉ 7.9 s trong khi wall là 32.7 s.
+
+**Sửa:** cờ `chunk_pass` giữ nguyên cho cả prompt (xóa sau `run_positions`), `run_batch_n` đọc chứ
+không `take`; dòng `PROFILE` thêm `(this pass X ms)` sau trung bình, phần trăm phase vẫn là trung bình.
+`render_pass_line` tách ra để test (`a_pass_line_carries_its_own_time_and_the_running_split`,
+`two_passes_average_but_do_not_sum`).
+
+**Kiểm chứng, cùng binary, 4096 token:**
+
+| chế độ | dòng chunk | dòng decode | tổng `this pass` | wall |
+|---|---:|---:|---:|---:|
+| trước khi sửa, chunk 32 | 32 | 96 | 7.9 s | 32.7 s |
+| sau khi sửa, chunk 32 | **128** | **0** | **32.12 s** | 32.68 s |
+| sau khi sửa, chunk 128 (mặc định) | 32 | 0 | 27.93 s | 28.48 s |
+
+Tổng `this pass` + 0.56 s nạp khớp wall trong 0.6 s ở cả hai chế độ, và không còn dòng decode nào
+trong lúc prefill. Đây là công cụ đo, không phải đường chạy model: không đổi kết quả, chỉ đổi số báo.
+=======
+>>>>>>> origin/main

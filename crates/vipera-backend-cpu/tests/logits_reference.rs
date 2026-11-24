@@ -20,7 +20,7 @@
 //! Q4_K dots in its own order, so the values agree to a tolerance rather than bit for bit. The test
 //! holds the argmax exactly and the top rows to `LOGIT_TOLERANCE`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use vipera_backend_cpu::CpuBackend;
 use vipera_core::planner::KvCacheType;
@@ -35,6 +35,15 @@ const TOKENS_PER_BLOCK: u64 = 16;
 /// top logit of 22.6, which is 1% of the margin the distribution actually has; 0.3 leaves room for
 /// that and is still far below the tens of logits a wrong per-head norm shifts things by.
 const LOGIT_TOLERANCE: f32 = 0.3;
+
+/// The same measure for a scaled model over a long sequence. Measured on the synthetic Qwen2.5-1.5B
+/// YaRN file (factor 4, 32768 trained positions) at 64 and 6001 tokens: the unscaled control on the
+/// same sequence moved 0.333 and 0.194, the scaled one 0.357 and 0.566, with the same argmax. The
+/// extra is the two ways of building the table: llama.cpp multiplies `theta_scale` pair by pair and
+/// vipera raises the base per pair, which is 6.7e-4 rad apart at position 6000 (pair 6), amplified
+/// by 28 layers of a sharper distribution. A wrong ramp or a missing magnitude shows up as a
+/// different argmax, not as this.
+const SCALED_LOGIT_TOLERANCE: f32 = 0.75;
 
 fn model_path() -> Option<PathBuf> {
     let path = std::env::var_os("VIPERA_TEST_MODEL").map(PathBuf::from)?;
@@ -87,6 +96,17 @@ fn top_rows(logits: &[f32], count: usize) -> Vec<(u32, f32)> {
     rows
 }
 
+/// The architecture the reference run recorded, so the same comparison serves whichever model the
+/// dump was taken from. Dumps written before the field existed are the qwen3 ones.
+fn reference_arch(text: &str) -> String {
+    let at = match text.find("\"arch\":\"") {
+        Some(at) => at + 8,
+        None => return "qwen3".to_owned(),
+    };
+    let rest = &text[at..];
+    rest[..rest.find('"').expect("the arch value ends")].to_owned()
+}
+
 #[test]
 #[ignore = "needs a qwen3 GGUF and a reference run of llama.cpp on it"]
 fn qwen3_logits_match_the_reference_run() {
@@ -102,12 +122,43 @@ fn qwen3_logits_match_the_reference_run() {
         );
         return;
     };
-    let (tokens, expected) = parse_reference(&text);
-    let mut backend = CpuBackend::load(&path).expect("load model");
+    compare_with_reference(&path, &text, LOGIT_TOLERANCE);
+}
+
+/// The same comparison for a model whose rotary table is scaled (linear or YaRN), on a sequence long
+/// enough for the rule to matter:
+///
+/// ```bash
+/// scripts/logits-dump.sh /tmp/qwen2.5-1.5b-yarn.gguf $(python3 -c 'print(" ".join(map(str, IDS)))') \
+///     > /tmp/yarn-logits.json
+/// VIPERA_TEST_MODEL=/tmp/qwen2.5-1.5b-yarn.gguf VIPERA_REFERENCE_LOGITS=/tmp/yarn-logits.json \
+///   cargo test -p vipera-backend-cpu --release --test logits_reference -- --ignored scaled --nocapture
+/// ```
+#[test]
+#[ignore = "needs a scaled GGUF and a reference run of llama.cpp on it"]
+fn scaled_model_logits_match_the_reference_run() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL to the scaled GGUF");
+        return;
+    };
+    let reference = reference_path();
+    let Ok(text) = std::fs::read_to_string(&reference) else {
+        eprintln!(
+            "skipped: no reference at {}; run scripts/logits-dump.sh",
+            reference.display()
+        );
+        return;
+    };
+    compare_with_reference(&path, &text, SCALED_LOGIT_TOLERANCE);
+}
+
+fn compare_with_reference(path: &Path, text: &str, tolerance: f32) {
+    let (tokens, expected) = parse_reference(text);
+    let mut backend = CpuBackend::load(path).expect("load model");
     assert_eq!(
         backend.architecture(),
-        "qwen3",
-        "this test pins the qwen3 layout; point VIPERA_TEST_MODEL at one"
+        reference_arch(text),
+        "the reference was dumped from a different architecture; point VIPERA_TEST_MODEL at that model"
     );
 
     let config = backend.config();
@@ -157,8 +208,8 @@ fn qwen3_logits_match_the_reference_run() {
         expected[0].0, expected[0].1, got[0].0, got[0].1
     );
     assert!(
-        worst <= LOGIT_TOLERANCE,
-        "worst top-row logit differs by {worst:.4}, over the {LOGIT_TOLERANCE} tolerance"
+        worst <= tolerance,
+        "worst top-row logit differs by {worst:.4}, over the {tolerance} tolerance"
     );
     /* The order inside the tail of the top sixteen flips on this run, and one row at the very edge of
      * it (rank 15 against rank 16) trades places with a neighbour 0.2 away, because those rows sit
