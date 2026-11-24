@@ -150,12 +150,12 @@ impl KeepKv {
     }
 }
 
-/// A score's rank, with everything that is not a number treated as the worst score.
+/// A score's rank, with everything that is not finite treated as the worst score.
 fn rank(score: f32) -> f32 {
-    if score.is_nan() {
-        f32::NEG_INFINITY
-    } else {
+    if score.is_finite() {
         score
+    } else {
+        f32::NEG_INFINITY
     }
 }
 
@@ -244,6 +244,17 @@ mod tests {
         };
         let policy = KeepKv::new(2, 8);
         let scores = [f32::NAN, 0.0, -1.0];
+        assert_eq!(policy.retain(&flat, &scores), vec![1, 2]);
+    }
+
+    #[test]
+    fn an_infinite_score_ranks_below_every_real_one() {
+        let flat = Geometry {
+            bytes_per_token: 1,
+            tokens_per_block: 1,
+        };
+        let policy = KeepKv::new(2, 8);
+        let scores = [f32::INFINITY, 0.0, -1.0];
         assert_eq!(policy.retain(&flat, &scores), vec![1, 2]);
     }
 
