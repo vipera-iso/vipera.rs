@@ -538,6 +538,102 @@
 - [ ] `comm-contribute` — Contribution (code, doc, test) — Freebuff
 - [ ] `comm-maintain` — Maintenance (fix, update, support) — Freebuff
 
+### P41 — AGENT + AUTONOMOUS (thêm)
+- [ ] `agent-tool-use` — Tool calling (function, JSON schema) — OpenCode
+- [ ] `agent-multi-step` — Multi-step reasoning (plan, execute, verify) — OpenCode
+- [ ] `agent-memory` — Agent memory (short-term + long-term, vector) — OpenCode
+- [ ] `agent-reflection` — Self-reflection (critique + improve) — OpenCode
+- [ ] `agent-multi-agent` — Multi-agent (debate, vote, specialize) — OpenCode
+- [ ] `agent-critic` — Critic model (reject + regenerate) — OpenCode
+- [ ] `agent-verifier` — Verifier (check output, math, code) — OpenCode
+- [ ] `agent-planner` — Planner (decompose, schedule, execute) — OpenCode
+- [ ] `agent-executor` — Executor (run tool, parse result) — OpenCode
+- [ ] `agent-orchestrator` — Orchestrator (route, parallel, merge) — OpenCode
+
+### P42 — RAG + RETRIEVAL (thêm)
+- [ ] `rag-hybrid` — Hybrid retrieval (BM25 + vector) — OpenCode
+- [ ] `rag-graph` — GraphRAG (entity + relation) — OpenCode
+- [ ] `rag-hierarchical` — HieraRAG (multi-level chunk) — Freebuff
+- [ ] `rag-temporal` — TemporalRAG (time-aware) — Freebuff
+- [ ] `rag-multi-doc` — Multi-document (cross-ref) — Freebuff
+- [ ] `rag-citation` — Citation (source + span) — Freebuff
+- [ ] `rag-eval` — RAG eval (retrieval + generation) — Freebuff
+- [ ] `rag-cache` — RAG cache (query + context) — Freebuff
+- [ ] `rag-update` — RAG update (incremental index) — Freebuff
+- [ ] `rag-privacy` — RAG privacy (PII, access control) — Freebuff
+
+### P43 — CODE + AGENTIC (thêm)
+- [ ] `code-gen` — Code generation (Python, Rust, C++) — OpenCode
+- [ ] `code-review` — Code review (bug, style, perf) — OpenCode
+- [ ] `code-test` — Auto-test (unit, integration) — Freebuff
+- [ ] `code-debug` — Debug (root cause, fix) — OpenCode
+- [ ] `code-refactor` — Refactor (clean, perf) — OpenCode
+- [ ] `code-doc` — Auto-doc (docstring, comment) — Freebuff
+- [ ] `code-security` — Security scan (SAST, DAST) — Freebuff
+- [ ] `code-dependency` — Dependency update (SemVer) — Freebuff
+- [ ] `code-ci` — CI pipeline (build, test, deploy) — Freebuff
+- [ ] `code-migration` — Migration (legacy → new) — OpenCode
+
+### P44 — SCIENTIFIC + DOMAIN (thêm)
+- [ ] `sci-math` — Math (symbolic, numeric) — OpenCode
+- [ ] `sci-physics` — Physics (simulation, FEA) — OpenCode
+- [ ] `sci-chem` — Chemistry (molecular, reaction) — OpenCode
+- [ ] `sci-bio` — Biology (protein, genome) — OpenCode
+- [ ] `sci-medical` — Medical (diagnosis, drug) — Freebuff
+- [ ] `sci-finance` — Finance (risk, portfolio) — Freebuff
+- [ ] `sci-climate` — Climate (forecast, model) — Freebuff
+- [ ] `sci-engineering` — Engineering (CAD, FEA) — Freebuff
+- [ ] `sci-research` — Research (literature, experiment) — Freebuff
+- [ ] `sci-data` — Data (ETL, BI, dashboard) — Freebuff
+
+### P45 — EDGE + EMBEDDED (thêm)
+- [ ] `edge-raspberry` — Raspberry Pi (ARM NEON, 4GB) — Freebuff
+- [ ] `edge-jetson` — NVIDIA Jetson (CUDA, int8) — Freebuff
+- [ ] `edge-micro` — Microcontroller (ESP32, STM32) — Freebuff
+- [ ] `edge-wasm` — WASM (browser, edge) — OpenCode
+- [ ] `edge-webgpu` — WebGPU (browser GPU) — OpenCode
+- [ ] `edge-quant` — Edge quantization (2-bit, 4-bit) — OpenCode
+- [ ] `edge-batch` — Edge batch (inference + train) — OpenCode
+- [ ] `edge-sync` — Edge sync (cloud ↔ edge) — Freebuff
+- [ ] `edge-update` — Edge update (OTA, model) — Freebuff
+- [ ] `edge-security` — Edge security (key, cert) — Freebuff
+
+### P46 — CLOUD + SCALED (thêm)
+- [ ] `cloud-aws` — AWS (SageMaker, EC2, S3) — Freebuff
+- [ ] `cloud-gcp` — GCP (Vertex, GKE, GCS) — Freebuff
+- [ ] `cloud-azure` — Azure (ML, AKS, Blob) — Freebuff
+- [ ] `cloud-k8s` — Kubernetes (Helm, operator) — Freebuff
+- [ ] `cloud-serverless` — Serverless (Lambda, Cloud Functions) — Freebuff
+- [ ] `cloud-batch` — Batch (Spark, Ray, Dask) — Freebuff
+- [ ] `cloud-mlflow` — MLflow (track, version) — Freebuff
+- [ ] `cloud-pipeline` — Pipeline (Airflow, Argo) — Freebuff
+- [ ] `cloud-monitor` — Monitor (CloudWatch, GCP Monitoring) — Freebuff
+- [ ] `cloud-cost` — Cost (FinOps, tag) — Freebuff
+
+### P47 — ENTERPRISE (thêm)
+- [ ] `ent-sso` — SSO (SAML, OIDC) — Freebuff
+- [ ] `ent-scm` — SCM (Active Directory, LDAP) — Freebuff
+- [ ] `ent-gov` — Governance (policy, role) — Freebuff
+- [ ] `ent-audit` — Audit (log, report) — Freebuff
+- [ ] `ent-billing` — Billing (usage, invoice) — Freebuff
+- [ ] `ent-support` — Support (ticket, chat) — Freebuff
+- [ ] `ent-sla` — SLA (uptime, response) — Freebuff
+- [ ] `ent-iso` — ISO 27001 (security) — Freebuff
+- [ ] `ent-soc2` — SOC2 (compliance) — Freebuff
+- [ ] `ent-hipaa` — HIPAA (medical) — Freebuff
+
+### P48 — RESEARCH FRONTIER (thêm)
+- [ ] `frontier-transformer` — Transformer v2 (linear, log) — OpenCode
+- [ ] `frontier-moe` — MoE v2 (expert choice, dynamic) — OpenCode
+- [ ] `frontier-longctx` — Long context (1M, 10M) — OpenCode
+- [ ] `frontier-multimodal` — Multi-modal (text, image, audio, video) — OpenCode
+- [ ] `frontier-world` — World model (physics, simulation) — OpenCode
+- [ ] `frontier-robotics` — Robotics (vision, control) — OpenCode
+- [ ] `frontier-science` — AI for science (material, drug) — OpenCode
+- [ ] `frontier-math` — AI for math (theorem, proof) — OpenCode
+- [ ] `frontier-alignment` — Alignment (safety, value) — OpenCode
+- [ ] `frontier-scaling` — Scaling law (compute, data, model) — OpenCode
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
@@ -548,11 +644,11 @@
 | Tối (18h-2h) | 12 tasks | 48 | 160 |
 | **Tổng 24h (P0-P3)** | **40 tasks** | **160** | **160** |
 
-> **411 tasks** (P0-P40) × 1 cycle = **1644 contributions**
-> 411 × 2 cycles = **3288 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
-> 411 × 3 cycles = **4932 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
+> **491 tasks** (P0-P48) × 1 cycle = **1964 contributions**
+> 491 × 2 cycles = **3928 contributions** → đạt 1000 rule trong **48h (2 ngày)** ✓
+> 491 × 3 cycles = **5892 contributions** → đạt 2000 rule trong **72h (3 ngày)** ✓
 
-**Gợi ý: 1 cycle trong 24h → 1644 contributions (vượt 1000 rule)**
+**Gợi ý: 1 cycle trong 24h → 1964 contributions (vượt 1000 rule)**
 
 ## LỆNH CHẠY
 
