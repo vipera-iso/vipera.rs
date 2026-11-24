@@ -34,6 +34,20 @@ Two habits the ledger depends on:
   `kv_row_order_at_1024` are the working examples; the recipe is the "How to measure a switch on
   this machine" section of the ledger.
 
+## What a claim has to carry
+
+The checklist behind "Adding an entry", in one place. A ledger row records:
+
+- the measurement command, exact and copy-pasteable;
+- the date, and the machine (CPU, cores, RAM, OS);
+- the model (arch, quant, size) and the thread count (`VIPERA_THREADS`);
+- the baseline and the new arm, measured under the same conditions;
+- the switch that gates the change (`VIPERA_*` variable, feature, or "none — default path").
+
+The withdrawn prefill/decode claim in [`../../README.md`](../../README.md) is the failure this list
+prevents: it was read off `PROFILE` running averages, which undercount by ~11%, and carried none of
+these fields, so nothing in the entry could show the number was wrong.
+
 ## Reproducing
 
 Every bench in the ledger is an `#[ignore]`d test, so `cargo test --workspace` stays fast and the

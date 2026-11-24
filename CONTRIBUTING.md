@@ -46,6 +46,22 @@ is expected to be green at every commit, so a local run alone does not prove the
   how the same switch once measured 20% and later 34%. `attention_combinations` and
   `kv_row_order_at_1024` are the examples to copy, and the ledger describes the recipe.
 
+## What a performance claim carries
+
+Evidence, not a verb. A `perf` change states, next to the number:
+
+- the **measurement command**, copy-pasteable, with `--release` and any `--ignored` flag;
+- the **date** and the **machine**: CPU model, physical cores, RAM, OS;
+- the **model** (GGUF arch, quant, size) and the **thread count** (`VIPERA_THREADS`);
+- the **baseline and the new number**, measured under the same conditions — a fresh arm against a
+  remembered one is not a comparison;
+- the **switch that gates it** (`VIPERA_*` variable, feature, or "none — default path"), so the
+  change can be turned off.
+
+The withdrawn claim in `README.md` is why this exists: it summed `PROFILE` running averages, which
+undercount by ~11%, and recorded no command, date or thread count, so nothing in it could show the
+number was wrong before it had already been published.
+
 ## Checkpoints
 
 When a piece of work reaches a stopping point, a short note under
