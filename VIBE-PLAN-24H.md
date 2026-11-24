@@ -394,6 +394,150 @@
 - [ ] `research-safety` — Safety (jailbreak, toxicity, bias) — Freebuff
 - [ ] `research-efficiency` — Efficiency (FLOPs, memory, energy) — Freebuff
 
+### P29 — HARDWARE + BACKEND (thêm)
+- [ ] `hw-amd` — ROCm/AMD GPU support (hipblas, ck) — OpenCode
+- [ ] `hw-intel` — Intel GPU (oneAPI, SYCL) — OpenCode
+- [ ] `hw-npu` — NPU support (Intel Movidius, Apple Neural Engine) — OpenCode
+- [ ] `hw-riscv` — RISC-V backend (vector extension) — OpenCode
+- [ ] `hw-sparc` — SPARC/ARM backend (aarch64 NEON) — Freebuff
+- [ ] `hw-raspi` — Raspberry Pi (ARM NEON, 4GB) — Freebuff
+- [ ] `hw-jetson` — NVIDIA Jetson (CUDA + int8) — Freebuff
+- [ ] `hw-tpu` — Google TPU (XLA, JAX) — OpenCode
+- [ ] `hw-webgpu` — WebGPU (browser inference) — OpenCode
+- [ ] `hw-wasm` — WASM (browser + edge) — OpenCode
+
+### P30 — LANGUAGE + INTEROP (thêm)
+- [ ] `lang-python` — Python API (vipera-py, PyTorch integration) — OpenCode
+- [ ] `lang-javascript` — JS/TS API (Node.js + browser) — Freebuff
+- [ ] `lang-go` — Go API (cgo + bindings) — Freebuff
+- [ ] `lang-java` — Java/Kotlin API (JNI + Android) — Freebuff
+- [ ] `lang-swift` — Swift API (iOS + macOS) — Freebuff
+- [ ] `lang-csharp` — C#/.NET API (P/Invoke) — Freebuff
+- [ ] `lang-r` — R API (stat + ML integration) — Freebuff
+- [ ] `lang-matlab` — MATLAB API (C interface) — Freebuff
+- [ ] `lang-ml` — ML framework interop (PyTorch, JAX, TF) — OpenCode
+- [ ] `lang-cuda` — CUDA C++ API (native kernel access) — OpenCode
+
+### P31 — SECURITY + HARDENING (thêm)
+- [ ] `sec-memory` — Memory safety (no overflow, no UAF) — OpenCode
+- [ ] `sec-input` — Input validation (malformed GGUF, huge prompt) — Freebuff
+- [ ] `sec-output` — Output sanitization (no prompt injection) — Freebuff
+- [ ] `sec-auth` — Authentication (API key, JWT, OAuth2) — Freebuff
+- [ ] `sec-tls` — TLS 1.3 (mutual auth, cert pinning) — Freebuff
+- [ ] `sec-audit` — Audit log (who, what, when, hash) — Freebuff
+- [ ] `sec-fuzz` — Fuzz testing (GGUF, tokenizer, server) — Freebuff
+- [ ] `sec-deps` — Dependency audit (cargo audit, SCA) — Freebuff
+- [ ] `sec-supply` — Supply chain (SBOM, reproducible build) — Freebuff
+- [ ] `sec-hard` — Hardening (ASLR, DEP, NX, stack canary) — OpenCode
+
+### P32 — PERFORMANCE + TUNING (thêm)
+- [ ] `perf-flame` — Flame graph generation (perf + FlameGraph) — OpenCode
+- [ ] `perf-gprof` — gprof-style profiling (function level) — OpenCode
+- [ ] `perf-tune` — Auto-tuning (thread count, tile size, batch) — OpenCode
+- [ ] `perf-simd` — SIMD autotuning (AVX2/AVX512/NEON selection) — OpenCode
+- [ ] `perf-memory` — Memory profiling (peak, RSS, allocation) — Freebuff
+- [ ] `perf-bottleneck` — Bottleneck detection (CPU vs memory vs disk) — Freebuff
+- [ ] `perf-scaling` — Scaling test (1-128 threads, Amdahl) — Freebuff
+- [ ] `perf-thermal` — Thermal throttling monitor (CPU temp vs perf) — Freebuff
+- [ ] `perf-power` — Power consumption (watt-meter integration) — Freebuff
+- [ ] `perf-roofline` — Roofline model (FLOPs vs bandwidth) — OpenCode
+
+### P33 — MODEL MANAGEMENT (thêm)
+- [ ] `mm-hub` — Model hub (download, list, search, cache) — Freebuff
+- [ ] `mm-registry` — Model registry (version, tag, lineage) — Freebuff
+- [ ] `mm-version` — Model versioning (semantic, rollback) — Freebuff
+- [ ] `mm-share` — Model sharing (team, org, public) — Freebuff
+- [ ] `mm-convert` — Model conversion (GGUF ↔ safetensors ↔ ONNX) — OpenCode
+- [ ] `mm-optimize` — Model optimization (prune, quantize, distill) — OpenCode
+- [ ] `mm-benchmark` — Model benchmark (accuracy vs speed vs memory) — Freebuff
+- [ ] `mm-compare` — Model comparison (side-by-side, A/B) — Freebuff
+- [ ] `mm-archive` — Model archive (cold storage, restore) — Freebuff
+- [ ] `mm-lifecycle` — Model lifecycle (create, train, serve, retire) — Freebuff
+
+### P34 — USER INTERFACE (thêm)
+- [ ] `ui-chat` — Chat interface (terminal, web, mobile) — Freebuff
+- [ ] `ui-stream` — Streaming UI (token-by-token, live) — Freebuff
+- [ ] `ui-voice` — Voice UI (TTS + STT, hands-free) — Freebuff
+- [ ] `ui-canvas` — Canvas UI (drawing + explanation) — Freebuff
+- [ ] `ui-code` — Code UI (editor + autocomplete) — Freebuff
+- [ ] `ui-table` — Table UI (structured data + query) — Freebuff
+- [ ] `ui-chart` — Chart UI (visualization + insight) — Freebuff
+- [ ] `ui-form` — Form UI (fill + validate + submit) — Freebuff
+- [ ] `ui-game` — Game UI (interactive + AI opponent) — Freebuff
+- [ ] `ui-custom` — Custom UI (plugin + extension) — Freebuff
+
+### P35 — API + INTEGRATION (thêm)
+- [ ] `api-openai` — OpenAI-compatible API (chat, completions, models) — Freebuff
+- [ ] `api-anthropic` — Anthropic-compatible API (Claude) — Freebuff
+- [ ] `api-mistral` — Mistral-compatible API — Freebuff
+- [ ] `api-llama` — llama.cpp-compatible API (llama-server) — Freebuff
+- [ ] `api-gRPC` — gRPC API (protobuf, streaming) — OpenCode
+- [ ] `api-webhook` — Webhook API (trigger on event) — Freebuff
+- [ ] `api-batch` — Batch API (async, large-scale) — Freebuff
+- [ ] `api-stream` — Stream API (SSE, WebSocket) — Freebuff
+- [ ] `api-auth` — Auth API (API key, JWT, OAuth2) — Freebuff
+- [ ] `api-rate` — Rate-limit API (per-key, per-IP) — Freebuff
+
+### P36 — DATA + PIPELINE (thêm)
+- [ ] `data-ingest` — Data ingestion (CSV, JSON, Parquet, DB) — Freebuff
+- [ ] `data-clean` — Data cleaning (dedup, normalize, fill) — Freebuff
+- [ ] `data-label` — Data labeling (auto + active) — Freebuff
+- [ ] `data-aug` — Data augmentation (synthetic, back-translation) — OpenCode
+- [ ] `data-split` — Data split (train, val, test, held-out) — Freebuff
+- [ ] `data-version` — Data versioning (DVC, LakeFS) — Freebuff
+- [ ] `data-lineage` — Data lineage (track, audit, provenance) — Freebuff
+- [ ] `data-quality` — Data quality (completeness, accuracy, freshness) — Freebuff
+- [ ] `data-security` — Data security (encryption, masking, access) — Freebuff
+- [ ] `data-compliance` — Data compliance (GDPR, HIPAA, CCPA) — Freebuff
+
+### P37 — MONITORING + OBSERVABILITY (thêm)
+- [ ] `mon-metrics` — Metrics (Prometheus, OpenTelemetry) — Freebuff
+- [ ] `mon-logs` — Logs (structured, ELK, Loki) — Freebuff
+- [ ] `mon-traces` — Traces (Jaeger, Zipkin, Tempo) — Freebuff
+- [ ] `mon-alert` — Alerts (PagerDuty, Slack, email) — Freebuff
+- [ ] `mon-dash` — Dashboards (Grafana, Kibana) — Freebuff
+- [ ] `mon-slo` — SLO (error budget, burn rate) — Freebuff
+- [ ] `mon-chaos` — Chaos (failure injection, resilience) — Freebuff
+- [ ] `mon-audit` — Audit (who, what, when, why) — Freebuff
+- [ ] `mon-cost` — Cost (CPU, GPU, memory, per-request) — Freebuff
+- [ ] `mon-perf` — Perf (latency, throughput, saturation) — Freebuff
+
+### P38 — TESTING + QA (thêm)
+- [ ] `test-unit` — Unit tests (kernel, module, function) — Freebuff
+- [ ] `test-integration` — Integration tests (API, pipeline) — Freebuff
+- [ ] `test-e2e` — End-to-end tests (full flow) — Freebuff
+- [ ] `test-load` — Load tests (10k req/min, sustained) — Freebuff
+- [ ] `test-stress` — Stress tests (overload, failover) — Freebuff
+- [ ] `test-soak` — Soak tests (24h, memory leak) — Freebuff
+- [ ] `test-fuzz` — Fuzz tests (random input, crash) — Freebuff
+- [ ] `test-a/b` — A/B tests (model, prompt, strategy) — Freebuff
+- [ ] `test-regression` — Regression tests (baseline, compare) — Freebuff
+- [ ] `test-coverage` — Coverage (unit, integration, e2e) — Freebuff
+
+### P39 — DOCS + TUTORIALS (thêm)
+- [ ] `docs-tutorial` — Tutorial (beginner, 1-hour) — Freebuff
+- [ ] `docs-guide` — Guide (intermediate, 4-hour) — Freebuff
+- [ ] `docs-advanced` — Advanced (expert, 8-hour) — Freebuff
+- [ ] `docs-api` — API reference (complete, examples) — Freebuff
+- [ ] `docs-faq` — FAQ (top 50 questions) — Freebuff
+- [ ] `docs-video` — Video tutorial (YouTube, 10-min) — Freebuff
+- [ ] `docs-workshop` — Workshop (hands-on, 2-hour) — Freebuff
+- [ ] `docs-community` — Community (forum, Discord, Slack) — Freebuff
+- [ ] `docs-blog` — Blog (update, release, feature) — Freebuff
+- [ ] `docs-contrib` — Contributing (guide, template) — Freebuff
+
+### P40 — COMMUNITY + ECOSYSTEM (thêm)
+- [ ] `comm-forum` — Forum (Q&A, help, share) — Freebuff
+- [ ] `comm-discord` — Discord (chat, community) — Freebuff
+- [ ] `comm-slack` — Slack (team, enterprise) — Freebuff
+- [ ] `comm-twitter` — Twitter/X (update, engagement) — Freebuff
+- [ ] `comm-github` — GitHub (issue, PR, action) — Freebuff
+- [ ] `comm-model` — Model community (share, discuss) — Freebuff
+- [ ] `comm-plugin` — Plugin community (build, share) — Freebuff
+- [ ] `comm-hackathon` — Hackathon (challenge, prize) — Freebuff
+- [ ] `comm-contribute` — Contribution (code, doc, test) — Freebuff
+- [ ] `comm-maintain` — Maintenance (fix, update, support) — Freebuff
+
 ## ĐẾM CONTRIBUTIONS
 
 | Phase | Tasks | Contributions (×4) | Tổng |
