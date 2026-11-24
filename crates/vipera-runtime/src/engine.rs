@@ -1032,7 +1032,16 @@ impl<F: ForwardPass> Engine<F> {
             return Ok(());
         }
 
-        let processed = sequence.processed();
+        if sequence.is_empty() {
+            return Err(ViperaError::internal("a speculative turn lost its tokens"));
+        }
+        // The verify pass needs the last token's logits, so one position is always recomputed.
+        // A restored context has every retained position already processed (`processed == len`),
+        // which would make `all[processed..]` an empty range and leave no answer to sample from;
+        // clamp to `len - 1`, the same position a plain decode step computes. Recomputing it is
+        // idempotent, and it restores the invariant that one token is left unprocessed after the
+        // pass. Without this, an empty draft slices past the end of `all` and panics.
+        let processed = sequence.processed().min(sequence.len() - 1);
         // One slot is always left for the model's own token after the accepted prefix.
         let room = (capacity - sequence.len() as u64).min(remaining.saturating_sub(1));
         let cap = turn.draft_cap.max(2);
@@ -1980,6 +1989,34 @@ mod tests {
             "the draft path was not timed under Stage::Speculative"
         );
         assert!(generation.log_line.contains("\"speculative\":"));
+    }
+
+    #[test]
+    fn a_restored_turn_with_an_empty_draft_does_not_panic() {
+        let mut engine = engine_with_forward(
+            EngineConfig {
+                speculative: true,
+                ..greedy()
+            },
+            RangeForward {
+                inner: ToyForward::new(32),
+            },
+            64,
+        );
+        let id = engine.admit(&[1, 2, 3], 1).unwrap();
+        engine.generate(id).unwrap();
+        let snapshot = engine.snapshot(id, None).unwrap();
+        engine.generate(id).unwrap();
+        engine.restore(id, snapshot).unwrap();
+        assert_eq!(
+            engine.sequence(id).unwrap().processed(),
+            engine.sequence(id).unwrap().len(),
+            "the restored context has every position already computed"
+        );
+        // No retained n-gram repeats, so the draft is empty. The verify stage must still
+        // compute the last position's logits instead of slicing an empty range.
+        let generation = engine.generate(id).unwrap();
+        assert_eq!(generation.tokens.len(), 1);
     }
 
     #[test]
