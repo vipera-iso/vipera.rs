@@ -118,7 +118,7 @@ impl SamplerConfig {
 ///
 /// Adding one is a new [`Strategy`] implementation plus an entry here; a [`Sampler`] finds it by
 /// name, so nothing else that samples has to change.
-pub static SAMPLERS: Registry = Registry::new(&[&Greedy, &Temperature]);
+pub static SAMPLERS: Registry = Registry::new(&[&Greedy, &Temperature, &Topp]);
 
 /// Greedy decoding: the best penalized logit, ties to the lowest id.
 ///
@@ -219,6 +219,88 @@ impl Strategy for Temperature {
         // the only case that still sorts every logit, and it is the only case where it cannot be
         // avoided: top-p is defined over the whole distribution.
         if uncut && cut.is_none() && weights.len() < logits.len() {
+            weights = top_candidates(logits, penalty, 0);
+            for (_, weight) in weights.iter_mut() {
+                *weight = (*weight * scale - peak).exp();
+            }
+            cut = mass_cut(&weights, target_mass);
+        }
+
+        weights.truncate(cut.unwrap_or(weights.len()));
+
+        let threshold = request.min_p * weights[0].1;
+        weights.retain(|(_, weight)| *weight >= threshold);
+
+        let mass: f32 = weights.iter().map(|(_, weight)| *weight).sum();
+        let target = rng.next_f64() * f64::from(mass);
+        let mut running = 0.0f64;
+        for (id, weight) in &weights {
+            running += f64::from(*weight);
+            if target < running {
+                return Ok(*id);
+            }
+        }
+        // Only reachable through floating-point rounding at the last candidate.
+        weights
+            .last()
+            .map_or(Err(SampleError::NoMass), |(id, _)| Ok(*id))
+    }
+}
+
+/// Top-p sampling: penalize, keep the shortest head of the distribution whose mass reaches
+/// `top_p`, and draw one.
+///
+/// The [`Temperature`] shape with a smaller head: the candidate set is capped at [`TOPP_HEAD`], so
+/// when the mass cut lands inside the head nothing is sorted, and the full vocabulary sort runs
+/// only when the head is exhausted without the cut.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Topp;
+
+impl Strategy for Topp {
+    fn name(&self) -> &'static str {
+        "topp"
+    }
+
+    fn draw(&self, request: &SampleRequest<'_>, rng: &mut dyn Random) -> Result<u32, SampleError> {
+        let logits = request.logits;
+        let penalty = request.penalty;
+        let scale = 1.0 / request.temperature;
+        let mut weights = top_candidates(logits, penalty, TOPP_HEAD);
+        if weights.is_empty() {
+            return Err(SampleError::NoFiniteLogits);
+        }
+
+        // The softmax denominator is the mass of every finite logit, in logit order, which is
+        // what the earlier version summed after it had allocated and sorted the whole vector. Only
+        // the candidates come from the bounded selection now.
+        let peak = weights[0].1 * scale;
+        let mut total = 0.0_f32;
+        for (id, logit) in logits.iter().enumerate() {
+            if logit.is_finite() {
+                let penalized = penalty.apply(id, *logit);
+                if penalized.is_finite() {
+                    total += (penalized * scale - peak).exp();
+                }
+            }
+        }
+        // `NaN` compares false against everything, so it is caught by the finiteness check.
+        if total <= 0.0 || !total.is_finite() {
+            return Err(SampleError::NoMass);
+        }
+
+        for (_, weight) in weights.iter_mut() {
+            *weight = (*weight * scale - peak).exp();
+        }
+
+        // `top_p` is compared against a share of the full mass, which is what the old division by
+        // `total` did; keeping the weights unnormalized saves a division per candidate.
+        let target_mass = request.top_p * total;
+        let mut cut = mass_cut(&weights, target_mass);
+
+        // The bounded head did not reach the cut and is not the whole vocabulary, so the exact
+        // answer needs the tail too. Unlike `Temperature`, the head here is a real cap, so this is
+        // the only case where the sort happens.
+        if cut.is_none() && weights.len() < logits.len() {
             weights = top_candidates(logits, penalty, 0);
             for (_, weight) in weights.iter_mut() {
                 *weight = (*weight * scale - peak).exp();
@@ -435,6 +517,13 @@ fn mass_cut(weights: &[(u32, f32)], target: f32) -> Option<usize> {
 /// mass is usually under a hundred tokens — while staying small enough that the bounded selection
 /// and the sort of the head together cost less than a millisecond.
 const NO_CUT_CANDIDATES: usize = 4096;
+
+/// How many leading candidates the [`Topp`] strategy holds before it decides the top-p cut is
+/// beyond them and falls back to sorting the vocabulary.
+///
+/// 2048 keeps the bounded selection and the rare full sort together well under the cost the
+/// no-cut head of [`Temperature`] pays.
+const TOPP_HEAD: usize = 2048;
 
 /// Descending by logit, then ascending by id, so the order is total and reproducible.
 fn by_probability(a: &(u32, f32), b: &(u32, f32)) -> Ordering {
@@ -670,12 +759,38 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_names_both_strategies_the_build_ships() {
+    fn the_registry_names_the_strategies_the_build_ships() {
         assert_eq!(
             SAMPLERS.names().collect::<Vec<_>>(),
-            vec!["greedy", "temperature"]
+            vec!["greedy", "temperature", "topp"]
         );
-        assert_eq!(SAMPLERS.len(), 2);
+        assert_eq!(SAMPLERS.len(), 3);
+    }
+
+    #[test]
+    fn topp_draws_a_valid_token_from_its_bounded_head() {
+        // A synthetic vocabulary long enough that the top-p cut is not always inside the head.
+        let logits: Vec<f32> = (0..20_000)
+            .map(|at| (((at * 13) % 97) as f32) / 5.0)
+            .collect();
+        let penalty = RepetitionPenalty::new(&[], 1.0, 0.0, 0.0, &[]);
+        let request = SampleRequest {
+            logits: &logits,
+            penalty: &penalty,
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 0.5,
+            min_p: 0.0,
+        };
+        let token = SAMPLERS
+            .find("topp")
+            .expect("the build ships topp")
+            .draw(&request, &mut Rng::from_seed(11))
+            .expect("a token id");
+        assert!(
+            (token as usize) < logits.len(),
+            "token {token} outside the vocabulary"
+        );
     }
 
     #[test]
