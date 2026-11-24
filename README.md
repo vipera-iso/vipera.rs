@@ -229,11 +229,13 @@ docs/benchmarks/              the surveys the plan was written from
   into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
   `LLAMA_SERVER` at a `llama-server` binary to compare against a live one instead.
 - **Hardware floor**: the AVX-512 VNNI kernels are the fast path, and a CPU without them is
-  correct but slower. Measured 2026-11-24 on the reference machine (wall clock, interleaved), the
-  AVX2-only arm (`VIPERA_NO_VNNI=1`, `pmaddubsw`) ran prefill at **29.4 vs 121.6 tok/s** (4096
-  tokens; 34.1 vs 185.8 at 512) and decode at **21.3 vs 30.5 tok/s** — a 4.1–5.5× prefill gap and
-  −30% decode. The tiled layout is over half of it: with VNNI but `VIPERA_TILED=0`, prefill measured
-  49.0 tok/s. Greedy output is identical across the levels on a short prompt (32 tokens), but
+  correct but slower. Measured 2026-11-24 on the reference machine (wall clock, interleaved, same
+  binary), the AVX2-only arm (`VIPERA_NO_VNNI=1`, `pmaddubsw`) ran prefill at **29.4 vs 142.6 tok/s**
+  (4096 tokens; 32.3 vs 204.8 at 512) and decode at **21.0 vs 31.0 tok/s** — a 4.9–6.3× prefill gap
+  and −32% decode. The tiled layout is over half of it: with VNNI but `VIPERA_TILED=0`, prefill
+  measured 44.9 tok/s. That arm also runs a 32-token prompt chunk instead of 128 (`prefill_chunk`,
+  `VIPERA_PREFILL_CHUNK` overrides it), measured 9% faster there and 15% slower on the tiled arm.
+  Greedy output is identical across the levels on a short prompt (32 tokens), but
   a long prefill sums in a different order, so a token can differ at temperature 0; the same build
   on the same machine is deterministic. Ledger: `docs/benchmarks.md`, 2026-11-24.
 - **Activation precision**: Q4_K activations are multiplied as `i8` by default, so outputs agree

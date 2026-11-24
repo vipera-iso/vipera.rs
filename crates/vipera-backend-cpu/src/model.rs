@@ -29,6 +29,40 @@ use crate::quant::{self, Fusion, f16_to_f32, f32_to_f16};
 /// spill registers at 16 but the weight read saved dominates on prefill.
 const MAX_BATCH: usize = 128;
 
+/// Positions one prompt chunk computes, which is [`MAX_BATCH`] except where a narrower chunk is
+/// faster.
+///
+/// On a CPU without the 512-bit VNNI tile, the Q4_K prefill falls back to the row kernel, whose
+/// per-row activation working set is `chunk × 288` bytes — 36 KB at 128, over the 32 KB L1D, so the
+/// same activation bytes are re-fetched for every row. A 32-wide chunk keeps it at 9 KB and
+/// measured 9.1% less prefill time on that arm (4096 tokens: 139.55/140.17 s against
+/// 155.18/152.66 s; 512: 16.33/16.50 s against 18.05/18.06 s), while the tiled arm is 14.9%
+/// *slower* that narrow (30.58/30.66 s against 35.13 s), so the cap is conditional on the level.
+/// `VIPERA_PREFILL_CHUNK=N` overrides it for an A/B in one binary, rounded down to a multiple of
+/// eight and clamped to `[8, MAX_BATCH]`.
+fn prefill_chunk() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        let requested = std::env::var_os("VIPERA_PREFILL_CHUNK").and_then(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        });
+        prefill_chunk_from(requested, crate::simd::vnni512_available())
+    })
+}
+
+/// [`prefill_chunk`]'s rule without the process-wide cache, so the two branches are testable on one
+/// machine: a requested width wins, rounded down to a multiple of eight and clamped; otherwise the
+/// tiled level keeps `MAX_BATCH` and every other level takes 32.
+fn prefill_chunk_from(requested: Option<usize>, tiled: bool) -> usize {
+    match requested {
+        Some(value) => (value & !7).clamp(8, MAX_BATCH),
+        None if tiled => MAX_BATCH,
+        None => 32,
+    }
+}
+
 /// The numbers a forward pass needs, read from the file rather than assumed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelConfig {
@@ -800,7 +834,7 @@ impl CpuBackend {
         let mut logits = Vec::new();
         let mut start = 0;
         while start < tokens.len() {
-            let end = (start + MAX_BATCH).min(tokens.len());
+            let end = (start + prefill_chunk()).min(tokens.len());
             let mut entries: Vec<BatchEntry<'_>> = (start..end)
                 .map(|index| BatchEntry {
                     tokens: context.tokens,
@@ -5000,6 +5034,19 @@ fn vector(file: &GgufFile, data: &[u8], name: &str, len: usize) -> Result<Vec<f3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prefill_chunk_is_max_batch_only_on_the_tiled_level() {
+        // The tiled kernel wants a wide chunk; the row fallback measured faster at 32.
+        assert_eq!(prefill_chunk_from(None, true), MAX_BATCH);
+        assert_eq!(prefill_chunk_from(None, false), 32);
+        // An override wins, rounds down to a multiple of eight, and stays inside the kernel's
+        // dispatch widths: 100 -> 96, 3 -> 8, 4096 -> MAX_BATCH.
+        assert_eq!(prefill_chunk_from(Some(100), true), 96);
+        assert_eq!(prefill_chunk_from(Some(3), false), 8);
+        assert_eq!(prefill_chunk_from(Some(4096), true), MAX_BATCH);
+        assert_eq!(prefill_chunk_from(Some(32), true), 32);
+    }
 
     #[test]
     fn rms_norm_matches_the_definition() {
