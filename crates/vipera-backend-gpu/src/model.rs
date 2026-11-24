@@ -161,6 +161,19 @@ impl GpuModel {
             .unwrap_or("qwen2")
             .to_owned();
         let key = |name: &str| format!("{arch}.{name}");
+        // The CPU backend rotates scaled models (linear, YaRN); this one builds the plain table
+        // only, so a model that declares a rule is refused rather than served with wrong angles.
+        if let Some(kind) = file
+            .metadata
+            .get(&key("rope.scaling.type"))
+            .and_then(Value::as_str)
+            && kind != "none"
+        {
+            return Err(ViperaError::unsupported(format!(
+                "{arch}.rope.scaling.type is \"{kind}\"; the device path implements the plain \
+                 rotary table only"
+            )));
+        }
         let hidden = meta_usize(&file, &key("embedding_length"), 1536);
         let heads = meta_usize(&file, &key("attention.head_count"), 12);
         let shape = LayerShape {

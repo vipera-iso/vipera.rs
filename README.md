@@ -31,18 +31,20 @@ that lost.
 
 | | vipera | llama.cpp, same machine | vipera / llama.cpp |
 |---|---:|---:|---:|
-| prefill, 128 tokens | 194 tok/s | 202 | 0.96–0.97x |
-| prefill, 512 tokens | 186 tok/s | 204–212 | 0.89–0.90x |
-| prefill, 1024 tokens | 177 tok/s | 196–207 | 0.86–0.89x |
-| prefill, 4096 tokens | 129 tok/s | 159–164 | 0.79–0.80x |
+| prefill, 128 tokens | 226 tok/s | 218 | 1.04x |
+| prefill, 512 tokens | 210 tok/s | 210 | 1.00x |
+| prefill, 1024 tokens | 198 tok/s | 198 | 1.00x |
+| prefill, 4096 tokens | 162 tok/s | 157 | 1.03x |
 | decode, shallow | 34.6 tok/s (33.83 ms, `VIPERA_TILED_A` on) | 33.9–36.7 | 0.94–1.02x |
 | decode, 4k of history | 24.2 tok/s | 25.3 | 0.96x |
 | decode, 32k of history, window 2048 | 28.0 tok/s (35.8 ms/step) | not measured | — (6.8 tok/s with the full history) |
 | KV held for a windowed 32k run | 61 MB | not measured | — (896 MB with the full history) |
 
-llama.cpp is ahead on prefill at every length and level on decode. The prefill gap is not a
-batch-width artefact: the matvecs cost the same per chunk at 4k as at 1k, while attention grows with
-the history, from 6% of the first chunk to 41% of a 4k one.
+Prefill is level with llama.cpp to +4% across those four lengths, re-measured on 2026-11-24 after an
+earlier table showed a 20–21% deficit at 4096; decode is level, and llama.cpp's remaining edge is at
+depth (0.96x at 4k of history). Prefill cost is not batch width: the matvecs cost the same per chunk
+at 4k as at 1k, while attention grows with the history, from 6% of the first chunk to 41% of a 4k
+one.
 
 Against the hardware rather than another engine: the Q4_K and Q6_K kernels stream weights at
 29–30 GB/s (68–70% of the 43 GB/s this machine can read at all), and the output projection reaches
@@ -50,8 +52,9 @@ Against the hardware rather than another engine: the Q4_K and Q6_K kernels strea
 
 ### Repacking the weights, and what it is worth
 
-llama.cpp's prefill is measured here at 217–227 tok/s (512 tokens) against the engine's 172, and
-ik_llama.cpp at 268.7 / 199.4 tok/s at 512 / 4096 tokens against 209.6 / 140.3.
+llama.cpp's prefill is measured here at 217–227 tok/s (512 tokens), against an engine that measured
+172 in that session and 210 in the 2026-11-24 re-measurement, and ik_llama.cpp at 268.7 / 199.4
+tok/s at 512 / 4096 tokens against 209.6 / 140.3.
 
 - **Ubatch is not it.** Running ik_llama.cpp at `-ub 128`, 256 and 512 moves it by 3–8%, not 15–20%.
 - **The per-dot broadcast is not it either.** The tiled kernel spends one `vpbroadcastd` and one
@@ -100,6 +103,11 @@ curl -s localhost:8080/v1/chat/completions \
 - **Sampling**: greedy, temperature, top-k, top-p, min-p, repetition, presence and frequency
   penalties, per-token `logit_bias`, seeded RNG.
 - **Generation** on the CPU, with a KV cache in `f16` or `q8_0`, streamed to stdout token by token.
+- **RoPE scaling** (linear and YaRN, from the model's `rope.scaling.*` metadata): a model
+  extended past its training length rotates the way llama.cpp rotates it; a model without the
+  keys is bit-identical to before. CPU only (the CUDA backend refuses such a model). Held to the
+  ggml formula in unit tests and to llama.cpp's logits on a file whose metadata was set to YaRN
+  (same argmax at 64 and 6001 tokens, ledger 2026-11-24); not yet run on a model trained with YaRN.
 - **Long context**: an optional sliding window (`VIPERA_ATTN_WINDOW`, 0 by default) over the first
   `sinks` tokens plus the last `window` positions, which keeps a decode step flat at depth, and a
   ring KV that holds only the blocks that window can reach (61 MB at 32k instead of 896 MB). It is
@@ -120,9 +128,14 @@ curl -s localhost:8080/v1/chat/completions \
   the non-streaming path, `response_format: json_object` validation, `GET /v1/models`, `/health`,
   `/ready`, `/metrics`, bearer auth, error envelopes, and a per-key (or per-peer) request budget
   (600/min by default, `--rate-limit N`, `--rate-limit 0` turns it off). `--tls-cert`/`--tls-key`
-  serve HTTPS and re-read the files when they change. Every request writes one JSON line to stderr
+  serve HTTPS and re-read the files when they change; a build with `--features acme` can order and
+  renew the certificate itself (`--acme-domain`, HTTP-01). Every request writes one JSON line to stderr
   (`{"event":"request","peer":…,"method":…,"path":…,"status":…,"micros":…}`, the same shape
   `vipera generate` prints), and `VIPERA_ACCESS_LOG=0` silences it.
+- **CUDA generation** (`--features cuda`, `generate --backend cuda`): the same `ForwardPass` on one
+  device, Q4_K/Q6_K weights and `f16` KV, one request at a time. Prefill is one position per weight
+  read and the speculative draft is off; `--kv-type q8_0` and `VIPERA_ATTN_WINDOW` are refused with
+  the reason instead of being ignored.
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
   scalar reference.
 - **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8` default on — A1): the decode row-kernel path packs
@@ -188,16 +201,27 @@ docs/benchmarks/              the surveys the plan was written from
 ## Limitations
 
 - **GPU**: `vipera-backend-gpu` implements `ForwardPass` on one CUDA device with `f16` KV, and
-  `cargo test -p vipera-backend-gpu` holds it to the CPU backend through the runtime's KV buffer.
-  No Metal or Vulkan backend, no batched (prefill) kernel yet, no sliding window (a ring table is
-  refused), and the CLI has no `--backend cuda` yet, so a normal build still runs on the CPU.
-  `verify` reports host memory only.
-- **Prefill**: llama.cpp is faster at every prompt length measured here, from 3–4% at 128 tokens to
-  20–21% at 4096; decode is level. Both are measured on the machine described above, not estimated.
+  `cargo test -p vipera-backend-gpu` holds it to the CPU backend through the runtime's KV buffer
+  (passing on a GTX 1650: same argmax at both checkpoints, cosine 0.9997). `generate --backend cuda`
+  reaches it, but only when the binary is built with `--features cuda`; a normal build is CPU only
+  and refuses the flag by name. No Metal or Vulkan backend, no batched (prefill) kernel (device
+  prefill is one position per weight read), no sliding window (a ring table is refused), no
+  speculative draft (it reads through `logits_range`, which the device backend does not implement),
+  and `verify` reports host memory only.
+- **Prefill**: re-measured 2026-11-24, the engine is level with llama.cpp to +4% at every length
+  from 128 to 4096 tokens; the 20–21% deficit at 4096 an earlier table recorded is not reproduced.
+  Decode is level too, with llama.cpp up to 4–6% ahead at depth (4k of history). What moved prefill
+  is not attributed to one switch — the A/B for that has not been run — and the residual cost is
+  attention growing with the history (6% of the first chunk at 1k, 41% of a 4k chunk) rather than
+  batch width.
 - **Algorithm registry**: pipeline stages exist, but the algorithm crates are not written, so the
   planner has a single CPU path to choose from.
-- **Server**: TLS needs a certificate; there is no ACME client, so issue or renew it out of band
-  and write the files in place. Rate limiting is opt-in by design, and a request that cannot fit
+- **Server**: TLS needs a certificate. An ACME client exists but is not in the default build:
+  compile with `--features acme` and pass `--acme-domain` (plus optional `--acme-contact`,
+  `--acme-directory`, `--acme-http-address`) to order and renew it over HTTP-01, writing the files
+  `--tls-cert`/`--tls-key` name; without the feature those flags do not exist and you issue or renew
+  out of band. Rate limiting is on by default (600/min per key, or per peer without a key;
+  `--rate-limit N` changes it, `--rate-limit 0` turns it off), and a request whose plan does not fit
   in memory is refused rather than served.
 - **Parity checks**: the continuation test compares against a usage recording of llama.cpp checked
   into `bins/vipera/tests/fixtures`, so it runs on a machine with only the model; point
@@ -206,8 +230,6 @@ docs/benchmarks/              the surveys the plan was written from
   with the `f32` path on the checked prompts but are not bit-identical to it; `VIPERA_Q4K_F32=1`
   runs Q4_K with `f32` activations, and its greedy continuation on the checked prompt is pinned by
   `bins/vipera/tests/fixtures/q4k_f32_continuation.json`.
-- **No releases.** `main` is the only supported version; there are no versioned artifacts to pin,
-  and the gate on the merge commit is the confirmation that a change is good.
 
 ## Contributing
 

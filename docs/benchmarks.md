@@ -4449,3 +4449,118 @@ trong epilogue. Switch default OFF.
 từ 68–165 tok/s nên không thể tách win. **Trạng thái: chưa đo xong, chưa có verdict.** H4 rời có thể
 re-run khi máy ổn; nếu muốn đo "pure skip" có thể đặt `VIPERA_TRIATTENTION_THRESHOLD=0` (skip
 không điều kiện).
+
+## Prefill re-measured, 128 / 512 / 1024 / 4096, against llama.cpp — 2026-11-24
+
+**Why:** the README table of 2026-11-15 claimed llama.cpp was ahead at every prompt length (3–4% at
+128 tokens, 20–21% at 4096). Re-measured on the machine above, same model (`qwen2.5-1.5b-instruct-q4_k_m.gguf`),
+llama.cpp `e574a17` (build 466), `VIPERA_THREADS=8` and `-t 8`, f16 KV, default switches.
+
+**Method.** The prompt is exactly `N` tokens: `"the" + " the" × (N−1)`, counted with
+`vipera tokenize --json` before running (128/512/1024/4096 all exact). Prefill time is the sum of the
+`PROFILE chunk` lines — the engine's own 128-token chunks — and `tok/s = N / that`:
+
+```bash
+VIPERA_THREADS=8 VIPERA_PROFILE_STEP=1 ./target/release/vipera generate \
+  ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  --prompt "$(python3 -c 'print("the"+" the"*4095)')" --max-tokens 1 --ctx 4096 --temperature 0
+llama-bench -m ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf -p N -n 0 -r 3 -t 8
+```
+
+Four rounds per length, the order alternating (vipera first on odd rounds, llama.cpp first on even),
+median reported with the range. A prose prompt (`"The quick brown fox…" × 410`, 4101 tokens) was
+measured once as a check that the repeated-token prompt is not doing the work for the engine:
+vipera 160.15 tok/s, llama.cpp 157.41 tok/s at `-p 4101`, same ordering as below.
+
+| prompt tokens | vipera tok/s (range) | llama.cpp tok/s (range) | vipera / llama.cpp |
+|---|---:|---:|---:|
+| 128 | 225.9 (224.9–227.4) | 217.6 (215.4–221.3) | 1.04 |
+| 512 | 209.8 (206.5–213.3) | 209.9 (208.5–212.3) | 1.00 |
+| 1024 | 197.6 (196.3–201.1) | 197.7 (195.7–198.4) | 1.00 |
+| 4096 | 162.4 (160.0–173.6) | 157.2 (156.0–157.9) | 1.03 |
+
+**Verdict: prefill is level with llama.cpp to +4%, not 20–21% behind.** The old 4096 figure is not
+reproduced; the ratio, not the absolute tok/s, is the row that settles it.
+
+**Machine state is the caveat.** An earlier sweep one hour before this one measured llama.cpp at
+178.8 tok/s on `pp128` and vipera at 194.8, against 217.6 / 225.9 here — the same binaries, the same
+commands, ~18% apart. That is the throttled state the H2–H4 sections describe, and it is why only
+the within-sweep ratios are quoted and the earlier sweep is not a ledger row. Do not compare a
+number from this table with a number from a table measured on a different day without re-running
+both arms.
+
+**Not attribution.** This section does not separate which change closed the gap: no single lever was
+switched off against it. `VIPERA_ATTN_GEMM` (H1) is default off and therefore not the cause; the
+candidates are defaults that landed between the 2026-11-15 table and today. A lever claim needs its
+own A/B, in one process, per the recipe above.
+
+**Harness check, same day.** `prefill_vs_decode` (backend called directly, whole prompt in one
+`ForwardContext`) measured 218.6 tok/s at n=128 and 205.9 at n=512; `prefill_long_prompt` measured
+192.8 at 1024 and **132.8 at 4096**. The 4096 number is the harness, not the engine: one 4096-token
+context is slower than 32 chunks of 128 on this machine, which is why the engine-level command above
+is the one quoted. Keep quoting the CLI for end-to-end prefill and the harness for kernel changes.
+
+
+## RoPE scaling (linear, YaRN) từ metadata GGUF — 2026-11-24
+
+**Giá:** không có giá tốc độ — đây là tính năng cho ngữ cảnh dài, không phải tối ưu. Điều kiện duy
+nhất: model không khai báo `rope.scaling.*` thì đường chạy phải giống cũ **từng bit**.
+
+**Thay đổi (`crates/vipera-backend-cpu/src/model.rs`):** `RopeScaling` (`none`/`linear`/`yarn`) đọc
+từ `{arch}.rope.scaling.{type,factor,original_context_length,attn_factor,yarn_beta_fast,
+yarn_beta_slow}`, mặc định theo llama.cpp (`original_context_length` rơi về `context_length`,
+`beta_fast = 32`, `beta_slow = 1`, `attn_factor = 1`). Công thức theo ggml `rope_yarn` và
+`ggml_rope_yarn_corr_dims`. Kiểu lạ (ví dụ `longrope`) bị từ chối bằng tên thay vì quay sai góc;
+`factor <= 0` cũng bị từ chối. `RopeAngles::scaled` dựng bảng một lần cho mỗi vị trí như trước;
+`RopeScaling::NONE` đi đúng biểu thức cũ. Backend GPU từ chối model có scaling (chỉ có bảng thường).
+
+**Test (`cargo test -p vipera-backend-cpu --lib`, 96 -> 100 passed):**
+- `rope_without_scaling_is_bit_identical_to_the_original_table` — `to_bits` bằng nhau với biểu thức cũ.
+- `yarn_correction_range_matches_the_published_llama2_values` — (20, 46) cho head 128, base 10000, 4096.
+- `linear_and_yarn_scaling_follow_the_ggml_formula` — so với bản chép độc lập bằng f64, 4 cấu hình.
+- `yarn_keeps_fast_pairs_interpolates_slow_ones_and_scales_the_magnitude`.
+
+**Gate:** `scripts/gate.sh fmt lint test` xanh.
+
+### Logits đối chiếu llama.cpp — cùng ngày
+
+**File tham chiếu, dựng lại được:** Qwen2.5-1.5B Q4_K_M cộng ba khoá metadata, không sửa weight nào
+(offset tensor là tương đối so với đầu data section, nên chèn metadata chỉ dịch chỗ bắt đầu):
+
+```bash
+scripts/gguf_set_metadata.py ~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf \
+  /tmp/qwen2.5-1.5b-yarn.gguf \
+  qwen2.rope.scaling.type=str:yarn qwen2.rope.scaling.factor=f32:4.0 \
+  qwen2.rope.scaling.original_context_length=u32:32768
+# 1117320736 -> 1117320896 bytes, +3 keys; chạy lại ra file giống hệt từng byte
+```
+
+llama.cpp `e574a17` (build 466) đọc đúng file đó và in `rope scaling = yarn`, `freq_scale_train =
+0.25`, `n_ctx_orig_yarn = 32768` — hai bên cùng một phép biến đổi, không phải một bên bỏ qua metadata.
+
+**Lệnh:** `scripts/logits-dump.sh <file> <ids...>` cho top-16 logits của vị trí cuối (dumper nay tự đặt
+`n_ctx`/`n_batch` theo độ dài chuỗi và in `arch`), rồi
+
+```bash
+VIPERA_TEST_MODEL=/tmp/qwen2.5-1.5b-yarn.gguf VIPERA_REFERENCE_LOGITS=/tmp/yarn-logits.json \
+  cargo test -p vipera-backend-cpu --release --test logits_reference -- --ignored scaled --nocapture
+```
+
+| chuỗi | argmax | top-16 lệch tối đa | đối chứng model không scaling, cùng chuỗi |
+|---|---:|---:|---:|
+| 64 token | giống (34208) | **0.357** | 0.333 |
+| 6001 token | giống (576) | **0.566** | 0.194 |
+
+**Đọc số:** cùng argmax, top-8 có đủ mặt ở cả hai độ dài, nên ramp và hệ số magnitude đúng — sai ramp
+hoặc thiếu `1 + 0.1·ln(factor)` sẽ đổi argmax chứ không đổi 0.3. Phần lệch thêm so với đối chứng là cấu
+trúc bảng: llama.cpp nhân `theta_scale` luỹ tiến từng cặp, vipera luỹ thừa cơ số theo từng cặp; tại vị
+trí 6000 cặp 6 hai cách lệch **6.7e-4 rad**, rồi bị khuếch đại bởi `mscale = 1.1386` (q·k ×1.30) qua 28
+lớp. Vì vậy test giữ ngưỡng 0.3 cho qwen3 và dùng ngưỡng riêng 0.75 cho model scaling ở ngữ cảnh dài,
+giá trị ghi kèm trong test.
+
+**GPU:** `generate --backend cuda` từ chối cả `yarn` và `longrope` trên GTX 1650 với thông báo nêu tên
+rule; model không khai báo scaling vẫn chạy và ra đúng continuation như CPU.
+
+**Không kiểm được:** đây vẫn là metadata YaRN gắn lên model train ở 32768 vị trí, không phải model
+được train/convert với YaRN thật, nên chưa có kết luận perplexity ở ngữ cảnh dài; muốn thế cần một GGUF
+YaRN native và `scripts/logits-dump.sh` chạy ở đúng độ dài đó.

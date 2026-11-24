@@ -46,10 +46,14 @@ USAGE:
                   [--repetition-penalty F] [--recent IDS] [--json]
     vipera verify <model.gguf> [--ctx N] [--kv-type f16|q8_0|q4_0] [--cpu] [--json]
     vipera generate <model.gguf> --prompt TEXT [--chat] [--system TEXT] [--max-tokens N]
-                    [--ctx N] [--kv-type f16|q8_0] [--temperature F] [--top-k N] [--top-p F]
-                    [--min-p F] [--repetition-penalty F] [--seed N] [--json]
+                    [--ctx N] [--kv-type f16|q8_0] [--backend cpu|cuda]
+                    [--temperature F] [--top-k N] [--top-p F] [--min-p F]
+                    [--repetition-penalty F] [--seed N] [--json]
     vipera serve <model.gguf> [--host ADDR] [--port N] [--api-key KEY] [--model-id NAME]
-                 [--ctx N] [--kv-type f16|q8_0]
+                 [--ctx N] [--kv-type f16|q8_0] [--rate-limit N]
+                 [--tls-cert FILE --tls-key FILE]
+                 [--acme-domain NAME [--acme-contact URI] [--acme-directory URL]
+                  [--acme-http-address ADDR]]   (server built with --features acme)
     vipera --help
 
 COMMANDS:
@@ -60,8 +64,13 @@ COMMANDS:
     tokenize      Tokenize text or a rendered chat with the model's own vocabulary
     sample        Sample token ids from logits with a fixed seed and print the result
     verify        Load a model and compare measured memory with the plan's prediction
-    generate      Run the model on the CPU and print what it writes next
-    serve         Serve OpenAI-compatible chat completions over HTTP, streaming included
+    generate      Run the model and print what it writes next; --backend cuda uses one CUDA
+                  device (f16 KV, no sliding window) when the binary was built with the `cuda`
+                  feature, and --backend cpu (the default) needs no GPU
+    serve         Serve OpenAI-compatible chat completions over HTTP, streaming included;
+                  --rate-limit caps requests per minute per key (default 600, 0 disables),
+                  --tls-cert/--tls-key serve HTTPS, and with --features acme the --acme-*
+                  flags order and renew the certificate over HTTP-01 instead
 
 EXIT CODES:
     0 success · 1 usage · 2 bad input · 3 infeasible plan · 4 internal
@@ -559,6 +568,7 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
     let mut max_tokens: u32 = 32;
     let mut ctx: Option<u64> = None;
     let mut kv_type = KvCacheType::F16;
+    let mut backend_kind = BackendKind::Cpu;
     let mut sampler = SamplerConfig {
         temperature: 0.0,
         ..SamplerConfig::default()
@@ -588,6 +598,10 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
             }
             "--kv-type" => {
                 kv_type = KvCacheType::parse(next_value(args, index, "--kv-type")?)?;
+                index += 1;
+            }
+            "--backend" => {
+                backend_kind = BackendKind::parse(next_value(args, index, "--backend")?)?;
                 index += 1;
             }
             "--temperature" => {
@@ -645,18 +659,10 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
 
     // One read serves both the metadata and the weights: the backend keeps the bytes it will read
     // rows from, so nothing is copied twice.
-    let bytes = std::fs::read(resolve_model_path(path)?)?;
+    let resolved = resolve_model_path(path)?;
+    let bytes = std::fs::read(&resolved)?;
     let file = GgufFile::parse(&bytes)?;
     let tokenizer = Tokenizer::from_gguf(&file)?;
-    let backend = CpuBackend::from_bytes(bytes, &file)?;
-    let model = backend.config();
-
-    let bytes_per_token = model.kv_bytes_per_token_for(kv_type).ok_or_else(|| {
-        ViperaError::unsupported(format!(
-            "this model cannot store its KV cache as {}",
-            kv_type.as_str()
-        ))
-    })?;
     let context_limit = file.describe().context_limit.unwrap_or(2048);
     if let Some(requested) = ctx
         && requested > context_limit
@@ -666,36 +672,6 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
         )));
     }
     let context_length = ctx.unwrap_or(context_limit.min(2048));
-    let kv = KvCache::new(KvConfig::for_run(
-        bytes_per_token,
-        DEFAULT_TOKENS_PER_BLOCK,
-        context_length,
-        kept_window(),
-        1,
-    )?)?;
-
-    let mut eos = Vec::new();
-    for marker in ["<|im_end|>", "<|endoftext|>", "</s>"] {
-        if let Some(id) = tokenizer.token_id(marker)
-            && !eos.contains(&id)
-        {
-            eos.push(id);
-        }
-    }
-    let mut engine = Engine::new(
-        kv,
-        backend,
-        EngineConfig {
-            eos,
-            sampler,
-            recent_window: 128,
-            // One request at a time keeps the CLI's tokens exactly what they were before batching.
-            max_batch: 1,
-            // Greedy generation is a single turn here, so draft verification always has the step
-            // to itself and emits the same tokens one weight read at a time.
-            speculative: true,
-        },
-    );
 
     let ids = if chat {
         let mut messages = Vec::new();
@@ -708,8 +684,135 @@ fn generate_command(args: &[String]) -> Result<u8, ViperaError> {
         tokenizer.encode(&prompt)?
     };
 
+    match backend_kind {
+        BackendKind::Cpu => {
+            let backend = CpuBackend::from_bytes(bytes, &file)?;
+            let model = backend.config();
+            let bytes_per_token = model.kv_bytes_per_token_for(kv_type).ok_or_else(|| {
+                ViperaError::unsupported(format!(
+                    "this model cannot store its KV cache as {}",
+                    kv_type.as_str()
+                ))
+            })?;
+            let kv = KvCache::new(KvConfig::for_run(
+                bytes_per_token,
+                DEFAULT_TOKENS_PER_BLOCK,
+                context_length,
+                kept_window(),
+                1,
+            )?)?;
+            let engine = Engine::new(kv, backend, engine_config(&tokenizer, sampler, true));
+            run_engine(engine, &tokenizer, &ids, max_tokens, json)
+        }
+        #[cfg(feature = "cuda")]
+        BackendKind::Cuda => {
+            if kv_type != KvCacheType::F16 {
+                return Err(ViperaError::unsupported(
+                    "the device backend stores its KV cache as f16; drop --kv-type",
+                ));
+            }
+            if kept_window().is_some() {
+                return Err(ViperaError::unsupported(
+                    "the device backend walks positions densely, so VIPERA_ATTN_WINDOW needs the \
+                     CPU backend",
+                ));
+            }
+            // The device backend reads the file itself and needs only the path, so the metadata
+            // copy is released before the weights are read a second time.
+            drop(file);
+            drop(bytes);
+            let device = vipera_backend_gpu::Device::open(0)?;
+            let backend = vipera_backend_gpu::GpuBackend::load(
+                device,
+                std::path::Path::new(&resolved),
+                usize::try_from(context_length)
+                    .map_err(|_| ViperaError::usage("the context does not fit in memory"))?,
+            )?;
+            let width = backend.model().kv_width() as u64;
+            let depth = backend.model().depth() as u64;
+            // f16 rows, K and V, every layer: the same arithmetic the CPU backend does for
+            // `KvCacheType::F16`.
+            let bytes_per_token = 2 * depth * width * 2;
+            let kv = KvCache::new(KvConfig::for_run(
+                bytes_per_token,
+                DEFAULT_TOKENS_PER_BLOCK,
+                context_length,
+                None,
+                1,
+            )?)?;
+            // Speculative draft verification reads a row per position through `logits_range`,
+            // which the device backend does not implement; the device path decodes one token per
+            // weight read with the draft off.
+            let engine = Engine::new(kv, backend, engine_config(&tokenizer, sampler, false));
+            run_engine(engine, &tokenizer, &ids, max_tokens, json)
+        }
+    }
+}
+
+/// Which backend `generate` runs the model on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Cpu,
+    #[cfg(feature = "cuda")]
+    Cuda,
+}
+
+impl BackendKind {
+    fn parse(raw: &str) -> Result<Self, ViperaError> {
+        match raw {
+            "cpu" => Ok(Self::Cpu),
+            #[cfg(feature = "cuda")]
+            "cuda" => Ok(Self::Cuda),
+            #[cfg(not(feature = "cuda"))]
+            "cuda" => Err(ViperaError::usage(
+                "this build has no device backend; rebuild with --features cuda",
+            )),
+            other => Err(ViperaError::usage(format!(
+                "unknown backend \"{other}\"; expected cpu\
+                 {}",
+                if cfg!(feature = "cuda") {
+                    " or cuda"
+                } else {
+                    ""
+                }
+            ))),
+        }
+    }
+}
+
+/// Everything `EngineConfig` is here, shared by both backends so their runs differ only in the
+/// forward pass.
+fn engine_config(tokenizer: &Tokenizer, sampler: SamplerConfig, speculative: bool) -> EngineConfig {
+    let mut eos = Vec::new();
+    for marker in ["<|im_end|>", "<|endoftext|>", "</s>"] {
+        if let Some(id) = tokenizer.token_id(marker)
+            && !eos.contains(&id)
+        {
+            eos.push(id);
+        }
+    }
+    EngineConfig {
+        eos,
+        sampler,
+        recent_window: 128,
+        // One request at a time keeps the CLI's tokens exactly what they were before batching.
+        max_batch: 1,
+        // Greedy generation is a single turn here, so draft verification always has the step to
+        // itself and emits the same tokens one weight read at a time.
+        speculative,
+    }
+}
+
+/// Run one prompt through an engine and print the turn, whichever backend computed it.
+fn run_engine<F: ForwardPass>(
+    mut engine: Engine<F>,
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    max_tokens: u32,
+    json: bool,
+) -> Result<u8, ViperaError> {
     let started = Instant::now();
-    let sequence = engine.admit(&ids, max_tokens)?;
+    let sequence = engine.admit(ids, max_tokens)?;
     // Text mode prints as tokens arrive; JSON needs the whole turn before it can emit a document.
     let mut seen = Vec::new();
     let mut shown = String::new();

@@ -71,9 +71,11 @@ int main(int argc, char **argv) {
 
     struct llama_context_params context_params = llama_context_default_params();
     /* Room for the sequence plus the usual slack: a context of only a few positions makes
-     * llama.cpp reserve a graph that is too small and hands back a row nobody computed. */
-    context_params.n_ctx = 512;
-    context_params.n_batch = 512;
+     * llama.cpp reserve a graph that is too small and hands back a row nobody computed. The room
+     * follows the sequence so a long-context reference (thousands of positions) is one decode. */
+    const int32_t room = n_tokens + 8 > 512 ? n_tokens + 8 : 512;
+    context_params.n_ctx = room;
+    context_params.n_batch = room;
     context_params.n_threads = 8;
     context_params.n_threads_batch = 8;
     struct llama_context *context = llama_init_from_model(model, context_params);
@@ -111,7 +113,9 @@ int main(int argc, char **argv) {
         offer(&top, id, logits[id]);
     }
 
-    printf("{\"n_vocab\":%d,\"tokens\":[", n_vocab);
+    char arch[64] = {0};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    printf("{\"arch\":\"%s\",\"n_vocab\":%d,\"tokens\":[", arch, n_vocab);
     for (int32_t at = 0; at < n_tokens; at++) {
         printf("%s%d", at == 0 ? "" : ",", tokens[at]);
     }

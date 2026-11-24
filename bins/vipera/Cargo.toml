@@ -8,12 +8,16 @@ license.workspace = true
 [features]
 # EXC-003: pass the ACME provisioning feature through to the server crate.
 acme = ["vipera-server/acme"]
+# EXC-006: `generate --backend cuda` on one device. Off by default, so the normal build stays CPU
+# only and links nothing that binds a C driver API.
+cuda = ["dep:vipera-backend-gpu"]
 
 [dependencies]
 vipera-core.workspace = true
 vipera-errors.workspace = true
 vipera-runtime.workspace = true
 vipera-backend-cpu.workspace = true
+vipera-backend-gpu = { workspace = true, optional = true }
 vipera-sampler.workspace = true
 vipera-tokenizer.workspace = true
 vipera-traits.workspace = true
