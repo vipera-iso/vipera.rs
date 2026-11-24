@@ -4631,9 +4631,9 @@ Hai bản đầu của mục này sai số, cả hai vì cách đo chứ không 
    là bản build 32 (chỉ `gate.sh` sau đó mới rebuild), nên bảng "128" khi đó thật ra là 32: prefill
    4096 ra 33.3 s thay vì 29.0 s, và tỉ lệ bị báo thành 4.1× thay vì 4.9×.
 
-Từ nay: tổng prefill/decode lấy **wall-clock** (trừ hằng số nạp model đo riêng); `PROFILE` chỉ dùng
-cho *tỉ lệ % trong một pass cùng width*; trước mỗi sweep ghi `md5sum target/release/vipera` và build
-lại nếu source vừa đổi.
+Từ nay: tổng prefill/decode lấy **wall-clock** (trừ hằng số nạp model đo riêng) hoặc cộng cột
+`this pass` của `PROFILE`; trước mỗi sweep ghi `md5sum target/release/vipera` và build lại nếu source
+vừa đổi. Hai lỗi gốc ở trên đã được sửa trong code — xem mục cuối file.
 
 ## Prefill/decode wall-clock đối chiếu llama.cpp, cùng phiên — 2026-11-24 (phương pháp sửa)
 
@@ -4737,3 +4737,31 @@ band. Đây là hành vi numeric-policy giống tile zmm, không phải bit-iden
 **Verdict: giữ** (2.65–2.93×, vượt ngưỡng 10% rất xa). Điều bất ngờ: nút cổ chai của kernel hàng
 không phải độ rộng lệnh — `pmaddubsw` chỉ bằng nửa `vpdpbusd` mỗi lệnh — mà là việc mỗi hàng đọc lại
 activation và trả epilogue riêng; layout tiled hoá ra đáng giá hơn cả phần width.
+
+## `PROFILE`: in thời gian từng pass, và mảnh bị tính nhầm thành decode — 2026-11-24
+
+**Lỗi 1 (số liệu):** dòng `PROFILE chunk N X ms` chỉ có trung bình luỹ tiến, không có thời gian của
+pass vừa xong, nên không có cách nào lấy tổng từ output — cộng các trung bình là sai (xem "Bài học
+đo" ở trên, nơi cách này làm prefill 4096 báo 162.4 thay vì 144.7 tok/s).
+
+**Lỗi 2 (phân loại):** `run_batch_n` gọi `begin(std::mem::take(&mut self.chunk_pass))`, nên **mảnh
+đầu tiên** của một prompt chunk được tính là chunk, các mảnh sau bị tính là decode: tổng chunk thấp
+hơn thực tế theo đúng số mảnh, và trung bình decode bị làm bẩn bởi công việc prefill. Với
+`VIPERA_PREFILL_CHUNK=32` (4 mảnh/chunk), 4096 token cho 32 dòng chunk + **96 dòng decode** và tổng
+chunk chỉ 7.9 s trong khi wall là 32.7 s.
+
+**Sửa:** cờ `chunk_pass` giữ nguyên cho cả prompt (xóa sau `run_positions`), `run_batch_n` đọc chứ
+không `take`; dòng `PROFILE` thêm `(this pass X ms)` sau trung bình, phần trăm phase vẫn là trung bình.
+`render_pass_line` tách ra để test (`a_pass_line_carries_its_own_time_and_the_running_split`,
+`two_passes_average_but_do_not_sum`).
+
+**Kiểm chứng, cùng binary, 4096 token:**
+
+| chế độ | dòng chunk | dòng decode | tổng `this pass` | wall |
+|---|---:|---:|---:|---:|
+| trước khi sửa, chunk 32 | 32 | 96 | 7.9 s | 32.7 s |
+| sau khi sửa, chunk 32 | **128** | **0** | **32.12 s** | 32.68 s |
+| sau khi sửa, chunk 128 (mặc định) | 32 | 0 | 27.93 s | 28.48 s |
+
+Tổng `this pass` + 0.56 s nạp khớp wall trong 0.6 s ở cả hai chế độ, và không còn dòng decode nào
+trong lúc prefill. Đây là công cụ đo, không phải đường chạy model: không đổi kết quả, chỉ đổi số báo.

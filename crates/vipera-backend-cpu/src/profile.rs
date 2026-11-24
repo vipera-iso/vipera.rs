@@ -221,6 +221,56 @@ fn bits_per_weight(label: &str) -> f64 {
     }
 }
 
+/// One `PROFILE` line: the running split over every pass of this kind, and the pass that just
+/// finished.
+///
+/// Both numbers matter and they are not interchangeable. The phase shares are averages, because one
+/// pass is noise, but a total needs the sum of the per-pass figures: a chunk wider than the batch
+/// kernel's window runs as several passes, and a running average cannot be summed into a total
+/// (adding the averages overcounts early passes and undercounts late ones). `this pass` is what a
+/// script should sum.
+fn render_pass_line(
+    kind: &str,
+    steps: u64,
+    average: u64,
+    pass: u64,
+    counters: &[AtomicU64; 9],
+) -> String {
+    let names = [
+        "q4k",
+        "q6k",
+        "other_dot",
+        "attention",
+        "norm",
+        "proj",
+        "rope",
+        "kv_write",
+        "elem",
+    ];
+    let mut line = format!(
+        "PROFILE {kind} {steps} {:.2} ms (this pass {:.2} ms):",
+        average as f64 / 1e6,
+        pass as f64 / 1e6
+    );
+    let mut claimed = 0;
+    for (index, name) in names.iter().enumerate() {
+        let nanos = counters[index].load(Ordering::Relaxed) / steps;
+        claimed += nanos;
+        let share = nanos as f64 / average as f64 * 100.0;
+        line.push_str(&format!(
+            " {name} {:.2}ms ({share:.0}%)",
+            nanos as f64 / 1e6
+        ));
+    }
+    let rest = average.saturating_sub(claimed);
+    line.push_str(&format!(
+        " rest {:.2}ms ({:.0}%)",
+        rest as f64 / 1e6,
+        rest as f64 / average as f64 * 100.0
+    ));
+    line
+}
+
 /// Print the per-shape table, biggest total first, as an average over the passes timed.
 fn print_shapes(steps: u64, prefill: bool) {
     let shapes = SHAPES.lock().unwrap_or_else(|error| error.into_inner());
@@ -285,40 +335,53 @@ pub fn finish_pass(start: Option<Instant>) {
     let steps = steps_at.fetch_add(1, Ordering::Relaxed) + 1;
     let average = total_at.load(Ordering::Relaxed) / steps;
     let kind = if prefill { "chunk" } else { "decode" };
-    let names = [
-        "q4k",
-        "q6k",
-        "other_dot",
-        "attention",
-        "norm",
-        "proj",
-        "rope",
-        "kv_write",
-        "elem",
-    ];
-    let mut line = format!("PROFILE {kind} {steps} {:.2} ms:", average as f64 / 1e6);
-    let mut claimed = 0;
-    for (index, name) in names.iter().enumerate() {
-        let nanos = counters[index].load(Ordering::Relaxed) / steps;
-        claimed += nanos;
-        let share = nanos as f64 / average as f64 * 100.0;
-        line.push_str(&format!(
-            " {name} {:.2}ms ({share:.0}%)",
-            nanos as f64 / 1e6
-        ));
-    }
-    let rest = average.saturating_sub(claimed);
-    line.push_str(&format!(
-        " rest {:.2}ms ({:.0}%)",
-        rest as f64 / 1e6,
-        rest as f64 / average as f64 * 100.0
-    ));
-    eprintln!("{line}");
+    eprintln!(
+        "{}",
+        render_pass_line(kind, steps, average, total, counters)
+    );
     // One table per run, once the caches and the pool are warm: the first passes carry the fault-in
     // cost of the weights, which is not what a steady-state question is about. A prompt makes fewer,
     // longer passes than a decode run, so its table is printed every sixteen chunks, as a running
     // average: a 4k prompt over a 128-token chunk is 32 of them.
     if (!prefill && steps == 20) || (prefill && steps % 16 == 0) {
         print_shapes(steps, prefill);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// The line has to carry the pass's own time: a chunk wider than the batch window runs as
+    /// several passes, and summing running averages is not a total (it undercounted a 4k prefill by
+    /// ~11% once already).
+    #[test]
+    fn a_pass_line_carries_its_own_time_and_the_running_split() {
+        let counters: [AtomicU64; 9] = std::array::from_fn(|_| AtomicU64::new(0));
+        let line = render_pass_line("chunk", 7, 884_580_000, 901_230_000, &counters);
+        assert!(
+            line.starts_with("PROFILE chunk 7 884.58 ms (this pass 901.23 ms):"),
+            "{line}"
+        );
+        assert!(line.contains(" q4k 0.00ms (0%)"), "{line}");
+        assert!(line.contains(" rest 884.58ms (100%)"), "{line}");
+    }
+
+    /// Two passes at different costs: the average is their mean, and a caller that wants the total
+    /// adds the two `this pass` figures instead.
+    #[test]
+    fn two_passes_average_but_do_not_sum() {
+        let counters: [AtomicU64; 9] = std::array::from_fn(|_| AtomicU64::new(0));
+        counters[0].fetch_add(200_000_000, Ordering::Relaxed);
+        let first = render_pass_line("chunk", 1, 400_000_000, 400_000_000, &counters);
+        assert!(first.contains("(this pass 400.00 ms)"), "{first}");
+        counters[0].fetch_add(200_000_000, Ordering::Relaxed);
+        let second = render_pass_line("chunk", 2, 300_000_000, 200_000_000, &counters);
+        assert!(
+            second.contains(" 2 300.00 ms (this pass 200.00 ms)"),
+            "{second}"
+        );
+        assert!(second.contains(" q4k 200.00ms (67%)"), "{second}");
     }
 }

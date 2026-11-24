@@ -653,10 +653,15 @@ impl CpuBackend {
         // by position so the KV it writes is in place before the position that reads it. Handing the
         // chunk to that path turns `n` reads of 1.117 GB into `ceil(n / 8)`.
         if context.new_tokens.len() > 1 {
-            // The batch path records the pass itself, so this one does not.
+            // The batch path records the passes itself, so this one does not. The flag stays set for
+            // every piece the chunk is split into and is cleared when the prompt is done: taking it
+            // per call made the first piece a chunk and the rest decode steps, which understated
+            // the chunk time and polluted the decode average.
             let _ = pass;
             self.chunk_pass = true;
-            return self.run_positions(context);
+            let result = self.run_positions(context);
+            self.chunk_pass = false;
+            return result;
         }
         if context.new_tokens.is_empty() {
             return Err(ViperaError::invalid_argument(
@@ -1023,7 +1028,7 @@ impl CpuBackend {
                 "a KV block must hold at least one token",
             ));
         }
-        let pass = crate::profile::begin(std::mem::take(&mut self.chunk_pass));
+        let pass = crate::profile::begin(self.chunk_pass);
         let config = self.config;
         let mut positions = [0_usize; B];
         let mut tokens = [0_u32; B];
