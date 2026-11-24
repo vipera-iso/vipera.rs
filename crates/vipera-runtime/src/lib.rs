@@ -16,6 +16,7 @@
 pub mod engine;
 pub mod kv;
 pub mod memory;
+pub mod moe;
 pub mod pipeline;
 pub mod sequence;
 
@@ -25,6 +26,7 @@ pub use engine::{
 };
 pub use kv::{DEFAULT_TOKENS_PER_BLOCK, KvCache, KvConfig};
 pub use memory::{WeightBuffer, parse_status_kib, peak_resident_bytes, resident_bytes};
+pub use moe::MoEExpertCache;
 pub use pipeline::{
     BatchContext, BatchEntry, ForwardContext, ForwardPass, RequestLog, Stage, StageTimings,
 };
