@@ -107,13 +107,24 @@ impl<'d, const B: usize> Pool<'d, B> {
 
     /// Take a tile buffer for this product, or allocate one when the free list is empty.
     pub(crate) fn take_tile(&self, blocks: usize, halves: usize) -> Arc<SharedTile> {
+        let needed = blocks.saturating_mul(halves).saturating_mul(64 * 16 * 4);
         let buffer = self
             .tiles
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .pop();
         Arc::new(match buffer {
-            Some(buffer) => SharedTile::from_buffer(buffer, blocks, halves),
+            Some(mut buffer) => {
+                // A recycled buffer may be larger than this product and carry stale bytes in the
+                // logical range. Clear it so reused memory is never observed after truncation.
+                if buffer.len() != needed {
+                    buffer.clear();
+                    buffer.resize(needed, 0);
+                } else {
+                    buffer.fill(0);
+                }
+                SharedTile::from_buffer(buffer, blocks, halves)
+            }
             None => SharedTile::new(blocks, halves),
         })
     }
@@ -208,16 +219,31 @@ impl<'d, const B: usize> Pool<'d, B> {
                 .map_err(|_| ViperaError::internal("activation preparation panicked"))?;
             ready.push((first_entry, built));
         }
+        let mut worker_panicked = false;
+        let mut disconnected = false;
         for _ in 0..dispatched {
-            let (first_entry, built) = self.prepared.recv().map_err(|_| {
-                ViperaError::internal("a matvec worker stopped before preparing its activations")
-            })?;
+            let (first_entry, built) = match self.prepared.recv() {
+                Ok(reply) => reply,
+                Err(_) => {
+                    disconnected = true;
+                    break;
+                }
+            };
             if first_entry == usize::MAX {
-                return Err(ViperaError::internal(
-                    "a matvec worker panicked preparing activations",
-                ));
+                worker_panicked = true;
+                continue;
             }
             ready.push((first_entry, built));
+        }
+        if disconnected {
+            return Err(ViperaError::internal(
+                "a matvec worker stopped before preparing its activations",
+            ));
+        }
+        if worker_panicked {
+            return Err(ViperaError::internal(
+                "a matvec worker panicked preparing activations",
+            ));
         }
         ready.sort_by_key(|(first_entry, _)| *first_entry);
         let all: Vec<OwnedActivation> = ready.into_iter().flat_map(|(_, built)| built).collect();
@@ -266,6 +292,9 @@ impl<'d, const B: usize> Pool<'d, B> {
             )));
         }
         let rows = out.len() / B;
+        if rows == 0 {
+            return Ok(());
+        }
         let threads = threads.min(self.workers.len()).max(1);
         if threads == 1 {
             let activation = BatchActivation::new(activations);
@@ -341,16 +370,33 @@ impl<'d, const B: usize> Pool<'d, B> {
         }
 
         let mut worker_panicked = false;
+        let mut copy_error = None;
+        let mut disconnected = false;
         for _ in 0..dispatched {
-            let (first_row, values) = self
-                .replies
-                .recv()
-                .map_err(|_| ViperaError::internal("a matvec worker stopped before replying"))?;
+            let (first_row, values) = match self.replies.recv() {
+                Ok(reply) => reply,
+                Err(_) => {
+                    disconnected = true;
+                    break;
+                }
+            };
             if first_row == usize::MAX {
                 worker_panicked = true;
                 continue;
             }
-            copy_back::<B>(out, rows, first_row, &values)?;
+            if copy_error.is_none()
+                && let Err(error) = copy_back::<B>(out, rows, first_row, &values)
+            {
+                copy_error = Some(error);
+            }
+        }
+        if disconnected {
+            return Err(ViperaError::internal(
+                "a matvec worker stopped before replying",
+            ));
+        }
+        if let Some(error) = copy_error {
+            return Err(error);
         }
         if worker_panicked {
             return Err(ViperaError::internal(
@@ -694,6 +740,76 @@ mod tests {
     /// ```text
     /// cargo test -p vipera-backend-cpu --release --lib pool_prep_cost -- --ignored --nocapture
     /// ```
+    /// A buffer recycled from a larger product must not expose stale bytes when reused at a
+    /// smaller shape. The pool clears recycled buffers before handing them out.
+    #[test]
+    fn recycled_tile_is_zeroed_before_reuse() {
+        std::thread::scope(|scope| {
+            let pool = Pool::<1>::new(scope, 1);
+            let big = pool.take_tile(2, 1);
+            let pattern = vec![7_i8; 512];
+            let q: Vec<&[i8]> = vec![pattern.as_slice()];
+            big.fill_entries(0, &q);
+            pool.recycle_tile(big);
+
+            let small = pool.take_tile(1, 1);
+            let buf = match Arc::try_unwrap(small) {
+                Ok(tile) => tile.into_buffer(),
+                Err(_) => panic!("freshly taken tile should be uniquely owned"),
+            };
+            assert!(
+                buf.iter().all(|&byte| byte == 0),
+                "recycled buffer exposed stale data after truncation"
+            );
+        });
+    }
+
+    /// Zero-row batches are a no-op and must not dispatch zero-sized jobs.
+    #[test]
+    fn fill_batch_zero_rows_is_noop() {
+        std::thread::scope(|scope| {
+            let pool = Pool::<1>::new(scope, 2);
+            let activation = OwnedActivation::new(vipera_core::gguf::GgmlType::F32, &[1.0f32; 32]);
+            let activations = Arc::new([activation]);
+            let mut out: Vec<f32> = Vec::new();
+            let result = pool.fill_batch(
+                vipera_core::gguf::GgmlType::F32,
+                &[],
+                0,
+                2,
+                &activations,
+                &mut out,
+                None,
+            );
+            assert!(result.is_ok(), "zero-row batch should succeed: {result:?}");
+        });
+    }
+
+    /// Recycling a still-shared tile must not duplicate-release its buffer into the free list.
+    #[test]
+    fn shared_tile_recycle_is_ignored() {
+        std::thread::scope(|scope| {
+            let pool = Pool::<1>::new(scope, 1);
+            let tile = pool.take_tile(1, 1);
+            let alias = Arc::clone(&tile);
+            pool.recycle_tile(tile);
+            assert_eq!(
+                Arc::strong_count(&alias),
+                1,
+                "alias should remain the only owner"
+            );
+            // The buffer was not released while aliased, so dropping the last owner should not
+            // panic or poison the pool. Taking a new tile still works.
+            drop(alias);
+            let fresh = pool.take_tile(1, 1);
+            let buf = match Arc::try_unwrap(fresh) {
+                Ok(tile) => tile.into_buffer(),
+                Err(_) => panic!("freshly taken tile should be uniquely owned"),
+            };
+            assert_eq!(buf.len(), 64 * 16 * 4);
+        });
+    }
+
     #[test]
     #[ignore = "measurement, not a correctness check"]
     fn pool_prep_cost() {
