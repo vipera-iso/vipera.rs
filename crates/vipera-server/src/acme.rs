@@ -357,6 +357,12 @@ fn not_after(der: &[u8]) -> Result<SystemTime, String> {
 
 fn parse_time(tag: u8, text: &[u8]) -> Result<SystemTime, String> {
     let text = std::str::from_utf8(text).map_err(|_| "certificate time is not ASCII".to_owned())?;
+    // The fixed offsets below are byte offsets. Valid UTF-8 can still put a multi-byte character
+    // across one of them, so insist on ASCII before slicing; a malformed token is an error, not a
+    // panic in the renewal thread.
+    if !text.is_ascii() {
+        return Err(format!("certificate time {text:?} is not ASCII"));
+    }
     let text = text
         .strip_suffix('Z')
         .ok_or_else(|| format!("certificate time {text:?} is not UTC"))?;
@@ -808,5 +814,73 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600, "the key is {mode:o}, not 0600");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DER `Time` token whose text has a multi-byte character at a fixed byte offset used to
+    /// panic on `text[..2]` / `text[..4]`, taking the renewal thread down instead of retrying.
+    /// Truncated tokens and an empty certificate must be reported as errors too.
+    #[test]
+    fn malformed_time_tokens_and_empty_certificates_are_errors_not_panics() {
+        for der in [
+            &b""[..],
+            &b"\x30"[..],
+            &b"\x30\x80\x17\x0c\x30"[..],
+            &b"\x30\x84\xff\xff\xff\xff"[..],
+        ] {
+            assert!(not_after(der).is_err(), "truncated DER {der:?} parsed");
+        }
+        assert!(
+            parse_time(UTC_TIME, "€123456789Z".as_bytes()).is_err(),
+            "a multi-byte character at the UTCTime year boundary parsed"
+        );
+        assert!(
+            parse_time(GENERALIZED_TIME, "é€123456789Z".as_bytes()).is_err(),
+            "a multi-byte character at the generalized year boundary parsed"
+        );
+
+        let dir = std::env::temp_dir().join(format!("vipera-acme-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let cert = dir.join("empty.crt");
+        std::fs::write(&cert, b"").expect("write an empty certificate");
+        assert!(
+            expiry_of(&cert).is_err(),
+            "an empty certificate has a usable expiry"
+        );
+        std::fs::write(
+            &cert,
+            b"-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write an empty CERTIFICATE block");
+        assert!(
+            expiry_of(&cert).is_err(),
+            "an empty CERTIFICATE block has a usable expiry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A malformed token in a challenge request is a 404, never a panic in the map lookup.
+    #[test]
+    fn a_malformed_challenge_token_gets_a_404_without_panicking() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the challenge listener");
+        let address = listener.local_addr().expect("addr");
+        let map = Mutex::new(HashMap::new());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut client = TcpStream::connect(address).expect("connect");
+                client
+                    .write_all(
+                        b"GET /.well-known/acme-challenge/%00%2f../token HTTP/1.1\r\n\
+                          Host: localhost\r\n\r\n",
+                    )
+                    .expect("write the request");
+                let mut response = String::new();
+                client
+                    .read_to_string(&mut response)
+                    .expect("read the reply");
+                assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+            });
+            let (mut stream, _) = listener.accept().expect("accept");
+            answer_one(&mut stream, &map).expect("answer");
+        });
     }
 }
