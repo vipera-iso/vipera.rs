@@ -201,6 +201,16 @@ impl Extents {
                 "MLA needs at least one head and one value per head",
             ));
         }
+        if shape.rank == 0 {
+            return Err(ViperaError::invalid_argument(
+                "MLA needs a non-zero latent rank",
+            ));
+        }
+        if shape.query_width() == 0 {
+            return Err(ViperaError::invalid_argument(
+                "MLA needs at least one key dimension (nope_dim or rope_dim)",
+            ));
+        }
         let query_need = entries * shape.heads * shape.query_width();
         if query.len() < query_need {
             return Err(short("query", query.len(), query_need));
@@ -752,6 +762,123 @@ mod tests {
         assert!(
             message.contains("latent cache"),
             "the error names the wrong slice: {message}"
+        );
+    }
+
+    #[test]
+    fn zero_length_and_single_token_shapes_do_not_panic_and_slice_kv_correctly() {
+        // No queries: nothing to attend, no keys to read.
+        let shape = SHAPE;
+        let empty = Case::new(shape, vec![], 41);
+        let mut out = vec![f32::NAN; 0];
+        attend(
+            &empty.query,
+            &empty.cache(),
+            &empty.positions,
+            shape,
+            &empty.weights(),
+            &mut out,
+        )
+        .expect("zero entries should be accepted");
+        assert!(out.is_empty());
+
+        // A single token seeing a single key is the value up-projection of that key.
+        let one = Case::new(shape, vec![1], 43);
+        let absorbed = one.run(shape, true);
+        let decompressed = one.run(shape, false);
+        let expected = oracle(&one, shape, 0, 1);
+        assert!(largest_gap(&absorbed, &expected) < 1e-6);
+        assert!(largest_gap(&decompressed, &expected) < 1e-6);
+
+        // Single-token odd shapes: no nope half, no rope half, and a rank-1 latent.
+        let nope_only = MlaShape {
+            rope_dim: 0,
+            ..shape
+        };
+        let case = Case::new(nope_only, vec![1], 47);
+        let gap = largest_gap(&case.run(nope_only, true), &case.run(nope_only, false));
+        assert!(gap < 1e-5, "no-rope odd shape differed by {gap}");
+
+        let rope_only = MlaShape {
+            nope_dim: 0,
+            ..shape
+        };
+        let case = Case::new(rope_only, vec![1, 2], 53);
+        let absorbed = case.run(rope_only, true);
+        let decompressed = case.run(rope_only, false);
+        assert!(largest_gap(&absorbed, &decompressed) < 1e-5);
+        for (entry, &seen) in case.positions.iter().enumerate() {
+            let width = rope_only.heads * rope_only.value_dim;
+            let got = &absorbed[entry * width..(entry + 1) * width];
+            let want = oracle(&case, rope_only, entry, seen);
+            assert!(
+                largest_gap(got, &want) < 1e-5,
+                "nope_dim=0 entry {entry} off oracle by {}",
+                largest_gap(got, &want)
+            );
+        }
+
+        let rank_one = MlaShape { rank: 1, ..shape };
+        let case = Case::new(rank_one, vec![1, 3, 2], 59);
+        let absorbed = case.run(rank_one, true);
+        let decompressed = case.run(rank_one, false);
+        assert!(largest_gap(&absorbed, &decompressed) < 1e-5);
+    }
+
+    #[test]
+    fn degenerate_shapes_are_refused_without_panicking() {
+        let case = Case::new(SHAPE, vec![1], 61);
+
+        let rank_zero = MlaShape { rank: 0, ..SHAPE };
+        let mut out = vec![0.0_f32; rank_zero.heads * rank_zero.value_dim];
+        let query = vec![0.0_f32; rank_zero.heads * rank_zero.query_width()];
+        let err = attend(
+            &query,
+            &MlaCache {
+                latent: &[],
+                rope: &case.rope[..rank_zero.rope_dim],
+            },
+            &[1],
+            rank_zero,
+            &MlaWeights {
+                value_up: &[],
+                key_up: &[],
+            },
+            &mut out,
+        )
+        .expect_err("rank=0 should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rank"),
+            "rank=0 error should name the degenerate dimension: {msg}"
+        );
+
+        let no_key_dims = MlaShape {
+            nope_dim: 0,
+            rope_dim: 0,
+            ..SHAPE
+        };
+        let mut out = vec![0.0_f32; no_key_dims.heads * no_key_dims.value_dim];
+        let err = attend(
+            &[],
+            &MlaCache {
+                latent: &case.latent[..no_key_dims.rank],
+                rope: &[],
+            },
+            &[1],
+            no_key_dims,
+            &MlaWeights {
+                value_up: &case.value_up
+                    [..no_key_dims.heads * no_key_dims.value_dim * no_key_dims.rank],
+                key_up: &[],
+            },
+            &mut out,
+        )
+        .expect_err("no key dimensions should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nope_dim") || msg.contains("rope_dim") || msg.contains("key"),
+            "no-key-dims error should name the degenerate dimension: {msg}"
         );
     }
 }
