@@ -17,10 +17,6 @@ use crate::quant::f16_to_f32;
 /// number so the two paths walk the rows in the same order.
 pub(crate) const GROUP_ROWS: usize = 16;
 
-/// Heads the AVX2 kernels keep in registers. The scalar path does not need the bound, but callers
-/// pass the same shapes and the block kernel uses it to reject what the vector path would.
-const HEADS_IN_REGISTERS: usize = 8;
-
 /// Widen little-endian `f16` values into `f32`, stopping at whichever slice is shorter.
 pub(crate) fn half_to_float(source: &[u8], values: &mut [f32]) {
     let length = values.len().min(source.len() / 2);
@@ -138,6 +134,10 @@ pub(crate) fn axpy_f16_f32_heads_exact(
 }
 
 /// `P` positions folded into the same targets, `weights` position-major as `weights[p * count + head]`.
+///
+/// Unlike the AVX2 kernel this loop has no register budget, so a head count above the vector
+/// kernel's limit still accumulates: dropping it here would silently lose the V contribution on
+/// an odd or wide group instead of matching one [`axpy_f16_f32_heads_exact`] call per position.
 pub(crate) fn axpy_f16_f32_heads_exact_block<const P: usize>(
     targets: &mut [f32],
     head_dim: usize,
@@ -148,7 +148,7 @@ pub(crate) fn axpy_f16_f32_heads_exact_block<const P: usize>(
         return;
     }
     let count = weights.len() / P;
-    if count == 0 || count > HEADS_IN_REGISTERS || targets.len() < count * head_dim {
+    if count == 0 || targets.len() < count * head_dim {
         return;
     }
     for (position, row) in rows.iter().enumerate() {
@@ -401,6 +401,141 @@ mod tests {
         assert_eq!(block.len(), per_position.len());
         for (lane, (block, single)) in block.iter().zip(&per_position).enumerate() {
             assert!(close(*block, *single, 1e-6), "block, lane {lane}");
+        }
+    }
+
+    /// Regression: the scalar block kernel has no SIMD register budget, so a head count above
+    /// the vector kernel's limit must still accumulate. A one-call-per-position reference catches
+    /// the silent no-op this used to make on an odd group with a narrow `head_dim`.
+    #[test]
+    fn the_scalar_block_accumulates_at_odd_head_counts_above_the_vector_limit() {
+        fn check<const P: usize>(rng: &mut Rng, head_dim: usize, heads: usize) {
+            let rows: Vec<Vec<u8>> = (0..P).map(|_| rng.row(head_dim)).collect();
+            let refs: [&[u8]; P] = std::array::from_fn(|at| rows[at].as_slice());
+            let weights: Vec<f32> = (0..P * heads).map(|_| rng.unit()).collect();
+            let mut block = vec![0.0_f32; heads * head_dim];
+            axpy_f16_f32_heads_exact_block::<P>(&mut block, head_dim, &weights, &refs);
+            let mut per_position = vec![0.0_f32; heads * head_dim];
+            for (position, row) in refs.iter().enumerate() {
+                let slice = &weights[position * heads..(position + 1) * heads];
+                axpy_f16_f32_heads_exact(&mut per_position, head_dim, slice, row);
+            }
+            assert_ne!(
+                block,
+                vec![0.0_f32; heads * head_dim],
+                "block no-op at P {P}"
+            );
+            for (lane, (block, single)) in block.iter().zip(&per_position).enumerate() {
+                assert_eq!(
+                    block.to_bits(),
+                    single.to_bits(),
+                    "block P {P} heads {heads} head_dim {head_dim}, lane {lane}"
+                );
+            }
+        }
+
+        let mut rng = Rng(0x005c_a1f7);
+        for head_dim in [1_usize, 3, 7] {
+            for heads in [9_usize, 11] {
+                check::<3>(&mut rng, head_dim, heads);
+                check::<5>(&mut rng, head_dim, heads);
+            }
+        }
+    }
+
+    /// The scalar `f16` kernels must agree with a decode-then-`f32` reference on odd lengths,
+    /// odd head counts and narrow activations — the shapes a group of heads with a short
+    /// `head_dim` can have. The widening, the dot and the axpy are bit-exact; the grouped axpy
+    /// differs only where it fuses, which the tolerance covers.
+    #[test]
+    fn the_scalar_f16_kernels_match_the_decoded_reference_on_odd_narrow_shapes() {
+        use vipera_core::gguf::GgmlType;
+        let mut rng = Rng(0x005c_a2ab);
+        for length in [1_usize, 3, 5, 7, 15, 17, 31, 33] {
+            let row = rng.row(length);
+            let decoded = crate::quant::dequantize(GgmlType::F16, &row, length, 1).unwrap();
+            let mut widened = vec![0.0_f32; length];
+            half_to_float(&row, &mut widened);
+            assert_eq!(widened, decoded, "half_to_float, length {length}");
+
+            let a: Vec<f32> = (0..length).map(|_| rng.unit()).collect();
+            assert_eq!(
+                dot_f16_f32(&a, &row).to_bits(),
+                dot_f32(&a, &decoded).to_bits(),
+                "dot_f16_f32, length {length}"
+            );
+            let mut left = vec![0.0_f32; length];
+            let mut right = vec![0.0_f32; length];
+            axpy_f16_f32(&mut left, 0.375, &row);
+            axpy_f32(&mut right, 0.375, &decoded);
+            assert_eq!(left, right, "axpy_f16_f32, length {length}");
+        }
+
+        for head_dim in [1_usize, 3, 7, 15] {
+            for heads in [1_usize, 3, 5, 7, 9] {
+                let row = rng.row(head_dim);
+                let decoded = crate::quant::dequantize(GgmlType::F16, &row, head_dim, 1).unwrap();
+                let q: Vec<f32> = (0..(heads + 2) * head_dim).map(|_| rng.unit()).collect();
+                let mut got = vec![0.0_f32; heads];
+                dot_f16_f32_heads(&q, 2, heads, head_dim, &row, &mut got);
+                let mut exact = vec![0.0_f32; heads];
+                dot_f16_f32_heads_exact(&q, 2, heads, head_dim, &row, &mut exact);
+                for head in 0..heads {
+                    let want = dot_f32(&q[(2 + head) * head_dim..(3 + head) * head_dim], &decoded);
+                    assert_eq!(
+                        got[head].to_bits(),
+                        want.to_bits(),
+                        "heads {heads} hd {head_dim} head {head}"
+                    );
+                    assert_eq!(
+                        exact[head].to_bits(),
+                        want.to_bits(),
+                        "exact heads {heads} hd {head_dim} head {head}"
+                    );
+                }
+
+                let weights: Vec<f32> = (0..heads).map(|_| rng.unit()).collect();
+                let mut got = vec![0.0_f32; heads * head_dim];
+                let mut exact = vec![0.0_f32; heads * head_dim];
+                axpy_f16_f32_heads(&mut got, head_dim, &weights, &row);
+                axpy_f16_f32_heads_exact(&mut exact, head_dim, &weights, &row);
+                let mut want = vec![0.0_f32; heads * head_dim];
+                for (head, weight) in weights.iter().enumerate() {
+                    axpy_f32(
+                        &mut want[head * head_dim..(head + 1) * head_dim],
+                        *weight,
+                        &decoded,
+                    );
+                }
+                assert_eq!(got, want, "axpy heads {heads} hd {head_dim}");
+                assert_eq!(exact, want, "axpy exact heads {heads} hd {head_dim}");
+
+                for positions in [3_usize, 5, 7] {
+                    let rows: Vec<Vec<u8>> = (0..positions).map(|_| rng.row(head_dim)).collect();
+                    let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+                    let w: Vec<f32> = (0..positions * heads).map(|_| rng.unit()).collect();
+                    let mut got = vec![0.0_f32; heads * head_dim];
+                    let mut want = vec![0.0_f32; heads * head_dim];
+                    axpy_f16_group(&mut got, head_dim, heads, &w, &refs);
+                    for (position, row) in refs.iter().enumerate() {
+                        let dec =
+                            crate::quant::dequantize(GgmlType::F16, row, head_dim, 1).unwrap();
+                        for head in 0..heads {
+                            axpy_f32(
+                                &mut want[head * head_dim..(head + 1) * head_dim],
+                                w[position * heads + head],
+                                &dec,
+                            );
+                        }
+                    }
+                    for (lane, (got, want)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            close(*got, *want, TOLERANCE),
+                            "axpy group p {positions} heads {heads} hd {head_dim} lane {lane}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
         }
     }
 }
