@@ -329,19 +329,39 @@ impl Parser<'_> {
         if self.peek() == Some(b'-') {
             self.at += 1;
         }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.at += 1;
+        // Integer part: `0`, or a nonzero digit followed by any digits (RFC 8259).
+        match self.peek() {
+            Some(b'0') => {
+                self.at += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(format!("bad number at byte {start}"));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.at += 1;
+                }
+            }
+            _ => return Err(format!("bad number at byte {start}")),
         }
+        // Fraction: one or more digits after the point.
         if self.peek() == Some(b'.') {
             self.at += 1;
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(format!("bad number at byte {start}"));
+            }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.at += 1;
             }
         }
+        // Exponent: at least one digit after the sign, if there is one.
         if matches!(self.peek(), Some(b'e' | b'E')) {
             self.at += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.at += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(format!("bad number at byte {start}"));
             }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.at += 1;
@@ -418,6 +438,29 @@ mod tests {
             "nul",
         ] {
             assert!(Json::parse(body).is_err(), "{body} should be rejected");
+        }
+    }
+
+    #[test]
+    fn number_syntax_matches_rfc_8259() {
+        // Strict: leading zeros, a fraction with no digits and an exponent with no digits are
+        // all malformed, and a number must be consumed whole.
+        for body in ["01", "-01", "1.", "5.", "1e", "1E+", "1e2x"] {
+            assert!(Json::parse(body).is_err(), "{body} should be rejected");
+        }
+        for body in [
+            "0",
+            "-0",
+            "1",
+            "-12",
+            "1.5",
+            "-0.5",
+            "1e2",
+            "1E+3",
+            "-0.5e-1",
+            "123.45e-6",
+        ] {
+            assert!(Json::parse(body).is_ok(), "{body} should parse");
         }
     }
 
