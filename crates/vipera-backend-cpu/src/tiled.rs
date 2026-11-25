@@ -360,7 +360,9 @@ pub(crate) fn matvec_tiled_batch<const B: usize>(
                 }
                 for slot in 0..sub_cnt {
                     for entry in 0..n_entries {
-                        acc[entry][slot] += sub_acc[entry][slot];
+                        // `slot` is relative to the sub-tile; the row-tile accumulator
+                        // is indexed by the row within the whole 64-row tile.
+                        acc[entry][sub0 + slot] += sub_acc[entry][slot];
                     }
                 }
                 sub0 += sub_cnt;
@@ -682,6 +684,103 @@ mod tests {
                 assert!(
                     (g - want).abs() <= tol,
                     "entry {entry} row {row}: got {g} want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_accumulates_every_16_row_subtile() {
+        // A 64-row tile is accumulated as four 16-row sub-tiles. Each sub-tile's partial
+        // must land in its own output rows: using the sub-tile-relative slot for the
+        // row-tile accumulator collapsed all four into rows 0..16 and left the rest 0.
+        let cols = 256;
+        for rows in [17, 40, 65] {
+            let stride = crate::quant::row_bytes(GgmlType::F32, cols).expect("stride");
+            let mut data = vec![0u8; stride * rows];
+            for chunk in data.as_chunks_mut::<4>().0 {
+                chunk.copy_from_slice(&1.0_f32.to_le_bytes());
+            }
+            let xs = vec![vec![1.0_f32; cols]; 8];
+            let activations: [&[f32]; 8] = std::array::from_fn(|e| xs[e].as_slice());
+            let mut got = vec![0.0; 8 * rows];
+            matvec_tiled_batch(
+                GgmlType::F32,
+                &data,
+                stride,
+                cols,
+                rows,
+                &activations,
+                &mut got,
+            )
+            .expect("tiled f32");
+            for entry in 0..8 {
+                for row in 0..rows {
+                    let v = got[entry * rows + row];
+                    assert!(
+                        (v - cols as f32).abs() < 1e-3,
+                        "rows={rows} entry {entry} row {row}: got {v}, want {cols}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q4k_tiled_many_rows_matches_read_row() {
+        // Narrow K (one 256-wide tile) but 40 rows: crosses two 16-row sub-tile
+        // boundaries inside one 64-row tile, which the quantized path must handle.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 7;
+            state ^= state >> 3;
+            state ^= state << 8;
+            state
+        };
+        let cols = 256;
+        let rows = 40;
+        let stride = crate::quant::row_bytes(GgmlType::Q4K, cols).expect("stride");
+        let mut data = vec![0u8; stride * rows];
+        for row in 0..rows {
+            let off = row * stride;
+            data[off..off + 2].copy_from_slice(&crate::quant::f32_to_f16(0.02).to_le_bytes());
+            data[off + 2..off + 4].copy_from_slice(&crate::quant::f32_to_f16(0.01).to_le_bytes());
+            for i in 0..12 {
+                data[off + 4 + i] = (next() % 64) as u8;
+            }
+            for i in 0..128 {
+                data[off + 16 + i] = next() as u8;
+            }
+        }
+        let xs: Vec<Vec<f32>> = (0..8)
+            .map(|_| {
+                (0..cols)
+                    .map(|_| (((next() % 2000) as f32) / 1000.0) - 1.0)
+                    .collect()
+            })
+            .collect();
+        let activations: [&[f32]; 8] = std::array::from_fn(|e| xs[e].as_slice());
+        let mut got = vec![0.0; 8 * rows];
+        matvec_tiled_batch(
+            GgmlType::Q4K,
+            &data,
+            stride,
+            cols,
+            rows,
+            &activations,
+            &mut got,
+        )
+        .expect("tiled q4k");
+        for (entry, x) in xs.iter().enumerate() {
+            for row in 0..rows {
+                let mut w = vec![0.0; cols];
+                crate::quant::read_row(GgmlType::Q4K, &data, cols, row, &mut w).expect("read_row");
+                let want: f32 = w.iter().zip(x).map(|(a, b)| a * b).sum();
+                let v = got[entry * rows + row];
+                let tol = 1e-3 + 1e-4 * want.abs();
+                assert!(
+                    (v - want).abs() <= tol,
+                    "entry {entry} row {row}: got {v}, want {want}"
                 );
             }
         }
