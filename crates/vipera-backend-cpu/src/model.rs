@@ -6729,11 +6729,32 @@ mod tests {
                         share
                     }
                 );
-                assert_eq!(
-                    output, &baseline,
-                    "{:?} must compute what the baseline computes",
-                    switches
-                );
+                // The GQA-share arms are the one documented exception. With sharing on,
+                // `attention_streaming_heads` fuses the score and value folds across the
+                // heads of one key head, "and regroups each head's sum, so it is not
+                // bit-identical to the per-head kernel" (doc of `gqa_share_enabled`,
+                // model.rs:2211, and `attention_streaming_heads`, model.rs:2448-2458). The
+                // other arms are asserted bit-identical: a timing difference must stay
+                // invisible to scheduling and locality.
+                let max_diff = output
+                    .iter()
+                    .zip(baseline.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                if gqa_share_enabled() {
+                    assert!(
+                        max_diff <= 1e-5,
+                        "{:?} must compute what the baseline computes within the documented \
+                         rounding of the GQA-share path, max_diff {max_diff}",
+                        switches
+                    );
+                } else {
+                    assert_eq!(
+                        output, &baseline,
+                        "{:?} must compute what the baseline computes",
+                        switches
+                    );
+                }
             }
         }
     }
