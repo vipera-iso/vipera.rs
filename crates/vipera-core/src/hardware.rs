@@ -188,6 +188,26 @@ core id\t\t: 0
     }
 
     #[test]
+    fn zero_cores_and_no_devices_is_a_valid_profile() {
+        // A machine whose /proc/cpuinfo is unreadable and which has no nvidia-smi reports a
+        // profile with cpu_cores_physical == 0 and an empty devices list; looking a device up in
+        // it and computing its fingerprint must not panic, and the zero-core field must be the
+        // one the fingerprint folds in.
+        let degenerate = HardwareProfile {
+            cpu_cores_physical: 0,
+            ram_total_bytes: 0,
+            devices: Vec::new(),
+        };
+        assert!(degenerate.device(DeviceKind::Cuda).is_none());
+        assert!(degenerate.device(DeviceKind::Cpu).is_none());
+        let one_core = HardwareProfile {
+            cpu_cores_physical: 1,
+            ..degenerate.clone()
+        };
+        assert_ne!(degenerate.fingerprint(), one_core.fingerprint());
+    }
+
+    #[test]
     fn parses_smi_rows_into_devices() {
         let text = "\
 NVIDIA GeForce RTX 3060, 12288, 11000, 560.35.03, 8.6
