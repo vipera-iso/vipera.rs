@@ -729,7 +729,7 @@ mod tests {
     /// is 176 GFLOPS single thread, llama.cpp's is 229 (`docs/benchmarks.md` 2026-11-23). A rate
     /// here well above 176 would put the gap in the engine, not in the kernel.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn bench_prefill_band_gflops() {
         use crate::quant::{BatchActivation, OwnedActivation, fill_rows_batch};
         use vipera_core::gguf::types::GgmlType;

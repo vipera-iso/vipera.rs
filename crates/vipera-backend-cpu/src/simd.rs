@@ -1,8 +1,10 @@
 //! AVX2 kernels for the two quantized formats a Q4_K_M file is made of.
 //!
-//! This is the only module in the workspace allowed to use `unsafe`: `std::arch` intrinsics require it.
-//! Each kernel mirrors the scalar one in [`crate::quant`] operation for operation, takes exactly the
-//! same inputs, and the tests below run both over randomised blocks and compare.
+//! The hot paths of this module are the only ones the crate sanctions as the workspace's
+//! performance path: `std::arch` intrinsics require them. Each kernel mirrors the scalar one in
+//! [`crate::quant`] operation for operation, takes exactly the same inputs, and the tests below
+//! run both over randomised blocks and compare. (`bus.rs` has a documented opt-out for file
+//! mapping, EXC-005.)
 //!
 //! Dispatch happens at runtime through `is_x86_feature_detected!("avx2")`; on a CPU without it the
 //! scalar code is used and this module is never reached.
@@ -4368,7 +4370,7 @@ mod tests {
     /// Ignored by default: `cargo test -p vipera-backend-cpu --release --lib -- --ignored
     /// --nocapture transposed_k_scores`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn transposed_k_scores() {
         const HEADS: usize = 12;
         const KV_HEADS: usize = 2;
@@ -4515,7 +4517,7 @@ mod tests {
     /// Ignored by default. `cargo test -p vipera-backend-cpu --release --lib -- --ignored
     /// --nocapture attention_phase_cost`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn attention_phase_cost() {
         const HEADS: usize = 12;
         const POSITIONS: usize = 1024;
@@ -4575,7 +4577,7 @@ mod tests {
     /// Ignored by default. Run it with
     /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_vnni_versus_maddubs`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_vnni_versus_maddubs() {
         if !available() {
             eprintln!("skipped: this CPU has no AVX2");
@@ -5310,7 +5312,7 @@ mod tests {
     /// arms; this isolates the scale header. +2.8% bytes is the only repack a decode-bound model can
     /// afford, so if this arm does not move, no 4.5 bpw repack will.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn bench_repacked_q4k_scale_header() {
         const N: usize = 1 << 16;
         const ROUNDS: usize = 20;
@@ -6095,7 +6097,7 @@ mod tests {
     /// Ignored by default: it is a measurement, not a check. Run it with
     /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_shape_breakdown`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_shape_breakdown() {
         if !available() {
             eprintln!("skipped: this CPU has no AVX2");
@@ -6190,7 +6192,7 @@ mod tests {
     /// Ignored by default: it is a measurement, not a check. Run it with
     /// `cargo test -p vipera-backend-cpu --release -- --ignored --nocapture q4k_packed_throughput`.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_packed_throughput() {
         if !vnni_available() {
             eprintln!("skipped: no VNNI");
@@ -6257,7 +6259,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_dot_throughput() {
         if !available() {
             eprintln!("skipped: this CPU has no AVX2");
@@ -6336,7 +6338,7 @@ mod tests {
     /// Single-threaded on purpose: ggml's figure in `vipera-ggml` is
     /// Does a wider prefill batch pay? Same shapes and kernel as the B=128 bench below, one arm each.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_tiled_batch_width_128_against_256() {
         if !vnni512_available() {
             eprintln!("skipped: this CPU has no AVX-512 VNNI");
@@ -6369,7 +6371,7 @@ mod tests {
 
     /// single-threaded too, and the pool would hide the kernel difference.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_tiled_batch128_throughput() {
         if !vnni512_available() {
             eprintln!("skipped: this CPU has no AVX-512 VNNI");
@@ -6402,7 +6404,7 @@ mod tests {
     /// Reuse falls with the batch too, so a flat curve is the interesting
     /// answer: it would mean the tile is not what caps the kernel.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_tiled_batch_sweep() {
         if !vnni512_available() {
             eprintln!("skipped: this CPU has no AVX-512 VNNI");
@@ -6438,7 +6440,7 @@ mod tests {
     /// stream, and the ratio between them is the headroom prefill leaves on the
     /// table when the weights are not cached.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn q4k_tiled_streaming_throughput() {
         if !vnni512_available() {
             eprintln!("skipped: this CPU has no AVX-512 VNNI");
@@ -7007,7 +7009,7 @@ mod tests {
     /// How much of the tiled kernel is epilogue: same dpbusd chain, with the six vector ops and
     /// two broadcasts per (row, sub-block) folded into one convert and one add.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn bench_epilogue_probe() {
         use std::sync::atomic::Ordering;
         if !vnni512_available() {
@@ -7236,7 +7238,7 @@ mod tests {
     /// is what prefill does; the L2-hot figure in `q4k_tiled_batch128_throughput` flatters the
     /// load, since from the second pass the weights are in cache.
     #[test]
-    #[ignore]
+    #[ignore = "measurement; run with --ignored --nocapture"]
     fn bench_no_weight_probe_streaming() {
         use std::sync::atomic::Ordering;
         if !vnni512_available() {

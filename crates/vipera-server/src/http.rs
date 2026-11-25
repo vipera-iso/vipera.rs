@@ -218,7 +218,14 @@ pub(crate) fn read_request(stream: &mut dyn Transport) -> std::io::Result<Incomi
     let mut headers = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_owned(), value.trim().to_owned()));
+            // RFC 9112 requires the field name to be a token, so there is no space before the
+            // colon. Accepting "Content-Length : 5" lets a front proxy that drops the space
+            // disagree with this server about where the request ends.
+            if name.is_empty() || name != name.trim() {
+                respond_error(stream, 400, "invalid_request", "malformed header line")?;
+                return Ok(Incoming::Rejected { status: 400 });
+            }
+            headers.push((name.to_owned(), value.trim().to_owned()));
         }
     }
 
@@ -471,6 +478,8 @@ mod tests {
             (b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
             (two_encodings, 400), // conflicting framing
             (two_keys, 400),      // conflicting identity
+            (b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n", 400), // space before the colon
+            (b"GET / HTTP/1.1\r\n X-Bad: y\r\n\r\n", 400), // space after the line break
             (&oversized, 400),    // header block never ends
         ];
         for (bytes, expected) in cases {
