@@ -188,4 +188,101 @@ mod tests {
         assert_eq!(Value::I32(-1).as_u64(), None);
         assert_eq!(Value::F32(1.0).as_u64(), None);
     }
+
+    #[test]
+    fn reads_an_empty_array() {
+        // Type 9 with count=0 yields an empty Vec<Value>
+        let mut bytes = 4u32.to_le_bytes().to_vec(); // element type u32
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // count = 0
+        let mut r = Reader::new(&bytes);
+        let v = read_value(&mut r, 9, 0).unwrap();
+        assert_eq!(v, Value::Array(vec![]));
+        assert_eq!(v.array_len(), Some(0));
+    }
+
+    #[test]
+    fn reads_an_array_with_one_element() {
+        // Type 9 with count=1 and one element
+        let mut bytes = 4u32.to_le_bytes().to_vec(); // element type u32
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // count = 1
+        bytes.extend_from_slice(&42u32.to_le_bytes()); // value 42
+        let mut r = Reader::new(&bytes);
+        let v = read_value(&mut r, 9, 0).unwrap();
+        assert_eq!(v, Value::Array(vec![Value::U32(42)]));
+        assert_eq!(v.array_len(), Some(1));
+    }
+
+    #[test]
+    fn rejects_oversized_array() {
+        // Type 9 with count > MAX_ALLOCATION should be rejected
+        let mut bytes = 4u32.to_le_bytes().to_vec(); // element type u32
+        bytes.extend_from_slice(&(1u64 << (20 + 1)).to_le_bytes()); // count = MAX_ALLOCATION + 1
+        let mut r = Reader::new(&bytes);
+        let err = read_value(&mut r, 9, 0).unwrap_err();
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn rejects_truncated_array() {
+        // Type 9 with count=2 but only one element's bytes provided
+        let mut bytes = 4u32.to_le_bytes().to_vec(); // element type u32
+        bytes.extend_from_slice(&2u64.to_le_bytes()); // count = 2
+        bytes.extend_from_slice(&7u32.to_le_bytes()); // first element only
+        let mut r = Reader::new(&bytes);
+        let err = read_value(&mut r, 9, 0).unwrap_err();
+        assert!(err.to_string().contains("unexpected end of file"));
+    }
+
+    #[test]
+    fn reads_empty_string_value() {
+        // Type 8 with length=0 yields an empty string.
+        // GGUF string format: u64 byte length followed by that many UTF-8 bytes.
+        let bytes = 0u64.to_le_bytes().to_vec(); // length = 0
+        // No string payload follows since length is 0.
+        let mut r = Reader::new(&bytes);
+        let v = read_value(&mut r, 8, 0).unwrap();
+        assert_eq!(v, Value::Str("".to_owned()));
+        assert_eq!(v.as_str(), Some(""));
+    }
+
+    #[test]
+    fn test_as_u64_bool_returns_none() {
+        assert_eq!(Value::Bool(true).as_u64(), None);
+        assert_eq!(Value::Bool(false).as_u64(), None);
+    }
+
+    #[test]
+    fn test_as_u64_str_returns_none() {
+        assert_eq!(Value::Str("hello".to_owned()).as_u64(), None);
+    }
+
+    #[test]
+    fn test_as_u64_f32_returns_none() {
+        assert_eq!(Value::F32(1.0).as_u64(), None);
+    }
+
+    #[test]
+    fn test_as_u64_negative_i8_returns_none() {
+        assert_eq!(Value::I8(-5).as_u64(), None);
+    }
+
+    #[test]
+    fn test_as_u64_positive_i8_returns_some() {
+        assert_eq!(Value::I8(5).as_u64(), Some(5));
+    }
+
+    #[test]
+    fn test_as_f32_i32_converts() {
+        assert_eq!(Value::I32(42).as_f32(), Some(42.0));
+    }
+
+    #[test]
+    fn test_as_f32_u32_converts() {
+        assert_eq!(Value::U32(42).as_f32(), Some(42.0));
+    }
+
+    #[test]
+    fn test_as_f32_bool_returns_none() {
+        assert_eq!(Value::Bool(true).as_f32(), None);
+    }
 }
