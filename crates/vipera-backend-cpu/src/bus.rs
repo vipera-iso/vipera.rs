@@ -177,10 +177,16 @@ impl WeightSource {
     /// The tier a layer is in under the window the pass last installed.
     pub fn tier_of(&self, layer: usize) -> Tier {
         let start = self.placed.load(Ordering::Relaxed);
-        if self.vram.is_some() && layer >= start && layer < start + self.window {
+        if self.window == 0 {
+            if self.vram.is_some() && start != usize::MAX {
+                return Tier::Vram;
+            }
+            return Tier::Ram;
+        }
+        if self.vram.is_some() && layer >= start && layer < start.saturating_add(self.window) {
             return Tier::Vram;
         }
-        if self.window == 0 || start == usize::MAX || layer < start + self.window {
+        if start == usize::MAX || layer < start.saturating_add(self.window) {
             Tier::Ram
         } else {
             Tier::Ssd
@@ -193,9 +199,22 @@ impl WeightSource {
     /// mmap-and-page-cache path it was before; with it, every layer that enters the window is also
     /// handed to the sink, and the ones that leave are released.
     pub fn install_vram(&mut self, sink: Arc<dyn VramSink>) {
+        let previous = self.placed.swap(usize::MAX, Ordering::Relaxed);
+        if let Some(old) = &self.vram
+            && previous != usize::MAX
+        {
+            let len = self.spans.len();
+            let (start, end) = if self.window == 0 {
+                (0, len)
+            } else {
+                let s = previous.min(len);
+                (s, previous.saturating_add(self.window).min(len))
+            };
+            for index in start..end {
+                old.release(index);
+            }
+        }
         self.vram = Some(sink);
-        // Nothing has been placed yet, so the first `advance` decides the window from scratch.
-        self.placed.store(usize::MAX, Ordering::Relaxed);
     }
 
     /// Bytes the device holds, or zero when there is no device.
@@ -218,29 +237,41 @@ impl WeightSource {
         let Backing::Mapped(map) = &self.backing else {
             return;
         };
-        if self.window == 0 {
+        let len = self.spans.len();
+        let window = self.window;
+        if window == 0 {
+            let previous = self.placed.swap(0, Ordering::Relaxed);
+            if previous != usize::MAX {
+                return;
+            }
+            for span in &self.spans[..len] {
+                let _ = map.advise_range(memmap2::Advice::WillNeed, span.start, span.len);
+            }
+            if let Some(sink) = &self.vram {
+                for index in 0..len {
+                    if let Some(bytes) = self.layer_bytes(index) {
+                        sink.bring(index, bytes);
+                    }
+                }
+            }
             return;
         }
         let previous = self.placed.swap(layer, Ordering::Relaxed);
         if previous == layer {
             return;
         }
-        let end = (layer + self.window).min(self.spans.len());
-        for span in &self.spans[layer.min(end)..end] {
+        let end = layer.saturating_add(window).min(len);
+        let new_start = layer.min(len);
+        for span in &self.spans[new_start..end] {
             let _ = map.advise_range(memmap2::Advice::WillNeed, span.start, span.len);
         }
         if let Some(sink) = &self.vram {
-            // Two windows: the one that was resident and the one that replaces it. A layer is
-            // brought when it is in the new one and was not in the old, released the other way
-            // round. Both loops are over the window, not the model.
-            let len = self.spans.len();
-            let new_start = layer.min(len);
-            let new_end = (layer + self.window).min(len);
+            let new_end = end;
             let old_start = previous.min(len);
             let old_end = if previous == usize::MAX {
                 new_start
             } else {
-                (previous + self.window).min(len)
+                previous.saturating_add(window).min(len)
             };
             for index in new_start..new_end {
                 if (index < old_start || index >= old_end)
@@ -258,7 +289,9 @@ impl WeightSource {
         // Only the layers that left the window are handed back: advising a layer the pass is about
         // to touch again would just cost a fault.
         if previous != usize::MAX {
-            for span in &self.spans[previous.min(layer)..layer.min(self.spans.len())] {
+            let release_end = layer.min(len);
+            let release_start = previous.min(release_end);
+            for span in &self.spans[release_start..release_end] {
                 mapped::release(map, span.start, span.len);
             }
         }
@@ -338,6 +371,67 @@ fn layer_spans(file: &GgufFile) -> Vec<Span> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A sink that records every bring/release so tests can assert ordering and duplication.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<(bool, usize)>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<(bool, usize)> {
+            self.events.lock().expect("poisoned").clone()
+        }
+        fn brings(&self) -> Vec<usize> {
+            self.events()
+                .into_iter()
+                .filter_map(|(bring, idx)| bring.then_some(idx))
+                .collect()
+        }
+        fn releases(&self) -> Vec<usize> {
+            self.events()
+                .into_iter()
+                .filter_map(|(bring, idx)| (!bring).then_some(idx))
+                .collect()
+        }
+    }
+
+    impl VramSink for RecordingSink {
+        fn bring(&self, layer: usize, _bytes: &[u8]) {
+            self.events.lock().expect("poisoned").push((true, layer));
+        }
+        fn release(&self, layer: usize) {
+            self.events.lock().expect("poisoned").push((false, layer));
+        }
+        fn held_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    /// Build a mapped source with `layer_count` contiguous 64-byte spans.
+    fn mapped_source(layer_count: usize, window: usize) -> WeightSource {
+        let total = layer_count * 64;
+        let map = memmap2::MmapOptions::new()
+            .len(total.max(1))
+            .map_anon()
+            .expect("anon mmap")
+            .make_read_only()
+            .expect("readonly");
+        let spans = (0..layer_count)
+            .map(|i| Span {
+                start: i * 64,
+                len: 64,
+            })
+            .collect();
+        WeightSource {
+            backing: Backing::Mapped(map),
+            spans,
+            window,
+            placed: AtomicUsize::new(usize::MAX),
+            vram: None,
+        }
+    }
 
     #[test]
     fn a_full_window_is_ram_and_a_narrow_one_leaves_the_tail_on_disk() {
@@ -363,5 +457,107 @@ mod tests {
         assert_eq!(source.bytes(), &bytes[..]);
         assert!(!source.is_mapped());
         assert_eq!(source.tier_of(0), Tier::Ram);
+    }
+
+    #[test]
+    fn advancing_zero_length_window_with_vram_brings_every_layer_once() {
+        let mut source = mapped_source(4, 0);
+        let sink = Arc::new(RecordingSink::default());
+        source.install_vram(sink.clone());
+
+        source.advance(0);
+        let mut brings = sink.brings();
+        brings.sort_unstable();
+        assert_eq!(brings, vec![0, 1, 2, 3], "window=0 should bring all layers");
+        assert!(sink.releases().is_empty(), "no releases for full window");
+
+        // Advancing again must not duplicate handles.
+        source.advance(1);
+        source.advance(3);
+        let mut brings2 = sink.brings();
+        brings2.sort_unstable();
+        assert_eq!(
+            brings2,
+            vec![0, 1, 2, 3],
+            "full window must not bring layers twice"
+        );
+        assert!(
+            sink.releases().is_empty(),
+            "full window must not release layers"
+        );
+        for layer in 0..4 {
+            assert_eq!(source.tier_of(layer), Tier::Vram);
+        }
+    }
+
+    #[test]
+    fn advancing_empty_spans_does_not_panic_or_touch_sink() {
+        let mut source = mapped_source(0, 2);
+        let sink = Arc::new(RecordingSink::default());
+        source.install_vram(sink.clone());
+
+        source.advance(0);
+        source.advance(usize::MAX / 2);
+        assert!(sink.events().is_empty(), "no layers means no sink calls");
+    }
+
+    #[test]
+    fn reinstalling_vram_does_not_duplicate_handles() {
+        let mut source = mapped_source(4, 2);
+        let sink_a = Arc::new(RecordingSink::default());
+        source.install_vram(sink_a.clone());
+        source.advance(0);
+        assert_eq!(sink_a.brings().len(), 2);
+
+        let sink_b = Arc::new(RecordingSink::default());
+        source.install_vram(sink_b.clone());
+        // Old sink's held layers should be released before reset.
+        assert_eq!(
+            sink_a.releases().len(),
+            2,
+            "old sink layers must be released on reinstall"
+        );
+
+        source.advance(0);
+        let mut brings_b = sink_b.brings();
+        brings_b.sort_unstable();
+        assert_eq!(brings_b, vec![0, 1]);
+        // No duplicate brings on the new sink.
+        source.advance(0);
+        let mut brings_b2 = sink_b.brings();
+        brings_b2.sort_unstable();
+        assert_eq!(brings_b2, vec![0, 1], "reinstall must not duplicate brings");
+    }
+
+    #[test]
+    fn advancing_beyond_span_count_is_a_zero_length_batch_without_panic() {
+        let mut source = mapped_source(3, 2);
+        let sink = Arc::new(RecordingSink::default());
+        source.install_vram(sink.clone());
+        source.advance(1);
+        assert_eq!(sink.brings(), vec![1, 2]);
+
+        sink.events.lock().expect("poisoned").clear();
+        source.advance(10);
+        assert!(
+            sink.brings().is_empty(),
+            "advancing past end should bring nothing"
+        );
+        assert_eq!(
+            sink.releases(),
+            vec![1, 2],
+            "advancing past end should release old window"
+        );
+    }
+
+    #[test]
+    fn advancing_with_saturating_layer_index_does_not_panic() {
+        let mut source = mapped_source(3, 2);
+        let sink = Arc::new(RecordingSink::default());
+        source.install_vram(sink.clone());
+        source.advance(usize::MAX);
+        assert!(sink.brings().is_empty());
+        // A second extreme advance must also be calm.
+        source.advance(usize::MAX - 1);
     }
 }
