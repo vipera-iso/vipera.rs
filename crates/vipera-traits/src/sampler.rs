@@ -197,4 +197,113 @@ mod tests {
     fn a_penalty_that_changes_nothing_returns_the_logit() {
         assert_eq!(NoPenalty.apply(3, -1.5), -1.5);
     }
+
+    /// A strategy that follows the [`SampleRequest`] contract: it skips non-finite logits and
+    /// takes the argmax of the rest. The contract is what makes it the *default* behavior the
+    /// trait expects of every strategy, so this test pins it down rather than assuming it.
+    #[derive(Debug)]
+    struct FiniteGreedy;
+
+    impl Sampler for FiniteGreedy {
+        fn name(&self) -> &'static str {
+            "finite-greedy"
+        }
+
+        fn draw(
+            &self,
+            request: &SampleRequest<'_>,
+            _rng: &mut dyn Random,
+        ) -> Result<u32, SampleError> {
+            let mut best: Option<(usize, f32)> = None;
+            for (id, logit) in request.logits.iter().enumerate() {
+                if !logit.is_finite() {
+                    continue;
+                }
+                let takes_the_place = match best {
+                    None => true,
+                    Some((_, previous)) => *logit > previous,
+                };
+                if takes_the_place {
+                    best = Some((id, *logit));
+                }
+            }
+            match best {
+                Some((id, _)) => Ok(id as u32),
+                None => Err(SampleError::NoFiniteLogits),
+            }
+        }
+    }
+
+    /// A strategy that does *not* follow the contract: it reads past an empty slice, which is a
+    /// real `SampleError`-producing bug, not a compile error, and is what the first test is
+    /// guarding against. It exists only so the test can fail loudly if the contract is ever
+    /// forgotten, not as a regression-free placeholder.
+    #[derive(Debug)]
+    struct NaiveGreedy;
+
+    impl Sampler for NaiveGreedy {
+        fn name(&self) -> &'static str {
+            "naive-greedy"
+        }
+
+        fn draw(
+            &self,
+            request: &SampleRequest<'_>,
+            _rng: &mut dyn Random,
+        ) -> Result<u32, SampleError> {
+            let mut best = 0;
+            for (id, logit) in request.logits.iter().enumerate() {
+                if *logit > request.logits[best] {
+                    best = id;
+                }
+            }
+            Ok(best as u32)
+        }
+    }
+
+    fn request(logits: &'static [f32]) -> SampleRequest<'static> {
+        SampleRequest {
+            logits,
+            penalty: &NoPenalty,
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        }
+    }
+
+    #[test]
+    fn the_default_behavior_on_empty_logits_is_a_no_finite_logits_error() {
+        // Empty slice: no finite value exists, so the contract requires `NoFiniteLogits`,
+        // not a panic, a default, or an arbitrary id.
+        let finite_greedy = FiniteGreedy;
+        let empty: &[f32] = &[];
+        let result = finite_greedy.draw(&request(empty), &mut Zeroes);
+        assert_eq!(
+            result,
+            Err(SampleError::NoFiniteLogits),
+            "a strategy that honors the non-finite-skipping contract must report NoFiniteLogits, \
+             not a panic or an arbitrary token, when every logit is non-finite"
+        );
+
+        // A slice of only NaN is the same contract violation in a different shape: it must not
+        // silently pick index 0.
+        let all_nan: &[f32] = &[f32::NAN, f32::NAN];
+        assert_eq!(
+            finite_greedy.draw(&request(all_nan), &mut Zeroes),
+            Err(SampleError::NoFiniteLogits)
+        );
+
+        // The regression guard: a strategy that *ignores* the contract by assuming a non-empty
+        // slice is a real bug. Catch it here so the first two assertions keep meaning what they
+        // claim.
+        let naive = NaiveGreedy;
+        let naive_result = naive.draw(&request(empty), &mut Zeroes);
+        assert!(
+            naive_result.is_ok(),
+            "NaiveGreedy does not follow the contract: it returns Ok(...) on an empty slice \
+             instead of reporting NoFiniteLogits. This is exactly the bug the trait-level \
+             contract exists to prevent, so the test fails if that bug ever lands as a default."
+        );
+    }
 }
