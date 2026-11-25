@@ -4785,3 +4785,19 @@ trong nhiễu; không có con số khác đáng kể.
 
 **Kết quả:** **neutral** — switch giữ mặc định tắt; ghi số thực như trên vào ledger này.
 
+## Ba switch mặc định bật (ADR-005) — 2026-11-25
+
+**Quyết định:** `VIPERA_TILED_A` và `VIPERA_Q4K8` chuyển sang mặc định bật; `VIPERA_ATTN_GEMM` giữ
+opt-in. Đây là bản ghi quyết định, không phải phép đo mới: các số before/after của từng switch đã có
+trong ledger này (mục W-1a và mục repack 8x8 phía trên) và trong ADR-004/ADR-006.
+
+| Switch | Trước | Sau | Bằng chứng |
+|---|---|---|---|
+| `VIPERA_TILED_A` | mặc định tắt | mặc định bật (`=0` tắt) | W-1a: NLL +0.45..0.69%; chunk 8T +2.6% (trong nhiễu) |
+| `VIPERA_Q4K8` | mặc định tắt | mặc định bật (`=0` tắt) | lab 1.056x ở 8 thread; activation per-256 |
+| `VIPERA_ATTN_GEMM` | mặc định tắt | **vẫn tắt** | `logits_each_matches_single_passes` đỏ ở "position 1 differs" khi bật |
+
+**Chưa chạy:** phép đo paired cho cả ba switch bật cùng lúc, và NLL 6 văn bản của ADR-003 trên cấu
+hình mới. `VIPERA_ATTN_GEMM` chỉ có thể bật khi kernel tile và kernel từng entry chia sẻ một thứ tự
+cộng (hoặc owner đổi invariant của speculation/prefix cache). Chi tiết: ADR-005 §2-§3.
+

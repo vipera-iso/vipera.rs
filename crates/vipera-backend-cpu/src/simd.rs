@@ -7446,8 +7446,9 @@ const _: () = assert!(core::mem::size_of::<BlockQ4Kx8>() == Q4K8_BLOCK);
 #[cfg(all(test, target_arch = "x86_64"))]
 static Q4K8_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Whether the Pha 1b 8x8 kernel is on: `VIPERA_Q4K8`, default off (ADR-006). Any value but `0`
-/// or empty turns it on, the repository's `env_truthy` convention.
+/// Whether the Pha 1b 8x8 kernel is on: `VIPERA_Q4K8`, **on by default** since ADR-005 accepted the
+/// per-256 activation it quantizes to. `VIPERA_Q4K8=0` (or `false`, `off`, `no`) restores the row
+/// kernel.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn q4k8_enabled() -> bool {
     #[cfg(test)]
@@ -7457,15 +7458,7 @@ pub(crate) fn q4k8_enabled() -> bool {
         _ => {}
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        // Off by default (ADR-006): the 8x8 repack quantizes the activation to `block_q8_K` with
-        // one scale per 256 values, which is a numeric-policy change and not this switch's call.
-        // `env_truthy` semantics, like every other `VIPERA_*` switch: unset, empty or `0` is off.
-        std::env::var("VIPERA_Q4K8").ok().is_some_and(|value| {
-            let value = value.trim();
-            !value.is_empty() && value != "0"
-        })
-    })
+    *ENABLED.get_or_init(|| crate::tiled::env_default_on("VIPERA_Q4K8"))
 }
 
 /// `make_block_q4_Kx8`: pack the eight rows starting at `first_row` into one `BlockQ4Kx8` per

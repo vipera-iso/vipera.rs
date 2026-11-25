@@ -11,7 +11,7 @@ in the engine itself: the workspace's two dependencies sit outside it and are re
 quietly assumed — `rustls` for TLS in `vipera serve` (`EXC-002`), `cudarc` for the CUDA backend
 (`EXC-006`) — in [`CONSTRAINTS.md`](CONSTRAINTS.md).
 
-## Recent wins (all behind switches, default off)
+## Recent wins (all behind switches)
 
 | Direction | Mechanism | Switch | Numbers (see [`docs/benchmarks.md`](docs/benchmarks.md)) |
 |---|---|---|---|
@@ -20,7 +20,7 @@ quietly assumed — `rustls` for TLS in `vipera serve` (`EXC-002`), `cudarc` for
 | H3 — DisSparse port (prefill, neutral on this machine) | Top-N rows per query entry in `attend_rows_sparse` | `VIPERA_PREFILL_SPARSE` | ledger "H3: DisSparse port — 2026-11-24" |
 | H4 — TriAttention phase 1 (fused prefill skip, measurement pending) | Skip prefill tiles below threshold in `attend_rows_shared` | `VIPERA_TRIATTENTION` | ledger "H4: TriAttention phase-1 — 2026-11-24", branch `perf/attn-triattention` |
 | 8x8 decode repack (A1) | `block_q4_Kx8` decode row-kernel path, `vpdpbusd` | `VIPERA_Q4K8` | step −34.8%, decode +53% (Pha 1b) |
-| W1a tiled-band activation | Per-256 activation scales (`VIPERA_TILED_A`, default off) | `VIPERA_TILED_A` | chunk 8T +2.6% (2026-11-24) |
+| W1a tiled-band activation | Per-256 activation scales (`VIPERA_TILED_A`, default on since ADR-005) | `VIPERA_TILED_A` | chunk 8T +2.6% (2026-11-24) |
 
 ## Where it stands
 
@@ -147,10 +147,10 @@ curl -s localhost:8080/v1/chat/completions \
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
   scalar reference. `vipera profile` prints the level the engine will use (`cpu_simd`: `avx512-vnni`,
   `vnni256`, `avx2`, `neon` or `scalar`), so a mixed fleet can see which host fell back.
-- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8`, default off per ADR-006 — `=1` turns it on): the
+- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8`, default on since ADR-005 — `=0` turns it off): the
   decode row-kernel path packs 8 rows as the ggml `block_q4_Kx8` and dots with `vpdpbusd` — step
   −34.8%, decode +53%. It changes the activation granularity, which is why it is not the default.
-- **W1a tiled-band activation** (`VIPERA_TILED_A`, default off): the prefill tiled band reads one
+- **W1a tiled-band activation** (`VIPERA_TILED_A`, default on since ADR-005): the prefill tiled band reads one
   scale per 256-value block (`TiledActivation`, `fill_rows_batch`) plus 16 raw-`x` sums per block.
 - **Prefill-sparse attention** (`VIPERA_PREFILL_SPARSE`, default off) and **RefineKV**
   (`VIPERA_KV_REFINEKV`, default off) — the two experiments in the "Recent wins" table.
