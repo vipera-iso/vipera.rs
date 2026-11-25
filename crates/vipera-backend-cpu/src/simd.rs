@@ -4824,6 +4824,107 @@ mod tests {
         }
     }
 
+    /// Regression: the Q4_K tiled range must agree with the integer row kernel on an odd row
+    /// count, a non-zero first row, and a narrow activation count — the shape a decode step
+    /// or a narrow batch can hit. Mirrors `q6k_tiled_range_matches_batch_q8_on_odd_narrow_shapes`.
+    #[test]
+    fn q4k_tiled_range_matches_batch_vnni_on_odd_narrow_shapes() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        let mut rng = Rng(0x9e37_79b9_1234_5678);
+        let total_rows = 7usize;
+        let first_row = 2usize;
+        let count = 5usize;
+        let cols = 256usize;
+        let blocks = cols / 256;
+        let data: Vec<u8> = (0..total_rows)
+            .flat_map(|_| q4k_row(&mut rng, blocks))
+            .collect();
+        let stride = blocks * 144;
+        let b = 3usize;
+        let source: Vec<Vec<f32>> = (0..b)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let xs: [&QuantizedX; 3] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums: [&[f32]; 3] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut got = vec![0.0_f32; b * count];
+        assert!(try_q4k_matvec_tiled_range::<3>(
+            &data, stride, first_row, count, &xs, &sums, &mut got, None
+        ));
+        for row in 0..count {
+            let rr = first_row + row;
+            let rb = &data[rr * stride..(rr + 1) * stride];
+            let mut totals = [0.0_f32; 3];
+            // SAFETY: whole blocks, VNNI-512 checked above.
+            unsafe { q4k_dot_batch_vnni::<3>(rb, &xs, &sums, &mut totals) };
+            for entry in 0..b {
+                let want = totals[entry];
+                let gotv = got[entry * count + row];
+                assert!(
+                    (gotv - want).abs() <= 1e-3 + 1e-4 * want.abs(),
+                    "row {row} entry {entry}: got {gotv}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// Fuzz-style audit of the Q4_K tiled range over shapes.
+    #[test]
+    fn q4k_tiled_range_audit_shapes() {
+        if !vnni_available() || !vnni512_available() {
+            return;
+        }
+        for seed in [0x9e37_79b9_1234_5678u64, 0x1234_5678_9abc_def0] {
+            for cols in [256usize, 512] {
+                for total_rows in 1usize..=12 {
+                    for first_row in 0..total_rows {
+                        for count in 1..=(total_rows - first_row) {
+                            let mut rng = Rng(seed);
+                            let blocks = cols / 256;
+                            let data: Vec<u8> = (0..total_rows)
+                                .flat_map(|_| q4k_row(&mut rng, blocks))
+                                .collect();
+                            let stride = blocks * 144;
+                            let b = 3usize;
+                            let source: Vec<Vec<f32>> = (0..b)
+                                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                                .collect();
+                            let xs_vec: Vec<QuantizedX> =
+                                source.iter().map(|x| QuantizedX::new(x)).collect();
+                            let sums_vec: Vec<Vec<f32>> =
+                                source.iter().map(|x| crate::quant::x_sums(x)).collect();
+                            let xs: [&QuantizedX; 3] = std::array::from_fn(|e| &xs_vec[e]);
+                            let sums: [&[f32]; 3] = std::array::from_fn(|e| sums_vec[e].as_slice());
+                            let mut got = vec![0.0_f32; b * count];
+                            let ok = try_q4k_matvec_tiled_range::<3>(
+                                &data, stride, first_row, count, &xs, &sums, &mut got, None,
+                            );
+                            assert!(ok, "try returned false");
+                            for row in 0..count {
+                                let rr = first_row + row;
+                                let rb = &data[rr * stride..(rr + 1) * stride];
+                                let mut totals = [0.0_f32; 3];
+                                unsafe { q4k_dot_batch_vnni::<3>(rb, &xs, &sums, &mut totals) };
+                                for entry in 0..b {
+                                    let want = totals[entry];
+                                    let gotv = got[entry * count + row];
+                                    if (gotv - want).abs() > 1e-3 + 1e-4 * want.abs() {
+                                        panic!(
+                                            "seed {seed:x} cols {cols} total_rows {total_rows} first_row {first_row} count {count}: row {row} entry {entry}: got {gotv}, want {want}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// W1a parity: the per-256-scale activation (`VIPERA_TILED_A`) vs the batch row kernel on
     /// the per-32 activation. The two disagree by the W1a activation-quant noise (measured: max
     /// diff 2.63 on this shape — the W1a codes the band reads are the same integers, only their
