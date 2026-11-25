@@ -615,7 +615,7 @@ impl Served {
                 eos.push(id);
             }
         }
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             kv,
             backend,
             EngineConfig {
@@ -633,6 +633,10 @@ impl Served {
                 speculative: true,
             },
         );
+        // A chat client resends the whole conversation each turn, so most of a request's prompt is
+        // the previous request's. The server keeps finished prompts' KV and copies the shared
+        // prefix instead of recomputing it. `VIPERA_PREFIX_CACHE=0` turns it off.
+        engine.set_prefix_cache(vipera_runtime::engine::prefix_cache_enabled(true));
 
         let engine = Arc::new(Mutex::new(engine));
         let router = Arc::new(Router::new());

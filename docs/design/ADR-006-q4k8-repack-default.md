@@ -1,6 +1,6 @@
 # ADR-006: `VIPERA_Q4K8` (Q4_K 8x8 repack) — mặc định **tắt**
 
-Status: **Accepted — default off.** Kernel đã port và nối vào engine, nhưng đường đó chỉ chạy khi
+Status: **Accepted — default off.** *(Bị thay thế một phần bởi ADR-005 ngày 2026-11-25: `VIPERA_Q4K8` giờ mặc định bật; `=0` tắt.)* Kernel đã port và nối vào engine, nhưng đường đó chỉ chạy khi
 `VIPERA_Q4K8=1`. Bật default cần hai thứ chưa có: một phép đo paired và một quyết định số học.
 Ngày: 2026-11-24 · Owner: *cần điền* · Supersedes: none · Liên quan: ADR-003, ADR-004,
 `docs/design/repack-port-plan.md`, `docs/benchmarks.md` mục "Pha 1b".

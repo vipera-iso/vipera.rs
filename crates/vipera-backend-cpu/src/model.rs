@@ -87,6 +87,8 @@ pub struct ModelConfig {
     /// Context extension of the rotary table (`rope.scaling.*`); [`RopeScaling::NONE`] unless the
     /// file declares one.
     pub rope_scaling: RopeScaling,
+    /// How a head's values pair up: by the architecture, not the file.
+    pub rope_layout: RopeLayout,
 }
 
 /// Which context-extension rule reshapes the rotary frequencies.
@@ -99,6 +101,17 @@ pub enum RopeScalingKind {
     /// YaRN: high-frequency pairs keep their angle, low-frequency pairs are interpolated, the
     /// ones between blend on a ramp, and cos/sin carry a magnitude correction.
     Yarn,
+}
+
+/// How the values of one head pair up for rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeLayout {
+    /// Pairs `(i, i + head_dim / 2)`: Qwen2 and Qwen3 (`LLAMA_ROPE_TYPE_NEOX` in llama.cpp).
+    NeoX,
+    /// Adjacent pairs `(2i, 2i + 1)`: `LLAMA_ROPE_TYPE_NORM`, which the `llama` architecture uses.
+    /// llama.cpp's converter permutes that architecture's Q and K weights into this layout, so
+    /// rotating such a file as NeoX pairs the wrong values.
+    Norm,
 }
 
 /// The `rope.scaling.*` metadata of a model, with llama.cpp's defaults for what a file leaves out.
@@ -153,9 +166,15 @@ impl RopeScaling {
         head_dim: usize,
         base: f32,
         corr: [f32; 2],
+        freq_factor: f32,
     ) -> (f32, f32) {
         let exponent = 2.0 * index as f32 / head_dim as f32;
-        let extrapolated = position as f32 * (1.0 / base.powf(exponent));
+        let mut extrapolated = position as f32 * (1.0 / base.powf(exponent));
+        // `rope_freqs.weight`: ggml divides the angle by the pair's factor before the scaling rule
+        // sees it (`rope_yarn(theta / ff, ...)`).
+        if freq_factor != 1.0 {
+            extrapolated /= freq_factor;
+        }
         let freq_scale = 1.0 / self.factor;
         let interpolated = freq_scale * extrapolated;
         let mut magnitude = self.attn_factor;
@@ -470,6 +489,9 @@ pub struct CpuBackend {
     tok_embd: Tensor,
     output: Tensor,
     output_norm: Vec<f32>,
+    /// `rope_freqs.weight`: the converter's per-pair divisors of the rotary angle (Llama 3's
+    /// scaling ships this way), one per pair of a head, or empty when the file has none.
+    rope_factors: std::sync::Arc<[f32]>,
     layers: Vec<Layer>,
     /// Residual-stream scratch; private to the model, `pub(crate)` so [`super::engine`] can
     /// prefault it.
@@ -523,6 +545,27 @@ impl CpuBackend {
         let tok_embd = matrix(file, "token_embd.weight", config.hidden, config.vocab)?;
         let output = matrix(file, "output.weight", config.hidden, config.vocab).unwrap_or(tok_embd);
         let output_norm = vector(file, bytes, "output_norm.weight", config.hidden)?;
+        let rope_factors: std::sync::Arc<[f32]> =
+            optional_vector(file, bytes, "rope_freqs.weight", config.head_dim / 2)?.into();
+        if !rope_factors.is_empty() {
+            // The angle table of a head wider than 64 pairs is computed on the fly, without room
+            // for per-pair factors; refusing beats rotating every long position wrongly.
+            if config.head_dim / 2 > 64 {
+                return Err(ViperaError::unsupported(format!(
+                    "rope_freqs.weight on a head of {} values: the CPU backend holds per-pair \
+                     frequency factors for heads up to 128",
+                    config.head_dim
+                )));
+            }
+            if let Some(bad) = rope_factors
+                .iter()
+                .find(|factor| !factor.is_finite() || **factor <= 0.0)
+            {
+                return Err(ViperaError::unsupported(format!(
+                    "rope_freqs.weight holds {bad}, which cannot divide a rotary angle"
+                )));
+            }
+        }
 
         let mut layers = Vec::with_capacity(config.layers);
         for index in 0..config.layers {
@@ -587,6 +630,7 @@ impl CpuBackend {
             tok_embd,
             output,
             output_norm,
+            rope_factors,
             layers,
             x: vec![0.0; config.hidden],
             h: vec![0.0; config.hidden],
@@ -625,6 +669,13 @@ impl CpuBackend {
         }
         let pass = crate::profile::begin(false);
         let config = self.config;
+        let rope_factors = std::sync::Arc::clone(&self.rope_factors);
+        let rope_rule = RopeRule {
+            base: config.rope_base,
+            scaling: &config.rope_scaling,
+            layout: config.rope_layout,
+            factors: &rope_factors,
+        };
         // A prompt chunk is a group of positions that share every weight read, which is exactly what
         // the batch path already does: one entry per position, each with a single new token, ordered
         // by position so the KV it writes is in place before the position that reads it. Handing the
@@ -750,22 +801,8 @@ impl CpuBackend {
                     crate::profile::note(crate::profile::Phase::Proj, at);
 
                     let at = crate::profile::stamp();
-                    rope(
-                        q,
-                        position,
-                        shape.heads,
-                        shape.head_dim,
-                        config.rope_base,
-                        &config.rope_scaling,
-                    );
-                    rope(
-                        k,
-                        position,
-                        shape.kv_heads,
-                        shape.head_dim,
-                        config.rope_base,
-                        &config.rope_scaling,
-                    );
+                    rope_ruled(q, position, shape.heads, shape.head_dim, &rope_rule);
+                    rope_ruled(k, position, shape.kv_heads, shape.head_dim, &rope_rule);
                     crate::profile::note(crate::profile::Phase::Rope, at);
                     let at = crate::profile::stamp();
                     kv.write(position, index, shape, k, v)?;
@@ -1007,6 +1044,13 @@ impl CpuBackend {
         }
         let pass = crate::profile::begin(self.chunk_pass);
         let config = self.config;
+        let rope_factors = std::sync::Arc::clone(&self.rope_factors);
+        let rope_rule = RopeRule {
+            base: config.rope_base,
+            scaling: &config.rope_scaling,
+            layout: config.rope_layout,
+            factors: &rope_factors,
+        };
         let mut positions = [0_usize; B];
         let mut tokens = [0_u32; B];
         for (entry, context) in contexts.iter().enumerate() {
@@ -1082,14 +1126,7 @@ impl CpuBackend {
             // the position alone, so the tables are built once here and shared by all 28 layers.
             let rope_angles: Vec<RopeAngles> = positions
                 .iter()
-                .map(|position| {
-                    RopeAngles::scaled(
-                        *position,
-                        shape.head_dim,
-                        config.rope_base,
-                        &config.rope_scaling,
-                    )
-                })
+                .map(|position| RopeAngles::ruled(*position, shape.head_dim, &rope_rule))
                 .collect();
 
             for (index, layer) in layers.iter().enumerate() {
@@ -1516,6 +1553,11 @@ impl ModelConfig {
             vocab,
             rms_eps: f32_of("attention.layer_norm_rms_epsilon", 1e-6),
             rope_base: f32_of("rope.freq_base", 10_000.0),
+            rope_layout: if architecture == "llama" {
+                RopeLayout::Norm
+            } else {
+                RopeLayout::NeoX
+            },
             rope_scaling: {
                 let kind = file
                     .metadata
@@ -3867,6 +3909,14 @@ const KV_TILE: usize = 64;
 /// model that is enough to flip a greedy token (the 40-token probe reads `1000 times` on the
 /// per-entry path and `100 times,` on this one). Same policy as the position-chunked kernel and
 /// `VIPERA_ATTN_GQA_SHARE`: the bit-exact path stays the default until the owner says otherwise.
+///
+/// ADR-005 tried to flip this default and the gate stopped it: the shared kernel is entered only at
+/// `entries.div_ceil(QBLOCK) > 1`, so a position's logits depend on how many tokens share its chunk,
+/// and `logits_each_matches_single_passes` fails at position 1 (measured 2026-11-25, `=0` passes,
+/// default fails; re-measured on the 11:40 revision of the patch, which re-flipped the default and
+/// left the test untouched: still fails). Speculative decode verifies a draft in one batch and the
+/// prefix cache assumes a position is bit-stable across chunkings; both need that invariant. It stays
+/// opt-in until the tile kernel and the per-entry kernel share one reduction order.
 fn attention_qblock_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -3936,7 +3986,11 @@ fn attend_rows_shared(
     let kv_heads = shape.kv_heads;
     let query = heads * head_dim;
     let width = kv_heads * head_dim;
-    let layer_bytes = kv[0].layout.bytes_per_row(width);
+    let layout = kv[0].layout;
+    let layer_bytes = layout.bytes_per_row(width);
+    // One KV head's slice of a row: `head_dim` halves, or `head_dim / 32` q8_0 blocks (the dispatch
+    // only sends q8_0 here when a head is a whole number of blocks).
+    let head_bytes = layout.bytes_per_row(head_dim);
     let order = AttentionSwitches::from_env().order;
     let scale = 1.0 / (head_dim as f32).sqrt();
     // One worker per tile of queries: the tile is what shares a decode of the history, so a split
@@ -3957,6 +4011,13 @@ fn attend_rows_shared(
         let mut values_f32 = vec![0.0_f32; KV_TILE * head_dim];
         let mut scores = vec![0.0_f32; Q_TILE * KV_TILE];
         let mut key_bases = [0_usize; KV_TILE];
+        // q8_0 rows decode into this before the K tile's transposing store; f16 never touches it.
+        let head_row_len = if layout == KvLayout::Q8_0 {
+            head_dim
+        } else {
+            0
+        };
+        let mut head_row = vec![0.0_f32; head_row_len];
         let storage = kv[0].storage;
 
         // One walk of the history per tile of queries and keys: the K and V rows are decoded once
@@ -4006,18 +4067,38 @@ fn attend_rows_shared(
                         break;
                     }
                     for row in 0..fold {
-                        let base = key_bases[row] + kv_head * head_dim * 2;
-                        crate::simd::f16_row_to_f32_strided(
-                            &storage[base..][..head_dim * 2],
-                            &mut keys_f32[row..],
-                            fold,
-                        );
+                        let base = key_bases[row] + kv_head * head_bytes;
                         let value = kv[0].value_row(order, key_bases[row], layer_bytes)
-                            + kv_head * head_dim * 2;
-                        crate::simd::f16_row_to_f32(
-                            &storage[value..][..head_dim * 2],
-                            &mut values_f32[row * head_dim..][..head_dim],
-                        );
+                            + kv_head * head_bytes;
+                        match layout {
+                            KvLayout::F16 => {
+                                crate::simd::f16_row_to_f32_strided(
+                                    &storage[base..][..head_bytes],
+                                    &mut keys_f32[row..],
+                                    fold,
+                                );
+                                crate::simd::f16_row_to_f32(
+                                    &storage[value..][..head_bytes],
+                                    &mut values_f32[row * head_dim..][..head_dim],
+                                );
+                            }
+                            KvLayout::Q8_0 => {
+                                // The same `[head_dim][keys]` K operand the f16 arm writes, one
+                                // decoded row at a time: the dequantized value is what the score
+                                // GEMM reads, so the GEMM and everything after it are shared.
+                                crate::compress::decode_q8_0(
+                                    &storage[base..][..head_bytes],
+                                    &mut head_row,
+                                );
+                                for (dim, value) in head_row.iter().enumerate() {
+                                    keys_f32[row + dim * fold] = *value;
+                                }
+                                crate::compress::decode_q8_0(
+                                    &storage[value..][..head_bytes],
+                                    &mut values_f32[row * head_dim..][..head_dim],
+                                );
+                            }
+                        }
                     }
                     for head in head_first..head_last {
                         // The GEMM accumulates into its output, and the previous head's weights are
@@ -4267,7 +4348,8 @@ fn attend_entries(
     // view between them. One walk of the history over a block of queries reads every K/V row
     // `QBLOCK` times fewer; the rows are then the traffic of the pass rather than its arithmetic.
     if entries > 1
-        && kv[0].layout == KvLayout::F16
+        && (kv[0].layout == KvLayout::F16
+            || (kv[0].layout == KvLayout::Q8_0 && shape.head_dim.is_multiple_of(32)))
         && one_kv_for_all(kv)
         && !quant::exact_dot_requested()
         && attention_window().is_none()
@@ -4733,6 +4815,19 @@ struct RopeAngles {
     scaling: RopeScaling,
     /// YaRN's ramp bounds, computed once per table rather than once per pair.
     correction: [f32; 2],
+    /// Which values of a head rotate together.
+    layout: RopeLayout,
+}
+
+/// Everything about a model's rotary table except the position: the base, the scaling rule, how
+/// a head pairs up, and the converter's per-pair frequency factors (`rope_freqs.weight`, empty
+/// when the file has none).
+#[derive(Clone, Copy)]
+struct RopeRule<'a> {
+    base: f32,
+    scaling: &'a RopeScaling,
+    layout: RopeLayout,
+    factors: &'a [f32],
 }
 
 impl RopeAngles {
@@ -4741,7 +4836,22 @@ impl RopeAngles {
         Self::scaled(position, head_dim, base, &RopeScaling::NONE)
     }
 
+    #[cfg(test)]
     fn scaled(position: usize, head_dim: usize, base: f32, scaling: &RopeScaling) -> Self {
+        Self::ruled(
+            position,
+            head_dim,
+            &RopeRule {
+                base,
+                scaling,
+                layout: RopeLayout::NeoX,
+                factors: &[],
+            },
+        )
+    }
+
+    fn ruled(position: usize, head_dim: usize, rule: &RopeRule<'_>) -> Self {
+        let (base, scaling) = (rule.base, rule.scaling);
         let half = head_dim / 2;
         let correction = if scaling.kind == RopeScalingKind::Yarn {
             scaling.correction_range(head_dim, base)
@@ -4756,10 +4866,12 @@ impl RopeAngles {
             tabled: half <= 64,
             scaling: *scaling,
             correction,
+            layout: rule.layout,
         };
         if angles.tabled {
             for index in 0..half {
-                angles.pairs[index] = angles.compute(index);
+                let factor = rule.factors.get(index).copied().unwrap_or(1.0);
+                angles.pairs[index] = angles.compute(index, factor);
             }
         }
         angles
@@ -4767,11 +4879,15 @@ impl RopeAngles {
 
     /// `(sin, cos)` of pair `index`: the original expression when there is no scaling, so a model
     /// without `rope.scaling.*` rotates bit for bit as it did.
-    fn compute(&self, index: usize) -> (f32, f32) {
+    fn compute(&self, index: usize, freq_factor: f32) -> (f32, f32) {
         if self.scaling.kind == RopeScalingKind::None && self.scaling.attn_factor == 1.0 {
             let exponent = 2.0 * index as f32 / self.head_dim as f32;
             let inv = 1.0 / self.base.powf(exponent);
-            return (self.position as f32 * inv).sin_cos();
+            let mut theta = self.position as f32 * inv;
+            if freq_factor != 1.0 {
+                theta /= freq_factor;
+            }
+            return theta.sin_cos();
         }
         self.scaling.rotation(
             self.position,
@@ -4779,6 +4895,7 @@ impl RopeAngles {
             self.head_dim,
             self.base,
             self.correction,
+            freq_factor,
         )
     }
 
@@ -4787,7 +4904,9 @@ impl RopeAngles {
         if self.tabled {
             return self.pairs[index];
         }
-        self.compute(index)
+        // A table wider than 64 pairs has no room for frequency factors: the loader refuses a
+        // file that carries them for such a head, so none apply here.
+        self.compute(index, 1.0)
     }
 }
 
@@ -4795,6 +4914,31 @@ impl RopeAngles {
 /// `(i, i + head_dim / 2)`.
 fn rope_with(vector: &mut [f32], angles: &RopeAngles, heads: usize, head_dim: usize) {
     let half = head_dim / 2;
+    if angles.layout == RopeLayout::Norm {
+        // Adjacent pairs `(2i, 2i + 1)`: the same arithmetic as below on a different pairing.
+        for head in vector.chunks_exact_mut(head_dim).take(heads) {
+            if angles.tabled {
+                for (pair, (sin, cos)) in head
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(&angles.pairs[..half])
+                {
+                    let (low, high) = (pair[0], pair[1]);
+                    pair[0] = low * cos - high * sin;
+                    pair[1] = low * sin + high * cos;
+                }
+            } else {
+                for index in 0..half {
+                    let (sin, cos) = angles.at(index);
+                    let (low, high) = (head[2 * index], head[2 * index + 1]);
+                    head[2 * index] = low * cos - high * sin;
+                    head[2 * index + 1] = low * sin + high * cos;
+                }
+            }
+        }
+        return;
+    }
     if angles.tabled {
         // The two halves are rotated together but live apart, so each is reached through its own
         // slice: a pair at a time through one slice would carry a bounds check and a shifted index
@@ -4822,6 +4966,7 @@ fn rope_with(vector: &mut [f32], angles: &RopeAngles, heads: usize, head_dim: us
 }
 
 /// Rotary embedding, NeoX layout: rotate pairs `(i, i + head_dim / 2)`.
+#[cfg(test)]
 fn rope(
     vector: &mut [f32],
     position: usize,
@@ -4833,6 +4978,22 @@ fn rope(
     rope_with(
         vector,
         &RopeAngles::scaled(position, head_dim, base, scaling),
+        heads,
+        head_dim,
+    )
+}
+
+/// [`rope`] under a model's whole rule: pairing, scaling and frequency factors.
+fn rope_ruled(
+    vector: &mut [f32],
+    position: usize,
+    heads: usize,
+    head_dim: usize,
+    rule: &RopeRule<'_>,
+) {
+    rope_with(
+        vector,
+        &RopeAngles::ruled(position, head_dim, rule),
         heads,
         head_dim,
     )
@@ -5390,6 +5551,11 @@ mod tests {
     /// A GGUF v3 file carrying the five keys `ModelConfig::from_gguf` reads, one F32
     /// `token_embd.weight` so the vocabulary can be read, and the `rope.scaling.type` asked for.
     fn synthetic_qwen2(rope_type: &str) -> Vec<u8> {
+        synthetic_gguf("qwen2", rope_type)
+    }
+
+    /// [`synthetic_qwen2`] for any architecture name: the keys are prefixed with it.
+    fn synthetic_gguf(architecture: &str, rope_type: &str) -> Vec<u8> {
         fn push_string(out: &mut Vec<u8>, text: &str) {
             out.extend_from_slice(&(text.len() as u64).to_le_bytes());
             out.extend_from_slice(text.as_bytes());
@@ -5403,16 +5569,16 @@ mod tests {
         let mut metadata = Vec::new();
         push_string(&mut metadata, "general.architecture");
         metadata.extend_from_slice(&8u32.to_le_bytes());
-        push_string(&mut metadata, "qwen2");
-        for (key, value) in [
-            ("qwen2.block_count", 1),
-            ("qwen2.embedding_length", 8),
-            ("qwen2.attention.head_count", 2),
-            ("qwen2.feed_forward_length", 16),
+        push_string(&mut metadata, architecture);
+        for (suffix, value) in [
+            ("block_count", 1),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("feed_forward_length", 16),
         ] {
-            push_u32_key(&mut metadata, key, value);
+            push_u32_key(&mut metadata, &format!("{architecture}.{suffix}"), value);
         }
-        push_string(&mut metadata, "qwen2.rope.scaling.type");
+        push_string(&mut metadata, &format!("{architecture}.rope.scaling.type"));
         metadata.extend_from_slice(&8u32.to_le_bytes());
         push_string(&mut metadata, rope_type);
 
@@ -5455,6 +5621,139 @@ mod tests {
             .to_string();
         for needle in ["rope.scaling.type", "longrope", "linear", "yarn"] {
             assert!(message.contains(needle), "{needle} missing from {message}");
+        }
+    }
+
+    /// `rope_freqs.weight` divides each pair's angle, held to an f64 transcription of
+    /// `sin(position * base^(-2i/d) / factor)` and not to the f32 expression itself.
+    #[test]
+    fn rope_frequency_factors_divide_the_angle_of_their_pair() {
+        let head_dim = 128_usize;
+        // Llama 3's shape: 1 for the fast pairs, a ramp, then the full factor for the slow ones.
+        let factors: Vec<f32> = (0..head_dim / 2)
+            .map(|index| match index {
+                0..=19 => 1.0,
+                20..=43 => 1.0 + (index - 19) as f32 * 7.0 / 24.0,
+                _ => 8.0,
+            })
+            .collect();
+        let rule = RopeRule {
+            base: 500_000.0,
+            scaling: &RopeScaling::NONE,
+            layout: RopeLayout::NeoX,
+            factors: &factors,
+        };
+        for position in [0_usize, 1, 17, 255] {
+            let table = RopeAngles::ruled(position, head_dim, &rule);
+            for (index, factor) in factors.iter().enumerate() {
+                let angle = position as f64 * 500_000.0_f64.powf(-2.0 * index as f64 / 128.0)
+                    / f64::from(*factor);
+                let (sin, cos) = table.at(index);
+                assert!(
+                    (f64::from(sin) - angle.sin()).abs() < 5e-5,
+                    "sin {position}/{index}"
+                );
+                assert!(
+                    (f64::from(cos) - angle.cos()).abs() < 5e-5,
+                    "cos {position}/{index}"
+                );
+            }
+        }
+    }
+
+    /// A file whose factors are all one rotates bit for bit as one without the tensor, so adding
+    /// the tensor to a model that does not need it cannot move a result.
+    #[test]
+    fn unit_frequency_factors_are_bit_identical_to_none() {
+        let factors = vec![1.0_f32; 64];
+        for scaling in [
+            RopeScaling::NONE,
+            RopeScaling {
+                kind: RopeScalingKind::Yarn,
+                factor: 4.0,
+                original_context: 4096,
+                attn_factor: 1.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+            },
+        ] {
+            let with = RopeRule {
+                base: 10_000.0,
+                scaling: &scaling,
+                layout: RopeLayout::NeoX,
+                factors: &factors,
+            };
+            for position in [0_usize, 3, 1000, 70_000] {
+                let plain = RopeAngles::scaled(position, 128, 10_000.0, &scaling);
+                let given = RopeAngles::ruled(position, 128, &with);
+                for index in 0..64 {
+                    let (a, b) = (plain.at(index), given.at(index));
+                    assert_eq!(a.0.to_bits(), b.0.to_bits());
+                    assert_eq!(a.1.to_bits(), b.1.to_bits());
+                }
+            }
+        }
+    }
+
+    /// The adjacent-pair layout rotates exactly what the half-split layout rotates, once the
+    /// values are put in the order llama.cpp's converter leaves them in: same arithmetic, so the
+    /// bits match.
+    #[test]
+    fn the_norm_layout_is_the_neox_layout_on_permuted_values() {
+        let (heads, head_dim) = (3_usize, 16_usize);
+        let half = head_dim / 2;
+        let original: Vec<f32> = (0..heads * head_dim)
+            .map(|at| ((at * 7 % 19) as f32 - 9.0) * 0.31)
+            .collect();
+        // Converter order: value `i` of the first half lands at `2i`, value `i` of the second at
+        // `2i + 1`.
+        let mut permuted = vec![0.0_f32; original.len()];
+        for head in 0..heads {
+            for index in 0..half {
+                permuted[head * head_dim + 2 * index] = original[head * head_dim + index];
+                permuted[head * head_dim + 2 * index + 1] =
+                    original[head * head_dim + half + index];
+            }
+        }
+        let factors: Vec<f32> = (0..half).map(|index| 1.0 + index as f32 * 0.5).collect();
+        let rule = |layout| RopeRule {
+            base: 10_000.0,
+            scaling: &RopeScaling::NONE,
+            layout,
+            factors: &factors,
+        };
+        let mut neox = original.clone();
+        rope_ruled(&mut neox, 37, heads, head_dim, &rule(RopeLayout::NeoX));
+        let mut norm = permuted.clone();
+        rope_ruled(&mut norm, 37, heads, head_dim, &rule(RopeLayout::Norm));
+        for head in 0..heads {
+            for index in 0..half {
+                let at = head * head_dim;
+                assert_eq!(norm[at + 2 * index].to_bits(), neox[at + index].to_bits());
+                assert_eq!(
+                    norm[at + 2 * index + 1].to_bits(),
+                    neox[at + half + index].to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_architecture_decides_how_a_head_pairs_up() {
+        for (architecture, want) in [
+            ("qwen2", RopeLayout::NeoX),
+            ("qwen3", RopeLayout::NeoX),
+            ("llama", RopeLayout::Norm),
+        ] {
+            let file = GgufFile::parse(&synthetic_gguf(architecture, "none"))
+                .expect("the synthetic file parses");
+            assert_eq!(
+                ModelConfig::from_gguf(&file)
+                    .expect("a supported architecture")
+                    .rope_layout,
+                want,
+                "{architecture}"
+            );
         }
     }
 
@@ -5754,6 +6053,79 @@ mod tests {
             .map(|(one, many)| (one - many).abs())
             .fold(0.0_f32, f32::max);
         assert!(worst < 1e-5, "row sharing moved an output by {worst}");
+    }
+
+    /// The row-sharing kernel on a q8_0 cache against the per-entry kernel on the same cache: the
+    /// tile decodes each row through the layout, so the only difference left is the regrouped sums.
+    /// 70 entries cross two query tiles and a 330-position history crosses five key tiles.
+    #[test]
+    fn qblock_attention_matches_the_per_entry_kernel_on_a_q8_0_cache() {
+        let shape = AttnShape {
+            heads: 6,
+            kv_heads: 2,
+            head_dim: 64,
+        };
+        let query = shape.heads * shape.head_dim;
+        let entries = 70usize;
+        let first = 260usize;
+        let tokens_per_block = 16;
+        let table: Vec<u32> = (0..(first + entries).div_ceil(tokens_per_block) as u32).collect();
+        let mut storage = Vec::new();
+        filled_kv(
+            &mut storage,
+            KvLayout::Q8_0,
+            shape,
+            tokens_per_block,
+            &table,
+            first + entries,
+        );
+        let bytes_per_token = 2 * 2 * KvLayout::Q8_0.bytes_per_row(shape.kv_heads * shape.head_dim);
+        let kv = KvView {
+            storage: &mut storage,
+            table: &table,
+            tokens_per_block,
+            bytes_per_token,
+            layout: KvLayout::Q8_0,
+        };
+        let q: Vec<f32> = (0..entries * query)
+            .map(|at| ((at * 13 % 29) as f32 - 14.0) * 0.07)
+            .collect();
+        let positions: Vec<usize> = (0..entries).map(|slot| first + slot + 1).collect();
+
+        let mut expected = vec![0.0_f32; entries * query];
+        for entry in 0..entries {
+            let read = KvRead::of(&kv);
+            let mut scratch = AttnScratch::default();
+            attend_entry(
+                AttentionCall {
+                    q: &q[entry * query..][..query],
+                    kv: &read,
+                    layer: 0,
+                    positions: positions[entry],
+                    shape,
+                    heads: 0..shape.heads,
+                    out: &mut expected[entry * query..][..query],
+                },
+                &mut scratch,
+            )
+            .expect("one entry");
+        }
+
+        let reads: Vec<KvRead<'_>> = (0..entries).map(|_| KvRead::of(&kv)).collect();
+        for workers in [1, 2] {
+            let mut shared = vec![0.0_f32; entries * query];
+            attend_rows_shared(&q, &reads, &positions, 0, shape, &mut shared, workers)
+                .expect("shared");
+            let worst = expected
+                .iter()
+                .zip(&shared)
+                .map(|(one, many)| (one - many).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                worst < 1e-5,
+                "q8_0 row sharing with {workers} workers moved an output by {worst}"
+            );
+        }
     }
 
     /// The row-sharing kernel skips the masked tail of short rows: the same answer as the
@@ -7007,6 +7379,7 @@ mod tests {
             rms_eps: 1e-6,
             rope_base: 10_000.0,
             rope_scaling: RopeScaling::NONE,
+            rope_layout: RopeLayout::NeoX,
         };
         assert_eq!(config.kv_layout(68).expect("q8_0"), KvLayout::Q8_0);
         assert_eq!(config.kv_layout(128).expect("f16"), KvLayout::F16);
