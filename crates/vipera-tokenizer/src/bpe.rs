@@ -409,4 +409,114 @@ mod tests {
         let out = encoder.merge(vec!['a', 'b', 'c']);
         assert_eq!(out, vec!["a", "b", "c"]);
     }
+
+    fn byte_bpe_tokenizer() -> crate::Tokenizer {
+        use vipera_conformance::{GgufBuilder, MetaValue};
+        use vipera_core::gguf::GgufFile;
+
+        let mut tokens: Vec<String> = Vec::new();
+        let mut types: Vec<i32> = Vec::new();
+        for b in 0u16..=255 {
+            tokens.push(format!("<0x{b:02X}>"));
+            types.push(6);
+        }
+        // Add GPT-2 byte-alphabet single-char pieces needed by the encoder.
+        let table = alphabet();
+        for b in 0u16..=255 {
+            let piece = table.to_char[b as usize].to_string();
+            if !tokens.iter().any(|t| t == &piece) {
+                tokens.push(piece);
+                types.push(1);
+            }
+        }
+        // Add a merge so the tokenizer uses the BPE path (merge_count > 0).
+        tokens.push("ab".to_owned());
+        types.push(1);
+        let merges = vec!["a b".to_owned()];
+
+        let mut builder = GgufBuilder::minimal();
+        builder.metadata.push((
+            "tokenizer.ggml.tokens".to_owned(),
+            MetaValue::StrArray(tokens),
+        ));
+        builder.metadata.push((
+            "tokenizer.ggml.token_type".to_owned(),
+            MetaValue::I32Array(types),
+        ));
+        builder.metadata.push((
+            "tokenizer.ggml.merges".to_owned(),
+            MetaValue::StrArray(merges),
+        ));
+        builder.metadata.push((
+            "tokenizer.ggml.model".to_owned(),
+            MetaValue::Str("gpt2".to_owned()),
+        ));
+        builder.metadata.push((
+            "tokenizer.ggml.pre".to_owned(),
+            MetaValue::Str("qwen2".to_owned()),
+        ));
+        let file = GgufFile::parse(&builder.build()).expect("fixture parses");
+        crate::Tokenizer::from_gguf(&file).expect("vocabulary loads")
+    }
+
+    #[test]
+    fn bpe_decode_rejects_malformed_token_ids_without_panic() {
+        let tok = byte_bpe_tokenizer();
+        for bad in [
+            u32::MAX,
+            tok.vocab().len() as u32,
+            tok.vocab().len() as u32 + 1,
+        ] {
+            let err = tok.decode(&[bad]).unwrap_err().to_string();
+            assert!(
+                err.contains("outside the vocabulary"),
+                "unexpected error for id {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bpe_decode_empty_sequence_is_empty() {
+        let tok = byte_bpe_tokenizer();
+        assert_eq!(tok.decode(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn bpe_decode_boundary_byte_merges_round_trip() {
+        let tok = byte_bpe_tokenizer();
+        // Multi-byte UTF-8 chars exercise byte boundaries across BPE token boundaries.
+        for text in [
+            "a",
+            "ab",
+            "hello world",
+            "café",
+            "中文",
+            "😀",
+            "a😀b",
+            "é😀中",
+        ] {
+            let ids = tok.encode(text).expect("encode");
+            let decoded = tok.decode(&ids).expect("decode");
+            assert_eq!(decoded, text, "round trip failed for {text:?}");
+        }
+    }
+
+    #[test]
+    fn bpe_decode_invalid_utf8_byte_sequences_return_error_not_panic() {
+        let tok = byte_bpe_tokenizer();
+        // Lone continuation byte and incomplete multi-byte sequence are invalid UTF-8.
+        let continuation = tok.vocab().byte_token(0x80).expect("<0x80>");
+        let lead = tok.vocab().byte_token(0xC3).expect("<0xC3>");
+        for ids in [
+            &[continuation][..],
+            &[lead][..],
+            &[lead, continuation, continuation][..],
+        ] {
+            let result = tok.decode(ids);
+            assert!(
+                result.is_err(),
+                "invalid UTF-8 bytes should be rejected, got {result:?} for {ids:?}"
+            );
+        }
+    }
 }
