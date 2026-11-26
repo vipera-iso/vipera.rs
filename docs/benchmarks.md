@@ -5311,3 +5311,20 @@ Parity không đổi: `q3k_tiled_range_matches_the_row_kernel` (batch 4/16/32/40
 
 `prefill_vs_decode` trên Q3_K_M: pp512 151.0 tok/s (N=4) vs **155.1** (N=8), trong nhiễu ±3% của
 máy này. Ghi "neutral", giữ N=4 (diff nhỏ hơn). Nếu sau này đo 5 lần và N=8 ổn định ≥5% thì mới đổi.
+
+## Q3_K: vector hoá unpack scale trong prologue — 2026-11-26
+
+**Giả thuyết:** `q3k_scales` (unpack 12 byte → 16 scale, 16 phép chuyển scalar mỗi block) là phần
+prologue còn lại trong row kernel; vector hoá phần chuyển đổi sẽ cắt ≥8% thời gian block.
+Ngưỡng: decode ctx32 ≥ 29.5 tok/s.
+
+Thay đổi: giữ nguyên 12 phép bit-unpack (đã tối thiểu), thay 16 lần `f32::from(byte as i8 - 32)`
+bằng 2 nhóm `_mm256_cvtepi8_epi32` → trừ 32 → `cvtepi32_ps`. Không đổi byte nào của model.
+
+| | trước | sau |
+|---|---:|---:|
+| decode ctx32 | 27.0 tok/s (37.0 ms) | **30.4 tok/s (32.9 ms)** |
+| prefill pp512 | 151.0 tok/s | 155.1 tok/s |
+
+**+12.6% decode**, prefill trong nhiễu. Giá trị số học không đổi (cùng scale, cùng thứ tự), parity
+row kernel và tiled vẫn xanh. Đây là mức gần trần: decode Q4_K_M cùng máy 31.8 tok/s.
