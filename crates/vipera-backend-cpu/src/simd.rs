@@ -2664,6 +2664,276 @@ unsafe fn q3k_band_rows<const N: usize>(
     }
 }
 
+/// Codes of one Q5_K block, one byte each (0..31), in value order, plus the eight `d · scale` and
+/// the eight `dmin · min` coefficients of its 32-value groups.
+///
+/// # Safety
+///
+/// `block` must point at one whole 176-byte block and `codes` must have room for 256 bytes.
+#[target_feature(enable = "avx2")]
+unsafe fn q5k_decode_codes(
+    block: *const u8,
+    codes: &mut [u8; 256],
+    coef: &mut [f32; 8],
+    mins: &mut [f32; 8],
+) {
+    // SAFETY: the caller points at one whole block; every vector store lands inside `codes`.
+    unsafe {
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales = std::slice::from_raw_parts(block.add(4), 12);
+        let qh = _mm256_loadu_si256(block.add(16) as *const __m256i);
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let sixteen = _mm256_set1_epi8(16);
+        let zero = _mm256_setzero_si256();
+        let out = codes.as_mut_ptr();
+        // The low nibbles of one 32-byte word feed the first 32 values and the high nibbles the
+        // next 32, so each half takes its own `qh` bit: `$bit` for the low, `$bit + 1` for the top.
+        let high_for = |bit: u32| {
+            let mask = _mm256_set1_epi8((1_u8 << bit) as i8);
+            _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, mask), zero), sixteen)
+        };
+        macro_rules! codes_for_half {
+            ($qs:expr, $bit:literal, $at:literal) => {{
+                let low = _mm256_or_si256(_mm256_and_si256($qs, low_mask), high_for($bit));
+                let top = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16($qs, 4), low_mask),
+                    high_for($bit + 1),
+                );
+                _mm256_storeu_si256(out.add($at) as *mut __m256i, low);
+                _mm256_storeu_si256(out.add($at + 32) as *mut __m256i, top);
+            }};
+        }
+        let qs = block.add(48);
+        codes_for_half!(_mm256_loadu_si256(qs as *const __m256i), 0, 0);
+        codes_for_half!(_mm256_loadu_si256(qs.add(32) as *const __m256i), 2, 64);
+        codes_for_half!(_mm256_loadu_si256(qs.add(64) as *const __m256i), 4, 128);
+        codes_for_half!(_mm256_loadu_si256(qs.add(96) as *const __m256i), 6, 192);
+        for (group, (coefficient, minimum)) in coef.iter_mut().zip(mins.iter_mut()).enumerate() {
+            let (sc, m) = crate::quant::q4k_scale_min(scales, group);
+            *coefficient = d * f32::from(sc);
+            *minimum = dmin * f32::from(m);
+        }
+    }
+}
+
+/// `N` Q5_K rows against the sixteen activations of one tile half, one pass over each block.
+///
+/// Per 32-value group the weights are eight 4-byte words (eight `dpbusd`), the same count the row
+/// kernel spends per row; the block's code and scale decode is paid once for `N · 16` outputs, and
+/// the `dmin · min · Σx` term rides the float sums the caller already has for each activation.
+///
+/// # Safety
+///
+/// `data` must point at whole 176-byte blocks for rows `first_row .. first_row + N`, `stride` must
+/// be `blocks · 176`, `view` must describe a tile half of `blocks · 4096` bytes, `view.sums` must
+/// hold 8 entries per block per activation, and the CPU must have AVX-512 VNNI with VL.
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+unsafe fn q5k_band_rows<const N: usize>(
+    data: *const u8,
+    stride: usize,
+    first_row: usize,
+    blocks: usize,
+    view: Q5kBandView,
+) {
+    // SAFETY: the caller's contract is this function's contract; every load stays inside the rows,
+    // blocks, groups and sixteen columns it describes.
+    unsafe {
+        let mut weights = [_mm512_setzero_ps(); N];
+        let mut minimums = [_mm512_setzero_ps(); N];
+        let mut codes = [[0_u8; 256]; N];
+        let mut coef = [[0.0_f32; 8]; N];
+        let mut mins = [[0.0_f32; 8]; N];
+        for b in 0..blocks {
+            for t in 0..N {
+                let block = data.add((first_row + t) * stride + b * 176);
+                // SAFETY: one whole block per row, as the caller promises.
+                q5k_decode_codes(block, &mut codes[t], &mut coef[t], &mut mins[t]);
+            }
+            let block_act = view.act.add(b * view.act_stride);
+            for group in 0..8 {
+                let mut a = [_mm512_setzero_si512(); 8];
+                for (word, slot) in a.iter_mut().enumerate() {
+                    *slot = _mm512_loadu_si512(
+                        block_act.add(group * 512 + word * 64) as *const __m512i
+                    );
+                }
+                for (t, (weight, minimum)) in
+                    weights.iter_mut().zip(minimums.iter_mut()).enumerate()
+                {
+                    let mut acc = _mm512_setzero_si512();
+                    for (word, lane) in a.iter().enumerate() {
+                        let packed = u32::from_le_bytes(
+                            codes[t][group * 32 + word * 4..][..4]
+                                .try_into()
+                                .expect("four bytes"),
+                        );
+                        acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *lane);
+                    }
+                    let dx = _mm512_loadu_ps(view.dxs.add((b * view.dx_stride + group) * 16));
+                    *weight = _mm512_fmadd_ps(
+                        _mm512_cvtepi32_ps(acc),
+                        _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][group])),
+                        *weight,
+                    );
+                    // The float sums already carry the activation scale, so the minimum term
+                    // multiplies them by `dmin · min` alone — applying `dx` twice double-counts it.
+                    let sums = _mm512_loadu_ps(view.sums.add((b * view.dx_stride + group) * 16));
+                    *minimum = _mm512_fmadd_ps(sums, _mm512_set1_ps(mins[t][group]), *minimum);
+                }
+            }
+        }
+        let mut lanes = [0.0_f32; 16];
+        for (t, (weight, minimum)) in weights.iter().zip(minimums.iter()).enumerate() {
+            _mm512_storeu_ps(lanes.as_mut_ptr(), _mm512_sub_ps(*weight, *minimum));
+            for (col, value) in lanes.iter().take(view.columns).enumerate() {
+                *view.out.add(col * view.count + t) = *value;
+            }
+        }
+    }
+}
+
+/// Where one Q5_K tile half's activations, scales, float sums and outputs live.
+#[derive(Clone, Copy)]
+struct Q5kBandView {
+    act: *const i8,
+    act_stride: usize,
+    dxs: *const f32,
+    dx_stride: usize,
+    sums: *const f32,
+    out: *mut f32,
+    count: usize,
+    columns: usize,
+}
+
+/// The activations of one Q5_K band pass: their quantized form plus the float sums the minimum
+/// term needs, bundled so the kernel stays within the argument budget.
+pub(crate) struct Q5kArgs<'a, const B: usize> {
+    pub(crate) xs: &'a [&'a QuantizedX; B],
+    pub(crate) sums: &'a [&'a [f32]; B],
+}
+
+/// The tiled Q5_K prefill path: bands of four rows over the shared activation tile.
+///
+/// # Safety
+///
+/// `stride` must be whole 176-byte blocks, `xs[e]` must hold `blocks · 256` values and
+/// `blocks · 8` scales, `sums[e]` at least `blocks · 8` entries, `out` must have `B · count`
+/// entries, and the CPU must have AVX-512 VNNI with VL.
+pub(crate) unsafe fn q5k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    args: Q5kArgs<'_, B>,
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) {
+    // SAFETY: the caller validated the lengths; every access below stays inside them.
+    unsafe {
+        const N: usize = 4;
+        let Q5kArgs { xs, sums } = args;
+        let blocks = stride / 176;
+        let halves = B.div_ceil(16);
+        let owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = q3k_act_band(xs, blocks);
+                &owned_act
+            }
+        };
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * 16];
+        let mut float_sums = vec![0.0_f32; blocks * halves * 8 * 16];
+        for b in 0..blocks {
+            for (entry, x) in xs.iter().enumerate() {
+                let half = entry / 16;
+                let col = entry % 16;
+                for group in 0..8 {
+                    let at = ((b * halves + half) * 8 + group) * 16 + col;
+                    dxs[at] = x.d[b * 8 + group];
+                    float_sums[at] = sums[entry][b * 8 + group];
+                }
+            }
+        }
+        for half in 0..halves {
+            let columns = (B - half * 16).min(16);
+            let half_act = act.as_ptr().add(half * 4096);
+            let mut row = first_row;
+            let last = first_row + count;
+            while row + N <= last {
+                q5k_band_rows::<N>(
+                    data.as_ptr(),
+                    stride,
+                    row,
+                    blocks,
+                    Q5kBandView {
+                        act: half_act,
+                        act_stride: halves * 4096,
+                        dxs: dxs.as_ptr().add(half * 8 * 16),
+                        dx_stride: halves * 8,
+                        sums: float_sums.as_ptr().add(half * 8 * 16),
+                        out: out.as_mut_ptr().add(half * 16 * count + (row - first_row)),
+                        count,
+                        columns,
+                    },
+                );
+                row += N;
+            }
+            for tail in row..last {
+                for col in 0..columns {
+                    let entry = half * 16 + col;
+                    let start = tail * stride;
+                    *out.get_unchecked_mut(entry * count + tail - first_row) = q5k_dot_vnni(
+                        &data[start..start + stride],
+                        &xs[entry].q,
+                        &xs[entry].d,
+                        sums[entry],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`q5k_matvec_tiled_range`] with the shape checks the dispatch needs.
+pub(crate) fn try_q5k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    args: Q5kArgs<'_, B>,
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) -> bool {
+    if !vnni512_available()
+        || stride == 0
+        || !stride.is_multiple_of(176)
+        || B == 0
+        || B > MAX_HALVES * 16
+        || count == 0
+    {
+        return false;
+    }
+    let blocks = stride / 176;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || first_row + count > data.len() / stride
+        || args
+            .xs
+            .iter()
+            .any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+        || args.sums.iter().any(|s| s.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: the checks above match the kernel's contract, and it re-checks the CPU itself.
+    unsafe {
+        q5k_matvec_tiled_range(data, stride, first_row, count, args, out, tile);
+    }
+    true
+}
+
 /// The tiled Q3_K prefill path: bands of four rows over the shared activation tile.
 ///
 /// Returns false when the shape is one this kernel does not take, so the caller keeps its row
@@ -7002,6 +7272,89 @@ mod tests {
             }
         }
         println!("(sink {sink:.3})");
+    }
+
+    /// The tiled Q5_K path must reproduce the row kernel for every batch width and row count,
+    /// including a partial last band, with `sums` taken from the same activation.
+    #[test]
+    fn q5k_tiled_range_matches_the_row_kernel() {
+        if !vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0110);
+        let cols = 1536;
+        let blocks = cols / 256;
+        let stride = blocks * 176;
+        let rows = 11;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q5k_row(&mut rng, blocks)).collect();
+        for batch in [4_usize, 16, 40] {
+            let xs: Vec<Vec<f32>> = (0..batch)
+                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                .collect();
+            let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+            let sums: Vec<Vec<f32>> = xs.iter().map(|x| crate::quant::x_sums(x)).collect();
+            let refs: Vec<&QuantizedX> = quantized.iter().collect();
+            let sum_refs: Vec<&[f32]> = sums.iter().map(|s| s.as_slice()).collect();
+            for count in [1_usize, 4, 9] {
+                let mut out = vec![0.0_f32; batch * count];
+                // SAFETY: whole blocks, matching activations and sums, and the CPU feature checked.
+                unsafe {
+                    macro_rules! args_for {
+                        ($n:literal) => {
+                            Q5kArgs {
+                                xs: refs.as_slice().try_into().expect("batch width"),
+                                sums: sum_refs.as_slice().try_into().expect("batch width"),
+                            }
+                        };
+                    }
+                    match batch {
+                        4 => q5k_matvec_tiled_range::<4>(
+                            &data,
+                            stride,
+                            0,
+                            count,
+                            args_for!(4),
+                            &mut out,
+                            None,
+                        ),
+                        16 => q5k_matvec_tiled_range::<16>(
+                            &data,
+                            stride,
+                            0,
+                            count,
+                            args_for!(16),
+                            &mut out,
+                            None,
+                        ),
+                        _ => q5k_matvec_tiled_range::<40>(
+                            &data,
+                            stride,
+                            0,
+                            count,
+                            args_for!(40),
+                            &mut out,
+                            None,
+                        ),
+                    }
+                }
+                for (entry, xq) in quantized.iter().enumerate() {
+                    for local in 0..count {
+                        let start = local * stride;
+                        // SAFETY: whole blocks and a matching activation.
+                        let want = unsafe {
+                            q5k_dot_vnni(&data[start..start + stride], &xq.q, &xq.d, &sums[entry])
+                        };
+                        let got = out[entry * count + local];
+                        let tol = 1e-3 + 1e-4 * want.abs();
+                        assert!(
+                            (got - want).abs() <= tol,
+                            "batch {batch} count {count} row {local} entry {entry}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Prices the tiled path against one row-kernel call per (row, activation).

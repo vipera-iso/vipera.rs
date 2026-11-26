@@ -1593,6 +1593,23 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         {
             return;
         }
+        if ty == GgmlType::Q5K
+            && let Some(xs) = activation.quantized()
+            && crate::simd::try_q5k_matvec_tiled_range(
+                data,
+                stride,
+                first_row,
+                count,
+                crate::simd::Q5kArgs {
+                    xs,
+                    sums: activation.sums(),
+                },
+                out,
+                tile,
+            )
+        {
+            return;
+        }
         // Q3_K: four rows per band over the same sixteen-activation tile. The band decodes a
         // row-block's codes once for all sixteen activations instead of once per activation.
         if ty == GgmlType::Q3K

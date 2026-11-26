@@ -5328,3 +5328,20 @@ bằng 2 nhóm `_mm256_cvtepi8_epi32` → trừ 32 → `cvtepi32_ps`. Không đ�
 
 **+12.6% decode**, prefill trong nhiễu. Giá trị số học không đổi (cùng scale, cùng thứ tự), parity
 row kernel và tiled vẫn xanh. Đây là mức gần trần: decode Q4_K_M cùng máy 31.8 tok/s.
+
+## Q5_K: band cho prefill — 2026-11-26
+
+Port `q3k` band sang Q5_K: 8 nhóm 32 giá trị, code 5-bit (nibble + bit `qh`, mỗi nửa 32 byte dùng bit
+riêng), và số hạng `dmin·min·Σx` lấy từ `sums` float mà activation đã có — đúng như
+`q5k_dot_vnni`, không nhân `dx` hai lần. Kernel nhận `Q5kArgs { xs, sums }` để giữ trong ngân sách
+7 tham số của clippy.
+
+Parity: `q5k_tiled_range_matches_the_row_kernel` — batch 4/16/40 × count 1/4/9, khớp row kernel
+trong 1e-3 + 1e-4·|want|, kể cả band cuối không đủ 4 row.
+
+**Không đo được lợi ích trên Q3_K_M:** Q5_K chỉ 9.5 MiB / 876 MiB (1.1%), trần lợi ích ~1% — dưới
+độ phân giải của máy này. Số đo được (155.1 → 159.8 tok/s một lượt) là **trong nhiễu**, không phải
+bằng chứng; lượt đo sau đó cả đường sequential cũng tụt 22.5 → 17.7 tok/s (host bị bóp xung), nên
+không có so sánh tuyệt đối nào dùng được.
+
+Cần một model Q5_K_M để đo thật; lần này không tạo được (`/tmp` đầy giữa chừng, đã dọn).
