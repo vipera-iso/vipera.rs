@@ -27,7 +27,7 @@ use vipera_core::gguf::GgmlType;
 use vipera_errors::ViperaError;
 
 use crate::quant::{self, BatchActivation, Fusion, OwnedActivation};
-use crate::simd::SharedTile;
+use crate::simd::{BlockQ4Kx8, SharedTile};
 
 /// A run of entries to turn into owned activations. Each buffer holds the entry's values followed
 /// by room for its group sums, so a worker finishes it in place instead of copying it again.
@@ -58,6 +58,8 @@ type PrepReply = (usize, Vec<OwnedActivation>);
 struct Job<'d, const B: usize> {
     /// The whole tensor; the chunk is addressed by `first_row` and `stride`.
     data: &'d [u8],
+    /// The tensor's load-time Q4_Kx8 packing, when `VIPERA_Q4K8` built one.
+    packed: Option<&'d [BlockQ4Kx8]>,
     /// Bytes per row.
     stride: usize,
     ty: GgmlType,
@@ -248,6 +250,7 @@ impl<'d, const B: usize> Pool<'d, B> {
         &self,
         ty: GgmlType,
         data: &'d [u8],
+        packed: Option<&'d [BlockQ4Kx8]>,
         stride: usize,
         threads: usize,
         activations: &Arc<[OwnedActivation; B]>,
@@ -269,7 +272,16 @@ impl<'d, const B: usize> Pool<'d, B> {
         let threads = threads.min(self.workers.len()).max(1);
         if threads == 1 {
             let activation = BatchActivation::new(activations);
-            quant::fill_rows_batch(ty, data, stride, 0, &activation, out, tile.as_deref());
+            quant::fill_rows_batch(
+                ty,
+                data,
+                stride,
+                0,
+                &activation,
+                packed,
+                out,
+                tile.as_deref(),
+            );
             return Ok(());
         }
 
@@ -283,6 +295,7 @@ impl<'d, const B: usize> Pool<'d, B> {
             let count = per_thread.min(rows - first_row);
             let job = Job {
                 data,
+                packed,
                 stride,
                 ty,
                 first_row,
@@ -306,6 +319,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                         stride,
                         first_row,
                         &activation,
+                        packed,
                         &mut values,
                         tile.as_deref(),
                     );
@@ -328,6 +342,7 @@ impl<'d, const B: usize> Pool<'d, B> {
                     stride,
                     first_row,
                     &activation,
+                    packed,
                     &mut values,
                     tile.as_deref(),
                 );
@@ -447,6 +462,7 @@ fn run_worker<'d, const B: usize>(
                 job.stride,
                 job.first_row,
                 &activation,
+                job.packed,
                 &mut values,
                 job.tile.as_deref(),
             );
@@ -482,6 +498,7 @@ mod tests {
             let result = pool.fill_batch(
                 vipera_core::gguf::GgmlType::F32,
                 &data,
+                None,
                 128,
                 2,
                 &activations,
@@ -658,6 +675,7 @@ mod tests {
                                 pool.fill_batch(
                                     vipera_core::gguf::GgmlType::Q4K,
                                     &matrix,
+                                    None,
                                     stride,
                                     participants,
                                     &owned,

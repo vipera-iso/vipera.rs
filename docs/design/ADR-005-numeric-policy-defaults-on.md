@@ -1,7 +1,9 @@
 # ADR-005: ba switch đổi số học thành mặc định bật
 
-Status: **Accepted, trừ `VIPERA_ATTN_GEMM`.** Chủ repo chọn chấp nhận các đánh đổi tốc độ-lấy-số-học
-cho `VIPERA_TILED_A` và `VIPERA_Q4K8`; `VIPERA_ATTN_GEMM` bị cổng chặn và trở lại opt-in (§3).
+Status: **Superseded một phần, 2026-11-25.** Phép đo paired end-to-end (§5) cho thấy cả hai switch
+mặc định bật là regression trên máy tham chiếu: `VIPERA_Q4K8` 0.49x decode (repack trong mỗi lần gọi)
+và `VIPERA_TILED_A` 0.58x prefill. Cả hai trả về **opt-in**; `VIPERA_ATTN_GEMM` vẫn opt-in (§3).
+Quyết định gốc giữ nguyên dưới đây làm bản ghi lịch sử.
 Ngày: 2026-11-25 · Supersedes: ADR-006 (một phần). ADR-004 vẫn đúng (giữ opt-in).
 
 ## 1. Context
@@ -44,6 +46,22 @@ từng cái (`tiled::env_default_on`).
   một pass batch và prefix cache trong `serve` cũng dựa vào cùng giả định đó, nên tile không thể là
   mặc định cho tới khi hai kernel chia sẻ một thứ tự cộng — hoặc owner đổi hẳn policy và sửa test/
   invariant đó trước, chứ không phải nới ngưỡng.
+
+## 5. Re-measurement — 2026-11-25 (supersedes §2)
+
+A/B hai arm, hai vòng xen kẽ đảo thứ tự, `taskset -c 0-7`, `VIPERA_THREADS=8`, cùng GGUF Qwen2.5-1.5B
+Q4_K_M. ik_llama.cpp `1180df7` cùng phiên: pp128 253.6 tok/s, tg64 29.2 tok/s.
+
+| Arm | pp128 | decode ctx 32 | kernel Q4_K 1T |
+|---|---:|---:|---:|
+| default (cả hai bật) | 125.3 | 16.4 | 3.88 GB/s |
+| `VIPERA_TILED_A=0`, `VIPERA_Q4K8` mặc định | 122.9 | 32.4 | — |
+| cả hai tắt | **213.2** | **32.5** | **12.97 GB/s** |
+
+The wired Q4_K8 path repacks weights inside every call (`quant.rs::fill_rows_q4k8_groups` calls
+`make_blocks_q4k8`), so it never amortizes the repack; the lab 1.056x was pre-packed. TILED_A's
++2.6% chunk does not reproduce at pp128. Both defaults reverted to opt-in; chi tiết trong
+`docs/benchmarks.md` mục "Q4K8 mặc định bật — đo lại end-to-end" và mục "TILED_A mặc định bật".
 
 ## 4. Rollback
 

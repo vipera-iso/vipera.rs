@@ -104,6 +104,9 @@ pub struct WeightSource {
     placed: AtomicUsize,
     /// Where the window's layers also go, when the process has a device to put them on.
     vram: Option<Arc<dyn VramSink>>,
+    /// One load-time Q4_Kx8 packing per Q4_K tensor, keyed by the tensor's file offset, when
+    /// `VIPERA_Q4K8` asked for it. Empty otherwise, so the default path allocates nothing.
+    q4k8: std::sync::OnceLock<std::collections::HashMap<usize, Arc<[crate::simd::BlockQ4Kx8]>>>,
 }
 
 enum Backing {
@@ -138,6 +141,7 @@ impl WeightSource {
             window: window_from_env(),
             placed: AtomicUsize::new(usize::MAX),
             vram: None,
+            q4k8: std::sync::OnceLock::new(),
         };
         source.report();
         Ok((source, file))
@@ -151,9 +155,27 @@ impl WeightSource {
             window: window_from_env(),
             placed: AtomicUsize::new(usize::MAX),
             vram: None,
+            q4k8: std::sync::OnceLock::new(),
         };
         source.report();
         source
+    }
+
+    /// Record every tensor's load-time Q4_Kx8 packing (see [`crate::simd::pack_q4k8_rows`]), keyed
+    /// by file offset. Called once, before the first pass.
+    pub(crate) fn set_q4k8(
+        &self,
+        packed: std::collections::HashMap<usize, Arc<[crate::simd::BlockQ4Kx8]>>,
+    ) {
+        let _ = self.q4k8.set(packed);
+    }
+
+    /// The packing [`WeightSource::insert_q4k8`] recorded for the tensor at `start`, if any.
+    pub(crate) fn q4k8(&self, start: usize) -> Option<&[crate::simd::BlockQ4Kx8]> {
+        self.q4k8
+            .get()
+            .and_then(|packed| packed.get(&start))
+            .map(|packed| packed.as_ref())
     }
 
     /// The whole model, borrowed for a pass.
@@ -358,6 +380,7 @@ mod tests {
             window: 1,
             placed: AtomicUsize::new(usize::MAX),
             vram: None,
+            q4k8: std::sync::OnceLock::new(),
         };
         source.advance(0);
         assert_eq!(source.bytes(), &bytes[..]);

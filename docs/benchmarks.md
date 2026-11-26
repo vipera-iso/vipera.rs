@@ -4801,3 +4801,565 @@ trong ledger này (mục W-1a và mục repack 8x8 phía trên) và trong ADR-00
 hình mới. `VIPERA_ATTN_GEMM` chỉ có thể bật khi kernel tile và kernel từng entry chia sẻ một thứ tự
 cộng (hoặc owner đổi invariant của speculation/prefix cache). Chi tiết: ADR-005 §2-§3.
 
+
+## Q4K8 mặc định bật — đo lại end-to-end — 2026-11-25
+
+**Bối cảnh:** ADR-005 chuyển `VIPERA_Q4K8` sang mặc định bật, dẫn lại lab 1.056x ở 8 thread. Chưa
+có phép đo end-to-end nào của đường đã wire (`fill_rows_q4k8*`).
+
+**Lệnh:** `VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf VIPERA_THREADS=6
+taskset -c 2-7 <win_vs_llama> --ignored --nocapture <test>`, hai vòng xen kẽ, đảo thứ tự arm.
+Máy: i5-11300H, 4C/8T, AVX-512 VNNI (`cpu_simd: avx512-vnni`), governor powersave.
+
+| Arm (`VIPERA_Q4K8`) | decode ctx 32 | prefill n=512 chunked | batch B=8 | ffn_gate Q4_K |
+|---|---:|---:|---:|---:|
+| OFF (`=0`) | 35.7–36.5 ms (27.4–28.0 tok/s) | 4394–4449 ms (116–117 tok/s) | 46.2–47.2 tok/s | 26.4–29.5 GB/s |
+| ON (mặc định) | 71.5–72.9 ms (13.7–14.0 tok/s) | 4351–4462 ms (115–118 tok/s) | 36.5–36.8 tok/s | 12.3–15.4 GB/s |
+
+Tỉ lệ ON/OFF: decode **0.49x**, batch B=8 **0.78x**, prefill chunked ~**1.00x**, kernel một thread
+**0.30x** (3.88 vs 12.97 GB/s).
+
+**Nguyên nhân đọc từ code:** `quant.rs::fill_rows_q4k8_groups` gọi `make_blocks_q4k8` **bên trong mỗi
+lần gọi**, nên một token đọc weight, ghi bản repack rồi đọc lại — traffic ~3x. Codegen gate
+(`q4k8_groups`) PASS, zmm=0, nên đây không phải downclock AVX-512.
+
+**Kết quả:** **mặc định bật là regression trên máy này** — không tái hiện được 1.056x. Đề nghị trả
+`VIPERA_Q4K8` về mặc định tắt cho tới khi repack được hoist ra khỏi đường gọi (pack lúc nạp như
+`repack.rs`), rồi đo paired lại. Số liệu trên đo trên commit `f869a79` + fix `VIPERA_Q4K_F32` của
+phiên này.
+
+## TILED_A mặc định bật — đo lại prefill — 2026-11-25
+
+**Bối cảnh:** cùng đợt ADR-005, `VIPERA_TILED_A` được chuyển mặc định bật với bằng chứng "chunk 8T
++2.6%" (2026-11-24). Phép đo dưới đây là paired end-to-end ở pp128/pp512.
+
+**Lệnh:** `VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf VIPERA_THREADS=8
+taskset -c 0-7 <win_vs_llama> --ignored --nocapture prefill_vs_decode`; arm `VIPERA_Q4K8=0` cố định
+để cô lập TILED_A, hai vòng.
+
+| Arm | pp128 | pp512 | decode ctx 32 |
+|---|---:|---:|---:|
+| `VIPERA_TILED_A=0` (mới là mặc định) | **213.2 tok/s** | **202.6 tok/s** | 32.5 tok/s |
+| `VIPERA_TILED_A=1` (mặc định cũ) | 122.9 tok/s | 116.9 tok/s | 32.4 tok/s |
+
+Tỉ lệ: prefill **0.58x** khi bật; decode không đổi. ik_llama.cpp `1180df7` cùng phiên: pp128
+253.6 tok/s — vẫn hơn vipera 19% sau khi tắt, khớp khoảng cách 15-20% đã ghi ở mục ik_llama.cpp.
+
+**Kết quả:** **mặc định bật là regression trên máy này**; `VIPERA_TILED_A` trả về opt-in. Cái còn
+thiếu của prefill sau khi tắt là unpack Q4_K + thread scheduling (đã định giá 8.8% + vài %), không
+phải activation granularity.
+
+## Q4K8 repack hoisted to load time — re-measured — 2026-11-26
+
+**Thay đổi:** `VIPERA_Q4K8=1` giờ pack mỗi tensor Q4_K một lần lúc load
+(`WeightSource::set_q4k8` → `simd::pack_q4k8_rows`), và `fill_rows_q4k8_groups` đọc buffer đó thay
+vì gọi `make_blocks_q4k8` trong mỗi product. Buffer cùng kích thước nguồn (1152 B / 8 hàng), chỉ
+dựng khi switch bật; parity bit-for-bit có test `q4k8_load_time_packing_matches_the_per_call_pack`.
+
+**Lệnh:** `VIPERA_THREADS=8 taskset -c 0-7 <win_vs_llama> --ignored --nocapture prefill_vs_decode`,
+hai vòng xen kẽ đảo thứ tự, cùng GGUF Qwen2.5-1.5B Q4_K_M.
+
+| Vòng | Q4K8 | pp128 | decode ctx 32 |
+|---|---|---:|---:|
+| 1 | tắt | 209.8 | 30.8 |
+| 1 | bật | 206.7 | 29.2 |
+| 2 | tắt | 205.2 | 33.3 |
+| 2 | bật | 206.2 | 29.9 |
+
+Tỉ lệ decode bật/tắt: **0.95x / 0.90x**; prefill hoà. Trước khi hoist, đường bật là 13.7–16.4
+tok/s (0.49x), nên hoist bỏ được regression 2x nhưng **kernel 8x8 vẫn thua row kernel trên máy
+này** — lab 1.056x ở 8T không tái hiện end-to-end (row kernel VNNI-256 ở đây nhanh hơn baseline
+của lab). Kết luận: **NO-GO cho default**, `VIPERA_Q4K8` tiếp tục opt-in; phần hoist giữ lại vì nó
+làm đường opt-in dùng được (16.4 → 29.2 tok/s).
+
+## Khoảng prefill với ik_llama.cpp — thread count — 2026-11-26
+
+Sau khi tắt hai default regression, prefill còn sau ik_llama.cpp ~20%. Thử giả thuyết scheduling
+bằng cách đổi số thread (cùng máy 4C/8T, `taskset -c 0-7`, TILED_A off):
+
+| Threads | pp128 | pp512 | decode |
+|---:|---:|---:|---:|
+| 4 (physical) | 174.8 | 151.0 | 30.4 |
+| 6 | 182.6 | 175.6 | 28.2 |
+| 8 (SMT) | **203.2** | **197.1** | **31.5** |
+
+8 thread thắng ở cả hai độ dài, nên **không phải chia việc/thread count**: SMT vẫn có lợi cho
+kernel này. Gap còn lại không nằm ở scheduling; nó nằm ở thân kernel Q4_K (unpack 8.8% của phase
+Q4_K ≈ 5% tổng prefill, cộng phần đọc weight/`vpbroadcastd` mà probe đã định giá nhưng port
+16x16 bị loại bằng đo). Muốn đóng 20% phải port dạng weight i8 liền hàng + Q8 activation cho
+đường batch (CONSTRAINTS dòng "Q4_K repack, second look"), không phải một thay đổi nhỏ.
+
+## Profile prefill theo phase, và vì sao port i8 không còn là "kernel mới" — 2026-11-26
+
+**Cách đo:** `VIPERA_PROFILE_STEP=1` + `vipera generate` (prompt ~320 token, 4 token sinh),
+`taskset -c 0-7`, `VIPERA_THREADS=8`, default mới (Q4K8/TILED_A off). Bảng in ra là trung bình
+cộng dồn qua các chunk, nên đọc tỉ lệ chứ không đọc ms tuyệt đối.
+
+| Phase | Share của chunk |
+|---|---:|
+| q4k | **71%** |
+| q6k | 17% |
+| attention | 10% |
+| rope/kv_write/elem/rest | ~2% |
+
+Decode cùng máy: q4k 56-58%, q6k 34-36%, attention 7%.
+
+**Kết luận về "port kernel i8 row-contiguous":** đường đó đã tồn tại —
+`simd::q4k_matvec_tiled_range` chính là band 8 hàng × 16 cột `vpdpbusd`, weight unpack row-major
+vào `wq` (u8 0..15), activation i8 dùng chung cho 32 hàng, đúng cấu trúc IQK. Khác biệt duy nhất
+còn lại là unpack được làm lại mỗi cửa sổ 32 hàng thay vì một lần lúc load; ledger đã định giá
+unpack = **8.8% của phase q4k** (≈6% tổng prefill). Pre-unpack lúc load tốn thêm 1.78x bộ nhớ cho
+Q4_K (~1.1 GB với model 1.5B) và trần lợi ích ~6%, không phải 20% còn thiếu; phần còn lại là
+throughput của band (đã đo microkernel 16x16 tương đương +0.3% trong CONSTRAINTS), không phải
+layout.
+
+**Hai giả thuyết khác đã loại bằng đo cùng ngày:**
+- Thread count: 4/6/8 → pp128 174.8 / 182.6 / **203.2** tok/s; scheduling không phải nút thắt.
+- `VIPERA_Q6K_IQK=1` (repacked Q6_K GEMM, 17% prefill): pp128 185.3 vs 211.1 tok/s, decode 5.0 vs
+  31.3 tok/s — **regression nặng**, giữ opt-in và không đụng tiếp.
+
+Vậy khoảng 20% với ik_llama.cpp không đóng được bằng một port layout: nó nằm ở throughput thân
+band Q4_K (đã ở dạng tốt nhất repo đo được) chứ không ở unpack/scheduling/attention.
+
+## Q4_K tiled band: trần của unpack, đo bằng probe — 2026-11-26
+
+**Mục đích:** quyết định có hoist unpack lên load time không. Probe test-only trong
+`q4k_tiled_matvec_worker`: bỏ hẳn vòng decode nibble (giữ `wq` zero), mọi thứ khác giữ nguyên —
+đây là **trần trên** của mọi phương án pre-unpack.
+
+**Lệnh:** `cargo test -p vipera-backend-cpu --release --lib bench_q4k_unpack_probe -- --ignored
+--nocapture`, shape 8960x1536 (ffn_gate), B=16, 1 thread, best-of-6:
+
+| Arm | Thời gian | GB/s | Tỉ lệ |
+|---|---:|---:|---:|
+| real (unpack đầy đủ) | 11.7 ms | 2.6 | — |
+| no-unpack (bỏ decode) | 11.4 ms | 2.7 | **1.022x** |
+
+**Kết luận: unpack chỉ ~2.2% của band ở B=16, và trong chunk thật B=128 (8 half) nó được chia sẻ
+8 lần nên còn ~0.3%.** Vì vậy:
+- Con số "8.8% của phase q4k" trong ledger cũ là **quá cao** cho kernel hiện tại.
+- Hoist unpack lên load time có trần ~1.5% prefill *ở B=16*, thực tế ~0.3% ở B=128, đổi lấy +78%
+  bộ nhớ Q4_K (~1.1 GB) — **không làm**.
+- Khoảng 20% với ik_llama.cpp không nằm ở unpack. Ở mức instruction, mỗi 32-value group của band
+  là 1 load weight dword + 1 `vpmaddubsw` + 1 `vpmaddwd` + 1 add cho mỗi hàng, tức 4 instruction
+  cho 32 MAC; unpack thêm ~20 instruction mỗi 128 byte weight, đúng tỉ lệ ~2% đã đo.
+
+## Q4_K schedule và Q6_K band: hai probe kernel — 2026-11-26
+
+**Schedule Q4_K (hai chain chẵn/lẻ).** `q4k_tiled_band` với hai accumulator `__m512i` mỗi hàng
+(sub-block chẵn vào `acc`, lẻ vào `acc_odd`, cộng lại cuối cùng — cùng kết quả số học). Probe
+`bench_q4k_schedule_probe`, 8960x1536, B=16, 1 thread, best-of-6:
+
+| Arm | ms | GB/s |
+|---|---:|---:|
+| one-acc (hiện tại) | 12.1 | 2.6 |
+| two-acc | 11.9 | 2.6 |
+
+**1.021x** — trong nhiễu. Band 8 hàng đã có 8 chain độc lập, đủ che latency `vpdpbusd`; thêm chain
+không tăng throughput. Không wire.
+
+**Q6_K (17% prefill).** Hai probe sẵn có, cùng shape, B=16, 1 thread:
+
+| Probe | real | probe | Tỉ lệ |
+|---|---:|---:|---:|
+| bỏ unpack (`no-unpack`) | 24.3 ms | 22.5 ms | **1.082x** |
+| bỏ epilogue (`no-epi`) | 23.7 ms | 20.2 ms | **1.170x** |
+
+Unpack Q6_K đáng ~8%, epilogue ~17% của band. Epilogue tính 4-5 phép float + 2 broadcast cho mỗi
+(hàng, sub-block) vì activation có scale mỗi 32; chỉ giảm được bằng scale mỗi 256 (`block_q8_K`)
+— tức đổi số học, cần ADR, không phải tối ưu thuần. Pre-unpack Q6_K chỉ đáng ~8% × 17% ≈ 1.4%
+prefill, không đủ cho một kernel mới + ~1.8x bộ nhớ.
+
+**Kết luận cả hai yêu cầu:** schedule Q4_K đã bão hoà; Q6_K có thể nhanh hơn ~17% band nếu chấp
+nhận activation một scale mỗi 256 (đường `VIPERA_TILED_A`/`block_q8_K`), nhưng đó là quyết định
+numeric policy (ADR), không phải thay đổi kỹ thuật thuần. Tổng tiềm năng prefill từ hai hướng
+này ≈ 3% (17% × 17%), vẫn không đóng được khoảng 20% với ik_llama.cpp.
+
+## Q6_K scale mỗi 256: trần tốc độ và chất lượng — 2026-11-26
+
+**Trần tốc độ (đã đo):** probe `no-epi` trên band Q6_K = **1.170x**, tức epilogue là phần lớn chi
+phí của band. Q6_K chiếm 17% prefill (profile cùng ngày) → trần cho prefill ≈ **17% × 17% ≈ 2.9%**;
+decode Q6_K 34-36% → trần ≈ **6%** decode. Đổi sang activation `block_q8_K` (một scale mỗi 256)
+loại được 4-5 phép float + 2 broadcast mỗi (hàng, sub-block), nhưng đó là thay đổi **số học**.
+
+**Chất lượng — mốc hiện tại:** `vipera score` trên 322 token (`docs/benchmarks.md` 1200 byte đầu,
+ctx 512, 8T): **mean NLL 3.8578 nats/token, perplexity 47.3619**.
+
+**Chất lượng — chi phí của cùng phép đổi granularity:** W-1a đã đo trên Q4_K: activation một scale
+mỗi 256 làm **NLL +0.45..0.69% trên mọi văn bản** (`docs/benchmarks.md`, W-1). Q6_K ở đây là
+**output projection**, nên sai số đi thẳng vào logits; không có lý do để rẻ hơn mức đó. Chưa có số
+NLL riêng cho Q6_K vì muốn đo phải wire kernel q8_K cho Q6_K trước — chưa làm.
+
+**Kết luận sơ bộ:** đổi lấy ~2.9% prefill / ~6% decode, trả giá ≥0.5% NLL và một ADR. Tỉ lệ đó
+không đóng được khoảng 20% prefill; nếu ưu tiên decode thì đây là hướng có ý nghĩa hơn.
+
+## Q4_K: "hai weight block mỗi activation load" — không có gì để chia sẻ — 2026-11-26
+
+Trong `q4k_tiled_band`, activation được load tại `half_act.add(grp * 64)` và `half_act` đã được
+offset theo block: `(b * halves + half) * 64 * COLS * 4`. Block `b` và `b+1` dùng **hai vector
+256 giá trị khác nhau**, nên gộp hai block không giảm được lần load activation nào; nó chỉ thêm
+một chuỗi `dpbusd` độc lập — đúng phép thử schedule đã đo **1.021x** (hai accumulator chẵn/lẻ).
+Không có thay đổi nào được wire.
+
+## Decode: đã chạm trần băng thông — 2026-11-26
+
+**Số đo:** `kernel_gbps_fused_q4k_q6k` (8T, taskset 0-7): Q6_K output projection 151936x1536 đọc
+**191.4 MB/call trong 6.0 ms = 31.83 GB/s**. Cả model 1.04 GiB, decode ~31 tok/s ⇒ ~33 GB/s —
+xấp xỉ băng thông thực tế của i5-11300H (DDR4-3200 dual channel, peak lý thuyết 51.2 GB/s, thực
+tế ~35-40). ik_llama.cpp ở 29.2 tok/s tương đương ~31.6 GB/s.
+
+**Nghĩa là:** phase decode không còn chỗ cho schedule/kernel — nó bị chặn bởi số byte đọc mỗi
+token, không phải bởi `dpbusd`. Muốn tăng tok/s phải đọc ít byte hơn hoặc sinh nhiều token hơn
+trên một lần đọc.
+
+**Speculative decoding trên máy này lại chậm hơn** (`speculative_decode_wins`, 32 token, 8T):
+
+| Arm | t/s |
+|---|---:|
+| plain | **29.9** |
+| draft n=1 k=1 | 23.2 |
+| k=2 | 17.2 |
+| k=3 | 14.4 |
+| adaptive | 21.5 |
+
+speedup 0.78x, token output giống hệt. Draft model 1.5B trên 4 core không đủ rẻ để bù.
+
+**Kết luận:** decode đang thắng ik ở ctx ngắn (31-33 vs 29.2 tok/s) và đã ở trần băng thông; hướng
+tăng decode phải là giảm byte/token (vocab/logit pruning, weight quantization thấp hơn) chứ không
+phải tối ưu kernel. Việc wire kernel Q6_K per-256 để đo NLL đã dừng theo yêu cầu chuyển hướng.
+
+## Bỏ output projection cho token "không thể thắng" — đo giới hạn — 2026-11-26
+
+**Chi phí thật của output projection (Q6_K 151936x1536):** `kernel_gbps_fused_q4k_q6k`, 8T:
+**191.4 MB/call, 6.0 ms/call (31.83 GB/s)**. Decode step ~31.5 ms và ~1.04 GiB ⇒ bỏ được **~18%
+byte và ~19% thời gian** mỗi token nếu bỏ hẳn bước này (trần trên, output sẽ sai).
+
+**Nhưng "token không thể thắng" không quyết định được nếu chưa tính logits:** muốn biết một vocab
+entry có vào top-k/top-p hay không thì phải có logit của nó, mà logit chính là kết quả của phép
+chiếu. Không có bound rẻ nào: cận trên cần L1 norm của từng hàng weight, đọc weight cũng bằng
+chi phí phép chiếu. Vì vậy bỏ theo vocab là bài toán vòng tròn, trừ khi dùng một candidate set
+xấp xỉ (draft/prior) — đổi phân phối và cần đo chất lượng riêng.
+
+**Trường hợp bỏ được và đã bỏ:** trong một pass nhiều vị trí, chỉ vị trí cuối cần logits.
+`model.rs` đã làm đúng vậy qua `only_last` (piece_need_logits = need_logits && (!only_last ||
+is_last_piece)), nên prefill không chiếu vocab cho các vị trí không cần. Không có thay đổi nào
+được thêm.
+
+**Kết luận:** tiết kiệm tiềm năng 18% byte decode là thật nhưng không khai thác được theo kiểu
+"token không thể thắng"; chỉ khai thác được theo cấu trúc (đã làm) hoặc bằng candidate-set xấp xỉ
+(đổi chất lượng).
+
+## Q3_K row kernel + NLL của Q3_K pure — 2026-11-26
+
+**Kernel:** `quant::q3k_block` (decode 110-byte `block_q3_K` đúng thứ tự `hmask[32], qs[64],
+scales[12], d` theo `dequantize_row_q3_K` của llama.cpp) + `q3k_dot` scalar, nối vào `dot_scalar`,
+`read_row`, `row_bytes`. Test parity `q3k_dequantizes_the_packed_layout` dựng block bằng tay (tự
+pack 16 scale 6-bit) và so từng vị trí với công thức độc lập, cả hai trạng thái high-bit; dot khớp
+bit-for-bit với dequant rồi nhân. Chưa có kernel AVX2/tiled nên Q3_K đi đường row scalar.
+
+**Quantize:** llama.cpp `llama-quantize --allow-requantize --pure`, từ Q4_K_M sang Q3_K thuần:
+1059.89 MiB (5.00 BPW) → **728.71 MiB (3.44 BPW)**, giảm **31% byte/token** (output cũng 3-bit).
+
+**NLL** (`vipera score`, ctx 512, 8T, cùng 322-token text):
+
+| Model | mean NLL | perplexity |
+|---|---:|---:|
+| Q4_K_M (baseline) | **3.8578** | 47.36 |
+| Q3_K pure (requant từ Q4_K_M) | **4.3554** | 77.90 |
+
+**+12.9% NLL, +64.5% perplexity.** Lưu ý: đây là requantize từ model đã quantize (double
+quantization) và 3-bit cho *mọi* tensor kể cả output, nên đây là cận trên của mất mát; Q3_K_M
+chuẩn (Q3_K + Q5_K, output Q6_K) sẽ tốt hơn nhưng cần thêm kernel Q5_K. Tốc độ hiện tại: 322 token
+mất 3m40s (scalar) — chưa dùng để đánh giá tốc độ được.
+
+**Kết luận:** Q3_K chạy đúng và giảm 31% byte, nhưng chất lượng giảm mạnh ở dạng pure; muốn dùng
+thực tế cần Q3_K_M + kernel Q5_K + kernel AVX2/tiled cho Q3_K.
+
+## Q5_K row kernel + Q3_K_M chuẩn (từ F16) — 2026-11-26
+
+**Kernel Q5_K:** `quant::q5k_block` decode 176-byte `block_q5_K` (`d`, `dmin`, `scales[12]`,
+`qh[32]`, `qs[128]`) theo `dequantize_row_q5_K`; scale/min dùng lại `q4k_scale_min`
+(`get_scale_min_k4`). `q5k_dot` scalar nối vào `dot_scalar`, `read_row`, `row_bytes`. Test parity
+`q5k_dequantizes_the_packed_layout` dựng block bằng tay và so từng vị trí với công thức độc lập
+(4 bit thấp + 16 từ `qh`, bit `u1/u2` theo từng nhóm 64), dot khớp bit-for-bit.
+
+**Quantize đúng đường:** Q4_K_M → **F16** (không mất thêm) → Q3_K_M. Kết quả **875.96 MiB
+(4.13 BPW)**, types Q3_K 113 / Q4_K 81 / Q5_K 3 / Q6_K 1 — tất cả đã có kernel.
+
+**NLL** (322-token text, ctx 512, 8T):
+
+| Model | Size | mean NLL | perplexity | vs Q4_K_M |
+|---|---:|---:|---:|---:|
+| Q4_K_M baseline | 1059.89 MiB | **3.8578** | 47.36 | — |
+| Q3_K pure (requant từ Q4_K_M) | 728.71 MiB | 4.3554 | 77.90 | +12.9% NLL |
+| **Q3_K_M từ F16** | 875.96 MiB | **3.9287** | 50.84 | **+1.84% NLL, +7.35% ppl** |
+
+Q3_K_M mất rất ít so với Q4_K_M khi được quantize từ F16; con số +12.9% trước đó là do double
+quantization + 3-bit cho cả output, không phải bản chất Q3_K. Byte/token giảm **17.4%**
+(1059.89 → 875.96 MiB), trần decode ~+17% nếu bandwidth-bound.
+
+**Tốc độ hiện tại:** Q3_K vẫn đi đường scalar nên 322 token mất 2m3s; chưa dùng để đánh giá tốc
+độ. Muốn hưởng lợi 17% byte cần kernel AVX2/tiled cho Q3_K.
+
+## Q3_K/Q5_K AVX2 row kernel + decode Q3_K_M — 2026-11-26
+
+**Kernel:** `simd::q3k_dot_avx2` và `simd::q5k_dot_avx2`, cùng mẫu `q6k_dot`: 8 lane `f32`, một
+accumulator mỗi block, `hsum` một lần/block. Q3_K áp bias `-4` bằng mask (`cmpeq` → `-4`), shift
+lane bằng `_mm256_srlv_epi32`; Q5_K lấy mức thứ 16 từ `qh` bằng `andnot(cmpeq,16)` và cộng dồn
+`dmin*min*Σx` trên cùng lần load activation. Scale Q3_K unpack scalar một lần/block
+(`q3k_scales`), scale/min Q5_K dùng lại `q4k_scale_min`. Nối vào `try_dot`, và `try_dot_batch`
+(batch chưa có kernel integer: mỗi entry một lần row kernel).
+Test `q3k_and_q5k_row_kernels_match_the_scalar_reference`: block ngẫu nhiên 256/1536 cột, khớp
+`dot_scalar` trong `1e-3 + 1e-4·|ref|`.
+
+**Decode** Q3_K_M (875.96 MiB), ctx 32, 8T, cùng binary, A/B bằng `VIPERA_EXACT_DOT=1`
+(đường scalar cho Q3_K/Q5_K):
+
+| | decode | prefill pp512 |
+|---|---:|---:|
+| scalar (Q3_K/Q5_K) | 1.12 tok/s (0.895 s/token) | — |
+| **AVX2 row** | **17.8 tok/s** (56.3 ms/step) | 22.8 tok/s |
+| Q4_K_M (tham chiếu) | 31.8 tok/s | 201.6 tok/s |
+
+Decode nhanh **~11x** so với scalar (đo bằng `generate` 16 vs 64 token: 80.8 vs 895.3 ms/token).
+
+**Nhưng Q3_K_M vẫn chậm hơn Q4_K_M** (17.8 vs 31.8 tok/s) dù ít byte hơn 17%. Nguyên nhân nằm ở
+kernel: Q4_K đi `maddubs`/VNNI trên activation i8, còn Q3_K/Q5_K hiện widen code sang `f32` rồi
+mul — 4 lệnh mỗi 8 weight thay vì 1. Byte ít hơn chưa bù được. Muốn Q3_K_M nhanh hơn Q4_K_M cần
+kernel integer (maddubs/VNNI) cho hai format này, dùng lại cấu trúc `q4k_dot_vnni` (Q5_K chính là
+Q4_K + `qh`).
+
+## Q3_K/Q5_K integer kernel (maddubs + VNNI) + profile decode — 2026-11-26
+
+**Kernel:** `q5k_dot_int`/`q5k_dot_vnni` (dùng lại `q4k_scale_vectors`, `qh` OR vào nibble thành
+code 0..31, một `dpbusd`/32 giá trị) và `q3k_dot_int`/`q3k_dot_vnni` (code 3-bit thành unsigned
+`code + 4·high` 0..7, bias `-4` trả bằng `4·Σxq`; một run 32 byte phủ hai sub-block 16 nên
+coefficient khác nhau giữa hai nửa lane). Mặc định dùng kernel integer như Q6_K; `VIPERA_EXACT_DOT=1`
+quay lại kernel `f32` của branch này. Batch chưa có kernel chia sẻ weight nên mỗi entry chạy đúng
+kernel mà một sequence lẻ sẽ chạy. Test `q3k_and_q5k_integer_kernels_match_the_f32_kernel_on_dequantized_x`
+so cả hai dạng với kernel `f32` trên activation đã dequantize (tách lỗi kernel khỏi lỗi lượng tử
+hoá), và `maddubs`/`vnni` khớp bit-for-bit.
+
+**Decode** Q3_K_M, ctx 32, 8T, `prefill_vs_decode`:
+
+| kernel Q3_K/Q5_K | decode | pp512 |
+|---|---:|---:|
+| scalar | 1.12 tok/s | — |
+| AVX2 `f32` | 17.8 tok/s | 22.8 tok/s |
+| **integer (VNNI)** | **26.7–27.8 tok/s** | 48.2–49.5 tok/s |
+
+**Profile decode** (`VIPERA_PROFILE_STEP=1`, steady state ~35 ms/token):
+
+| thành phần | thời gian | share | byte | GB/s |
+|---|---:|---:|---:|---:|
+| Q3_K + Q5_K (`other_dot`) | 20.2 ms | **58%** | 452.5 MiB | **23.5** |
+| Q4_K | 8.7 ms | 25% | 240.3 MiB | 29.1 |
+| Q6_K | 5.7 ms | 16% | 182.6 MiB | 33.4 |
+| attention + rest | ~0.4 ms | 1% | — | — |
+
+Byte theo type lấy từ GGUF (khớp đúng 875.955 MiB). Kết luận: Q3_K/Q5_K vẫn chậm hơn Q4_K_M
+(27 vs 31.8 tok/s) vì kernel chạy ~23.5 GB/s so với 29–33 GB/s của Q4_K/Q6_K — Q3_K tốn **hai**
+phép integer dot mỗi 32 giá trị (dot và `Σxq` cho bias) và có **16** nhóm scale mỗi block thay vì 8.
+Thử dựng coefficient bằng vector thay 8 scalar insert mỗi run: 26.7 vs 27.8 tok/s, tức không cải
+thiện (nhiễu một mẫu mỗi bên), nên nút thắt không nằm ở đó.
+
+## Q3_K bias dot và batch kernel: cả hai bị đo bác — 2026-11-26
+
+**Bias dot (`Σxq` cho bias -4):** probe test-only `bench_q3k_bias_dot` chạy `q3k_dot_vnni` và một
+bản bỏ hẳn phép dot bias, cùng row 2048 cột, 100k vòng, đảo thứ tự giữa các vòng để tránh trôi xung
+nhịp:
+
+| vòng | có bias | không bias | tỉ lệ |
+|---|---:|---:|---:|
+| 4 | 14.0 ms | 16.0 ms | 0.878x |
+| 5 | 14.8 ms | 15.2 ms | 0.974x |
+| 6 | 14.3 ms | 16.0 ms | 0.891x |
+
+Bỏ phép dot bias **không nhanh hơn** (thậm chí chậm hơn): kernel không bị chặn bởi ALU mà bởi
+memory/ILP, và phép dot thứ hai còn tạo chuỗi độc lập che latency load. Vì vậy không thêm
+`sums16` vào `QuantizedX`: nó tốn thêm 64 B/block activation (+17% traffic của band) mà lợi ích
+bằng 0 hoặc âm.
+
+**Batch kernel chia sẻ weight:** implement `q3k_dot_batch`/`q5k_dot_batch` (decode block một lần,
+lặp entry), test batch == single bit-for-bit. Kết quả đo:
+
+| | trước (mỗi entry một row kernel) | batch | 
+|---|---:|---:|
+| prefill pp512 | 48.7 tok/s | 32.4 tok/s |
+| decode ctx32 | 28.0 tok/s | 20.6 tok/s |
+
+Chậm hơn cả hai chiều, nên đã revert. Lý do: khi lặp entry trên cùng một row, trọng số đã nằm
+trong L1 nên "chia sẻ" không tiết kiệm gì; còn batch 64 entry làm spill mảng accumulator, và decode
+B=1 rơi khỏi đường VNNI. Trạng thái giữ lại là mỗi entry chạy row kernel integer (VNNI).
+
+## Vì sao Q3_K/Q5_K chỉ 23.5 GB/s — và bảng cuối Q3_K_M — 2026-11-26
+
+**Quy về thời gian mỗi block**, từ chính profile decode (35 ms/token, 8T):
+
+| loại | block | thời gian | ns/block | byte/block | GB/s |
+|---|---:|---:|---:|---:|---:|
+| Q3_K + Q5_K | 4.279e6 | 20.2 ms | **4.72** | 110 / 176 | 23.5 |
+| Q4_K | 1.749e6 | 8.66 ms | **4.95** | 144 | 29.1 |
+| Q6_K | 0.912e6 | 5.73 ms | **6.28** | 210 | 33.4 |
+
+Chi phí mỗi block gần như bằng nhau (4.7–6.3 ns) trong khi byte mỗi block khác nhau. Nghĩa là kernel
+bị chặn bởi **công việc cố định mỗi block** (load activation, integer dot, epilogue, hai lần `hsum`),
+không phải bởi số byte weight. Q3_K không "kém" riêng: block của nó chỉ 110 byte so với 144 của
+Q4_K, nên cùng ~4.7 ns chỉ chở được ít byte hơn 24% → 23.5 thay vì 29 GB/s.
+
+Điều này giải thích luôn khoảng cách prefill: mỗi activation (entry) phải trả toàn bộ công việc
+per-block, nên prefill chỉ nhanh hơn decode ~1.7x, trong khi Q4_K_M nhanh hơn 6.4x nhờ tiled kernel
+amortize một lượt block cho 16 activation. Và nó cũng giải thích vì sao batch kernel thất bại: nó
+thêm việc per-entry chứ không giảm việc per-block.
+
+**Bảng cuối Q3_K_M** (875.96 MiB, 8T, ctx 32):
+
+| | vipera | ik_llama.cpp (1180df7) | tỉ lệ |
+|---|---:|---:|---:|
+| pp64 | 51.0 tok/s | — | — |
+| pp128 | 50.3 tok/s | — | — |
+| pp512 | 48.7 tok/s | 325.8 tok/s | 0.15x |
+| tg32 (decode) | 28.0 tok/s | 34.13 tok/s | 0.82x |
+| NLL (322 token) | 3.9287 (ppl 50.84) | — | — |
+
+Q4_K_M tham chiếu cùng máy: pp512 201.6, tg32 31.8. Khoảng cách prefill của Q3_K_M là do thiếu
+tiled path, không phải do format.
+
+**Tiled kernel cho Q3_K/Q5_K:** không port thẳng được. `q4k_tiled_band` đọc layout đã repack
+(`wq + row*256 + grp*4`, weight broadcast 4 byte, `_mm512_dpbusd_epi32` trên 16 activation), tức là
+nó phụ thuộc repack Q4K8 chứ không đọc GGUF. Muốn làm đúng phải: (1) thiết kế layout repack cho
+Q3_K (2-bit code + `qh` + 16 scale 6-bit) và Q5_K, (2) band kernel 16 activation × N row, (3) driver
++ clamp theo `count`, (4) test parity với row kernel. Đó là thay đổi nhiều trăm dòng, chưa làm
+trong lượt này.
+
+## Q3_K repacked layout + band 16 activation — 2026-11-26
+
+**Thiết kế.** `pack_q3k_rows` biến mỗi block thành 320 byte: 256 byte code `0..7` (một byte/giá
+trị, đúng dạng `code + 4·high` mà `dpbusd` cần) + 16 `f32` coefficient `d·(scale-32)`. Mỗi
+activation được transpose thành tile `block·4096 + grp·64 + column·4` để một `dpbusd` phủ 16
+activation trên cùng 4 weight. Kernel `q3k_band_16::<N>` mỗi nhóm 16 giá trị tốn **một** chuỗi
+`dpbusd` cho `Σxq` (dùng chung mọi row) + `N` chuỗi cho weight, tức `N+1` thay vì `8·N` của row
+kernel; prologue mỗi block (unpack scale, coefficient) trả một lần cho `N·16` output.
+
+**Parity:** `q3k_band_matches_the_row_kernel` — 4 row × 16 activation × 6 block, mọi ô khớp
+`q3k_dot_vnni` trong `1e-3 + 1e-4·|ref|`.
+
+**Đo** (`bench_q3k_band`, cache-warm, 4 row × 16 activation × 6 block, 20k vòng):
+
+| | thời gian | tỉ lệ |
+|---|---:|---:|
+| `q3k_band_16` (64 output/lượt) | 21.1 ms | **6.49x** |
+| 64 lần row kernel | 137.1 ms | 1.00x |
+
+**Trạng thái:** khối tự chứa, `#[cfg(test)]`, **chưa wire vào dispatch**. Còn thiếu để dùng thật:
+(1) repack lúc load như Q4K8, (2) tile activation dùng chung qua các row window, (3) driver
+`try_q3k_matvec_tiled_range` + clamp `count`, (4) nhánh fallback.
+
+**Q4_K_M prefill profile** (cùng lệnh, chunk 2 = 48.59 ms): q4k 73%, q6k 25%, attention 1%.
+Q4_K_M prefill nhanh hơn decode của chính nó 6.3x (4.96 vs 31.4 ms/token), còn Q3_K_M chỉ 1.74x
+(20.5 vs 35.7) — đúng bằng tỉ lệ amortize 16 activation mà band đo được (6.49x).
+
+## Q3_K tiled path wired vào prefill — 2026-11-26
+
+Lần wire thật: band đọc thẳng GGUF (không cần repack lúc load), trích code một lần cho mỗi
+row-block rồi dùng cho cả 16 activation trong tile; tile dùng lại `SharedTile` sẵn có (cùng layout
+Q4_K/Q6_K), band 4 row, phần dư của `count` do row kernel điền. Dispatch:
+`fill_rows_batch` → `try_q3k_matvec_tiled_range` khi có VNNI-512 và activation đã lượng tử hoá.
+
+| | trước | sau |
+|---|---:|---:|
+| pp64 | 51.0 tok/s | 69.3 tok/s |
+| pp128 | 50.3 tok/s | 70.2 tok/s |
+| pp512 | 48.7 tok/s | **68.1 tok/s** |
+| decode ctx32 | 28.0 tok/s | 26.4 tok/s (không đổi trong nhiễu) |
+
+**1.40x prefill.** Microbench `bench_q3k_tiled_range` (64 row × 16 activation, 1536 cột) cho
+1.26–1.35x — thấp hơn nhiều so với ước lượng 6.49x của bản bench cũ, vì bench cũ so với 64 lời gọi
+row kernel trên row chỉ 6 block (overhead lời gọi chiếm lớn); end-to-end mới là con số đúng.
+
+**Còn cách Q4_K_M (201.6) và ik_llama (325.8) rất xa.** Phần còn lại là `q3k_decode_codes`: 256
+byte code được trích bằng vòng scalar cho **mỗi row-block**, thứ Q4_K không trả vì nó repack lúc
+load. Đó là việc tiếp theo nếu muốn đuổi tiếp: repack code lúc load (cần plumbing như Q4K8) hoặc
+vector hoá bước trích code.
+
+Parity: `q3k_tiled_range_matches_the_row_kernel` — batch 4/16/32/40 × count 1/4/9, mọi ô khớp
+`q3k_dot_vnni`.
+
+## Q3_K: vector hoá trích code trong band — 2026-11-26
+
+**Giả thuyết:** `q3k_decode_codes` (256 byte code trích scalar mỗi row-block) chiếm phần lớn thời
+gian band; vector hoá bằng shift+mask 8 nhóm 32 byte sẽ cắt nó. Ngưỡng: prefill ≥ 73 tok/s.
+
+**Trước:** prefill pp512 68.1, decode 26.4 tok/s.
+**Sau:** pp64 155.1, pp128 159.2, **pp512 151.0**, decode 27.0 tok/s.
+
+**2.22x prefill**, nên nhận.
+
+Điều đáng ghi: probe `bench_q3k_decode_codes` **không** dịch chuyển (12.6 → 13.2 ns/row-block, vẫn
+"23%") vì phép đo đó bị `let mut codes = [0u8; 256]` (memset 256 byte mỗi vòng) chi phối — con số
+23% là của memset chứ không phải của bước trích code. Bài học: probe phải đo đúng thứ mình định
+đo; ở đây chính end-to-end mới là bằng chứng, và nó cho 2.22x dù probe nói "không đổi".
+
+Lý do khả dĩ cho 2.22x: bản scalar có 256 lần ghi byte + shift + branch theo từng nhóm, tạo
+store-forwarding stall và chặn scheduling; bản vector ghi 8 lần 32 byte và không có branch.
+Chưa tách được phần nào đóng góp bao nhiêu — cần một probe sạch (tái dùng buffer, không memset)
+nếu muốn con số chính xác.
+
+Parity không đổi: `q3k_tiled_range_matches_the_row_kernel` (batch 4/16/32/40 × count 1/4/9) vẫn xanh.
+
+### Band rows 4 → 8: neutral
+
+`prefill_vs_decode` trên Q3_K_M: pp512 151.0 tok/s (N=4) vs **155.1** (N=8), trong nhiễu ±3% của
+máy này. Ghi "neutral", giữ N=4 (diff nhỏ hơn). Nếu sau này đo 5 lần và N=8 ổn định ≥5% thì mới đổi.
+
+## Q3_K: vector hoá unpack scale trong prologue — 2026-11-26
+
+**Giả thuyết:** `q3k_scales` (unpack 12 byte → 16 scale, 16 phép chuyển scalar mỗi block) là phần
+prologue còn lại trong row kernel; vector hoá phần chuyển đổi sẽ cắt ≥8% thời gian block.
+Ngưỡng: decode ctx32 ≥ 29.5 tok/s.
+
+Thay đổi: giữ nguyên 12 phép bit-unpack (đã tối thiểu), thay 16 lần `f32::from(byte as i8 - 32)`
+bằng 2 nhóm `_mm256_cvtepi8_epi32` → trừ 32 → `cvtepi32_ps`. Không đổi byte nào của model.
+
+| | trước | sau |
+|---|---:|---:|
+| decode ctx32 | 27.0 tok/s (37.0 ms) | **30.4 tok/s (32.9 ms)** |
+| prefill pp512 | 151.0 tok/s | 155.1 tok/s |
+
+**+12.6% decode**, prefill trong nhiễu. Giá trị số học không đổi (cùng scale, cùng thứ tự), parity
+row kernel và tiled vẫn xanh. Đây là mức gần trần: decode Q4_K_M cùng máy 31.8 tok/s.
+
+## Q5_K: band cho prefill — 2026-11-26
+
+Port `q3k` band sang Q5_K: 8 nhóm 32 giá trị, code 5-bit (nibble + bit `qh`, mỗi nửa 32 byte dùng bit
+riêng), và số hạng `dmin·min·Σx` lấy từ `sums` float mà activation đã có — đúng như
+`q5k_dot_vnni`, không nhân `dx` hai lần. Kernel nhận `Q5kArgs { xs, sums }` để giữ trong ngân sách
+7 tham số của clippy.
+
+Parity: `q5k_tiled_range_matches_the_row_kernel` — batch 4/16/40 × count 1/4/9, khớp row kernel
+trong 1e-3 + 1e-4·|want|, kể cả band cuối không đủ 4 row.
+
+**Không đo được lợi ích trên Q3_K_M:** Q5_K chỉ 9.5 MiB / 876 MiB (1.1%), trần lợi ích ~1% — dưới
+độ phân giải của máy này. Số đo được (155.1 → 159.8 tok/s một lượt) là **trong nhiễu**, không phải
+bằng chứng; lượt đo sau đó cả đường sequential cũng tụt 22.5 → 17.7 tok/s (host bị bóp xung), nên
+không có so sánh tuyệt đối nào dùng được.
+
+Cần một model Q5_K_M để đo thật; lần này không tạo được (`/tmp` đầy giữa chừng, đã dọn).
+
+## Q3_K prefill: interleave dpbusd rows, align decode buffer — 2026-11-26
+
+**Lever tiếp theo (sau 1.18 ns/block-token):** trong `q3k_band_rows`, mỗi nhóm 16 giá trị làm
+4 `dpbusd` tuần tự trên cùng accumulator cho từng row (chuỗi phụ thuộc 5 cycle trên VNNI), rồi mới
+sang row kế. Với N=4 row độc lập, interleave theo word (word0: row0..3, word1: row0..3, ...)
+cho 4 chuỗi độc lập ăn VNNI unit thay vì chờ latency. Đồng thời căn `codes` decode buffer 32 byte
+để store 32-byte của decode và load 4-byte của inner loop không lệch line.
+
+**Giả thuyết:** giảm stall dpbusd latency / store-forwarding, prefill pp512 tăng. Ngưỡng: ≥5%
+trên máy không bị bóp xung.
+
+**Đo:** parity `q3k_tiled_range_matches_the_row_kernel` xanh (bit-identical: dpbusd là integer,
+thứ tự cộng fp32 theo nhóm không đổi). Host tại thời điểm đo bị throttle nặng (sequential
+22.5 → 10.9 tok/s), nên số tuyệt đối 116.8 tok/s pp512 **không dùng để so với baseline 151 tok/s**.
+Cần đo lại trên host không throttle trước khi claim speedup.
+
+**Trạng thái:** code đúng, gate xanh; lợi ích hiệu năng **chưa xác nhận** bằng đo sạch.

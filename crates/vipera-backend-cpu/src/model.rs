@@ -333,12 +333,21 @@ impl Tensor {
         &self,
         pool: &Pool<'d, 1>,
         file: &'d [u8],
+        packed: Option<&'d [crate::simd::BlockQ4Kx8]>,
         x: &[f32],
         out: &mut [f32],
     ) -> Result<(), ViperaError> {
         let at = crate::profile::stamp();
-        let result =
-            quant::matvec_pooled(pool, self.ty, self.data(file), self.cols, self.rows, x, out);
+        let result = quant::matvec_pooled_q4k8(
+            pool,
+            self.ty,
+            self.data(file),
+            packed,
+            self.cols,
+            self.rows,
+            x,
+            out,
+        );
         if let Some(at) = at {
             crate::profile::record_shape(
                 shape_name(self.ty),
@@ -357,6 +366,7 @@ impl Tensor {
         &self,
         pool: &Pool<'d, B>,
         file: &'d [u8],
+        packed: Option<&'d [crate::simd::BlockQ4Kx8]>,
         activations: &[&[f32]; B],
         fusion: &Fusion,
         out: &mut [f32],
@@ -367,8 +377,15 @@ impl Tensor {
             cols: self.cols,
             rows: self.rows,
         };
-        let result =
-            quant::matvec_pooled_batch(pool, matrix, self.data(file), activations, fusion, out);
+        let result = quant::matvec_pooled_batch_q4k8(
+            pool,
+            matrix,
+            self.data(file),
+            packed,
+            activations,
+            fusion,
+            out,
+        );
         if let Some(at) = at {
             crate::profile::record_shape(
                 shape_name(self.ty),
@@ -531,6 +548,41 @@ impl CpuBackend {
         file: &GgufFile,
     ) -> Result<Self, ViperaError> {
         let bytes = weights.bytes();
+        // `VIPERA_Q4K8`: pack every Q4_K matrix once, at load, so the 8x8 kernel reads the packed
+        // bytes instead of repacking them inside every product. Same size as the source (1152 bytes
+        // per eight rows), and only built when the switch is on.
+        #[cfg(target_arch = "x86_64")]
+        if crate::simd::q4k8_enabled() && crate::simd::vnni512_available() {
+            let mut packed = std::collections::HashMap::new();
+            for info in &file.tensors {
+                if info.ty != GgmlType::Q4K || info.dims.len() != 2 {
+                    continue;
+                }
+                let cols = info.dims[0] as usize;
+                let Ok((start, len)) = locate(file, info) else {
+                    continue;
+                };
+                let blocks = cols / crate::simd::QK;
+                let stride = blocks * 144;
+                if blocks == 0 || stride == 0 || !len.is_multiple_of(stride) {
+                    continue;
+                }
+                let rows = len / stride;
+                if rows < 8 {
+                    continue;
+                }
+                packed.insert(
+                    start,
+                    std::sync::Arc::from(crate::simd::pack_q4k8_rows(
+                        &bytes[start..start + len],
+                        stride,
+                        blocks,
+                        rows,
+                    )),
+                );
+            }
+            weights.set_q4k8(packed);
+        }
         let config = ModelConfig::from_gguf(file)?;
         let architecture = file
             .metadata
@@ -775,9 +827,15 @@ impl CpuBackend {
                     let at = crate::profile::stamp();
                     rms_norm(x, &layer.attn_norm, config.rms_eps, h);
                     crate::profile::note(crate::profile::Phase::Norm, at);
-                    layer.wq.matvec(&pool, file, h, q)?;
-                    layer.wk.matvec(&pool, file, h, k)?;
-                    layer.wv.matvec(&pool, file, h, v)?;
+                    layer
+                        .wq
+                        .matvec(&pool, file, weights.q4k8(layer.wq.start), h, q)?;
+                    layer
+                        .wk
+                        .matvec(&pool, file, weights.q4k8(layer.wk.start), h, k)?;
+                    layer
+                        .wv
+                        .matvec(&pool, file, weights.q4k8(layer.wv.start), h, v)?;
                     let at = crate::profile::stamp();
                     add_assign(q, &layer.bq);
                     add_assign(k, &layer.bk);
@@ -812,18 +870,26 @@ impl CpuBackend {
                     attend(q, &kv, index, position + 1, shape, attn_scratch, attn)?;
                     crate::profile::note(crate::profile::Phase::Attention, at);
 
-                    layer.wo.matvec(&pool, file, attn, h)?;
+                    layer
+                        .wo
+                        .matvec(&pool, file, weights.q4k8(layer.wo.start), attn, h)?;
                     let at = crate::profile::stamp();
                     add_assign(x, h);
                     crate::profile::note(crate::profile::Phase::Elem, at);
 
                     rms_norm(x, &layer.ffn_norm, config.rms_eps, h);
-                    layer.wg.matvec(&pool, file, h, gate)?;
-                    layer.wu.matvec(&pool, file, h, up)?;
+                    layer
+                        .wg
+                        .matvec(&pool, file, weights.q4k8(layer.wg.start), h, gate)?;
+                    layer
+                        .wu
+                        .matvec(&pool, file, weights.q4k8(layer.wu.start), h, up)?;
                     let at = crate::profile::stamp();
                     silu_mul(up, gate);
                     crate::profile::note(crate::profile::Phase::Elem, at);
-                    layer.wd.matvec(&pool, file, up, h)?;
+                    layer
+                        .wd
+                        .matvec(&pool, file, weights.q4k8(layer.wd.start), up, h)?;
                     let at = crate::profile::stamp();
                     add_assign(x, h);
                     crate::profile::note(crate::profile::Phase::Elem, at);
@@ -831,7 +897,7 @@ impl CpuBackend {
             }
 
             rms_norm(x, output_norm, config.rms_eps, h);
-            output.matvec(&pool, file, h, logits)?;
+            output.matvec(&pool, file, weights.q4k8(output.start), h, logits)?;
             crate::profile::finish_pass(pass);
             Ok(logits.clone())
         })
@@ -1162,6 +1228,7 @@ impl CpuBackend {
                 layer.wq.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wq.start),
                     &activations,
                     &norm,
                     &mut batch.q[..B * query],
@@ -1169,6 +1236,7 @@ impl CpuBackend {
                 layer.wk.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wk.start),
                     &activations,
                     &norm,
                     &mut batch.k[..B * kv_width],
@@ -1176,6 +1244,7 @@ impl CpuBackend {
                 layer.wv.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wv.start),
                     &activations,
                     &norm,
                     &mut batch.v[..B * kv_width],
@@ -1270,6 +1339,7 @@ impl CpuBackend {
                 layer.wo.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wo.start),
                     &rows::<B>(&batch.attn, hidden),
                     &Fusion::None,
                     &mut batch.h[..B * hidden],
@@ -1316,6 +1386,7 @@ impl CpuBackend {
                 layer.wg.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wg.start),
                     &activations,
                     &norm,
                     &mut gate[..B * ffn],
@@ -1323,6 +1394,7 @@ impl CpuBackend {
                 layer.wu.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wu.start),
                     &activations,
                     &norm,
                     &mut batch.up[..B * ffn],
@@ -1341,6 +1413,7 @@ impl CpuBackend {
                 layer.wd.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(layer.wd.start),
                     &rows::<B>(&batch.up, ffn),
                     &silu,
                     &mut batch.h[..B * hidden],
@@ -1370,6 +1443,7 @@ impl CpuBackend {
                 output.matvec(
                     &pool1,
                     file,
+                    weights.q4k8(output.start),
                     rows::<1>(&batch.h[entry * hidden..][..hidden], hidden)[0],
                     &mut batch.logits[..vocab],
                 )?;
@@ -1388,6 +1462,7 @@ impl CpuBackend {
                 output.matvec_batch::<B>(
                     &pool,
                     file,
+                    weights.q4k8(output.start),
                     &rows::<B>(&batch.h, hidden),
                     &Fusion::None,
                     &mut batch.logits_each[..B * vocab],

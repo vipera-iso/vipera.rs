@@ -79,24 +79,25 @@
 
 use std::arch::x86_64::{
     __m128i, __m256, __m256i, __m512, __m512i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss,
-    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_hadd_epi16, _mm_loadl_epi64, _mm_loadu_si128,
-    _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm_setr_epi8, _mm_setr_epi32,
-    _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_unpacklo_epi8, _mm256_add_epi16, _mm256_add_epi32,
-    _mm256_add_ps, _mm256_and_si256, _mm256_blend_epi32, _mm256_bsrli_epi128,
-    _mm256_castps256_ps128, _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128,
-    _mm256_cvtepi32_ps, _mm256_cvtepu8_epi16, _mm256_cvtepu8_epi32, _mm256_cvtph_ps,
-    _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32, _mm256_extractf128_ps,
-    _mm256_extracti128_si256, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_loadu_si256,
-    _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_max_epi32, _mm256_max_ps, _mm256_min_epi32,
-    _mm256_min_ps, _mm256_mul_ps, _mm256_or_si256, _mm256_permute2f128_si256,
+    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_hadd_epi16, _mm_loadl_epi64, _mm_loadu_ps,
+    _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm_setr_epi8,
+    _mm_setr_epi32, _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_unpacklo_epi8, _mm256_add_epi8,
+    _mm256_add_epi16, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256, _mm256_andnot_si256,
+    _mm256_blend_epi32, _mm256_bsrli_epi128, _mm256_castps256_ps128, _mm256_castsi128_si256,
+    _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cmpeq_epi32,
+    _mm256_cvtepi8_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi16, _mm256_cvtepu8_epi32,
+    _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32,
+    _mm256_extractf128_ps, _mm256_extracti128_si256, _mm256_fmadd_ps, _mm256_loadu_ps,
+    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_max_epi32, _mm256_max_ps,
+    _mm256_min_epi32, _mm256_min_ps, _mm256_mul_ps, _mm256_or_si256, _mm256_permute2f128_si256,
     _mm256_permutevar8x32_ps, _mm256_set_m128, _mm256_set1_epi8, _mm256_set1_epi16,
     _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi32, _mm256_setzero_ps, _mm256_setzero_si256,
     _mm256_shuffle_epi32, _mm256_slli_epi16, _mm256_slli_epi32, _mm256_srli_epi16,
-    _mm256_srli_epi32, _mm256_storeu_ps, _mm256_storeu_si256, _mm256_sub_epi16, _mm256_sub_epi32,
-    _mm256_sub_ps, _mm512_add_epi32, _mm512_add_ps, _mm512_cvtepi32_ps, _mm512_dpbusd_epi32,
-    _mm512_fmadd_ps, _mm512_fnmadd_ps, _mm512_loadu_ps, _mm512_loadu_si512, _mm512_mul_ps,
-    _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps, _mm512_setzero_si512,
-    _mm512_storeu_ps, _mm512_sub_ps,
+    _mm256_srli_epi32, _mm256_srlv_epi32, _mm256_storeu_ps, _mm256_storeu_si256, _mm256_sub_epi16,
+    _mm256_sub_epi32, _mm256_sub_ps, _mm512_add_epi32, _mm512_add_ps, _mm512_cvtepi32_ps,
+    _mm512_dpbusd_epi32, _mm512_fmadd_ps, _mm512_fnmadd_ps, _mm512_loadu_ps, _mm512_loadu_si512,
+    _mm512_mul_ps, _mm512_mullo_epi32, _mm512_set1_epi32, _mm512_set1_ps, _mm512_setzero_ps,
+    _mm512_setzero_si512, _mm512_storeu_ps, _mm512_sub_ps,
 };
 
 use vipera_core::gguf::GgmlType;
@@ -1559,6 +1560,28 @@ pub(crate) fn try_dot(
                     q4k_dot(row, &xq.q, &xq.d, sums)
                 }
             }
+            // The integer path is the default for both, as for Q6_K: `VIPERA_EXACT_DOT` restores
+            // the `f32` row kernel, which is what the pre-integer tokens were produced with.
+            GgmlType::Q3K => match xq {
+                Some(xq) if !crate::quant::exact_dot_requested() => {
+                    if vnni_available() {
+                        q3k_dot_vnni(row, &xq.q, &xq.d)
+                    } else {
+                        q3k_dot_int(row, &xq.q, &xq.d)
+                    }
+                }
+                _ => q3k_dot_avx2(row, x),
+            },
+            GgmlType::Q5K => match xq {
+                Some(xq) if !crate::quant::exact_dot_requested() => {
+                    if vnni_available() {
+                        q5k_dot_vnni(row, &xq.q, &xq.d, sums)
+                    } else {
+                        q5k_dot_int(row, &xq.q, &xq.d, sums)
+                    }
+                }
+                _ => q5k_dot_avx2(row, x),
+            },
             GgmlType::Q6K => match xq {
                 Some(xq) => {
                     // SAFETY: the outer block of `try_dot` and `vnni_available()` above establish
@@ -1627,6 +1650,46 @@ pub(crate) fn try_dot_batch<const B: usize>(
                 } else {
                     q4k_dot_batch(row, xs, activation.sums(), out)
                 }
+            }
+            true
+        }
+        // No weight-sharing batch kernel for these two: measured, the batch form was slower than
+        // running the row kernel once per entry (the row is already cache-warm across entries, and
+        // a batch of 64 spills the per-entry accumulators). Each entry takes the kernel a lone
+        // sequence would.
+        GgmlType::Q3K => {
+            let exact = crate::quant::exact_dot_requested();
+            for (entry, out) in out.iter_mut().enumerate() {
+                *out = match activation.quantized().map(|xs| &xs[entry]) {
+                    // SAFETY: as above; these kernels take `xq` and cover 256 values per block.
+                    Some(xq) if !exact => unsafe {
+                        if vnni_available() {
+                            q3k_dot_vnni(row, &xq.q, &xq.d)
+                        } else {
+                            q3k_dot_int(row, &xq.q, &xq.d)
+                        }
+                    },
+                    // SAFETY: as above; the `f32` row kernel covers 256 values per block.
+                    _ => unsafe { q3k_dot_avx2(row, activation.x()[entry]) },
+                };
+            }
+            true
+        }
+        GgmlType::Q5K => {
+            let exact = crate::quant::exact_dot_requested();
+            for (entry, out) in out.iter_mut().enumerate() {
+                *out = match activation.quantized().map(|xs| &xs[entry]) {
+                    // SAFETY: as above; these kernels take `xq` and cover 256 values per block.
+                    Some(xq) if !exact => unsafe {
+                        if vnni_available() {
+                            q5k_dot_vnni(row, &xq.q, &xq.d, activation.sums()[entry])
+                        } else {
+                            q5k_dot_int(row, &xq.q, &xq.d, activation.sums()[entry])
+                        }
+                    },
+                    // SAFETY: as above; the `f32` row kernel covers 256 values per block.
+                    _ => unsafe { q5k_dot_avx2(row, activation.x()[entry]) },
+                };
             }
             true
         }
@@ -1931,6 +1994,1067 @@ pub unsafe fn q6k_dot(row: &[u8], x: &[f32]) -> f32 {
         }
         total
     }
+}
+
+/// The sixteen Q3_K sub-block scales of one block, already biased by `-32`.
+///
+/// The twelve packed bytes are unpacked by the same bit shuffles `dequantize_row_q3_K` uses; the
+/// result is the per-16-value multiplier `d * (scale - 32)` is built from. Once per block, so the
+/// scalar work is not on the hot path.
+///
+/// # Safety
+///
+/// `block` must point at the start of a whole 110-byte block.
+#[target_feature(enable = "avx2")]
+unsafe fn q3k_scales(block: *const u8) -> [f32; 16] {
+    // SAFETY: the caller's contract says the four-byte reads below stay inside the block, and the
+    // two vector stores land inside the sixteen-float array.
+    unsafe {
+        let a0 = (block.add(96) as *const u32).read_unaligned();
+        let a1 = (block.add(100) as *const u32).read_unaligned();
+        let tmp = (block.add(104) as *const u32).read_unaligned();
+        const K1: u32 = 0x0303_0303;
+        const K2: u32 = 0x0f0f_0f0f;
+        let aux = [
+            (a0 & K2) | ((tmp & K1) << 4),
+            (a1 & K2) | (((tmp >> 2) & K1) << 4),
+            ((a0 >> 4) & K2) | (((tmp >> 4) & K1) << 4),
+            ((a1 >> 4) & K2) | (((tmp >> 6) & K1) << 4),
+        ];
+        // The sixteen unpacked bytes become floats eight at a time, so the per-block prologue is
+        // three vector ops per half instead of sixteen scalar conversions.
+        let bytes: [u8; 16] = std::mem::transmute(aux);
+        let mut out = [0.0_f32; 16];
+        let bias = _mm256_set1_epi32(32);
+        for half in 0..2 {
+            let lanes = _mm_loadl_epi64(bytes.as_ptr().add(half * 8) as *const __m128i);
+            let widened = _mm256_cvtepi8_epi32(lanes);
+            let biased = _mm256_sub_epi32(widened, bias);
+            _mm256_storeu_ps(out.as_mut_ptr().add(half * 8), _mm256_cvtepi32_ps(biased));
+        }
+        out
+    }
+}
+
+/// Dot product of one Q3_K row with `x`: the three-bit codes widened to `f32` eight at a time, with
+/// the `-4` bias applied as a mask instead of a branch.
+///
+/// # Safety
+///
+/// `row` must be whole 110-byte blocks, `x` 256 values per block, and the CPU must have AVX2.
+#[target_feature(enable = "avx2")]
+pub unsafe fn q3k_dot_avx2(row: &[u8], x: &[f32]) -> f32 {
+    // SAFETY: the caller guarantees whole blocks and matching activation length, and AVX2. Every
+    // load below stays inside one block and one 256-value activation block.
+    unsafe {
+        let mut total = 0.0_f32;
+        let blocks = row.len() / 110;
+        let three = _mm256_set1_epi32(3);
+        let zero = _mm256_setzero_si256();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 110);
+            let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
+            let scales = q3k_scales(block);
+            let mut accumulator = _mm256_setzero_ps();
+            let mut is = 0_usize;
+            let mut bit = 1_u32;
+            for half in 0..2 {
+                let qs = block.add(32 + half * 32);
+                let x_half = x.as_ptr().add(b * 256 + half * 128);
+                for run in 0..4 {
+                    let mask = _mm256_set1_epi32(bit as i32);
+                    let shift = _mm256_set1_epi32((run * 2) as i32);
+                    for part in 0..2 {
+                        let scale = _mm256_set1_ps(scales[is]);
+                        is += 1;
+                        let qs_part = qs.add(part * 16);
+                        let hm_part = block.add(part * 16);
+                        let x_part = x_half.add(run * 32 + part * 16);
+                        for at in 0..2 {
+                            let off = at * 8;
+                            let bytes = _mm_loadl_epi64(qs_part.add(off) as *const __m128i);
+                            // Variable shift, because the run number is a loop value.
+                            let codes = _mm256_and_si256(
+                                _mm256_srlv_epi32(_mm256_cvtepu8_epi32(bytes), shift),
+                                three,
+                            );
+                            let highs = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                                hm_part.add(off) as *const __m128i
+                            ));
+                            let clear = _mm256_cmpeq_epi32(_mm256_and_si256(highs, mask), zero);
+                            // `clear` is all ones where the sign bit is unset, so shifting it left
+                            // by two adds exactly `-4` there and nothing where it is set.
+                            let levels = _mm256_add_epi32(codes, _mm256_slli_epi32(clear, 2));
+                            let xv = _mm256_loadu_ps(x_part.add(off));
+                            accumulator = _mm256_add_ps(
+                                accumulator,
+                                _mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(levels), xv), scale),
+                            );
+                        }
+                    }
+                    bit <<= 1;
+                }
+            }
+            total += d * hsum(accumulator);
+        }
+        total
+    }
+}
+
+/// Dot product of one Q5_K row with `x`: the four low bits plus the sixteenth level from `qh`, with
+/// the `dmin * min` correction accumulated against the same activation loads.
+///
+/// # Safety
+///
+/// `row` must be whole 176-byte blocks, `x` 256 values per block, and the CPU must have AVX2.
+#[target_feature(enable = "avx2")]
+pub unsafe fn q5k_dot_avx2(row: &[u8], x: &[f32]) -> f32 {
+    // SAFETY: the caller guarantees whole blocks and matching activation length, and AVX2. Every
+    // load below stays inside one 176-byte block and one 256-value activation block.
+    unsafe {
+        let mut total = 0.0_f32;
+        let blocks = row.len() / 176;
+        let low_nibbles = _mm256_set1_epi32(0x0f);
+        let sixteen = _mm256_set1_epi32(16);
+        let zero = _mm256_setzero_si256();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 176);
+            let d = f16_to_f32(u16::from_le_bytes([*block.add(0), *block.add(1)]));
+            let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+            let scales = std::slice::from_raw_parts(block.add(4), 12);
+            let qh = block.add(16);
+            let qs = block.add(48);
+            let mut levels_acc = _mm256_setzero_ps();
+            let mut min_acc = _mm256_setzero_ps();
+            let mut is = 0_usize;
+            let mut bits = [1_u32, 2_u32];
+            for group in 0..4 {
+                let x_group = x.as_ptr().add(b * 256 + group * 64);
+                for (part, &bit) in bits.iter().enumerate() {
+                    let (sc, m) = crate::quant::q4k_scale_min(scales, is);
+                    is += 1;
+                    let scale = _mm256_set1_ps(f32::from(sc));
+                    let min = _mm256_set1_ps(f32::from(m));
+                    let mask = _mm256_set1_epi32(bit as i32);
+                    let x_part = x_group.add(part * 32);
+                    for at in 0..4 {
+                        let off = at * 8;
+                        let bytes = _mm_loadl_epi64(qs.add(group * 32 + off) as *const __m128i);
+                        let mut codes = _mm256_cvtepu8_epi32(bytes);
+                        codes = if part == 0 {
+                            _mm256_and_si256(codes, low_nibbles)
+                        } else {
+                            _mm256_srli_epi32(codes, 4)
+                        };
+                        let highs =
+                            _mm256_cvtepu8_epi32(_mm_loadl_epi64(qh.add(off) as *const __m128i));
+                        // Sixteen where the `qh` bit is set: the all-ones mask of `cmpeq` keeps
+                        // `sixteen`, and zeroes it where the bit is clear.
+                        let high_level = _mm256_andnot_si256(
+                            _mm256_cmpeq_epi32(_mm256_and_si256(highs, mask), zero),
+                            sixteen,
+                        );
+                        let levels = _mm256_cvtepi32_ps(_mm256_add_epi32(codes, high_level));
+                        let xv = _mm256_loadu_ps(x_part.add(off));
+                        levels_acc = _mm256_add_ps(
+                            levels_acc,
+                            _mm256_mul_ps(_mm256_mul_ps(levels, xv), scale),
+                        );
+                        min_acc = _mm256_add_ps(min_acc, _mm256_mul_ps(xv, min));
+                    }
+                }
+                bits[0] <<= 2;
+                bits[1] <<= 2;
+            }
+            total += d * hsum(levels_acc) - dmin * hsum(min_acc);
+        }
+        total
+    }
+}
+
+/// Q5_K dot against an `i8` activation: the same shape as [`q4k_dot`], with the fifth bit of each
+/// value taken from `qh` and OR-ed into the nibble before the integer multiply.
+///
+/// `maddubs` handles 32 values per instruction here where the `f32` kernel needs four widen rounds,
+/// which is where the byte saved by five-bit weights turns into time.
+///
+/// # Safety
+///
+/// `row` must be whole 176-byte blocks, `xq` 256 values and `dx` 8 scales per block, `sums` at
+/// least 8 entries per block, and the CPU must support AVX2.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn q5k_dot_int(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
+    // SAFETY: the caller states the lengths, and AVX2; every load stays inside them.
+    unsafe {
+        let blocks = row.len() / 176;
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let sixteen = _mm256_set1_epi8(16);
+        let zero = _mm256_setzero_si256();
+        let ones = _mm256_set1_epi16(1);
+        let mut weights = _mm256_setzero_ps();
+        let mut minimums = _mm256_setzero_ps();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 176);
+            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+            let (scale_at, min_at) = q4k_scale_vectors(block);
+            let coefficients = _mm256_mul_ps(
+                _mm256_mul_ps(scale_at, _mm256_loadu_ps(dx.as_ptr().add(b * 8))),
+                _mm256_set1_ps(d),
+            );
+            minimums = _mm256_fmadd_ps(
+                _mm256_mul_ps(min_at, _mm256_set1_ps(dmin)),
+                _mm256_loadu_ps(sums.as_ptr().add(b * 8)),
+                minimums,
+            );
+            let qh = _mm256_loadu_si256(block.add(16) as *const __m256i);
+            for j in 0..4 {
+                let packed = _mm256_loadu_si256(block.add(48 + j * 32) as *const __m256i);
+                let low_nibbles = _mm256_and_si256(packed, low_mask);
+                let high_nibbles = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                let low_bit = _mm256_set1_epi8((1_u32 << (2 * j)) as i8);
+                let high_bit = _mm256_set1_epi8((2_u32 << (2 * j)) as i8);
+                // `andnot(cmpeq(.., 0), 16)` is sixteen where the `qh` bit is set and zero elsewhere.
+                let low_codes = _mm256_or_si256(
+                    low_nibbles,
+                    _mm256_andnot_si256(
+                        _mm256_cmpeq_epi8(_mm256_and_si256(qh, low_bit), zero),
+                        sixteen,
+                    ),
+                );
+                let high_codes = _mm256_or_si256(
+                    high_nibbles,
+                    _mm256_andnot_si256(
+                        _mm256_cmpeq_epi8(_mm256_and_si256(qh, high_bit), zero),
+                        sixteen,
+                    ),
+                );
+                let values = xq.as_ptr().add(b * 256 + j * 64);
+                let low_sums = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(low_codes, _mm256_loadu_si256(values as *const __m256i)),
+                    ones,
+                );
+                let high_sums = _mm256_madd_epi16(
+                    _mm256_maddubs_epi16(
+                        high_codes,
+                        _mm256_loadu_si256(values.add(32) as *const __m256i),
+                    ),
+                    ones,
+                );
+                let low_coeff =
+                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j) as i32));
+                let high_coeff =
+                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j + 1) as i32));
+                weights = _mm256_fmadd_ps(_mm256_cvtepi32_ps(low_sums), low_coeff, weights);
+                weights = _mm256_fmadd_ps(_mm256_cvtepi32_ps(high_sums), high_coeff, weights);
+            }
+        }
+        hsum(weights) - hsum(minimums)
+    }
+}
+
+/// [`q5k_dot_int`] with `vpdpbusd`, which does the multiply and the four-way add in one
+/// instruction. The integer result is identical, so the float work is the same.
+///
+/// # Safety
+///
+/// As [`q5k_dot_int`], plus a CPU with `avx512_vnni` and `avx512_vl`.
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+pub(crate) unsafe fn q5k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32], sums: &[f32]) -> f32 {
+    // SAFETY: the caller states the lengths, and the CPU features; every load stays inside them.
+    unsafe {
+        let blocks = row.len() / 176;
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let sixteen = _mm256_set1_epi8(16);
+        let zero = _mm256_setzero_si256();
+        let mut weights = _mm256_setzero_ps();
+        let mut minimums = _mm256_setzero_ps();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 176);
+            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+            let (scale_at, min_at) = q4k_scale_vectors(block);
+            let coefficients = _mm256_mul_ps(
+                _mm256_mul_ps(scale_at, _mm256_loadu_ps(dx.as_ptr().add(b * 8))),
+                _mm256_set1_ps(d),
+            );
+            minimums = _mm256_fmadd_ps(
+                _mm256_mul_ps(min_at, _mm256_set1_ps(dmin)),
+                _mm256_loadu_ps(sums.as_ptr().add(b * 8)),
+                minimums,
+            );
+            let qh = _mm256_loadu_si256(block.add(16) as *const __m256i);
+            for j in 0..4 {
+                let packed = _mm256_loadu_si256(block.add(48 + j * 32) as *const __m256i);
+                let low_nibbles = _mm256_and_si256(packed, low_mask);
+                let high_nibbles = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                let low_bit = _mm256_set1_epi8((1_u32 << (2 * j)) as i8);
+                let high_bit = _mm256_set1_epi8((2_u32 << (2 * j)) as i8);
+                let low_codes = _mm256_or_si256(
+                    low_nibbles,
+                    _mm256_andnot_si256(
+                        _mm256_cmpeq_epi8(_mm256_and_si256(qh, low_bit), zero),
+                        sixteen,
+                    ),
+                );
+                let high_codes = _mm256_or_si256(
+                    high_nibbles,
+                    _mm256_andnot_si256(
+                        _mm256_cmpeq_epi8(_mm256_and_si256(qh, high_bit), zero),
+                        sixteen,
+                    ),
+                );
+                let values = xq.as_ptr().add(b * 256 + j * 64);
+                let low_sums = _mm256_dpbusd_epi32(
+                    zero,
+                    low_codes,
+                    _mm256_loadu_si256(values as *const __m256i),
+                );
+                let high_sums = _mm256_dpbusd_epi32(
+                    zero,
+                    high_codes,
+                    _mm256_loadu_si256(values.add(32) as *const __m256i),
+                );
+                let low_coeff =
+                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j) as i32));
+                let high_coeff =
+                    _mm256_permutevar8x32_ps(coefficients, _mm256_set1_epi32((2 * j + 1) as i32));
+                weights = _mm256_fmadd_ps(_mm256_cvtepi32_ps(low_sums), low_coeff, weights);
+                weights = _mm256_fmadd_ps(_mm256_cvtepi32_ps(high_sums), high_coeff, weights);
+            }
+        }
+        hsum(weights) - hsum(minimums)
+    }
+}
+
+/// Q3_K dot against an `i8` activation.
+///
+/// The three-bit codes are made unsigned (`code + 4·high`, 0..7) so `maddubs` accepts them, and the
+/// `-4` bias the reference applies to the low values becomes a subtraction of four times the
+/// activation sum over the same sixteen values. One 32-byte run covers two 16-value sub-blocks, so
+/// the coefficients differ across the lane halves: lanes 0-3 scale the first sub-block, 4-7 the
+/// second.
+///
+/// # Safety
+///
+/// `row` must be whole 110-byte blocks, `xq` 256 values per block, `dx` 8 scales per block, and the
+/// CPU must support AVX2. `sums` is unused for this format (Q3_K has no minimum term).
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn q3k_dot_int(row: &[u8], xq: &[i8], dx: &[f32]) -> f32 {
+    // SAFETY: the caller states the lengths, and AVX2; every load stays inside them.
+    unsafe {
+        let blocks = row.len() / 110;
+        let three = _mm256_set1_epi8(3);
+        let four_levels = _mm256_set1_epi8(4);
+        let ones = _mm256_set1_epi16(1);
+        let one_u8 = _mm256_set1_epi8(1);
+        let four = _mm256_set1_ps(4.0);
+        let zero = _mm256_setzero_si256();
+        let mut accumulator = _mm256_setzero_ps();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 110);
+            let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
+            let scales = q3k_scales(block);
+            let qh = _mm256_loadu_si256(block as *const __m256i);
+            let dx_at = dx.as_ptr().add(b * 8);
+            let mut bit = 1_u8;
+            for half in 0..2 {
+                let qs = block.add(32 + half * 32);
+                let x_half = b * 256 + half * 128;
+                // Per-half coefficients: this half's eight sub-block scales, each paired with the
+                // 32-value activation scale covering it, times `d`. Built with vectors so no
+                // per-run scalar insert is needed.
+                let dx4 = _mm_loadu_ps(dx_at.add(half * 4));
+                let dx8 = _mm256_set_m128(dx4, dx4);
+                let dx_dup =
+                    _mm256_permutevar8x32_ps(dx8, _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3));
+                let coeffs = _mm256_mul_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(scales.as_ptr().add(half * 8)), dx_dup),
+                    _mm256_set1_ps(d),
+                );
+                for run in 0..4 {
+                    let mask = _mm256_set1_epi8(bit as i8);
+                    let shift = _mm256_set1_epi32((run * 2) as i32);
+                    // Lanes 0-3 are the first sixteen values of the run, 4-7 the second.
+                    let pick = _mm256_setr_epi32(
+                        (2 * run) as i32,
+                        (2 * run) as i32,
+                        (2 * run) as i32,
+                        (2 * run) as i32,
+                        (2 * run + 1) as i32,
+                        (2 * run + 1) as i32,
+                        (2 * run + 1) as i32,
+                        (2 * run + 1) as i32,
+                    );
+                    // Byte `k` of the 32-byte run is the code of value `k`: part 0 in bytes 0-15,
+                    // part 1 in 16-31, which is row order. The variable shift is per 32-bit lane;
+                    // masking every byte with three removes the bits shifted in from the next byte
+                    // because a run shifts by at most six.
+                    let packed = _mm256_loadu_si256(qs as *const __m256i);
+                    let codes = _mm256_and_si256(_mm256_srlv_epi32(packed, shift), three);
+                    let high = _mm256_andnot_si256(
+                        _mm256_cmpeq_epi8(_mm256_and_si256(qh, mask), zero),
+                        four_levels,
+                    );
+                    let unsigned = _mm256_add_epi8(codes, high);
+                    let xv =
+                        _mm256_loadu_si256(xq.as_ptr().add(x_half + run * 32) as *const __m256i);
+                    let dot = _mm256_madd_epi16(_mm256_maddubs_epi16(unsigned, xv), ones);
+                    let bias = _mm256_madd_epi16(_mm256_maddubs_epi16(one_u8, xv), ones);
+                    // Lanes 0-3 cover the first sixteen values and 4-7 the second, so the two
+                    // sub-block coefficients are one vector with a different scale per half.
+                    let coefficients = _mm256_permutevar8x32_ps(coeffs, pick);
+                    let lanes = _mm256_sub_ps(
+                        _mm256_cvtepi32_ps(dot),
+                        _mm256_mul_ps(four, _mm256_cvtepi32_ps(bias)),
+                    );
+                    accumulator = _mm256_fmadd_ps(lanes, coefficients, accumulator);
+                    bit <<= 1;
+                }
+            }
+        }
+        hsum(accumulator)
+    }
+}
+
+/// [`q3k_dot_int`] with `vpdpbusd` in place of `maddubs` + `madd`. The integer result is identical.
+///
+/// # Safety
+///
+/// As [`q3k_dot_int`], plus a CPU with `avx512_vnni` and `avx512_vl`.
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+pub(crate) unsafe fn q3k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32]) -> f32 {
+    // SAFETY: the caller states the lengths, and the CPU features; every load stays inside them.
+    unsafe {
+        let blocks = row.len() / 110;
+        let three = _mm256_set1_epi8(3);
+        let four_levels = _mm256_set1_epi8(4);
+        let one_u8 = _mm256_set1_epi8(1);
+        let four = _mm256_set1_ps(4.0);
+        let zero = _mm256_setzero_si256();
+        let mut accumulator = _mm256_setzero_ps();
+        for b in 0..blocks {
+            let block = row.as_ptr().add(b * 110);
+            let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
+            let scales = q3k_scales(block);
+            let qh = _mm256_loadu_si256(block as *const __m256i);
+            let dx_at = dx.as_ptr().add(b * 8);
+            let mut bit = 1_u8;
+            for half in 0..2 {
+                let qs = block.add(32 + half * 32);
+                let x_half = b * 256 + half * 128;
+                // Per-half coefficients: this half's eight sub-block scales, each paired with the
+                // 32-value activation scale covering it, times `d`. Built with vectors so no
+                // per-run scalar insert is needed.
+                let dx4 = _mm_loadu_ps(dx_at.add(half * 4));
+                let dx8 = _mm256_set_m128(dx4, dx4);
+                let dx_dup =
+                    _mm256_permutevar8x32_ps(dx8, _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3));
+                let coeffs = _mm256_mul_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(scales.as_ptr().add(half * 8)), dx_dup),
+                    _mm256_set1_ps(d),
+                );
+                for run in 0..4 {
+                    let mask = _mm256_set1_epi8(bit as i8);
+                    let shift = _mm256_set1_epi32((run * 2) as i32);
+                    // Lanes 0-3 are the first sixteen values of the run, 4-7 the second.
+                    let pick = _mm256_setr_epi32(
+                        (2 * run) as i32,
+                        (2 * run) as i32,
+                        (2 * run) as i32,
+                        (2 * run) as i32,
+                        (2 * run + 1) as i32,
+                        (2 * run + 1) as i32,
+                        (2 * run + 1) as i32,
+                        (2 * run + 1) as i32,
+                    );
+                    let packed = _mm256_loadu_si256(qs as *const __m256i);
+                    let codes = _mm256_and_si256(_mm256_srlv_epi32(packed, shift), three);
+                    let high = _mm256_andnot_si256(
+                        _mm256_cmpeq_epi8(_mm256_and_si256(qh, mask), zero),
+                        four_levels,
+                    );
+                    let unsigned = _mm256_add_epi8(codes, high);
+                    let xv =
+                        _mm256_loadu_si256(xq.as_ptr().add(x_half + run * 32) as *const __m256i);
+                    let dot = _mm256_dpbusd_epi32(zero, unsigned, xv);
+                    let bias = _mm256_dpbusd_epi32(zero, one_u8, xv);
+                    let coefficients = _mm256_permutevar8x32_ps(coeffs, pick);
+                    let lanes = _mm256_sub_ps(
+                        _mm256_cvtepi32_ps(dot),
+                        _mm256_mul_ps(four, _mm256_cvtepi32_ps(bias)),
+                    );
+                    accumulator = _mm256_fmadd_ps(lanes, coefficients, accumulator);
+                    bit <<= 1;
+                }
+            }
+        }
+        hsum(accumulator)
+    }
+}
+
+/// The 16-activation tile the band kernel reads.
+///
+/// Layout: for every block and every group of four values, the sixteen activations' four values are
+/// contiguous (`block · 4096 + grp · 64 + column · 4`), the same bytes and layout as the Q4_K/Q6_K
+/// tile. Columns past `xs.len()` are zero-filled.
+pub(crate) fn q3k_act_band<const B: usize>(xs: &[&QuantizedX; B], blocks: usize) -> Vec<i8> {
+    let halves = B.div_ceil(16).max(1);
+    let mut act = vec![0_i8; blocks * halves * 4096];
+    for b in 0..blocks {
+        for (entry, x) in xs.iter().enumerate() {
+            let half = entry / 16;
+            let col = entry % 16;
+            let base = (b * halves + half) * 4096;
+            for grp in 0..64 {
+                let src = &x.q[b * 256 + grp * 4..][..4];
+                let at = base + grp * 64 + col * 4;
+                act[at..at + 4].copy_from_slice(src);
+            }
+        }
+    }
+    act
+}
+
+/// Codes of one Q3_K block, one byte each (`code + 4·high`), in value order, and the sixteen
+/// `d · (scale - 32)` coefficients.
+///
+/// Vector form: one 32-bit-lane shift and one byte mask per run, with the sign bits OR-ed in as a
+/// masked constant, so the 256 codes cost eight vector groups instead of 256 scalar iterations.
+/// The shift stays under eight bits, so shifting 16-bit lanes cannot carry one byte into the next,
+/// and the `& 3` would drop such a carry anyway.
+///
+/// # Safety
+///
+/// `block` must point at one whole 110-byte block; `codes` must have room for 256 bytes, and the
+/// CPU must support AVX2.
+#[target_feature(enable = "avx2")]
+unsafe fn q3k_decode_codes(block: *const u8, codes: &mut [u8; 256], coef: &mut [f32; 16]) {
+    // SAFETY: the caller points at one whole block, and `q3k_scales` needs exactly that. Every
+    // vector store lands inside the 256-byte `codes` above.
+    unsafe {
+        let three = _mm256_set1_epi8(3);
+        let four = _mm256_set1_epi8(4);
+        let zero = _mm256_setzero_si256();
+        let hm = _mm256_loadu_si256(block as *const __m256i);
+        let out = codes.as_mut_ptr();
+        macro_rules! codes_for_run {
+            ($qs:expr, $shift:literal, $bit:literal, $at:literal) => {{
+                let shifted = _mm256_srli_epi16($qs, $shift);
+                let levels = _mm256_and_si256(shifted, three);
+                let mask = _mm256_set1_epi8((1_u8 << $bit) as i8);
+                let high =
+                    _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hm, mask), zero), four);
+                _mm256_storeu_si256(out.add($at) as *mut __m256i, _mm256_or_si256(levels, high));
+            }};
+        }
+        let first = _mm256_loadu_si256(block.add(32) as *const __m256i);
+        codes_for_run!(first, 0, 0, 0);
+        codes_for_run!(first, 2, 1, 32);
+        codes_for_run!(first, 4, 2, 64);
+        codes_for_run!(first, 6, 3, 96);
+        let second = _mm256_loadu_si256(block.add(64) as *const __m256i);
+        codes_for_run!(second, 0, 4, 128);
+        codes_for_run!(second, 2, 5, 160);
+        codes_for_run!(second, 4, 6, 192);
+        codes_for_run!(second, 6, 7, 224);
+        let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
+        let scales = q3k_scales(block);
+        let scaling = _mm256_set1_ps(d);
+        for half in 0..2 {
+            let at = scales.as_ptr().add(half * 8);
+            _mm256_storeu_ps(
+                coef.as_mut_ptr().add(half * 8),
+                _mm256_mul_ps(_mm256_loadu_ps(at), scaling),
+            );
+        }
+    }
+}
+
+/// `N` Q3_K rows against the sixteen activations of one tile half, one pass over each weight block.
+///
+/// Per block: decode the `N` rows' codes and coefficients once, then per 16-value group one
+/// `dpbusd` chain for the activation sums (shared by every row) and one per row. Sixteen groups
+/// cost `N + 1` chains instead of the row kernel's `8 · N`, and the block prologue is paid once for
+/// `N · 16` outputs.
+///
+/// # Safety
+///
+/// `data` must point at whole 110-byte blocks for rows `first_row .. first_row + N`, `stride` must
+/// be `blocks · 110`, `act` must point at `blocks · 4096` bytes of tile for one half, `dxs` at
+/// `blocks · 16 · 16` floats, `out` at `N · count` floats, and the CPU must have AVX-512 VNNI with
+/// VL.
+/// Where one tile half's activations and scales live, and where the band writes its rows.
+#[derive(Clone, Copy)]
+struct Q3kBandView {
+    act: *const i8,
+    act_stride: usize,
+    dxs: *const f32,
+    dxs_stride: usize,
+    out: *mut f32,
+    /// Entries per activation in `out`, which is entry-major.
+    count: usize,
+    /// Live activation columns in this half; the tile is always sixteen wide.
+    columns: usize,
+}
+
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+unsafe fn q3k_band_rows<const N: usize>(
+    data: *const u8,
+    stride: usize,
+    first_row: usize,
+    blocks: usize,
+    view: Q3kBandView,
+) {
+    // SAFETY: the caller's contract is this function's contract; every load below stays inside the
+    // rows, blocks, groups and sixteen columns it describes.
+    unsafe {
+        let ones = _mm512_set1_epi32(0x0101_0101);
+        let four = _mm512_set1_ps(4.0);
+        let mut lanes_acc = [_mm512_setzero_ps(); N];
+        // The decode writes 256 bytes per row, then the group loop reads them back four bytes at a
+        // time. Aligning the buffer keeps the 32-byte stores and those small loads on the same line.
+        #[repr(align(32))]
+        struct Aligned256([u8; 256]);
+        let mut codes = std::array::from_fn::<_, N, _>(|_| Aligned256([0_u8; 256]));
+        let mut coef = [[0.0_f32; 16]; N];
+        for b in 0..blocks {
+            for t in 0..N {
+                let block = data.add((first_row + t) * stride + b * 110);
+                // SAFETY: one whole block per row, as the caller promises.
+                q3k_decode_codes(block, &mut codes[t].0, &mut coef[t]);
+            }
+            let block_act = view.act.add(b * view.act_stride);
+            let block_dx = view.dxs.add(b * view.dxs_stride);
+            #[allow(clippy::needless_range_loop)]
+            for k in 0..16 {
+                let a = [
+                    _mm512_loadu_si512(block_act.add(k * 256) as *const __m512i),
+                    _mm512_loadu_si512(block_act.add(k * 256 + 64) as *const __m512i),
+                    _mm512_loadu_si512(block_act.add(k * 256 + 128) as *const __m512i),
+                    _mm512_loadu_si512(block_act.add(k * 256 + 192) as *const __m512i),
+                ];
+                // The `-4` bias every code carries, summed for each column: one chain for all rows.
+                let mut bias = _mm512_setzero_si512();
+                for group in &a {
+                    bias = _mm512_dpbusd_epi32(bias, ones, *group);
+                }
+                let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), four);
+                let dx = _mm512_loadu_ps(block_dx.add(k * 16));
+                // Interleave rows across each word so the four independent dpbusd chains feed the
+                // VNNI unit instead of waiting on one row's 5-cycle latency.
+                let mut acc = [_mm512_setzero_si512(); N];
+                for (word, group) in a.iter().enumerate() {
+                    for t in 0..N {
+                        let packed = u32::from_le_bytes(
+                            codes[t].0[k * 16 + word * 4..][..4]
+                                .try_into()
+                                .expect("four bytes"),
+                        );
+                        acc[t] =
+                            _mm512_dpbusd_epi32(acc[t], _mm512_set1_epi32(packed as i32), *group);
+                    }
+                }
+                for (t, accumulator) in lanes_acc.iter_mut().enumerate() {
+                    let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc[t]), bias);
+                    let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][k]));
+                    *accumulator = _mm512_fmadd_ps(levels, scale, *accumulator);
+                }
+            }
+        }
+        // `out` is entry-major (`out[entry * count + row]`), so the sixteen lanes of a row are
+        // spread across sixteen entries rather than written as one contiguous run.
+        let mut lanes = [0.0_f32; 16];
+        for (t, accumulator) in lanes_acc.iter().enumerate() {
+            _mm512_storeu_ps(lanes.as_mut_ptr(), *accumulator);
+            for (col, value) in lanes.iter().take(view.columns).enumerate() {
+                *view.out.add(col * view.count + t) = *value;
+            }
+        }
+    }
+}
+
+/// Codes of one Q5_K block, one byte each (0..31), in value order, plus the eight `d · scale` and
+/// the eight `dmin · min` coefficients of its 32-value groups.
+///
+/// # Safety
+///
+/// `block` must point at one whole 176-byte block and `codes` must have room for 256 bytes.
+#[target_feature(enable = "avx2")]
+unsafe fn q5k_decode_codes(
+    block: *const u8,
+    codes: &mut [u8; 256],
+    coef: &mut [f32; 8],
+    mins: &mut [f32; 8],
+) {
+    // SAFETY: the caller points at one whole block; every vector store lands inside `codes`.
+    unsafe {
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales = std::slice::from_raw_parts(block.add(4), 12);
+        let qh = _mm256_loadu_si256(block.add(16) as *const __m256i);
+        let low_mask = _mm256_set1_epi8(0x0f);
+        let sixteen = _mm256_set1_epi8(16);
+        let zero = _mm256_setzero_si256();
+        let out = codes.as_mut_ptr();
+        // The low nibbles of one 32-byte word feed the first 32 values and the high nibbles the
+        // next 32, so each half takes its own `qh` bit: `$bit` for the low, `$bit + 1` for the top.
+        let high_for = |bit: u32| {
+            let mask = _mm256_set1_epi8((1_u8 << bit) as i8);
+            _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, mask), zero), sixteen)
+        };
+        macro_rules! codes_for_half {
+            ($qs:expr, $bit:literal, $at:literal) => {{
+                let low = _mm256_or_si256(_mm256_and_si256($qs, low_mask), high_for($bit));
+                let top = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16($qs, 4), low_mask),
+                    high_for($bit + 1),
+                );
+                _mm256_storeu_si256(out.add($at) as *mut __m256i, low);
+                _mm256_storeu_si256(out.add($at + 32) as *mut __m256i, top);
+            }};
+        }
+        let qs = block.add(48);
+        codes_for_half!(_mm256_loadu_si256(qs as *const __m256i), 0, 0);
+        codes_for_half!(_mm256_loadu_si256(qs.add(32) as *const __m256i), 2, 64);
+        codes_for_half!(_mm256_loadu_si256(qs.add(64) as *const __m256i), 4, 128);
+        codes_for_half!(_mm256_loadu_si256(qs.add(96) as *const __m256i), 6, 192);
+        for (group, (coefficient, minimum)) in coef.iter_mut().zip(mins.iter_mut()).enumerate() {
+            let (sc, m) = crate::quant::q4k_scale_min(scales, group);
+            *coefficient = d * f32::from(sc);
+            *minimum = dmin * f32::from(m);
+        }
+    }
+}
+
+/// `N` Q5_K rows against the sixteen activations of one tile half, one pass over each block.
+///
+/// Per 32-value group the weights are eight 4-byte words (eight `dpbusd`), the same count the row
+/// kernel spends per row; the block's code and scale decode is paid once for `N · 16` outputs, and
+/// the `dmin · min · Σx` term rides the float sums the caller already has for each activation.
+///
+/// # Safety
+///
+/// `data` must point at whole 176-byte blocks for rows `first_row .. first_row + N`, `stride` must
+/// be `blocks · 176`, `view` must describe a tile half of `blocks · 4096` bytes, `view.sums` must
+/// hold 8 entries per block per activation, and the CPU must have AVX-512 VNNI with VL.
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+unsafe fn q5k_band_rows<const N: usize>(
+    data: *const u8,
+    stride: usize,
+    first_row: usize,
+    blocks: usize,
+    view: Q5kBandView,
+) {
+    // SAFETY: the caller's contract is this function's contract; every load stays inside the rows,
+    // blocks, groups and sixteen columns it describes.
+    unsafe {
+        let mut weights = [_mm512_setzero_ps(); N];
+        let mut minimums = [_mm512_setzero_ps(); N];
+        let mut codes = [[0_u8; 256]; N];
+        let mut coef = [[0.0_f32; 8]; N];
+        let mut mins = [[0.0_f32; 8]; N];
+        for b in 0..blocks {
+            for t in 0..N {
+                let block = data.add((first_row + t) * stride + b * 176);
+                // SAFETY: one whole block per row, as the caller promises.
+                q5k_decode_codes(block, &mut codes[t], &mut coef[t], &mut mins[t]);
+            }
+            let block_act = view.act.add(b * view.act_stride);
+            for group in 0..8 {
+                let mut a = [_mm512_setzero_si512(); 8];
+                for (word, slot) in a.iter_mut().enumerate() {
+                    *slot = _mm512_loadu_si512(
+                        block_act.add(group * 512 + word * 64) as *const __m512i
+                    );
+                }
+                for (t, (weight, minimum)) in
+                    weights.iter_mut().zip(minimums.iter_mut()).enumerate()
+                {
+                    let mut acc = _mm512_setzero_si512();
+                    for (word, lane) in a.iter().enumerate() {
+                        let packed = u32::from_le_bytes(
+                            codes[t][group * 32 + word * 4..][..4]
+                                .try_into()
+                                .expect("four bytes"),
+                        );
+                        acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *lane);
+                    }
+                    let dx = _mm512_loadu_ps(view.dxs.add((b * view.dx_stride + group) * 16));
+                    *weight = _mm512_fmadd_ps(
+                        _mm512_cvtepi32_ps(acc),
+                        _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][group])),
+                        *weight,
+                    );
+                    // The float sums already carry the activation scale, so the minimum term
+                    // multiplies them by `dmin · min` alone — applying `dx` twice double-counts it.
+                    let sums = _mm512_loadu_ps(view.sums.add((b * view.dx_stride + group) * 16));
+                    *minimum = _mm512_fmadd_ps(sums, _mm512_set1_ps(mins[t][group]), *minimum);
+                }
+            }
+        }
+        let mut lanes = [0.0_f32; 16];
+        for (t, (weight, minimum)) in weights.iter().zip(minimums.iter()).enumerate() {
+            _mm512_storeu_ps(lanes.as_mut_ptr(), _mm512_sub_ps(*weight, *minimum));
+            for (col, value) in lanes.iter().take(view.columns).enumerate() {
+                *view.out.add(col * view.count + t) = *value;
+            }
+        }
+    }
+}
+
+/// Where one Q5_K tile half's activations, scales, float sums and outputs live.
+#[derive(Clone, Copy)]
+struct Q5kBandView {
+    act: *const i8,
+    act_stride: usize,
+    dxs: *const f32,
+    dx_stride: usize,
+    sums: *const f32,
+    out: *mut f32,
+    count: usize,
+    columns: usize,
+}
+
+/// The activations of one Q5_K band pass: their quantized form plus the float sums the minimum
+/// term needs, bundled so the kernel stays within the argument budget.
+pub(crate) struct Q5kArgs<'a, const B: usize> {
+    pub(crate) xs: &'a [&'a QuantizedX; B],
+    pub(crate) sums: &'a [&'a [f32]; B],
+}
+
+/// The tiled Q5_K prefill path: bands of four rows over the shared activation tile.
+///
+/// # Safety
+///
+/// `stride` must be whole 176-byte blocks, `xs[e]` must hold `blocks · 256` values and
+/// `blocks · 8` scales, `sums[e]` at least `blocks · 8` entries, `out` must have `B · count`
+/// entries, and the CPU must have AVX-512 VNNI with VL.
+pub(crate) unsafe fn q5k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    args: Q5kArgs<'_, B>,
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) {
+    // SAFETY: the caller validated the lengths; every access below stays inside them.
+    unsafe {
+        const N: usize = 4;
+        let Q5kArgs { xs, sums } = args;
+        let blocks = stride / 176;
+        let halves = B.div_ceil(16);
+        let owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = q3k_act_band(xs, blocks);
+                &owned_act
+            }
+        };
+        let mut dxs = vec![0.0_f32; blocks * halves * 8 * 16];
+        let mut float_sums = vec![0.0_f32; blocks * halves * 8 * 16];
+        for b in 0..blocks {
+            for (entry, x) in xs.iter().enumerate() {
+                let half = entry / 16;
+                let col = entry % 16;
+                for group in 0..8 {
+                    let at = ((b * halves + half) * 8 + group) * 16 + col;
+                    dxs[at] = x.d[b * 8 + group];
+                    float_sums[at] = sums[entry][b * 8 + group];
+                }
+            }
+        }
+        for half in 0..halves {
+            let columns = (B - half * 16).min(16);
+            let half_act = act.as_ptr().add(half * 4096);
+            let mut row = first_row;
+            let last = first_row + count;
+            while row + N <= last {
+                q5k_band_rows::<N>(
+                    data.as_ptr(),
+                    stride,
+                    row,
+                    blocks,
+                    Q5kBandView {
+                        act: half_act,
+                        act_stride: halves * 4096,
+                        dxs: dxs.as_ptr().add(half * 8 * 16),
+                        dx_stride: halves * 8,
+                        sums: float_sums.as_ptr().add(half * 8 * 16),
+                        out: out.as_mut_ptr().add(half * 16 * count + (row - first_row)),
+                        count,
+                        columns,
+                    },
+                );
+                row += N;
+            }
+            for tail in row..last {
+                for col in 0..columns {
+                    let entry = half * 16 + col;
+                    let start = tail * stride;
+                    *out.get_unchecked_mut(entry * count + tail - first_row) = q5k_dot_vnni(
+                        &data[start..start + stride],
+                        &xs[entry].q,
+                        &xs[entry].d,
+                        sums[entry],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`q5k_matvec_tiled_range`] with the shape checks the dispatch needs.
+pub(crate) fn try_q5k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    args: Q5kArgs<'_, B>,
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) -> bool {
+    if !vnni512_available()
+        || stride == 0
+        || !stride.is_multiple_of(176)
+        || B == 0
+        || B > MAX_HALVES * 16
+        || count == 0
+    {
+        return false;
+    }
+    let blocks = stride / 176;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || first_row + count > data.len() / stride
+        || args
+            .xs
+            .iter()
+            .any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+        || args.sums.iter().any(|s| s.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: the checks above match the kernel's contract, and it re-checks the CPU itself.
+    unsafe {
+        q5k_matvec_tiled_range(data, stride, first_row, count, args, out, tile);
+    }
+    true
+}
+
+/// The tiled Q3_K prefill path: bands of four rows over the shared activation tile.
+///
+/// Returns false when the shape is one this kernel does not take, so the caller keeps its row
+/// kernel. Rows past the last whole band of four are filled by the row kernel, keeping the same
+/// numbers the untied path would produce.
+///
+/// # Safety
+///
+/// `stride` must be whole 110-byte blocks, `xs[e]` must hold `blocks · 256` values and
+/// `blocks · 8` scales, `out` must have `B · count` entries, and the CPU must have AVX-512 VNNI
+/// with VL.
+pub(crate) unsafe fn q3k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) {
+    // SAFETY: the caller validated the lengths; every access below stays inside them.
+    unsafe {
+        const N: usize = 4;
+        let blocks = stride / 110;
+        let halves = B.div_ceil(16);
+        let owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = q3k_act_band(xs, blocks);
+                &owned_act
+            }
+        };
+        // One scale per 32-value group, repeated for the two 16-value groups it covers, kept per
+        // tile half so the kernel can read sixteen columns from one contiguous run.
+        let mut dxs = vec![0.0_f32; blocks * halves * 16 * 16];
+        for b in 0..blocks {
+            for (entry, x) in xs.iter().enumerate() {
+                let half = entry / 16;
+                let col = entry % 16;
+                for k in 0..16 {
+                    dxs[((b * halves + half) * 16 + k) * 16 + col] = x.d[b * 8 + k / 2];
+                }
+            }
+        }
+        for half in 0..halves {
+            let columns = (B - half * 16).min(16);
+            let half_act = act.as_ptr().add(half * 4096);
+            let half_dxs = dxs.as_ptr().add(half * 16 * 16);
+            let mut row = first_row;
+            let last = first_row + count;
+            while row + N <= last {
+                q3k_band_rows::<N>(
+                    data.as_ptr(),
+                    stride,
+                    row,
+                    blocks,
+                    Q3kBandView {
+                        act: half_act,
+                        act_stride: halves * 4096,
+                        dxs: half_dxs,
+                        dxs_stride: halves * 16 * 16,
+                        out: out.as_mut_ptr().add(half * 16 * count + (row - first_row)),
+                        count,
+                        columns,
+                    },
+                );
+                row += N;
+            }
+            for tail in row..last {
+                for col in 0..columns {
+                    let x = xs[half * 16 + col];
+                    let start = tail * stride;
+                    *out.get_unchecked_mut((half * 16 + col) * count + tail - first_row) =
+                        q3k_dot_vnni(&data[start..start + stride], &x.q, &x.d);
+                }
+            }
+        }
+    }
+}
+
+/// [`q3k_matvec_tiled_range`] with the shape checks the dispatch needs.
+pub(crate) fn try_q3k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) -> bool {
+    if !vnni512_available()
+        || stride == 0
+        || !stride.is_multiple_of(110)
+        || B == 0
+        || B > MAX_HALVES * 16
+        || count == 0
+    {
+        return false;
+    }
+    let blocks = stride / 110;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || first_row + count > data.len() / stride
+        || xs.iter().any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: the checks above match the kernel's contract, and it re-checks the CPU itself.
+    unsafe { q3k_matvec_tiled_range(data, stride, first_row, count, xs, out, tile) };
+    true
 }
 
 /// [`q4k_dot`] for `B` activations, dequantizing each 32-byte weight load once.
@@ -2623,6 +3747,12 @@ static NO_EPI_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 #[cfg(test)]
 static NO_UNPACK_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Schedule probe for the Q4_K band: accumulate even and odd sub-blocks in two integer chains per
+/// row instead of one, doubling the independent `dpbusd` chains. Test-only; the sum is the same
+/// (integer adds are associative), so this one could be wired if it wins.
+#[cfg(test)]
+static TWO_ACC_PROBE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Ceiling probe for a per-256-block activation scale: accumulates the eight sub-block partial
 /// sums in `i32` (scaled by a constant, since the real scale would live in the activation) and
 /// applies one convert plus one multiply-add per (row, block) instead of four ops per
@@ -2649,6 +3779,17 @@ fn tiled_no_epi() -> bool {
     #[cfg(test)]
     {
         NO_EPI_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn tiled_two_acc() -> bool {
+    #[cfg(test)]
+    {
+        TWO_ACC_PROBE.load(std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(not(test))]
     {
@@ -2737,6 +3878,9 @@ unsafe fn q4k_tiled_matvec_worker<const B: usize>(
         let no_weight = tiled_no_weight();
         let no_epi = tiled_no_epi();
         let per_block_epi = tiled_per_block_epi();
+        // Test-only ceiling probe: skip the nibble decode, leaving `wq` zeroed. Prices the unpack
+        // separately from the `dpbusd` chain; the values are wrong on purpose.
+        let no_unpack = tiled_no_unpack();
         // Window-major accumulation: one row window of `ROW_WIN` rows keeps its partial sums in
         // `buf` (ROW_WIN * stride_cols floats, L2-resident) across every block, and `out` is written
         // once per window. The old order walked all rows per 256-column slab and parked partials in
@@ -2780,13 +3924,16 @@ unsafe fn q4k_tiled_matvec_worker<const B: usize>(
                         scale_f[r][s] = dvec[r] * f32::from(scale);
                         min_f[r][s] = dminvec[r] * f32::from(min);
                     }
-                    let wrow = wq.as_mut_ptr().add(r * 256);
-                    for j in 0..4 {
-                        let packed = _mm256_loadu_si256(block.add(16 + j * 32) as *const __m256i);
-                        let low = _mm256_and_si256(packed, low_mask);
-                        let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
-                        _mm256_storeu_si256(wrow.add(j * 64) as *mut __m256i, low);
-                        _mm256_storeu_si256(wrow.add(j * 64 + 32) as *mut __m256i, high);
+                    if !no_unpack {
+                        let wrow = wq.as_mut_ptr().add(r * 256);
+                        for j in 0..4 {
+                            let packed =
+                                _mm256_loadu_si256(block.add(16 + j * 32) as *const __m256i);
+                            let low = _mm256_and_si256(packed, low_mask);
+                            let high = _mm256_and_si256(_mm256_srli_epi16(packed, 4), low_mask);
+                            _mm256_storeu_si256(wrow.add(j * 64) as *mut __m256i, low);
+                            _mm256_storeu_si256(wrow.add(j * 64 + 32) as *mut __m256i, high);
+                        }
                     }
                 }
                 let wq_ptr = wq.as_ptr();
@@ -3123,22 +4270,42 @@ unsafe fn q4k_tiled_band<const N: usize>(
         // Probe arm: one int accumulator across all eight sub-blocks, so the float work drops from
         // four ops per (row, sub-block) to one convert and one multiply-add per (row, block).
         let mut isum: [__m512i; N] = [_mm512_setzero_si512(); N];
+        let two_acc = tiled_two_acc();
         for s in 0..8 {
             let mut acc: [__m512i; N] = [_mm512_setzero_si512(); N];
+            let mut acc_odd: [__m512i; N] = [_mm512_setzero_si512(); N];
             for g in 0..8 {
                 let grp = s * 8 + g;
                 let codes = _mm512_loadu_si512(half_act.add(grp * 64) as *const __m512i);
-                for (t, slot) in acc.iter_mut().enumerate() {
-                    // The probe arm keeps every instruction of the real loop and drops only the
-                    // 4-byte weight load, so the difference prices that load.
-                    let word = if no_weight {
-                        0x1111_1111_i32
-                    } else {
-                        u32::from_le(std::ptr::read_unaligned(
-                            wq.add((band + t) * 256 + grp * 4) as *const u32
-                        )) as i32
-                    };
-                    *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word), codes);
+                if two_acc && g % 2 == 1 {
+                    for (t, slot) in acc_odd.iter_mut().enumerate() {
+                        let word = if no_weight {
+                            0x1111_1111_i32
+                        } else {
+                            u32::from_le(std::ptr::read_unaligned(
+                                wq.add((band + t) * 256 + grp * 4) as *const u32,
+                            )) as i32
+                        };
+                        *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word), codes);
+                    }
+                } else {
+                    for (t, slot) in acc.iter_mut().enumerate() {
+                        // The probe arm keeps every instruction of the real loop and drops only the
+                        // 4-byte weight load, so the difference prices that load.
+                        let word = if no_weight {
+                            0x1111_1111_i32
+                        } else {
+                            u32::from_le(std::ptr::read_unaligned(
+                                wq.add((band + t) * 256 + grp * 4) as *const u32,
+                            )) as i32
+                        };
+                        *slot = _mm512_dpbusd_epi32(*slot, _mm512_set1_epi32(word), codes);
+                    }
+                }
+            }
+            if two_acc {
+                for (even, odd) in acc.iter_mut().zip(acc_odd.iter()) {
+                    *even = _mm512_add_epi32(*even, *odd);
                 }
             }
             let dxv = _mm512_loadu_ps(dxs.add(s * COLS));
@@ -5754,6 +6921,567 @@ mod tests {
         row
     }
 
+    fn q3k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
+        let mut row = Vec::with_capacity(blocks * 110);
+        for _ in 0..blocks {
+            for _ in 0..108 {
+                row.push(rng.byte());
+            }
+            row.extend_from_slice(&rng.half(0.001, 0.03));
+        }
+        row
+    }
+
+    fn q5k_row(rng: &mut Rng, blocks: usize) -> Vec<u8> {
+        let mut row = Vec::with_capacity(blocks * 176);
+        for _ in 0..blocks {
+            row.extend_from_slice(&rng.half(0.001, 0.06));
+            row.extend_from_slice(&rng.half(0.0, 0.02));
+            for _ in 0..172 {
+                row.push(rng.byte());
+            }
+        }
+        row
+    }
+
+    /// The Q3_K and Q5_K row kernels must agree with the scalar reference within the tolerance the
+    /// other row kernels use (`1e-3 + 1e-4·|ref|`). Random block bytes cover every scale, every
+    /// `qh` bit pattern, and both halves of the block.
+    #[test]
+    fn q3k_and_q5k_row_kernels_match_the_scalar_reference() {
+        if !available() {
+            eprintln!("skipped: no AVX2");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0103);
+        for (ty, width) in [(GgmlType::Q3K, 110_usize), (GgmlType::Q5K, 176)] {
+            for cols in [256_usize, 1536] {
+                let blocks = cols / 256;
+                let row = if width == 110 {
+                    q3k_row(&mut rng, blocks)
+                } else {
+                    q5k_row(&mut rng, blocks)
+                };
+                let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+                let want = crate::quant::dot_scalar(ty, &row, &x, &[], None);
+                // SAFETY: whole blocks on both sides, and `available()` checked AVX2.
+                let got = unsafe {
+                    if width == 110 {
+                        q3k_dot_avx2(&row, &x)
+                    } else {
+                        q5k_dot_avx2(&row, &x)
+                    }
+                };
+                let tol = 1e-3 + 1e-4 * want.abs();
+                assert!(
+                    (got - want).abs() <= tol,
+                    "{ty:?} cols {cols}: {got} vs {want} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    /// `q3k_dot_vnni` with the bias dot removed, to price what precomputing the 16-value activation
+    /// sums could buy before any plumbing is added. Test-only and deliberately wrong.
+    #[cfg(test)]
+    #[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+    unsafe fn q3k_dot_vnni_without_bias(row: &[u8], xq: &[i8], dx: &[f32]) -> f32 {
+        // SAFETY: the caller states the lengths, and the CPU features; every load stays inside them.
+        unsafe {
+            let blocks = row.len() / 110;
+            let three = _mm256_set1_epi8(3);
+            let four_levels = _mm256_set1_epi8(4);
+            let zero = _mm256_setzero_si256();
+            let mut accumulator = _mm256_setzero_ps();
+            for b in 0..blocks {
+                let block = row.as_ptr().add(b * 110);
+                let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
+                let scales = q3k_scales(block);
+                let qh = _mm256_loadu_si256(block as *const __m256i);
+                let dx_at = dx.as_ptr().add(b * 8);
+                let mut bit = 1_u8;
+                for half in 0..2 {
+                    let qs = block.add(32 + half * 32);
+                    let x_half = b * 256 + half * 128;
+                    let dx4 = _mm_loadu_ps(dx_at.add(half * 4));
+                    let dx8 = _mm256_set_m128(dx4, dx4);
+                    let dx_dup =
+                        _mm256_permutevar8x32_ps(dx8, _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3));
+                    let coeffs = _mm256_mul_ps(
+                        _mm256_mul_ps(_mm256_loadu_ps(scales.as_ptr().add(half * 8)), dx_dup),
+                        _mm256_set1_ps(d),
+                    );
+                    for run in 0..4 {
+                        let mask = _mm256_set1_epi8(bit as i8);
+                        let shift = _mm256_set1_epi32((run * 2) as i32);
+                        let pick = _mm256_setr_epi32(
+                            (2 * run) as i32,
+                            (2 * run) as i32,
+                            (2 * run) as i32,
+                            (2 * run) as i32,
+                            (2 * run + 1) as i32,
+                            (2 * run + 1) as i32,
+                            (2 * run + 1) as i32,
+                            (2 * run + 1) as i32,
+                        );
+                        let packed = _mm256_loadu_si256(qs as *const __m256i);
+                        let codes = _mm256_and_si256(_mm256_srlv_epi32(packed, shift), three);
+                        let high = _mm256_andnot_si256(
+                            _mm256_cmpeq_epi8(_mm256_and_si256(qh, mask), zero),
+                            four_levels,
+                        );
+                        let unsigned = _mm256_add_epi8(codes, high);
+                        let xv = _mm256_loadu_si256(
+                            xq.as_ptr().add(x_half + run * 32) as *const __m256i
+                        );
+                        let dot = _mm256_dpbusd_epi32(zero, unsigned, xv);
+                        let coefficients = _mm256_permutevar8x32_ps(coeffs, pick);
+                        accumulator =
+                            _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot), coefficients, accumulator);
+                        bit <<= 1;
+                    }
+                }
+            }
+            hsum(accumulator)
+        }
+    }
+
+    /// Prices the bias dot: same row, same activation, with and without the second `dpbusd`.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q3k_bias_dot() {
+        if !vnni_available() {
+            eprintln!("skipped: no VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0105);
+        let cols = 2048;
+        let row = q3k_row(&mut rng, cols / 256);
+        let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+        let xq = QuantizedX::new(&x);
+        let dx = xq.d.clone();
+        let mut with = 0.0_f32;
+        let mut without = 0.0_f32;
+        let iterations = 100_000;
+        for round in 0..7 {
+            // Alternate which kernel runs first so a frequency drift cannot favour either.
+            let (first, second) = if round % 2 == 0 {
+                (true, false)
+            } else {
+                (false, true)
+            };
+            let start = std::time::Instant::now();
+            if first {
+                for _ in 0..iterations {
+                    // SAFETY: whole blocks, matching activation, VNNI checked above.
+                    with += unsafe { q3k_dot_vnni(&row, &xq.q, &dx) };
+                }
+            } else {
+                for _ in 0..iterations {
+                    // SAFETY: as above, with the test-only kernel that drops the bias dot.
+                    without += unsafe { q3k_dot_vnni_without_bias(&row, &xq.q, &dx) };
+                }
+            }
+            let first_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            if second {
+                for _ in 0..iterations {
+                    // SAFETY: as above.
+                    with += unsafe { q3k_dot_vnni(&row, &xq.q, &dx) };
+                }
+            } else {
+                for _ in 0..iterations {
+                    // SAFETY: as above, with the test-only kernel that drops the bias dot.
+                    without += unsafe { q3k_dot_vnni_without_bias(&row, &xq.q, &dx) };
+                }
+            }
+            let second_ms = start.elapsed().as_secs_f64() * 1e3;
+            let (with_ms, without_ms) = if first {
+                (first_ms, second_ms)
+            } else {
+                (second_ms, first_ms)
+            };
+            if round >= 3 {
+                println!(
+                    "q3k row {cols}: with bias {with_ms:.1} ms, without {without_ms:.1} ms, \
+                     ratio {:.3}x",
+                    with_ms / without_ms
+                );
+            }
+        }
+        println!("(checksums {with:.3} {without:.3})");
+    }
+
+    /// The tiled Q3_K path must reproduce the row kernel for every batch width and every row,
+    /// including widths that are not a multiple of sixteen and row counts that leave a tail.
+    #[test]
+    fn q3k_tiled_range_matches_the_row_kernel() {
+        if !vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0107);
+        let cols = 1536;
+        let blocks = cols / 256;
+        let stride = blocks * 110;
+        let rows = 11;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
+        for batch in [4_usize, 16, 32, 40] {
+            let xs: Vec<Vec<f32>> = (0..batch)
+                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                .collect();
+            let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+            for count in [1_usize, 4, 9] {
+                let first_row = 0;
+                let refs: Vec<&QuantizedX> = quantized.iter().collect();
+                let mut out = vec![0.0_f32; batch * count];
+                // SAFETY: whole blocks, a matching activation and row range, and the CPU feature
+                // checked above.
+                unsafe {
+                    let xs_refs: &[&QuantizedX] = &refs;
+                    let array: &[&QuantizedX] = xs_refs;
+                    match batch {
+                        4 => q3k_matvec_tiled_range::<4>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("four"),
+                            &mut out,
+                            None,
+                        ),
+                        16 => q3k_matvec_tiled_range::<16>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("sixteen"),
+                            &mut out,
+                            None,
+                        ),
+                        32 => q3k_matvec_tiled_range::<32>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("32"),
+                            &mut out,
+                            None,
+                        ),
+                        _ => q3k_matvec_tiled_range::<40>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("forty"),
+                            &mut out,
+                            None,
+                        ),
+                    }
+                }
+                for (entry, xq) in quantized.iter().enumerate() {
+                    for local in 0..count {
+                        let start = (first_row + local) * stride;
+                        // SAFETY: whole blocks and a matching activation.
+                        let want =
+                            unsafe { q3k_dot_vnni(&data[start..start + stride], &xq.q, &xq.d) };
+                        let got = out[entry * count + local];
+                        let tol = 1e-3 + 1e-4 * want.abs();
+                        assert!(
+                            (got - want).abs() <= tol,
+                            "batch {batch} count {count} row {local} entry {entry}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prices the scalar code decode inside the band: how much of a row-block's band time is
+    /// `q3k_decode_codes`.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q3k_decode_codes() {
+        if !vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0109);
+        let cols = 1536;
+        let blocks = cols / 256;
+        let stride = blocks * 110;
+        let rows = 4;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
+        let xs: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+        let refs: [&QuantizedX; 16] = std::array::from_fn(|entry| &quantized[entry]);
+        let act = q3k_act_band(&refs, blocks);
+        let mut dxs = vec![0.0_f32; blocks * 16 * 16];
+        for b in 0..blocks {
+            for k in 0..16 {
+                for (col, xq) in quantized.iter().enumerate() {
+                    dxs[(b * 16 + k) * 16 + col] = xq.d[b * 8 + k / 2];
+                }
+            }
+        }
+        let iterations = 200_000;
+        let mut sink = 0.0_f32;
+        let mut out = vec![0.0_f32; 16 * rows];
+        for round in 0..6 {
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                for row in 0..rows {
+                    for b in 0..blocks {
+                        let mut codes = [0_u8; 256];
+                        let mut coef = [0.0_f32; 16];
+                        // SAFETY: one whole block at a time inside the row.
+                        unsafe {
+                            q3k_decode_codes(
+                                data.as_ptr().add(row * stride + b * 110),
+                                &mut codes,
+                                &mut coef,
+                            );
+                        }
+                        sink += f32::from(codes[0]) + coef[0];
+                    }
+                }
+            }
+            let decode_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: four rows, one tile half, whole blocks.
+                unsafe {
+                    q3k_band_rows::<4>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        Q3kBandView {
+                            act: act.as_ptr(),
+                            act_stride: 4096,
+                            dxs: dxs.as_ptr(),
+                            dxs_stride: 16 * 16,
+                            out: out.as_mut_ptr(),
+                            count: rows,
+                            columns: 16,
+                        },
+                    );
+                }
+                sink += out[0];
+            }
+            let band_ms = start.elapsed().as_secs_f64() * 1e3;
+            if round >= 2 {
+                let decode_ns = decode_ms * 1e6 / (iterations * rows * blocks) as f64;
+                let band_ns = band_ms * 1e6 / (iterations * rows * blocks) as f64;
+                println!(
+                    "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, decode share {:.0}%",
+                    decode_ns / band_ns * 100.0
+                );
+            }
+        }
+        println!("(sink {sink:.3})");
+    }
+
+    /// The tiled Q5_K path must reproduce the row kernel for every batch width and row count,
+    /// including a partial last band, with `sums` taken from the same activation.
+    #[test]
+    fn q5k_tiled_range_matches_the_row_kernel() {
+        if !vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0110);
+        let cols = 1536;
+        let blocks = cols / 256;
+        let stride = blocks * 176;
+        let rows = 11;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q5k_row(&mut rng, blocks)).collect();
+        for batch in [4_usize, 16, 40] {
+            let xs: Vec<Vec<f32>> = (0..batch)
+                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                .collect();
+            let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+            let sums: Vec<Vec<f32>> = xs.iter().map(|x| crate::quant::x_sums(x)).collect();
+            let refs: Vec<&QuantizedX> = quantized.iter().collect();
+            let sum_refs: Vec<&[f32]> = sums.iter().map(|s| s.as_slice()).collect();
+            for count in [1_usize, 4, 9] {
+                let mut out = vec![0.0_f32; batch * count];
+                // SAFETY: whole blocks, matching activations and sums, and the CPU feature checked.
+                unsafe {
+                    macro_rules! args_for {
+                        ($n:literal) => {
+                            Q5kArgs {
+                                xs: refs.as_slice().try_into().expect("batch width"),
+                                sums: sum_refs.as_slice().try_into().expect("batch width"),
+                            }
+                        };
+                    }
+                    match batch {
+                        4 => q5k_matvec_tiled_range::<4>(
+                            &data,
+                            stride,
+                            0,
+                            count,
+                            args_for!(4),
+                            &mut out,
+                            None,
+                        ),
+                        16 => q5k_matvec_tiled_range::<16>(
+                            &data,
+                            stride,
+                            0,
+                            count,
+                            args_for!(16),
+                            &mut out,
+                            None,
+                        ),
+                        _ => q5k_matvec_tiled_range::<40>(
+                            &data,
+                            stride,
+                            0,
+                            count,
+                            args_for!(40),
+                            &mut out,
+                            None,
+                        ),
+                    }
+                }
+                for (entry, xq) in quantized.iter().enumerate() {
+                    for local in 0..count {
+                        let start = local * stride;
+                        // SAFETY: whole blocks and a matching activation.
+                        let want = unsafe {
+                            q5k_dot_vnni(&data[start..start + stride], &xq.q, &xq.d, &sums[entry])
+                        };
+                        let got = out[entry * count + local];
+                        let tol = 1e-3 + 1e-4 * want.abs();
+                        assert!(
+                            (got - want).abs() <= tol,
+                            "batch {batch} count {count} row {local} entry {entry}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prices the tiled path against one row-kernel call per (row, activation).
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q3k_tiled_range() {
+        if !vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0108);
+        let cols = 1536;
+        let blocks = cols / 256;
+        let stride = blocks * 110;
+        let rows = 64;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
+        let batch = 16;
+        let xs: Vec<Vec<f32>> = (0..batch)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+        let refs: Vec<&QuantizedX> = quantized.iter().collect();
+        let mut sink = 0.0_f32;
+        for round in 0..5 {
+            let mut out = vec![0.0_f32; batch * rows];
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                // SAFETY: whole blocks and a matching activation.
+                unsafe {
+                    q3k_matvec_tiled_range::<16>(
+                        &data,
+                        stride,
+                        0,
+                        rows,
+                        refs.as_slice().try_into().expect("sixteen"),
+                        &mut out,
+                        None,
+                    );
+                }
+                sink += out[0];
+            }
+            let tiled_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                for row in 0..rows {
+                    let bytes = &data[row * stride..(row + 1) * stride];
+                    for xq in &quantized {
+                        // SAFETY: whole blocks and a matching activation.
+                        sink += unsafe { q3k_dot_vnni(bytes, &xq.q, &xq.d) };
+                    }
+                }
+            }
+            let row_ms = start.elapsed().as_secs_f64() * 1e3;
+            if round >= 2 {
+                println!(
+                    "{rows} rows x {batch}: tiled {tiled_ms:.1} ms, row kernels {row_ms:.1} ms, {:.2}x",
+                    row_ms / tiled_ms
+                );
+            }
+        }
+        println!("(sink {sink:.3})");
+    }
+
+    /// The integer kernels must agree with the `f32` row kernel run on the *dequantized*
+    /// activation, which isolates kernel arithmetic from the quantization error of `x` itself.
+    /// Both the `maddubs` and the `dpbusd` form are checked, and the batch path must equal the
+    /// single path entry by entry.
+    #[test]
+    fn q3k_and_q5k_integer_kernels_match_the_f32_kernel_on_dequantized_x() {
+        if !available() {
+            eprintln!("skipped: no AVX2");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0104);
+        for (ty, width) in [(GgmlType::Q3K, 110_usize), (GgmlType::Q5K, 176)] {
+            for cols in [256_usize, 1536] {
+                let blocks = cols / 256;
+                let row = if width == 110 {
+                    q3k_row(&mut rng, blocks)
+                } else {
+                    q5k_row(&mut rng, blocks)
+                };
+                let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+                let xq = QuantizedX::new(&x);
+                let dx = xq.dequantized();
+                let sums = crate::quant::x_sums(&dx);
+                let want = crate::quant::dot_scalar(ty, &row, &dx, &sums, None);
+                // SAFETY: whole blocks, an activation of the same width, and AVX2.
+                let got = unsafe {
+                    match width {
+                        110 => q3k_dot_int(&row, &xq.q, &xq.d),
+                        _ => q5k_dot_int(&row, &xq.q, &xq.d, &sums),
+                    }
+                };
+                let tol = 1e-3 + 1e-4 * want.abs();
+                assert!(
+                    (got - want).abs() <= tol,
+                    "{ty:?} maddubs cols {cols}: {got} vs {want}"
+                );
+                if vnni_available() {
+                    // SAFETY: as above, and `vnni_available()` checked the features.
+                    let wide = unsafe {
+                        match width {
+                            110 => q3k_dot_vnni(&row, &xq.q, &xq.d),
+                            _ => q5k_dot_vnni(&row, &xq.q, &xq.d, &sums),
+                        }
+                    };
+                    assert!(
+                        (wide - want).abs() <= tol,
+                        "{ty:?} vnni cols {cols}: {wide} vs {want}"
+                    );
+                    assert_eq!(wide.to_bits(), got.to_bits(), "{ty:?} vnni vs maddubs");
+                }
+            }
+        }
+    }
+
     /// A Q6_K row of `blocks` blocks with random scales and nibbles.
     /// Q6_K tiled against the row kernel at the shape that dominates prefill.
     ///
@@ -7081,6 +8809,140 @@ mod tests {
         );
     }
 
+    /// The same probe for the Q4_K tiled band: real against the nibble decode skipped. The delta is
+    /// the unpack's share of the band, which is the ceiling a load-time unpack could recover.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q4k_unpack_probe() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            return;
+        }
+        let (rows, cols, copies) = (8960usize, 1536usize, 4usize);
+        let blocks = cols / 256;
+        let stride = blocks * 144;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        };
+        let mut row = vec![0_u8; stride];
+        for b in 0..blocks {
+            let at = b * 144;
+            row[at..at + 2].copy_from_slice(&crate::quant::f32_to_f16(0.02).to_le_bytes());
+            row[at + 2..at + 4].copy_from_slice(&crate::quant::f32_to_f16(0.01).to_le_bytes());
+            for byte in &mut row[at + 4..at + 144] {
+                *byte = next();
+            }
+        }
+        let count = rows * copies;
+        let data: Vec<u8> = (0..count).flat_map(|_| row.clone()).collect();
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|i| (i % 17) as f32 / 17.0 - 0.5).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut out = vec![0.0_f32; 16 * count];
+        let mut arm = |probe: bool| -> f64 {
+            NO_UNPACK_PROBE.store(probe, Ordering::Relaxed);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                try_q4k_matvec_tiled_range(&data, stride, 0, count, &xs, &sums, &mut out, None);
+                std::hint::black_box(&out);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let (mut real, mut probe) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..2 {
+            real = real.min(arm(false));
+            probe = probe.min(arm(true));
+        }
+        NO_UNPACK_PROBE.store(false, Ordering::Relaxed);
+        let bytes = (count * stride) as f64;
+        println!(
+            "q4k unpack probe {rows}x{cols} x16 x{copies}: real {:>7.1} ms ({:.1} GB/s) | \
+             no-unpack {:>7.1} ms ({:.1} GB/s) | {:.3}x",
+            real * 1e3,
+            bytes / real / 1e9,
+            probe * 1e3,
+            bytes / probe / 1e9,
+            real / probe,
+        );
+    }
+
+    /// Schedule probe for the Q4_K band: one integer chain per row against two (even/odd
+    /// sub-blocks). Same sum, so a win here is wireable.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q4k_schedule_probe() {
+        use std::sync::atomic::Ordering;
+        if !vnni512_available() {
+            return;
+        }
+        let (rows, cols, copies) = (8960usize, 1536usize, 4usize);
+        let blocks = cols / 256;
+        let stride = blocks * 144;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        };
+        let mut row = vec![0_u8; stride];
+        for b in 0..blocks {
+            let at = b * 144;
+            row[at..at + 2].copy_from_slice(&crate::quant::f32_to_f16(0.02).to_le_bytes());
+            row[at + 2..at + 4].copy_from_slice(&crate::quant::f32_to_f16(0.01).to_le_bytes());
+            for byte in &mut row[at + 4..at + 144] {
+                *byte = next();
+            }
+        }
+        let count = rows * copies;
+        let data: Vec<u8> = (0..count).flat_map(|_| row.clone()).collect();
+        let source: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|i| (i % 17) as f32 / 17.0 - 0.5).collect())
+            .collect();
+        let xs_vec: Vec<QuantizedX> = source.iter().map(|x| QuantizedX::new(x)).collect();
+        let xs: [&QuantizedX; 16] = std::array::from_fn(|e| &xs_vec[e]);
+        let sums_vec: Vec<Vec<f32>> = source.iter().map(|x| crate::quant::x_sums(x)).collect();
+        let sums: [&[f32]; 16] = std::array::from_fn(|e| sums_vec[e].as_slice());
+        let mut out = vec![0.0_f32; 16 * count];
+        let mut arm = |two: bool| -> f64 {
+            TWO_ACC_PROBE.store(two, Ordering::Relaxed);
+            let mut best = f64::INFINITY;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                try_q4k_matvec_tiled_range(&data, stride, 0, count, &xs, &sums, &mut out, None);
+                std::hint::black_box(&out);
+                best = best.min(start.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let (mut one, mut two) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..2 {
+            one = one.min(arm(false));
+            two = two.min(arm(true));
+        }
+        TWO_ACC_PROBE.store(false, Ordering::Relaxed);
+        let bytes = (count * stride) as f64;
+        println!(
+            "q4k schedule probe {rows}x{cols} x16 x{copies}: one-acc {:>7.1} ms ({:.1} GB/s) | \
+             two-acc {:>7.1} ms ({:.1} GB/s) | {:.3}x",
+            one * 1e3,
+            bytes / one / 1e9,
+            two * 1e3,
+            bytes / two / 1e9,
+            one / two,
+        );
+    }
+
     /// How much of the Q6_K tiled kernel is epilogue. Per (row, 16-value group) it does four ops
     /// and a broadcast over four `dpbusd`, so the ratio is worse than Q4_K's.
     #[test]
@@ -7413,7 +9275,6 @@ mod quantize_tests {
 // engine path to the row path within the repack prototype's tolerance.
 
 /// `block_q4_Kx8`: eight interleaved `block_q4_K` rows, the ggml layout `make_block_q4_Kx8` builds.
-#[cfg(target_arch = "x86_64")]
 #[repr(C, align(8))]
 pub(crate) struct BlockQ4Kx8 {
     /// `d` of the eight rows.
@@ -7428,7 +9289,6 @@ pub(crate) struct BlockQ4Kx8 {
 
 /// Bytes of one `block_q4_Kx8`: eight rows, one super-block each — the same 144 bytes per row as
 /// `block_q4_K`, so the layout moves nothing but the order.
-#[cfg(target_arch = "x86_64")]
 pub(crate) const Q4K8_BLOCK: usize = 1152;
 /// Values per Q4_K super-block (the activation is quantized in the same chunks).
 #[cfg(target_arch = "x86_64")]
@@ -7437,7 +9297,6 @@ pub(crate) const QK: usize = 256;
 #[cfg(target_arch = "x86_64")]
 pub(crate) const Q8K_BLOCK: usize = 292;
 
-#[cfg(target_arch = "x86_64")]
 const _: () = assert!(core::mem::size_of::<BlockQ4Kx8>() == Q4K8_BLOCK);
 
 /// Test-only override for [`q4k8_enabled`]: the switch is cached from the environment once, which
@@ -7446,9 +9305,11 @@ const _: () = assert!(core::mem::size_of::<BlockQ4Kx8>() == Q4K8_BLOCK);
 #[cfg(all(test, target_arch = "x86_64"))]
 static Q4K8_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Whether the Pha 1b 8x8 kernel is on: `VIPERA_Q4K8`, **on by default** since ADR-005 accepted the
-/// per-256 activation it quantizes to. `VIPERA_Q4K8=0` (or `false`, `off`, `no`) restores the row
-/// kernel.
+/// Whether the Pha 1b 8x8 kernel is on: `VIPERA_Q4K8`, **off by default** (ADR-006).
+///
+/// The repack is hoisted to load time (`WeightSource::set_q4k8`, one buffer per Q4_K tensor), which
+/// removed the 0.49x per-call regression, but the kernel still measures 0.90-0.93x the row kernel on
+/// decode at 8 threads (2026-11-26, paired). It stays opt-in: `VIPERA_Q4K8=1` turns it on.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn q4k8_enabled() -> bool {
     #[cfg(test)]
@@ -7458,7 +9319,7 @@ pub(crate) fn q4k8_enabled() -> bool {
         _ => {}
     }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::tiled::env_default_on("VIPERA_Q4K8"))
+    *ENABLED.get_or_init(|| crate::tiled::env_truthy("VIPERA_Q4K8"))
 }
 
 /// `make_block_q4_Kx8`: pack the eight rows starting at `first_row` into one `BlockQ4Kx8` per
@@ -7536,6 +9397,24 @@ pub(crate) fn make_blocks_q4k8(
         }
         out.push(blk);
     }
+}
+
+/// Pack every whole 8-row group of a Q4_K matrix once, at load time: group `g`'s `blocks`
+/// `BlockQ4Kx8` start at `g * blocks`. The hot path (`fill_rows_q4k8_groups`) then reads this
+/// buffer instead of calling [`make_blocks_q4k8`] on every product. The packed bytes are the same
+/// size as the source (1152 bytes per eight rows), so this copies the tensor, it does not expand it.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn pack_q4k8_rows(
+    src: &[u8],
+    stride: usize,
+    blocks: usize,
+    rows: usize,
+) -> Vec<BlockQ4Kx8> {
+    let mut packed = Vec::with_capacity(rows.div_ceil(8) * blocks);
+    for group in 0..rows / 8 {
+        make_blocks_q4k8(src, stride, group * 8, blocks, &mut packed);
+    }
+    packed
 }
 
 /// `quantize_row_q8_K_ref` per 256-value block (lab port): one scale for the whole block, the
