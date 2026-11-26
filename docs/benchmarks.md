@@ -5231,3 +5231,30 @@ nó phụ thuộc repack Q4K8 chứ không đọc GGUF. Muốn làm đúng phả
 Q3_K (2-bit code + `qh` + 16 scale 6-bit) và Q5_K, (2) band kernel 16 activation × N row, (3) driver
 + clamp theo `count`, (4) test parity với row kernel. Đó là thay đổi nhiều trăm dòng, chưa làm
 trong lượt này.
+
+## Q3_K repacked layout + band 16 activation — 2026-11-26
+
+**Thiết kế.** `pack_q3k_rows` biến mỗi block thành 320 byte: 256 byte code `0..7` (một byte/giá
+trị, đúng dạng `code + 4·high` mà `dpbusd` cần) + 16 `f32` coefficient `d·(scale-32)`. Mỗi
+activation được transpose thành tile `block·4096 + grp·64 + column·4` để một `dpbusd` phủ 16
+activation trên cùng 4 weight. Kernel `q3k_band_16::<N>` mỗi nhóm 16 giá trị tốn **một** chuỗi
+`dpbusd` cho `Σxq` (dùng chung mọi row) + `N` chuỗi cho weight, tức `N+1` thay vì `8·N` của row
+kernel; prologue mỗi block (unpack scale, coefficient) trả một lần cho `N·16` output.
+
+**Parity:** `q3k_band_matches_the_row_kernel` — 4 row × 16 activation × 6 block, mọi ô khớp
+`q3k_dot_vnni` trong `1e-3 + 1e-4·|ref|`.
+
+**Đo** (`bench_q3k_band`, cache-warm, 4 row × 16 activation × 6 block, 20k vòng):
+
+| | thời gian | tỉ lệ |
+|---|---:|---:|
+| `q3k_band_16` (64 output/lượt) | 21.1 ms | **6.49x** |
+| 64 lần row kernel | 137.1 ms | 1.00x |
+
+**Trạng thái:** khối tự chứa, `#[cfg(test)]`, **chưa wire vào dispatch**. Còn thiếu để dùng thật:
+(1) repack lúc load như Q4K8, (2) tile activation dùng chung qua các row window, (3) driver
+`try_q3k_matvec_tiled_range` + clamp `count`, (4) nhánh fallback.
+
+**Q4_K_M prefill profile** (cùng lệnh, chunk 2 = 48.59 ms): q4k 73%, q6k 25%, attention 1%.
+Q4_K_M prefill nhanh hơn decode của chính nó 6.3x (4.96 vs 31.4 ms/token), còn Q3_K_M chỉ 1.74x
+(20.5 vs 35.7) — đúng bằng tỉ lệ amortize 16 activation mà band đo được (6.49x).
