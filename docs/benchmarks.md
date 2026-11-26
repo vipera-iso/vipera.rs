@@ -5258,3 +5258,29 @@ kernel; prologue mỗi block (unpack scale, coefficient) trả một lần cho `
 **Q4_K_M prefill profile** (cùng lệnh, chunk 2 = 48.59 ms): q4k 73%, q6k 25%, attention 1%.
 Q4_K_M prefill nhanh hơn decode của chính nó 6.3x (4.96 vs 31.4 ms/token), còn Q3_K_M chỉ 1.74x
 (20.5 vs 35.7) — đúng bằng tỉ lệ amortize 16 activation mà band đo được (6.49x).
+
+## Q3_K tiled path wired vào prefill — 2026-11-26
+
+Lần wire thật: band đọc thẳng GGUF (không cần repack lúc load), trích code một lần cho mỗi
+row-block rồi dùng cho cả 16 activation trong tile; tile dùng lại `SharedTile` sẵn có (cùng layout
+Q4_K/Q6_K), band 4 row, phần dư của `count` do row kernel điền. Dispatch:
+`fill_rows_batch` → `try_q3k_matvec_tiled_range` khi có VNNI-512 và activation đã lượng tử hoá.
+
+| | trước | sau |
+|---|---:|---:|
+| pp64 | 51.0 tok/s | 69.3 tok/s |
+| pp128 | 50.3 tok/s | 70.2 tok/s |
+| pp512 | 48.7 tok/s | **68.1 tok/s** |
+| decode ctx32 | 28.0 tok/s | 26.4 tok/s (không đổi trong nhiễu) |
+
+**1.40x prefill.** Microbench `bench_q3k_tiled_range` (64 row × 16 activation, 1536 cột) cho
+1.26–1.35x — thấp hơn nhiều so với ước lượng 6.49x của bản bench cũ, vì bench cũ so với 64 lời gọi
+row kernel trên row chỉ 6 block (overhead lời gọi chiếm lớn); end-to-end mới là con số đúng.
+
+**Còn cách Q4_K_M (201.6) và ik_llama (325.8) rất xa.** Phần còn lại là `q3k_decode_codes`: 256
+byte code được trích bằng vòng scalar cho **mỗi row-block**, thứ Q4_K không trả vì nó repack lúc
+load. Đó là việc tiếp theo nếu muốn đuổi tiếp: repack code lúc load (cần plumbing như Q4K8) hoặc
+vector hoá bước trích code.
+
+Parity: `q3k_tiled_range_matches_the_row_kernel` — batch 4/16/32/40 × count 1/4/9, mọi ô khớp
+`q3k_dot_vnni`.

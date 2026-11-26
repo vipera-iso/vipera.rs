@@ -2480,64 +2480,11 @@ pub(crate) unsafe fn q3k_dot_vnni(row: &[u8], xq: &[i8], dx: &[f32]) -> f32 {
     }
 }
 
-/// Bytes one repacked Q3_K 256-value block takes: 256 one-byte codes, then 16 `f32` coefficients.
-#[cfg(test)]
-pub(crate) const Q3K_RECORD: usize = 256 + 16 * 4;
-
-/// Repack Q3_K rows into the layout the band kernel reads.
-///
-/// Per block: the 256 codes as one byte each (`code + 4·high`, the value the row kernel makes
-/// unsigned for `dpbusd`), then the sixteen `d * (scale - 32)` coefficients. Expanding three bits
-/// into a byte costs 256 bytes instead of 110, which is only paid here because a band reads each
-/// block once for sixteen activations; in the row kernel it would be a loss.
-///
-/// `data` holds whole rows of `stride` bytes; the output is `rows * blocks * Q3K_RECORD`.
-#[cfg(test)]
-pub(crate) fn pack_q3k_rows(data: &[u8], stride: usize) -> Vec<u8> {
-    assert!(
-        stride.is_multiple_of(110),
-        "a Q3_K row is whole 110-byte blocks"
-    );
-    let blocks = stride / 110;
-    let rows = data.len() / stride;
-    let mut out = vec![0_u8; rows * blocks * Q3K_RECORD];
-    for row in 0..rows {
-        for b in 0..blocks {
-            let block = &data[row * stride + b * 110..][..110];
-            let record = &mut out[(row * blocks + b) * Q3K_RECORD..][..Q3K_RECORD];
-            let hm = &block[0..32];
-            let qs = &block[32..96];
-            let d = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
-            // SAFETY: `block` is one whole 110-byte block, which is what `q3k_scales` requires.
-            let scales = unsafe { q3k_scales(block.as_ptr()) };
-            for half in 0..2 {
-                for run in 0..4 {
-                    let shift = run * 2;
-                    let bit = 1_u8 << (half * 4 + run);
-                    for part in 0..2 {
-                        for l in 0..16 {
-                            let low = (qs[half * 32 + part * 16 + l] >> shift) & 3;
-                            let high = if hm[part * 16 + l] & bit != 0 { 4 } else { 0 };
-                            let at = half * 128 + run * 32 + part * 16 + l;
-                            record[at] = low + high;
-                        }
-                    }
-                }
-            }
-            for (k, scale) in scales.iter().enumerate() {
-                record[256 + k * 4..260 + k * 4].copy_from_slice(&(d * scale).to_le_bytes());
-            }
-        }
-    }
-    out
-}
-
 /// The 16-activation tile the band kernel reads.
 ///
 /// Layout: for every block and every group of four values, the sixteen activations' four values are
-/// contiguous (`block · 4096 + grp · 64 + column · 4`), which is what lets one `dpbusd` cover
-/// sixteen activations against the same four weights. Columns past `xs.len()` are zero-filled.
-#[cfg(test)]
+/// contiguous (`block · 4096 + grp · 64 + column · 4`), the same bytes and layout as the Q4_K/Q6_K
+/// tile. Columns past `xs.len()` are zero-filled.
 pub(crate) fn q3k_act_band<const B: usize>(xs: &[&QuantizedX; B], blocks: usize) -> Vec<i8> {
     let halves = B.div_ceil(16).max(1);
     let mut act = vec![0_i8; blocks * halves * 4096];
@@ -2556,37 +2503,93 @@ pub(crate) fn q3k_act_band<const B: usize>(xs: &[&QuantizedX; B], blocks: usize)
     act
 }
 
-/// `N` repacked rows against sixteen activations, one pass over each weight block.
+/// Codes of one Q3_K block, one byte each (`code + 4·high`), in value order, and the sixteen
+/// `d · (scale - 32)` coefficients.
 ///
-/// Per 16-value group: one `dpbusd` for the activation sums (shared by every row), then one
-/// `dpbusd` chain per row on four weight words. Sixteen groups therefore cost `N + 1` integer dot
-/// chains per block instead of `N · 8` in the row kernel (`q3k_dot_vnni` needs two per 32 values),
-/// and the per-block prologue (scale unpack, coefficients) is paid once for `N · 16` outputs.
+/// The scalar work the band pays once per row and block, where the row kernel pays it once per row
+/// and activation.
 ///
 /// # Safety
 ///
-/// `wq` must point at `row + N` repacked rows of `block_stride = blocks * Q3K_RECORD` bytes, `act`
-/// at `blocks * 4096` bytes of tile, `dxs` at `blocks * 16 * 16` floats, `out` at `N * 16` floats,
-/// and the CPU must have AVX-512 VNNI with VL.
-#[cfg(test)]
-#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
-pub(crate) unsafe fn q3k_band_16<const N: usize>(
-    wq: *const u8,
-    row: usize,
-    block_stride: usize,
+/// `block` must point at one whole 110-byte block; `codes` must have room for 256 bytes.
+unsafe fn q3k_decode_codes(block: *const u8, codes: &mut [u8; 256], coef: &mut [f32; 16]) {
+    // SAFETY: the caller points at one whole block, and `q3k_scales` needs exactly that.
+    unsafe {
+        let hm = std::slice::from_raw_parts(block, 32);
+        let qs = std::slice::from_raw_parts(block.add(32), 64);
+        let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
+        let scales = q3k_scales(block);
+        for half in 0..2 {
+            for run in 0..4 {
+                let shift = run * 2;
+                let bit = 1_u8 << (half * 4 + run);
+                for part in 0..2 {
+                    let k = half * 8 + run * 2 + part;
+                    for l in 0..16 {
+                        let low = (qs[half * 32 + part * 16 + l] >> shift) & 3;
+                        let high = if hm[part * 16 + l] & bit != 0 { 4 } else { 0 };
+                        codes[k * 16 + l] = low + high;
+                    }
+                }
+            }
+        }
+        for (k, scale) in scales.iter().enumerate() {
+            coef[k] = d * scale;
+        }
+    }
+}
+
+/// `N` Q3_K rows against the sixteen activations of one tile half, one pass over each weight block.
+///
+/// Per block: decode the `N` rows' codes and coefficients once, then per 16-value group one
+/// `dpbusd` chain for the activation sums (shared by every row) and one per row. Sixteen groups
+/// cost `N + 1` chains instead of the row kernel's `8 · N`, and the block prologue is paid once for
+/// `N · 16` outputs.
+///
+/// # Safety
+///
+/// `data` must point at whole 110-byte blocks for rows `first_row .. first_row + N`, `stride` must
+/// be `blocks · 110`, `act` must point at `blocks · 4096` bytes of tile for one half, `dxs` at
+/// `blocks · 16 · 16` floats, `out` at `N · count` floats, and the CPU must have AVX-512 VNNI with
+/// VL.
+/// Where one tile half's activations and scales live, and where the band writes its rows.
+#[derive(Clone, Copy)]
+struct Q3kBandView {
     act: *const i8,
+    act_stride: usize,
     dxs: *const f32,
-    blocks: usize,
+    dxs_stride: usize,
     out: *mut f32,
+    /// Entries per activation in `out`, which is entry-major.
+    count: usize,
+    /// Live activation columns in this half; the tile is always sixteen wide.
+    columns: usize,
+}
+
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+unsafe fn q3k_band_rows<const N: usize>(
+    data: *const u8,
+    stride: usize,
+    first_row: usize,
+    blocks: usize,
+    view: Q3kBandView,
 ) {
     // SAFETY: the caller's contract is this function's contract; every load below stays inside the
     // rows, blocks, groups and sixteen columns it describes.
     unsafe {
-        let mut lanes_acc = [_mm512_setzero_ps(); N];
         let ones = _mm512_set1_epi32(0x0101_0101);
+        let four = _mm512_set1_ps(4.0);
+        let mut lanes_acc = [_mm512_setzero_ps(); N];
+        let mut codes = [[0_u8; 256]; N];
+        let mut coef = [[0.0_f32; 16]; N];
         for b in 0..blocks {
-            let block_act = act.add(b * 4096);
-            let block_dx = dxs.add(b * 16 * 16);
+            for t in 0..N {
+                let block = data.add((first_row + t) * stride + b * 110);
+                // SAFETY: one whole block per row, as the caller promises.
+                q3k_decode_codes(block, &mut codes[t], &mut coef[t]);
+            }
+            let block_act = view.act.add(b * view.act_stride);
+            let block_dx = view.dxs.add(b * view.dxs_stride);
             for k in 0..16 {
                 let a = [
                     _mm512_loadu_si512(block_act.add(k * 256) as *const __m512i),
@@ -2594,38 +2597,152 @@ pub(crate) unsafe fn q3k_band_16<const N: usize>(
                     _mm512_loadu_si512(block_act.add(k * 256 + 128) as *const __m512i),
                     _mm512_loadu_si512(block_act.add(k * 256 + 192) as *const __m512i),
                 ];
-                // The `-4` bias of every code, summed over this 16-value group for each column. One
-                // chain for all rows: it does not depend on the weights.
+                // The `-4` bias every code carries, summed for each column: one chain for all rows.
                 let mut bias = _mm512_setzero_si512();
                 for group in &a {
                     bias = _mm512_dpbusd_epi32(bias, ones, *group);
                 }
-                let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), _mm512_set1_ps(4.0));
+                let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), four);
                 let dx = _mm512_loadu_ps(block_dx.add(k * 16));
                 for (t, accumulator) in lanes_acc.iter_mut().enumerate() {
-                    let codes = wq.add((row + t) * block_stride + b * Q3K_RECORD);
-                    let weights = codes.add(k * 16);
                     let mut acc = _mm512_setzero_si512();
-                    for (at, group) in a.iter().enumerate() {
-                        let word = (weights.add(at * 4) as *const u32).read_unaligned();
-                        acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(word as i32), *group);
+                    for (word, group) in a.iter().enumerate() {
+                        let packed = u32::from_le_bytes(
+                            codes[t][k * 16 + word * 4..][..4]
+                                .try_into()
+                                .expect("four bytes"),
+                        );
+                        acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *group);
                     }
                     let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc), bias);
-                    let coef = f32::from_le_bytes([
-                        *codes.add(256 + k * 4),
-                        *codes.add(256 + k * 4 + 1),
-                        *codes.add(256 + k * 4 + 2),
-                        *codes.add(256 + k * 4 + 3),
-                    ]);
-                    let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef));
+                    let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][k]));
                     *accumulator = _mm512_fmadd_ps(levels, scale, *accumulator);
                 }
             }
         }
+        // `out` is entry-major (`out[entry * count + row]`), so the sixteen lanes of a row are
+        // spread across sixteen entries rather than written as one contiguous run.
+        let mut lanes = [0.0_f32; 16];
         for (t, accumulator) in lanes_acc.iter().enumerate() {
-            _mm512_storeu_ps(out.add(t * 16), *accumulator);
+            _mm512_storeu_ps(lanes.as_mut_ptr(), *accumulator);
+            for (col, value) in lanes.iter().take(view.columns).enumerate() {
+                *view.out.add(col * view.count + t) = *value;
+            }
         }
     }
+}
+
+/// The tiled Q3_K prefill path: bands of four rows over the shared activation tile.
+///
+/// Returns false when the shape is one this kernel does not take, so the caller keeps its row
+/// kernel. Rows past the last whole band of four are filled by the row kernel, keeping the same
+/// numbers the untied path would produce.
+///
+/// # Safety
+///
+/// `stride` must be whole 110-byte blocks, `xs[e]` must hold `blocks · 256` values and
+/// `blocks · 8` scales, `out` must have `B · count` entries, and the CPU must have AVX-512 VNNI
+/// with VL.
+pub(crate) unsafe fn q3k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) {
+    // SAFETY: the caller validated the lengths; every access below stays inside them.
+    unsafe {
+        const N: usize = 4;
+        let blocks = stride / 110;
+        let halves = B.div_ceil(16);
+        let owned_act;
+        let act: &[i8] = match tile.filter(|t| t.blocks() == blocks && t.halves() == halves) {
+            Some(tile) => tile.bytes(),
+            None => {
+                owned_act = q3k_act_band(xs, blocks);
+                &owned_act
+            }
+        };
+        // One scale per 32-value group, repeated for the two 16-value groups it covers, kept per
+        // tile half so the kernel can read sixteen columns from one contiguous run.
+        let mut dxs = vec![0.0_f32; blocks * halves * 16 * 16];
+        for b in 0..blocks {
+            for (entry, x) in xs.iter().enumerate() {
+                let half = entry / 16;
+                let col = entry % 16;
+                for k in 0..16 {
+                    dxs[((b * halves + half) * 16 + k) * 16 + col] = x.d[b * 8 + k / 2];
+                }
+            }
+        }
+        for half in 0..halves {
+            let columns = (B - half * 16).min(16);
+            let half_act = act.as_ptr().add(half * 4096);
+            let half_dxs = dxs.as_ptr().add(half * 16 * 16);
+            let mut row = first_row;
+            let last = first_row + count;
+            while row + N <= last {
+                q3k_band_rows::<N>(
+                    data.as_ptr(),
+                    stride,
+                    row,
+                    blocks,
+                    Q3kBandView {
+                        act: half_act,
+                        act_stride: halves * 4096,
+                        dxs: half_dxs,
+                        dxs_stride: halves * 16 * 16,
+                        out: out.as_mut_ptr().add(half * 16 * count + (row - first_row)),
+                        count,
+                        columns,
+                    },
+                );
+                row += N;
+            }
+            for tail in row..last {
+                for col in 0..columns {
+                    let x = xs[half * 16 + col];
+                    let start = tail * stride;
+                    *out.get_unchecked_mut((half * 16 + col) * count + tail - first_row) =
+                        q3k_dot_vnni(&data[start..start + stride], &x.q, &x.d);
+                }
+            }
+        }
+    }
+}
+
+/// [`q3k_matvec_tiled_range`] with the shape checks the dispatch needs.
+pub(crate) fn try_q3k_matvec_tiled_range<const B: usize>(
+    data: &[u8],
+    stride: usize,
+    first_row: usize,
+    count: usize,
+    xs: &[&QuantizedX; B],
+    out: &mut [f32],
+    tile: Option<&SharedTile>,
+) -> bool {
+    if !vnni512_available()
+        || stride == 0
+        || !stride.is_multiple_of(110)
+        || B == 0
+        || B > MAX_HALVES * 16
+        || count == 0
+    {
+        return false;
+    }
+    let blocks = stride / 110;
+    let cols = blocks * 256;
+    if out.len() != B.saturating_mul(count)
+        || first_row + count > data.len() / stride
+        || xs.iter().any(|x| x.q.len() < cols || x.d.len() < cols / 32)
+    {
+        return false;
+    }
+    // SAFETY: the checks above match the kernel's contract, and it re-checks the CPU itself.
+    unsafe { q3k_matvec_tiled_range(data, stride, first_row, count, xs, out, tile) };
+    true
 }
 
 /// [`q4k_dot`] for `B` activations, dequantizing each 32-byte weight load once.
@@ -6683,10 +6800,10 @@ mod tests {
         println!("(checksums {with:.3} {without:.3})");
     }
 
-    /// The band kernel must reproduce the row kernel's numbers for every row and every column of
-    /// its sixteen-activation tile.
+    /// The tiled Q3_K path must reproduce the row kernel for every batch width and every row,
+    /// including widths that are not a multiple of sixteen and row counts that leave a tail.
     #[test]
-    fn q3k_band_matches_the_row_kernel() {
+    fn q3k_tiled_range_matches_the_row_kernel() {
         if !vnni512_available() {
             eprintln!("skipped: no AVX-512 VNNI");
             return;
@@ -6694,56 +6811,84 @@ mod tests {
         let mut rng = Rng(0x5eed_0d07_0000_0107);
         let cols = 1536;
         let blocks = cols / 256;
-        let rows: Vec<Vec<u8>> = (0..4).map(|_| q3k_row(&mut rng, blocks)).collect();
-        let data: Vec<u8> = rows.concat();
         let stride = blocks * 110;
-        let repacked = pack_q3k_rows(&data, stride);
-        let xs: Vec<Vec<f32>> = (0..16)
-            .map(|_| (0..cols).map(|_| rng.unit()).collect())
-            .collect();
-        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
-        let refs: [&QuantizedX; 16] = std::array::from_fn(|entry| &quantized[entry]);
-        let band = q3k_act_band(&refs, blocks);
-        let mut dxs = vec![0.0_f32; blocks * 16 * 16];
-        for b in 0..blocks {
-            for k in 0..16 {
-                for (col, xq) in quantized.iter().enumerate() {
-                    dxs[(b * 16 + k) * 16 + col] = xq.d[b * 8 + k / 2];
+        let rows = 11;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
+        for batch in [4_usize, 16, 32, 40] {
+            let xs: Vec<Vec<f32>> = (0..batch)
+                .map(|_| (0..cols).map(|_| rng.unit()).collect())
+                .collect();
+            let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+            for count in [1_usize, 4, 9] {
+                let first_row = 0;
+                let refs: Vec<&QuantizedX> = quantized.iter().collect();
+                let mut out = vec![0.0_f32; batch * count];
+                // SAFETY: whole blocks, a matching activation and row range, and the CPU feature
+                // checked above.
+                unsafe {
+                    let xs_refs: &[&QuantizedX] = &refs;
+                    let array: &[&QuantizedX] = xs_refs;
+                    match batch {
+                        4 => q3k_matvec_tiled_range::<4>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("four"),
+                            &mut out,
+                            None,
+                        ),
+                        16 => q3k_matvec_tiled_range::<16>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("sixteen"),
+                            &mut out,
+                            None,
+                        ),
+                        32 => q3k_matvec_tiled_range::<32>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("32"),
+                            &mut out,
+                            None,
+                        ),
+                        _ => q3k_matvec_tiled_range::<40>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("forty"),
+                            &mut out,
+                            None,
+                        ),
+                    }
                 }
-            }
-        }
-        let mut out = [0.0_f32; 4 * 16];
-        // SAFETY: four repacked rows, a tile for all six blocks, sixteen columns of scales, and
-        // `vnni512_available()` checked the CPU.
-        unsafe {
-            q3k_band_16::<4>(
-                repacked.as_ptr(),
-                0,
-                blocks * Q3K_RECORD,
-                band.as_ptr(),
-                dxs.as_ptr(),
-                blocks,
-                out.as_mut_ptr(),
-            );
-        }
-        for (t, row) in rows.iter().enumerate() {
-            for (col, xq) in quantized.iter().enumerate() {
-                // SAFETY: whole blocks and a matching activation.
-                let want = unsafe { q3k_dot_vnni(row, &xq.q, &xq.d) };
-                let got = out[t * 16 + col];
-                let tol = 1e-3 + 1e-4 * want.abs();
-                assert!(
-                    (got - want).abs() <= tol,
-                    "row {t} col {col}: {got} vs {want}"
-                );
+                for (entry, xq) in quantized.iter().enumerate() {
+                    for local in 0..count {
+                        let start = (first_row + local) * stride;
+                        // SAFETY: whole blocks and a matching activation.
+                        let want =
+                            unsafe { q3k_dot_vnni(&data[start..start + stride], &xq.q, &xq.d) };
+                        let got = out[entry * count + local];
+                        let tol = 1e-3 + 1e-4 * want.abs();
+                        assert!(
+                            (got - want).abs() <= tol,
+                            "batch {batch} count {count} row {local} entry {entry}: {got} vs {want}"
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Prices the band against the row kernel on the same work: four rows × sixteen activations.
+    /// Prices the tiled path against one row-kernel call per (row, activation).
     #[test]
     #[ignore = "measurement, not a correctness check"]
-    fn bench_q3k_band() {
+    fn bench_q3k_tiled_range() {
         if !vnni512_available() {
             eprintln!("skipped: no AVX-512 VNNI");
             return;
@@ -6751,59 +6896,50 @@ mod tests {
         let mut rng = Rng(0x5eed_0d07_0000_0108);
         let cols = 1536;
         let blocks = cols / 256;
-        let rows: Vec<Vec<u8>> = (0..4).map(|_| q3k_row(&mut rng, blocks)).collect();
-        let data: Vec<u8> = rows.concat();
         let stride = blocks * 110;
-        let repacked = pack_q3k_rows(&data, stride);
-        let xs: Vec<Vec<f32>> = (0..16)
+        let rows = 64;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
+        let batch = 16;
+        let xs: Vec<Vec<f32>> = (0..batch)
             .map(|_| (0..cols).map(|_| rng.unit()).collect())
             .collect();
         let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
-        let refs: [&QuantizedX; 16] = std::array::from_fn(|entry| &quantized[entry]);
-        let band = q3k_act_band(&refs, blocks);
-        let mut dxs = vec![0.0_f32; blocks * 16 * 16];
-        for b in 0..blocks {
-            for k in 0..16 {
-                for (col, xq) in quantized.iter().enumerate() {
-                    dxs[(b * 16 + k) * 16 + col] = xq.d[b * 8 + k / 2];
-                }
-            }
-        }
-        let iterations = 20_000;
+        let refs: Vec<&QuantizedX> = quantized.iter().collect();
         let mut sink = 0.0_f32;
-        let mut out = [0.0_f32; 4 * 16];
         for round in 0..5 {
+            let mut out = vec![0.0_f32; batch * rows];
             let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                // SAFETY: as in the parity test above.
+            for _ in 0..20 {
+                // SAFETY: whole blocks and a matching activation.
                 unsafe {
-                    q3k_band_16::<4>(
-                        repacked.as_ptr(),
+                    q3k_matvec_tiled_range::<16>(
+                        &data,
+                        stride,
                         0,
-                        blocks * Q3K_RECORD,
-                        band.as_ptr(),
-                        dxs.as_ptr(),
-                        blocks,
-                        out.as_mut_ptr(),
+                        rows,
+                        refs.as_slice().try_into().expect("sixteen"),
+                        &mut out,
+                        None,
                     );
                 }
                 sink += out[0];
             }
-            let band_ms = start.elapsed().as_secs_f64() * 1e3;
+            let tiled_ms = start.elapsed().as_secs_f64() * 1e3;
             let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                for row in &rows {
+            for _ in 0..20 {
+                for row in 0..rows {
+                    let bytes = &data[row * stride..(row + 1) * stride];
                     for xq in &quantized {
                         // SAFETY: whole blocks and a matching activation.
-                        sink += unsafe { q3k_dot_vnni(row, &xq.q, &xq.d) };
+                        sink += unsafe { q3k_dot_vnni(bytes, &xq.q, &xq.d) };
                     }
                 }
             }
             let row_ms = start.elapsed().as_secs_f64() * 1e3;
             if round >= 2 {
                 println!(
-                    "4x16 over {blocks} blocks: band {band_ms:.1} ms, row kernels {row_ms:.1} ms, {:.2}x",
-                    row_ms / band_ms
+                    "{rows} rows x {batch}: tiled {tiled_ms:.1} ms, row kernels {row_ms:.1} ms, {:.2}x",
+                    row_ms / tiled_ms
                 );
             }
         }

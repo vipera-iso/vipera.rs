@@ -1593,6 +1593,16 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         {
             return;
         }
+        // Q3_K: four rows per band over the same sixteen-activation tile. The band decodes a
+        // row-block's codes once for all sixteen activations instead of once per activation.
+        if ty == GgmlType::Q3K
+            && let Some(xs) = activation.quantized()
+            && crate::simd::try_q3k_matvec_tiled_range(
+                data, stride, first_row, count, xs, out, tile,
+            )
+        {
+            return;
+        }
     }
     // The Q4_K 8x8 kernel, for every width the tiled path above did not take. It has to be every
     // width, not just the one `matvec` takes: the pool runs a batch of one exactly like a batch of
