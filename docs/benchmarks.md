@@ -5191,3 +5191,43 @@ lặp entry), test batch == single bit-for-bit. Kết quả đo:
 Chậm hơn cả hai chiều, nên đã revert. Lý do: khi lặp entry trên cùng một row, trọng số đã nằm
 trong L1 nên "chia sẻ" không tiết kiệm gì; còn batch 64 entry làm spill mảng accumulator, và decode
 B=1 rơi khỏi đường VNNI. Trạng thái giữ lại là mỗi entry chạy row kernel integer (VNNI).
+
+## Vì sao Q3_K/Q5_K chỉ 23.5 GB/s — và bảng cuối Q3_K_M — 2026-11-26
+
+**Quy về thời gian mỗi block**, từ chính profile decode (35 ms/token, 8T):
+
+| loại | block | thời gian | ns/block | byte/block | GB/s |
+|---|---:|---:|---:|---:|---:|
+| Q3_K + Q5_K | 4.279e6 | 20.2 ms | **4.72** | 110 / 176 | 23.5 |
+| Q4_K | 1.749e6 | 8.66 ms | **4.95** | 144 | 29.1 |
+| Q6_K | 0.912e6 | 5.73 ms | **6.28** | 210 | 33.4 |
+
+Chi phí mỗi block gần như bằng nhau (4.7–6.3 ns) trong khi byte mỗi block khác nhau. Nghĩa là kernel
+bị chặn bởi **công việc cố định mỗi block** (load activation, integer dot, epilogue, hai lần `hsum`),
+không phải bởi số byte weight. Q3_K không "kém" riêng: block của nó chỉ 110 byte so với 144 của
+Q4_K, nên cùng ~4.7 ns chỉ chở được ít byte hơn 24% → 23.5 thay vì 29 GB/s.
+
+Điều này giải thích luôn khoảng cách prefill: mỗi activation (entry) phải trả toàn bộ công việc
+per-block, nên prefill chỉ nhanh hơn decode ~1.7x, trong khi Q4_K_M nhanh hơn 6.4x nhờ tiled kernel
+amortize một lượt block cho 16 activation. Và nó cũng giải thích vì sao batch kernel thất bại: nó
+thêm việc per-entry chứ không giảm việc per-block.
+
+**Bảng cuối Q3_K_M** (875.96 MiB, 8T, ctx 32):
+
+| | vipera | ik_llama.cpp (1180df7) | tỉ lệ |
+|---|---:|---:|---:|
+| pp64 | 51.0 tok/s | — | — |
+| pp128 | 50.3 tok/s | — | — |
+| pp512 | 48.7 tok/s | 325.8 tok/s | 0.15x |
+| tg32 (decode) | 28.0 tok/s | 34.13 tok/s | 0.82x |
+| NLL (322 token) | 3.9287 (ppl 50.84) | — | — |
+
+Q4_K_M tham chiếu cùng máy: pp512 201.6, tg32 31.8. Khoảng cách prefill của Q3_K_M là do thiếu
+tiled path, không phải do format.
+
+**Tiled kernel cho Q3_K/Q5_K:** không port thẳng được. `q4k_tiled_band` đọc layout đã repack
+(`wq + row*256 + grp*4`, weight broadcast 4 byte, `_mm512_dpbusd_epi32` trên 16 activation), tức là
+nó phụ thuộc repack Q4K8 chứ không đọc GGUF. Muốn làm đúng phải: (1) thiết kế layout repack cho
+Q3_K (2-bit code + `qh` + 16 scale 6-bit) và Q5_K, (2) band kernel 16 activation × N row, (3) driver
++ clamp theo `count`, (4) test parity với row kernel. Đó là thay đổi nhiều trăm dòng, chưa làm
+trong lượt này.
