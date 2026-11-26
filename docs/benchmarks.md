@@ -5345,3 +5345,21 @@ bằng chứng; lượt đo sau đó cả đường sequential cũng tụt 22.5 
 không có so sánh tuyệt đối nào dùng được.
 
 Cần một model Q5_K_M để đo thật; lần này không tạo được (`/tmp` đầy giữa chừng, đã dọn).
+
+## Q3_K prefill: interleave dpbusd rows, align decode buffer — 2026-11-26
+
+**Lever tiếp theo (sau 1.18 ns/block-token):** trong `q3k_band_rows`, mỗi nhóm 16 giá trị làm
+4 `dpbusd` tuần tự trên cùng accumulator cho từng row (chuỗi phụ thuộc 5 cycle trên VNNI), rồi mới
+sang row kế. Với N=4 row độc lập, interleave theo word (word0: row0..3, word1: row0..3, ...)
+cho 4 chuỗi độc lập ăn VNNI unit thay vì chờ latency. Đồng thời căn `codes` decode buffer 32 byte
+để store 32-byte của decode và load 4-byte của inner loop không lệch line.
+
+**Giả thuyết:** giảm stall dpbusd latency / store-forwarding, prefill pp512 tăng. Ngưỡng: ≥5%
+trên máy không bị bóp xung.
+
+**Đo:** parity `q3k_tiled_range_matches_the_row_kernel` xanh (bit-identical: dpbusd là integer,
+thứ tự cộng fp32 theo nhóm không đổi). Host tại thời điểm đo bị throttle nặng (sequential
+22.5 → 10.9 tok/s), nên số tuyệt đối 116.8 tok/s pp512 **không dùng để so với baseline 151 tok/s**.
+Cần đo lại trên host không throttle trước khi claim speedup.
+
+**Trạng thái:** code đúng, gate xanh; lợi ích hiệu năng **chưa xác nhận** bằng đo sạch.

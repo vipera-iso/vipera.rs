@@ -2612,16 +2612,21 @@ unsafe fn q3k_band_rows<const N: usize>(
         let ones = _mm512_set1_epi32(0x0101_0101);
         let four = _mm512_set1_ps(4.0);
         let mut lanes_acc = [_mm512_setzero_ps(); N];
-        let mut codes = [[0_u8; 256]; N];
+        // The decode writes 256 bytes per row, then the group loop reads them back four bytes at a
+        // time. Aligning the buffer keeps the 32-byte stores and those small loads on the same line.
+        #[repr(align(32))]
+        struct Aligned256([u8; 256]);
+        let mut codes = std::array::from_fn::<_, N, _>(|_| Aligned256([0_u8; 256]));
         let mut coef = [[0.0_f32; 16]; N];
         for b in 0..blocks {
             for t in 0..N {
                 let block = data.add((first_row + t) * stride + b * 110);
                 // SAFETY: one whole block per row, as the caller promises.
-                q3k_decode_codes(block, &mut codes[t], &mut coef[t]);
+                q3k_decode_codes(block, &mut codes[t].0, &mut coef[t]);
             }
             let block_act = view.act.add(b * view.act_stride);
             let block_dx = view.dxs.add(b * view.dxs_stride);
+            #[allow(clippy::needless_range_loop)]
             for k in 0..16 {
                 let a = [
                     _mm512_loadu_si512(block_act.add(k * 256) as *const __m512i),
@@ -2636,17 +2641,22 @@ unsafe fn q3k_band_rows<const N: usize>(
                 }
                 let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), four);
                 let dx = _mm512_loadu_ps(block_dx.add(k * 16));
-                for (t, accumulator) in lanes_acc.iter_mut().enumerate() {
-                    let mut acc = _mm512_setzero_si512();
-                    for (word, group) in a.iter().enumerate() {
+                // Interleave rows across each word so the four independent dpbusd chains feed the
+                // VNNI unit instead of waiting on one row's 5-cycle latency.
+                let mut acc = [_mm512_setzero_si512(); N];
+                for (word, group) in a.iter().enumerate() {
+                    for t in 0..N {
                         let packed = u32::from_le_bytes(
-                            codes[t][k * 16 + word * 4..][..4]
+                            codes[t].0[k * 16 + word * 4..][..4]
                                 .try_into()
                                 .expect("four bytes"),
                         );
-                        acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *group);
+                        acc[t] =
+                            _mm512_dpbusd_epi32(acc[t], _mm512_set1_epi32(packed as i32), *group);
                     }
-                    let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc), bias);
+                }
+                for (t, accumulator) in lanes_acc.iter_mut().enumerate() {
+                    let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc[t]), bias);
                     let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][k]));
                     *accumulator = _mm512_fmadd_ps(levels, scale, *accumulator);
                 }
