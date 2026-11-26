@@ -5306,3 +5306,8 @@ Chưa tách được phần nào đóng góp bao nhiêu — cần một probe s�
 nếu muốn con số chính xác.
 
 Parity không đổi: `q3k_tiled_range_matches_the_row_kernel` (batch 4/16/32/40 × count 1/4/9) vẫn xanh.
+
+### Band rows 4 → 8: neutral
+
+`prefill_vs_decode` trên Q3_K_M: pp512 151.0 tok/s (N=4) vs **155.1** (N=8), trong nhiễu ±3% của
+máy này. Ghi "neutral", giữ N=4 (diff nhỏ hơn). Nếu sau này đo 5 lần và N=8 ổn định ≥5% thì mới đổi.
