@@ -2506,35 +2506,54 @@ pub(crate) fn q3k_act_band<const B: usize>(xs: &[&QuantizedX; B], blocks: usize)
 /// Codes of one Q3_K block, one byte each (`code + 4·high`), in value order, and the sixteen
 /// `d · (scale - 32)` coefficients.
 ///
-/// The scalar work the band pays once per row and block, where the row kernel pays it once per row
-/// and activation.
+/// Vector form: one 32-bit-lane shift and one byte mask per run, with the sign bits OR-ed in as a
+/// masked constant, so the 256 codes cost eight vector groups instead of 256 scalar iterations.
+/// The shift stays under eight bits, so shifting 16-bit lanes cannot carry one byte into the next,
+/// and the `& 3` would drop such a carry anyway.
 ///
 /// # Safety
 ///
-/// `block` must point at one whole 110-byte block; `codes` must have room for 256 bytes.
+/// `block` must point at one whole 110-byte block; `codes` must have room for 256 bytes, and the
+/// CPU must support AVX2.
+#[target_feature(enable = "avx2")]
 unsafe fn q3k_decode_codes(block: *const u8, codes: &mut [u8; 256], coef: &mut [f32; 16]) {
-    // SAFETY: the caller points at one whole block, and `q3k_scales` needs exactly that.
+    // SAFETY: the caller points at one whole block, and `q3k_scales` needs exactly that. Every
+    // vector store lands inside the 256-byte `codes` above.
     unsafe {
-        let hm = std::slice::from_raw_parts(block, 32);
-        let qs = std::slice::from_raw_parts(block.add(32), 64);
+        let three = _mm256_set1_epi8(3);
+        let four = _mm256_set1_epi8(4);
+        let zero = _mm256_setzero_si256();
+        let hm = _mm256_loadu_si256(block as *const __m256i);
+        let out = codes.as_mut_ptr();
+        macro_rules! codes_for_run {
+            ($qs:expr, $shift:literal, $bit:literal, $at:literal) => {{
+                let shifted = _mm256_srli_epi16($qs, $shift);
+                let levels = _mm256_and_si256(shifted, three);
+                let mask = _mm256_set1_epi8((1_u8 << $bit) as i8);
+                let high =
+                    _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hm, mask), zero), four);
+                _mm256_storeu_si256(out.add($at) as *mut __m256i, _mm256_or_si256(levels, high));
+            }};
+        }
+        let first = _mm256_loadu_si256(block.add(32) as *const __m256i);
+        codes_for_run!(first, 0, 0, 0);
+        codes_for_run!(first, 2, 1, 32);
+        codes_for_run!(first, 4, 2, 64);
+        codes_for_run!(first, 6, 3, 96);
+        let second = _mm256_loadu_si256(block.add(64) as *const __m256i);
+        codes_for_run!(second, 0, 4, 128);
+        codes_for_run!(second, 2, 5, 160);
+        codes_for_run!(second, 4, 6, 192);
+        codes_for_run!(second, 6, 7, 224);
         let d = f16_to_f32(u16::from_le_bytes([*block.add(108), *block.add(109)]));
         let scales = q3k_scales(block);
+        let scaling = _mm256_set1_ps(d);
         for half in 0..2 {
-            for run in 0..4 {
-                let shift = run * 2;
-                let bit = 1_u8 << (half * 4 + run);
-                for part in 0..2 {
-                    let k = half * 8 + run * 2 + part;
-                    for l in 0..16 {
-                        let low = (qs[half * 32 + part * 16 + l] >> shift) & 3;
-                        let high = if hm[part * 16 + l] & bit != 0 { 4 } else { 0 };
-                        codes[k * 16 + l] = low + high;
-                    }
-                }
-            }
-        }
-        for (k, scale) in scales.iter().enumerate() {
-            coef[k] = d * scale;
+            let at = scales.as_ptr().add(half * 8);
+            _mm256_storeu_ps(
+                coef.as_mut_ptr().add(half * 8),
+                _mm256_mul_ps(_mm256_loadu_ps(at), scaling),
+            );
         }
     }
 }
@@ -6883,6 +6902,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Prices the scalar code decode inside the band: how much of a row-block's band time is
+    /// `q3k_decode_codes`.
+    #[test]
+    #[ignore = "measurement, not a correctness check"]
+    fn bench_q3k_decode_codes() {
+        if !vnni512_available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        let mut rng = Rng(0x5eed_0d07_0000_0109);
+        let cols = 1536;
+        let blocks = cols / 256;
+        let stride = blocks * 110;
+        let rows = 4;
+        let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
+        let xs: Vec<Vec<f32>> = (0..16)
+            .map(|_| (0..cols).map(|_| rng.unit()).collect())
+            .collect();
+        let quantized: Vec<QuantizedX> = xs.iter().map(|x| QuantizedX::new(x)).collect();
+        let refs: [&QuantizedX; 16] = std::array::from_fn(|entry| &quantized[entry]);
+        let act = q3k_act_band(&refs, blocks);
+        let mut dxs = vec![0.0_f32; blocks * 16 * 16];
+        for b in 0..blocks {
+            for k in 0..16 {
+                for (col, xq) in quantized.iter().enumerate() {
+                    dxs[(b * 16 + k) * 16 + col] = xq.d[b * 8 + k / 2];
+                }
+            }
+        }
+        let iterations = 200_000;
+        let mut sink = 0.0_f32;
+        let mut out = vec![0.0_f32; 16 * rows];
+        for round in 0..6 {
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                for row in 0..rows {
+                    for b in 0..blocks {
+                        let mut codes = [0_u8; 256];
+                        let mut coef = [0.0_f32; 16];
+                        // SAFETY: one whole block at a time inside the row.
+                        unsafe {
+                            q3k_decode_codes(
+                                data.as_ptr().add(row * stride + b * 110),
+                                &mut codes,
+                                &mut coef,
+                            );
+                        }
+                        sink += f32::from(codes[0]) + coef[0];
+                    }
+                }
+            }
+            let decode_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: four rows, one tile half, whole blocks.
+                unsafe {
+                    q3k_band_rows::<4>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        Q3kBandView {
+                            act: act.as_ptr(),
+                            act_stride: 4096,
+                            dxs: dxs.as_ptr(),
+                            dxs_stride: 16 * 16,
+                            out: out.as_mut_ptr(),
+                            count: rows,
+                            columns: 16,
+                        },
+                    );
+                }
+                sink += out[0];
+            }
+            let band_ms = start.elapsed().as_secs_f64() * 1e3;
+            if round >= 2 {
+                let decode_ns = decode_ms * 1e6 / (iterations * rows * blocks) as f64;
+                let band_ns = band_ms * 1e6 / (iterations * rows * blocks) as f64;
+                println!(
+                    "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, decode share {:.0}%",
+                    decode_ns / band_ns * 100.0
+                );
+            }
+        }
+        println!("(sink {sink:.3})");
     }
 
     /// Prices the tiled path against one row-kernel call per (row, activation).

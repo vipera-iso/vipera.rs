@@ -5284,3 +5284,25 @@ vector hoá bước trích code.
 
 Parity: `q3k_tiled_range_matches_the_row_kernel` — batch 4/16/32/40 × count 1/4/9, mọi ô khớp
 `q3k_dot_vnni`.
+
+## Q3_K: vector hoá trích code trong band — 2026-11-26
+
+**Giả thuyết:** `q3k_decode_codes` (256 byte code trích scalar mỗi row-block) chiếm phần lớn thời
+gian band; vector hoá bằng shift+mask 8 nhóm 32 byte sẽ cắt nó. Ngưỡng: prefill ≥ 73 tok/s.
+
+**Trước:** prefill pp512 68.1, decode 26.4 tok/s.
+**Sau:** pp64 155.1, pp128 159.2, **pp512 151.0**, decode 27.0 tok/s.
+
+**2.22x prefill**, nên nhận.
+
+Điều đáng ghi: probe `bench_q3k_decode_codes` **không** dịch chuyển (12.6 → 13.2 ns/row-block, vẫn
+"23%") vì phép đo đó bị `let mut codes = [0u8; 256]` (memset 256 byte mỗi vòng) chi phối — con số
+23% là của memset chứ không phải của bước trích code. Bài học: probe phải đo đúng thứ mình định
+đo; ở đây chính end-to-end mới là bằng chứng, và nó cho 2.22x dù probe nói "không đổi".
+
+Lý do khả dĩ cho 2.22x: bản scalar có 256 lần ghi byte + shift + branch theo từng nhóm, tạo
+store-forwarding stall và chặn scheduling; bản vector ghi 8 lần 32 byte và không có branch.
+Chưa tách được phần nào đóng góp bao nhiêu — cần một probe sạch (tái dùng buffer, không memset)
+nếu muốn con số chính xác.
+
+Parity không đổi: `q3k_tiled_range_matches_the_row_kernel` (batch 4/16/32/40 × count 1/4/9) vẫn xanh.
