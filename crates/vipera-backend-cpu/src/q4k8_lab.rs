@@ -761,13 +761,31 @@ mod tests {
                         let batch: &[OwnedActivation; 128] =
                             owned[..128].try_into().expect("exact width");
                         let act = BatchActivation::<128>::new(batch);
-                        fill_rows_batch::<128>(GgmlType::Q4K, &raw, stride, 0, &act, out, None);
+                        fill_rows_batch::<128>(
+                            GgmlType::Q4K,
+                            &raw,
+                            stride,
+                            0,
+                            &act,
+                            None,
+                            out,
+                            None,
+                        );
                     }
                     16 => {
                         let batch: &[OwnedActivation; 16] =
                             owned[..16].try_into().expect("exact width");
                         let act = BatchActivation::<16>::new(batch);
-                        fill_rows_batch::<16>(GgmlType::Q4K, &raw, stride, 0, &act, out, None);
+                        fill_rows_batch::<16>(
+                            GgmlType::Q4K,
+                            &raw,
+                            stride,
+                            0,
+                            &act,
+                            None,
+                            out,
+                            None,
+                        );
                     }
                     other => panic!("no arm for {other} entries"),
                 }
@@ -783,7 +801,7 @@ mod tests {
                     let batch: &[OwnedActivation; 1] =
                         std::slice::from_ref(entry).try_into().expect("one");
                     let act = BatchActivation::<1>::new(batch);
-                    fill_rows_batch::<1>(GgmlType::Q4K, &raw, stride, 0, &act, out, None);
+                    fill_rows_batch::<1>(GgmlType::Q4K, &raw, stride, 0, &act, None, out, None);
                 }
                 best = best.min(start.elapsed().as_secs_f64());
             }

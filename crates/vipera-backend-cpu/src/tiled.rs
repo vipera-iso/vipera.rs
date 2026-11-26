@@ -27,24 +27,24 @@ pub(crate) fn tiled_enabled() -> bool {
     !std::env::var("VIPERA_TILED").is_ok_and(|value| value == "0")
 }
 
-/// Whether the W-1a tiled-band activation is on: `VIPERA_TILED_A`, **on by default** since ADR-005.
+/// Whether the W-1a tiled-band activation is on: `VIPERA_TILED_A`, **off by default**.
 ///
 /// W-1a changes the activation's arithmetic — the band reads one scale per 256-value block
 /// instead of the per-32 scales of `QuantizedX` — so the engine's numbers move: NLL +0.3..0.7% on
-/// every text measured (`docs/benchmarks.md`, W-1). The owner accepted that cost for the speed
-/// (ADR-005). `VIPERA_TILED_A=0` (or `false`, `off`, `no`) restores the per-32 activation.
+/// every text measured (`docs/benchmarks.md`, W-1). The 2026-11-25 re-measurement found the switch
+/// 1.7x **slower** at prefill (pp128 122.9 vs 213.2 tok/s), so it stays opt-in: `VIPERA_TILED_A=1`
+/// turns it on.
 pub(crate) fn tiled_a_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| env_default_on("VIPERA_TILED_A"))
+    *ENABLED.get_or_init(|| env_truthy("VIPERA_TILED_A"))
 }
 
-/// A switch that is on unless the environment names it off: `0`, `false`, `off` or `no`.
-pub(crate) fn env_default_on(name: &str) -> bool {
-    !std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
+/// Whether an environment switch asks to be on: the repository's `env_truthy` convention — unset,
+/// empty and `0` mean off, anything else means on.
+pub(crate) fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && value != "0"
     })
 }
 

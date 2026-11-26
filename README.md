@@ -20,7 +20,7 @@ quietly assumed — `rustls` for TLS in `vipera serve` (`EXC-002`), `cudarc` for
 | H3 — DisSparse port (prefill, neutral on this machine) | Top-N rows per query entry in `attend_rows_sparse` | `VIPERA_PREFILL_SPARSE` | ledger "H3: DisSparse port — 2026-11-24" |
 | H4 — TriAttention phase 1 (fused prefill skip, measurement pending) | Skip prefill tiles below threshold in `attend_rows_shared` | `VIPERA_TRIATTENTION` | ledger "H4: TriAttention phase-1 — 2026-11-24", branch `perf/attn-triattention` |
 | 8x8 decode repack (A1) | `block_q4_Kx8` decode row-kernel path, `vpdpbusd` | `VIPERA_Q4K8` | step −34.8%, decode +53% (Pha 1b) |
-| W1a tiled-band activation | Per-256 activation scales (`VIPERA_TILED_A`, default on since ADR-005) | `VIPERA_TILED_A` | chunk 8T +2.6% (2026-11-24) |
+| W1a tiled-band activation | Per-256 activation scales (`VIPERA_TILED_A`, opt-in) | `VIPERA_TILED_A` | re-measured 2026-11-25: 0.58x prefill, so opt-in |
 
 ## Where it stands
 
@@ -147,11 +147,14 @@ curl -s localhost:8080/v1/chat/completions \
 - **AVX2 and VNNI quantized kernels** (Q4_K, Q6_K), selected at runtime and checked against the
   scalar reference. `vipera profile` prints the level the engine will use (`cpu_simd`: `avx512-vnni`,
   `vnni256`, `avx2`, `neon` or `scalar`), so a mixed fleet can see which host fell back.
-- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8`, default on since ADR-005 — `=0` turns it off): the
-  decode row-kernel path packs 8 rows as the ggml `block_q4_Kx8` and dots with `vpdpbusd` — step
-  −34.8%, decode +53%. It changes the activation granularity, which is why it is not the default.
-- **W1a tiled-band activation** (`VIPERA_TILED_A`, default on since ADR-005): the prefill tiled band reads one
+- **8x8 repacked decode** (Q4_K, `VIPERA_Q4K8`, opt-in — `=1` turns it on): the decode row-kernel
+  path packs 8 rows as the ggml `block_q4_Kx8` and dots with `vpdpbusd`. It changes the activation
+  granularity. The weights are now repacked once at load time (2026-11-26), which removed the
+  0.49x per-call cost, but the kernel still measures 0.90-0.93x the row kernel on decode, so it
+  stays opt-in.
+- **W1a tiled-band activation** (`VIPERA_TILED_A`, opt-in — `=1` turns it on): the prefill tiled band reads one
   scale per 256-value block (`TiledActivation`, `fill_rows_batch`) plus 16 raw-`x` sums per block.
+  Re-measured 2026-11-25 at 0.58x prefill (pp128), so it stays opt-in.
 - **Prefill-sparse attention** (`VIPERA_PREFILL_SPARSE`, default off) and **RefineKV**
   (`VIPERA_KV_REFINEKV`, default off) — the two experiments in the "Recent wins" table.
 
