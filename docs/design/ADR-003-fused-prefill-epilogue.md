@@ -1,13 +1,13 @@
-# ADR-003: Fused epilogue (`fma` + `fnmadd`) cho kernel Q4_K tiled
+# ADR-003: fused epilogue (`fma` + `fnmadd`) for the Q4_K tiled kernel
 
-Status: **Accepted — giữ opt-in, default vẫn là multiply-then-add.** Bật làm default **chưa** được
-duyệt và không có trong commit này; điều kiện để lật nằm ở mục 8.
-Ngày: 2026-11-22 · Owner: *cần điền* · Supersedes: none
+Status: **Accepted — stays opt-in, the default is still multiply-then-add.** Making it the default has
+**not** been approved and is not part of this commit; the conditions to flip it are in section 8.
+Date: 2026-11-22 · Owner: *to be filled in* · Supersedes: none
 
-## 1. Context — số đo
+## 1. Context — the numbers
 
-Kernel `q4k_matvec_tiled_range` (`crates/vipera-backend-cpu/src/simd.rs`) là đường prefill cho mọi
-ma trận Q4_K. Mỗi cặp `(row, sub-block)` nó kết thúc bằng sáu phép vector:
+`q4k_matvec_tiled_range` (`crates/vipera-backend-cpu/src/simd.rs`) is the prefill path for every Q4_K
+matrix. For each `(row, sub-block)` pair it finishes with six vector operations:
 
 ```
 main    = (cvt(acc) · scale_f[row][s]) · dxv[s]
@@ -15,12 +15,13 @@ minterm = sumv[s] · min_f[row][s]
 facc   += main - minterm
 ```
 
-Ba probe trước đó (bỏ broadcast weight, bỏ epilogue float, bỏ cả hai) đặt epilogue ở **+33%
-(8960×1536)** và **+42% (1536×8960)** khi bỏ hẳn — nhưng epilogue là số học bắt buộc: `sum_s
-(cvt(acc_s)·scale_s·dx_s − sum_s·min_s)`. Câu hỏi của ADR này là có viết nó bằng ít phép hơn mà
-không phạm vào tolerance đã công bố của đường tiled hay không.
+Three earlier probes (remove the weight broadcast, remove the float epilogue, remove both) put the
+epilogue at **+33% (8960×1536)** and **+42% (1536×8960)** when removed entirely — but the epilogue is
+mandatory arithmetic: `sum_s (cvt(acc_s)·scale_s·dx_s − sum_s·min_s)`. This ADR asks whether it can be
+written in fewer operations without breaking the tiled path's published tolerance.
 
-Bản fused giữ nguyên `dxv` chung cho cả 16 cột, đưa `scale_f` vào một fma và `min_f` vào một fnmadd:
+The fused form keeps `dxv` shared across all 16 columns, folds `scale_f` into one fma and `min_f` into
+one fnmadd:
 
 ```
 scaled  = cvt(acc) · dxv
@@ -28,213 +29,224 @@ sum     = fma(scaled, scale_f[row][s], facc)
 facc    = fnmadd(sumv, min_f[row][s], sum)
 ```
 
-Bốn phép thay sáu. Đo trên i5-11300H, 1 thread, cùng binary, `VIPERA_Q4K_FMA_EPI` bật/tắt:
+Four operations instead of six. Measured on the i5-11300H, 1 thread, same binary, with
+`VIPERA_Q4K_FMA_EPI` on and off:
 
-| arm | 8960×1536 | 1536×8960 | chunk 4 (524 token, 8 thread), 5 cặp xen kẽ |
+| arm | 8960×1536 | 1536×8960 | chunk 4 (524 tokens, 8 threads), 5 alternating pairs |
 |---|---:|---:|---:|
 | multiply-then-add (default) | 153.4 / 149.5 GFLOPS | 165.2 / 173.2 GFLOPS | median **785.16 ms** |
-| fused (`VIPERA_Q4K_FMA_EPI=1`) | 165.1 / 167.4 (**+8.6%**) | 193.4 / 189.3 (**+12%**) | median **746.04 ms** (**−5.0%**, 5/5 cặp) |
+| fused (`VIPERA_Q4K_FMA_EPI=1`) | 165.1 / 167.4 (**+8.6%**) | 193.4 / 189.3 (**+12%**) | median **746.04 ms** (**−5.0%**, 5/5 pairs) |
 
-Nhánh `if` thêm vào không làm arm default chậm đi: 153.4/149.5 đo được nằm trong dải baseline cũ
-(151.7/152.6 ở lần đo trước, cùng shape).
+The added `if` does not slow the default arm: 153.4/149.5 falls inside the older baseline range
+(151.7/152.6 in the previous run, same shapes).
 
-## 2. Chất lượng — phần quyết định
+## 2. Quality — the deciding part
 
-### 2.1 Kiểm soát tính tất định
+### 2.1 Determinism control
 
-Trước khi so hai arm phải chắc chắn phép đo không phải nhiễu thread. Cùng prompt, cùng seed, 8 thread,
-24 token greedy:
+Before comparing two arms, make sure the measurement is not thread noise. Same prompt, same seed, 8
+threads, 24 greedy tokens:
 
-| so sánh | kết quả |
+| comparison | result |
 |---|---|
-| off vs off (3 lần) | **giống nhau từng token** |
-| fma vs fma (2 lần) | **giống nhau từng token** |
-| off vs fma | **khác** |
+| off vs off (3 runs) | **identical token by token** |
+| fma vs fma (2 runs) | **identical token by token** |
+| off vs fma | **different** |
 
-Cả hai arm đều tất định, nên khác biệt dưới đây là của số học chứ không của lịch thread.
+Both arms are deterministic, so the differences below belong to the arithmetic, not to thread
+scheduling.
 
-### 2.2 Chín prompt cố định, 24 token greedy
+### 2.2 Nine fixed prompts, 24 greedy tokens
 
-Prompt: 8 câu hỏi/việc ngắn (giải thích kỹ thuật, tiếng Việt, sinh mã Rust, toán, so sánh khái niệm,
-page fault, phương pháp benchmark, FMA) cộng một đoạn 986 token cắt từ `docs/benchmarks.md`. Mọi
-prompt đều ≥ 16 token nên đều đi qua đường tiled.
+Prompts: eight short questions/tasks (technical explanation, Vietnamese, writing Rust code, maths,
+comparing concepts, page faults, benchmarking methodology, FMA) plus a 986-token excerpt cut from
+`docs/benchmarks.md`. Every prompt is ≥ 16 tokens, so all of them take the tiled path.
 
 | | |
 |---|---|
-| prompt cho ra **giống hệt** | **3 / 9** |
-| độ đồng ý theo vị trí, trung bình | **0.625** |
-| vị trí lệch đầu tiên | 1, 4, 8, 11, 14, 23 (6 prompt); 3 prompt khớp tới hết |
-| prompt tiếng Việt (27 token) | lệch ngay **token thứ 1** |
-| prompt dài 986 token | lệch ở token thứ 8 |
+| prompts producing **identical** output | **3 / 9** |
+| positional agreement, average | **0.625** |
+| first diverging position | 1, 4, 8, 11, 14, 23 (6 prompts); 3 prompts match to the end |
+| Vietnamese prompt (27 tokens) | diverges at **token 1** |
+| 986-token prompt | diverges at token 8 |
 
-Ví dụ cùng prompt tiếng Việt: arm default mở đầu "Prefill và decode là hai thuật ngữ…", arm fused mở
-đầu "Từ khóa: prefill, decode, phần cứng…". Cả hai đều là output hợp lý của một model 1.5B; phép đo
-này **không** nói cái nào tốt hơn, chỉ nói rằng chúng khác nhau — và khác ngay từ token đầu.
+For the same Vietnamese prompt: the default arm opens with a sentence meaning "Prefill and decode are
+two terms…", the fused arm with "Keywords: prefill, decode, hardware…". Both are plausible outputs from
+a 1.5B model; this measurement says **nothing** about which is better, only that they differ — and
+differ from the very first token.
 
-### 2.3 Perplexity trên văn bản cố định
+### 2.3 Perplexity on fixed texts
 
-Đo bằng `vipera score` (lệnh mới trong commit cùng ngày: log-likelihood của một văn bản cố định,
-chia chunk 64 token qua đúng đường prefill nên kernel tiled — và FMA — có mặt trong phép đo). Năm
-văn bản cắt từ `docs/benchmarks.md` và `docs/design/*.md`, mỗi lượt chạy hai lần cho mỗi arm và cả
-hai arm đều tái lập từng chữ số:
+Measured with `vipera score` (a new command in the same commit: the log-likelihood of a fixed text,
+chunked at 64 tokens through the real prefill path, so the tiled kernel — and FMA — is part of the
+measurement). Five texts cut from `docs/benchmarks.md` and `docs/design/*.md`, each run twice per arm,
+with both arms reproducing every digit:
 
-| văn bản | token | mean NLL off | mean NLL fused | Δ |
+| text | tokens | mean NLL off | mean NLL fused | Δ |
 |---|---:|---:|---:|---:|
 | popcount, rays | 986 | 2.826631 | 2.823378 | **−0.00325** |
 | gate/up shapes | 1697 | 3.084673 | 3.083967 | **−0.00071** |
 | ggml bind | 2444 | 2.637364 | 2.639467 | **+0.00210** |
-| ADR-001 mở đầu | 1492 | 3.324126 | 3.324727 | **+0.00060** |
-| ADR-003 mục 2 | 1494 | 3.581916 | 3.582051 | **+0.00014** |
-| ADR-001, 60 dòng đầu (2026-11-23) | 1504 | 3.1906 | 3.1876 | **−0.00300** |
+| ADR-001 opening | 1492 | 3.324126 | 3.324727 | **+0.00060** |
+| ADR-003 section 2 | 1494 | 3.581916 | 3.582051 | **+0.00014** |
+| ADR-001, first 60 lines (2026-11-23) | 1504 | 3.1906 | 3.1876 | **−0.00300** |
 
-Dòng cuối đo lại ngày 2026-11-23 trên cây `perf/q4k-repack-8x8`, mỗi arm chạy hai lần và **tái lập
-từng chữ số** (off 3.1906 / fused 3.1876, perplexity 24.3027 / 24.2306). Nó lặp lại đúng kết luận của
-bảng: delta từng văn bản nằm ở mức 0.003 nats (±0.1%), đổi dấu tuỳ văn bản, không có xu hướng.
+The last row was re-measured on 2026-11-23 on the `perf/q4k-repack-8x8` tree, two runs per arm, and
+**reproduces every digit** (off 3.1906 / fused 3.1876, perplexity 24.3027 / 24.2306). It repeats the
+table's conclusion: the per-text delta sits around 0.003 nats (±0.1%), changes sign with the text, and
+shows no trend.
 
-**Bẫy khi chạy A/B:** `tiled_fma_enabled` đọc `var_os(..).is_some()`, nên `VIPERA_Q4K_FMA_EPI=0`
-vẫn **bật** fused. Arm default phải chạy bằng `env -u VIPERA_Q4K_FMA_EPI`, nếu không cả hai arm là
-cùng một cấu hình và phép đo cho ra hai số giống hệt nhau (đã xảy ra trong lần đo đầu của mục này).
+**A/B trap:** `tiled_fma_enabled` reads `var_os(..).is_some()`, so `VIPERA_Q4K_FMA_EPI=0` still **enables**
+the fused path. The default arm must be run with `env -u VIPERA_Q4K_FMA_EPI`, otherwise both arms are the
+same configuration and the measurement returns two identical numbers (which happened in this section's
+first run).
 
-Trung bình **−0.000224 nats/token**, tức **−0.007%**; hai văn bản tốt lên, ba xấu đi, và không văn
-bản nào lệch quá 0.003 nats (0.1%). Perplexity đổi 16.888 → 16.834 trên văn bản đầu. Ở độ phân giải
-này phép đo **không** phân biệt được hai arm — nó loại bỏ khả năng "fused làm tệ đi rõ rệt", không
-chứng minh hai arm cho cùng phân bố.
+Average **−0.000224 nats/token**, i.e. **−0.007%**; two texts improve, three get worse, and none moves
+more than 0.003 nats (0.1%). Perplexity moves 16.888 → 16.834 on the first text. At this resolution the
+measurement **cannot** tell the two arms apart — it rules out "fused makes things clearly worse", it does
+not prove the two arms share a distribution.
 
-### 2.4 Khoảng cách tới row kernel
+### 2.4 Distance to the row kernel
 
-Row kernel (`q4k_dot_batch_vnni`) là kernel mà decode dùng cho mọi ma trận Q4_K, nên "gần nó hơn"
-là tiêu chí trung tính còn đo được trong repo. Test `q4k_tiled_error_against_row_kernel` (48 row,
-512 cột, B=16, seed cố định, 768 giá trị):
+The row kernel (`q4k_dot_batch_vnni`) is what decode uses for every Q4_K matrix, so "closer to it" is a
+neutral criterion that can be measured in-repo. Test `q4k_tiled_error_against_row_kernel` (48 rows, 512
+columns, B=16, fixed seed, 768 values):
 
 | arm | max abs | max rel | mean rel |
 |---|---:|---:|---:|
 | multiply-then-add | 9.155e-5 | 4.784e-5 | 3.542e-7 |
 | fused | 9.155e-5 | 4.784e-5 | **3.250e-7** (−8%) |
 
-Worst case y hệt (cùng một giá trị, đến từ việc lượng tử hoá chứ không từ epilogue), sai số trung
-bình **giảm** — đúng như lý thuyết: một lần làm tròn thay vì hai thì không tệ đi.
+The worst case is identical (the same value, coming from quantization rather than the epilogue) and the
+mean error **drops** — as theory says it should: one rounding instead of two cannot be worse.
 
-### 2.5 Epilogue là đòn bẩy duy nhất còn lại của prefill
+### 2.5 The epilogue is prefill's only remaining lever
 
-Gap prefill một luồng so với llama.cpp (67.0 vs 87.53 tok/s) đã được chia pha (1 thread,
-`VIPERA_PROFILE_STEP=1`, chunk 128 token; `docs/benchmarks.md` 2026-11-23):
+The single-thread prefill gap against llama.cpp (67.0 vs 87.53 tok/s) was split by phase (1 thread,
+`VIPERA_PROFILE_STEP=1`, 128-token chunks; `docs/benchmarks.md`, 2026-11-23):
 
-| pha | % chunk | GFLOPS |
+| phase | % chunk | GFLOPS |
 |---|---:|---:|
 | q4k | 79% | 202 |
 | q6k | 16% | 179 |
 | attention | 4% | — |
-| cả prefill | 100% | 188 (llama: 229) |
+| whole prefill | 100% | 188 (llama: 229) |
 
-Band tách khỏi engine ở B=128 đạt 218 GFLOPS, nên pha q4k trong engine đã ở 93% kernel của nó —
-phần còn lấy được không nằm ở plumbing. Kernel dot của llama.cpp là AVX2 256-bit (`vpmaddubsw`,
-0 `zmm`) và tốn nhiều lệnh/MAC hơn band của ta, tức không có kernel nào bên đó để port thêm. Cả hai
-engine chạy 4.0 GHz, và gap decode một luồng (1.34x) bằng gap prefill (1.32x), nên nó không đến từ
-cách chia chunk.
+The band isolated from the engine at B=128 reaches 218 GFLOPS, so the engine's q4k phase is already at 93%
+of its own kernel — what is left is not in the plumbing. llama.cpp's dot kernel is AVX2 256-bit
+(`vpmaddubsw`, 0 `zmm`) and spends more instructions per MAC than our band, so there is no kernel over
+there left to port. Both engines run at 4.0 GHz, and the single-thread decode gap (1.34x) equals the
+prefill gap (1.32x), so it does not come from chunking.
 
-Hệ quả cho quyết định ở mục 5: trong 22% epilogue của pha q4k, bản fused lấy lại 8.6% thời gian
-chunk — mức duy nhất vượt ngưỡng 3%. Q6_K cùng bệnh (17.6% kernel) nhưng chỉ là 2.8% chunk, dưới
-ngưỡng; câu 2 ở mục 11 giữ nguyên là câu hỏi về switch, không phải về lợi ích.
+What that means for section 5: of the q4k phase's 22% epilogue, the fused form recovers 8.6% of chunk
+time — the only figure above the 3% threshold. Q6_K has the same disease (17.6% of its kernel) but is only
+2.8% of a chunk, below the gate; question 2 in section 11 stays a question about the switch, not about the
+benefit.
 
-## 3. Cái ADR này KHÔNG nói
+## 3. What this ADR does NOT say
 
-- **Không** nói fused cho output tốt hơn. Nó chỉ nói fused không tệ hơn về mặt số học so với row
-  kernel, và **có** đổi output. Muốn kết luận về chất lượng phải có bộ đo theo tác vụ (mục 8).
-- **Không** bao gồm phần còn lại của patch đề xuất: `transpose_16x16` khi dựng activation tile và
-  `q4k_tile_rows::<R>` tách riêng cho band/tail. Đường nóng của chunk mặc định đi qua `SharedTile`
-  (`SharedTile::fill_entries`), không qua nhánh transpose, nên transpose chỉ có nghĩa nếu port cả
-  `fill_entries` — đó là thay đổi riêng, đo riêng.
-- **Không** nói gì về Q6_K tiled (`q6k_matvec_tiled_range`). Nó đối xứng nhưng có epilogue khác và
-  chiếm 18% chunk; đo riêng. Đã đo (2026-11-23): epilogue của nó là **17.6%** kernel (`1.176x` khi gấp
-  lại), tức ~3% chunk, và weight unpack chỉ 4.8% (`1.048x`) — nên một switch Q6_K là phần thêm ~1% chunk
-  vào cùng quyết định này, không đáng một thay đổi riêng.
+- It does **not** say fused gives better output. It only says fused is no worse arithmetically than the
+  row kernel, and that it **does** change output. A quality conclusion needs a task-level measurement
+  (section 8).
+- It does **not** cover the rest of the proposed patch: `transpose_16x16` when building the activation
+  tile, and `q4k_tile_rows::<R>` split out for band/tail. The default chunk's hot path goes through
+  `SharedTile` (`SharedTile::fill_entries`), not the transpose branch, so the transpose only matters if
+  `fill_entries` is ported too — a separate change, measured separately.
+- It says nothing about Q6_K tiled (`q6k_matvec_tiled_range`). It is symmetric but has a different
+  epilogue and takes 18% of a chunk; measured separately. Already measured (2026-11-23): its epilogue is
+  **17.6%** of the kernel (`1.176x` when folded away), i.e. ~3% of a chunk, and the weight unpack only
+  4.8% (`1.048x`) — so a Q6_K switch would add ~1% of a chunk to this same decision, not worth a change
+  of its own.
 
 ## 4. Options
 
-Cập nhật sau khi có phép đo perplexity (mục 2.3): cả hai phép đo độc lập — sai số so với row
-kernel và NLL trên văn bản — đều nói fused không tệ hơn, nên **B trở thành lựa chọn có cơ sở**. Những
-gì còn giữ default ở A là hành vi: 6/9 prompt ra văn bản khác, và perplexity không nhìn thấy điều đó.
-Lật hay không là quyết định của owner, và ADR giữ nguyên trạng thái opt-in cho tới khi có quyết định
-đó — không phải vì thiếu số đo nữa.
+Updated once the perplexity measurement existed (section 2.3): both independent measurements — error
+against the row kernel and NLL on fixed texts — say fused is no worse, so **B becomes a defensible
+choice**. What still keeps A as the default is behaviour: 6/9 prompts produce different text, and
+perplexity cannot see that. Flipping it or not is the owner's decision, and this ADR keeps the opt-in
+state until that decision — no longer for lack of numbers.
 
-| # | Cách | Được | Mất | Policy |
+| # | Option | Gains | Costs | Policy |
 |---|---|---|---|---|
-| A | **Giữ multiply-then-add làm default, fused sau switch** (hiện tại) | 0 thay đổi hành vi; số đo và đường tắt có sẵn để lật sau | −5% chunk không được dùng | none |
-| B | Lật fused làm default, giữ `VIPERA_Q4K_EXACT_EPI=1` cho dạng cũ | −5% chunk; theo tiền lệ `VIPERA_EXACT_DOT` | Đổi output của mọi prefill ≥16 token; người dùng so kết quả với bản trước sẽ thấy khác | ADR này + cập nhật conformance |
-| C | Bỏ hẳn, xoá switch | Ít code nhất | Mất số đo +8.6/+12% vĩnh viễn; phải đo lại lần sau | none |
+| A | **Keep multiply-then-add as default, fused behind a switch** (current) | no behaviour change; the numbers and the fast path are there to flip later | the −5% chunk goes unused | none |
+| B | Flip fused to default, keep `VIPERA_Q4K_EXACT_EPI=1` for the old form | −5% chunk; follows the `VIPERA_EXACT_DOT` precedent | changes the output of every prefill of ≥16 tokens; users comparing against an earlier build see a difference | this ADR + conformance update |
+| C | Drop it entirely, delete the switch | least code | loses the +8.6/+12% numbers for good; re-measuring next time | none |
 
 ## 5. Decision
 
-**A.** Commit `bfb0fee` giữ dạng cũ làm default và đặt dạng fused sau `VIPERA_Q4K_FMA_EPI=1` (mặc
-định tắt), kèm số đo và lý do trong code và trong `docs/benchmarks.md`.
+**A.** Commit `bfb0fee` keeps the old form as the default and puts the fused form behind
+`VIPERA_Q4K_FMA_EPI=1` (off by default), with the numbers and the reasoning in code and in
+`docs/benchmarks.md`.
 
-Lý do chọn A thay vì B: hiệu quả của fused là thật và không tệ về số học, nhưng nó đổi output của
-**6/9** prompt ở token đầu tiên tới token thứ 23, và repo không có phép đo nào trả lời được "đổi như
-vậy là tốt lên hay xấu đi". Năm phần trăm thời gian prefill trên một prompt 524 token (≈39 ms trên
-một request) không đủ để tự nó gánh một thay đổi hành vi chưa đo được. Tiền lệ `VIPERA_EXACT_DOT`
-không chuyển thẳng sang được: ở đó dạng nhanh là **cùng** biểu thức với thứ tự cộng khác, đổi lại
-được một chuỗi phụ thuộc 128-link; ở đây là một lần làm tròn khác trên số hạng mà mọi layer sau đều
-tiêu thụ.
+Why A rather than B: the fused form's benefit is real and its arithmetic is no worse, but it changes the
+output of **6/9** prompts, from the first token through token 23, and the repo has no measurement that
+answers "is that change better or worse". Five percent of prefill time on a 524-token prompt (≈39 ms per
+request) is not enough on its own to carry an unmeasured behaviour change. The `VIPERA_EXACT_DOT`
+precedent does not transfer directly: there the fast form is the **same** expression with a different
+summation order, buying a 128-link dependency chain; here it is a different rounding of a term that every
+later layer consumes.
 
-## 6. Hệ quả
+## 6. Consequences
 
-- Người dùng có thể thử ngay: `VIPERA_Q4K_FMA_EPI=1`, không cần build lại.
-- Switch đọc env mỗi lần gọi, nên một process đo được cả hai arm — nhưng nó cũng có nghĩa **không**
-  được bật/tắt giữa hai lần gọi trong cùng một lần chạy nếu cần bit ổn định; chấp nhận được vì cả hai
-  arm đều tất định trong một cấu hình.
-- `q4k_tiled_range_matches_batch_vnni` (tolerance `1e-3 + 1e-4·|ref|`) xanh trên **cả hai** arm.
-  Đây là lý do thay đổi này là quyết định policy chứ không phải bug.
-- Không có test golden-token nào trong workspace, nên đường default không bị ràng buộc bởi bộ test —
-  ràng buộc là quyết định của con người.
+- Users can try it now: `VIPERA_Q4K_FMA_EPI=1`, no rebuild.
+- The switch reads the environment on every call, so one process can measure both arms — which also means
+  it must **not** be toggled between calls within a run if stable bits are needed; acceptable because both
+  arms are deterministic within one configuration.
+- `q4k_tiled_range_matches_batch_vnni` (tolerance `1e-3 + 1e-4·|ref|`) is green on **both** arms. That is
+  why this is a policy decision rather than a bug.
+- There is no golden-token test in the workspace, so the default path is not constrained by the test
+  suite — the constraint is a human decision.
 
 ## 7. Test oracle
 
-- `q4k_tiled_range_matches_batch_vnni`: parity tolerance với row kernel, phải xanh ở cả hai arm.
-- `q4k_tiled_error_against_row_kernel` (`#[ignore]`, measurement): in max/mean relative error; dùng
-  lại mỗi khi đụng epilogue, và là số liệu ở mục 2.3.
-- A/B token: 9 prompt cố định ở mục 2.2; nếu lật default thì bộ này là thứ phải chạy lại và ghi lại.
-- `cargo test -p vipera-backend-cpu --lib` (87 passed / 45 ignored) và `-p vipera-runtime --lib`.
+- `q4k_tiled_range_matches_batch_vnni`: parity tolerance against the row kernel, must be green on both
+  arms.
+- `q4k_tiled_error_against_row_kernel` (`#[ignore]`, measurement): prints max/mean relative error; reuse
+  it whenever the epilogue is touched, and it is the data behind section 2.3.
+- Token A/B: the nine fixed prompts from section 2.2; if the default is flipped, that set is what must be
+  re-run and recorded.
+- `cargo test -p vipera-backend-cpu --lib` (87 passed / 45 ignored) and `-p vipera-runtime --lib`.
 
-## 8. Promote (điều kiện để lật sang B)
+## 8. Promote (the conditions for flipping to B)
 
-| # | Tiêu chí | Ngưỡng |
+| # | Criterion | Threshold |
 |---|---|---|
-| 1 | chunk 4 | nhanh hơn **≥ 3%** median trên ≥5 cặp xen kẽ, box rảnh | đạt: −5.0%, 5/5 |
-| 2 | kernel GFLOPS | không chậm hơn ở cả hai shape | đạt: +8.6% / +12% |
-| 3 | sai số so với row kernel | mean rel không tăng | đạt: 3.250e-7 vs 3.542e-7 |
-| 4 | tất định | mỗi arm tự khớp qua nhiều lần chạy | đạt |
-| 5 | **chất lượng theo tác vụ** | perplexity trên văn bản cố định, "không tệ hơn" | đo rồi: −0.007% trung bình, 2 tốt / 3 xấu, dưới ngưỡng phân giải (`vipera score`, mục 2.3) |
-| 6 | chi phí hành vi | ghi rõ trong changelog rằng output prefill đổi | chưa làm |
+| 1 | chunk 4 | **≥ 3%** faster at the median over ≥5 alternating pairs, idle box | met: −5.0%, 5/5 |
+| 2 | kernel GFLOPS | no slower on either shape | met: +8.6% / +12% |
+| 3 | error against the row kernel | mean rel does not rise | met: 3.250e-7 vs 3.542e-7 |
+| 4 | determinism | each arm reproduces itself across runs | met |
+| 5 | **task-level quality** | perplexity on fixed texts, "not worse" | measured: −0.007% average, 2 better / 3 worse, below the resolution floor (`vipera score`, section 2.3) |
+| 6 | behaviour cost | the changelog states that prefill output changes | not done |
 
-Rollback: xoá một nhánh `if` hoặc để switch về default off; không đụng layout, không đụng kernel
-row, không đụng `SharedTile`.
+Rollback: delete one `if` branch or leave the switch at its default off; no layout, no row kernel, no
+`SharedTile` touched.
 
-## 9. Rủi ro
+## 9. Risks
 
-- **Output drift không đo được**: 5% prefill đổi 6/9 prompt. Nếu model hoặc prompt khác phản ứng mạnh
-  hơn, triệu chứng sẽ là "bản mới viết khác" chứ không phải một test đỏ.
-- **Đo trên một máy**: 153→165 GFLOPS là của Tiger Lake với MUL+FMA trên cùng cổng. Trên core có hai
-  cổng FMA (Zen 4/5, Xeon server) phần trăm có thể khác; không suy diễn.
-- **Nhiệt/load**: các lần đo chunk chênh tới ±5% giữa các buổi (cùng binary 800 vs 1025 ms ở lần đo
-  trước). Vì vậy mục 1 chỉ dùng tỉ lệ cùng cặp; con số tuyệt đối không phải cam kết.
-- **Switch env trong đường nóng**: một `var_os` mỗi lần gọi kernel; với prefill 35 block × 144 call
-  thì không đáng kể, nhưng nếu sau này kernel được gọi cho shape nhỏ thì nên cache.
+- **Unmeasurable output drift**: a 5% prefill gain changes 6/9 prompts. If another model or prompt reacts
+  more strongly, the symptom will be "the new build writes differently", not a red test.
+- **Measured on one machine**: 153→165 GFLOPS is Tiger Lake with MUL+FMA on the same port. On a core with
+  two FMA ports (Zen 4/5, Xeon server) the percentage may differ; do not extrapolate.
+- **Heat/load**: chunk runs varied by up to ±5% between sessions (the same binary at 800 vs 1025 ms in an
+  earlier run). So section 1 uses only within-pair ratios; the absolute numbers are not a promise.
+- **Env switch on the hot path**: one `var_os` per kernel call; negligible for a 35-block × 144-call
+  prefill, but if the kernel is later called on small shapes it should be cached.
 
 ## 10. Non-goals
 
-- Không đổi tổng thứ tự cộng giữa các sub-block (`facc` vẫn cộng dồn theo `s` tăng dần).
-- Không đụng `q6k_matvec_tiled_range`, `SharedTile`, `quant.rs`.
-- Không thêm dependency, không thêm `unsafe` ngoài `simd.rs`.
-- Không lật default trong ADR này.
+- No change to the summation order across sub-blocks (`facc` still accumulates over increasing `s`).
+- No touching `q6k_matvec_tiled_range`, `SharedTile`, `quant.rs`.
+- No new dependency, no `unsafe` outside `simd.rs`.
+- No default flip in this ADR.
 
 ## 11. Open questions
 
-1. `vipera score` đã có; bao nhiêu văn bản và độ dài nào là đủ để tiêu chí 5 có ý nghĩa (một file
-   ~1000 token cho ±0.1% NLL, nhưng không thấy được khác biệt hành vi)?
-2. Có nên gộp luôn phần Q6_K nếu nó cho cùng tỉ lệ, để chỉ có một switch cho "epilogue fused"?
-   Trả lời một nửa: tỉ lệ không cùng — 17.6% so với 21-23% của Q4_K, và phần Q6_K là 2.8% chunk
-   (16% chunk × 17.6% kernel, mục 2.5), tức dưới ngưỡng 3%: chỉ đáng làm nếu làm chung một lần với
-   switch của Q4_K, không đáng làm riêng. Còn lại là quyết định: gộp cho gọn switch, hay để nguyên vì
-   lợi ích dưới ngưỡng.
-3. Owner và ngày hết hạn của cam kết "default off" — nếu 6 tháng nữa không ai đo, giữ nguyên hay
-   xoá switch để khỏi mang code chết?
+1. `vipera score` now exists; how many texts and what length make criterion 5 meaningful (one ~1000-token
+   file gives ±0.1% NLL, but cannot see behavioural differences)?
+2. Should the Q6_K part be folded in if it shows the same ratio, so that there is only one "fused
+   epilogue" switch? Half answered: the ratios are not the same — 17.6% against Q4_K's 21-23% — and the
+   Q6_K part is 2.8% of a chunk (16% of the chunk × 17.6% of the kernel, section 2.5), i.e. below the 3%
+   gate: worth doing only together with the Q4_K switch, not on its own. What remains is a decision: fold
+   it in for a tidier switch, or leave it because the gain is below the gate.
+3. Owner and expiry of the "default off" commitment — if nobody measures for six months, keep it as it is
+   or delete the switch so the dead code does not ride along?
