@@ -27,6 +27,40 @@ pub(crate) fn tiled_enabled() -> bool {
     !std::env::var("VIPERA_TILED").is_ok_and(|value| value == "0")
 }
 
+/// `-1` follows the environment, `0` pins the row kernel, `1` pins the band. See
+/// [`pin_q3k_tiled`].
+static Q3K_TILED_PIN: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Pin the Q3_K tiled band for this process, or `None` to follow `VIPERA_Q3K_TILED` again.
+///
+/// A measurement hook: the workspace forbids `unsafe`, so an integration test cannot call
+/// `std::env::set_var`, and an A/B of the band against the row kernel has to run both arms in one
+/// process to survive this machine's drift. The engine itself never calls this.
+pub fn pin_q3k_tiled(value: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    Q3K_TILED_PIN.store(
+        match value {
+            None => -1,
+            Some(false) => 0,
+            Some(true) => 1,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the Q3_K tiled band runs: on by default, `VIPERA_Q3K_TILED=0` sends Q3_K back to the row
+/// kernel, and [`pin_q3k_tiled`] overrides both.
+///
+/// Read on every dispatch (not cached) so one process can measure both arms; the band and the row
+/// kernel are different summation orders, so this is a numeric-policy switch, not a bit-identity one.
+pub(crate) fn q3k_tiled_enabled() -> bool {
+    match Q3K_TILED_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        0 => false,
+        _ => !std::env::var("VIPERA_Q3K_TILED").is_ok_and(|value| value == "0"),
+    }
+}
+
 /// Whether the W-1a tiled-band activation is on: `VIPERA_TILED_A`, **off by default**.
 ///
 /// W-1a changes the activation's arithmetic — the band reads one scale per 256-value block
