@@ -5346,20 +5346,36 @@ không có so sánh tuyệt đối nào dùng được.
 
 Cần một model Q5_K_M để đo thật; lần này không tạo được (`/tmp` đầy giữa chừng, đã dọn).
 
-## Q3_K prefill: interleave dpbusd rows, align decode buffer — 2026-11-26
+## Q3_K band: interleave `dpbusd` rows, align the decode buffer — BÁC, revert 2026-11-27
 
-**Lever tiếp theo (sau 1.18 ns/block-token):** trong `q3k_band_rows`, mỗi nhóm 16 giá trị làm
-4 `dpbusd` tuần tự trên cùng accumulator cho từng row (chuỗi phụ thuộc 5 cycle trên VNNI), rồi mới
-sang row kế. Với N=4 row độc lập, interleave theo word (word0: row0..3, word1: row0..3, ...)
-cho 4 chuỗi độc lập ăn VNNI unit thay vì chờ latency. Đồng thời căn `codes` decode buffer 32 byte
-để store 32-byte của decode và load 4-byte của inner loop không lệch line.
+Lever của commit `a7e886e`: trong `q3k_band_rows`, đổi thứ tự 4 `dpbusd` của mỗi nhóm 16 giá trị từ
+"cả 4 word của một row rồi sang row kế" thành "mỗi word cho cả 4 row", và bọc buffer `codes` trong
+`#[repr(align(32))]`. Ngưỡng đặt trước: prefill pp512 ≥5%.
 
-**Giả thuyết:** giảm stall dpbusd latency / store-forwarding, prefill pp512 tăng. Ngưỡng: ≥5%
-trên máy không bị bóp xung.
+**Codegen (cùng shape, 4 row × 6 block × 16 cột).** Hai thứ tự **không** ra cùng assembly — bản
+aligned 713 lệnh / 3074 byte, bản unaligned 689 / 2965, lệch ở đoạn `vpdpbusd` và ở 24 lệnh prologue
+(`and rsp` + lưu/khôi phục do realign stack). Alignment đổi thật 8 store `vmovdqu` → `vmovdqa`;
+nhưng nó **không** đổi một lệnh nào của vòng trong.
 
-**Đo:** parity `q3k_tiled_range_matches_the_row_kernel` xanh (bit-identical: dpbusd là integer,
-thứ tự cộng fp32 theo nhóm không đổi). Host tại thời điểm đo bị throttle nặng (sequential
-22.5 → 10.9 tok/s), nên số tuyệt đối 116.8 tok/s pp512 **không dùng để so với baseline 151 tok/s**.
-Cần đo lại trên host không throttle trước khi claim speedup.
+**Kernel A/B (một process, hai arm xen kẽ, best-of-6, `ns/row-block`):**
 
-**Trạng thái:** code đúng, gate xanh; lợi ích hiệu năng **chưa xác nhận** bằng đo sạch.
+| build | interleaved | row order | tỉ lệ |
+|---|---:|---:|---:|
+| `codes` aligned 32 byte | 182.10 | 181.81 | 0.998× |
+| `codes` là `[u8; 256]` | 173.02 | 173.19 | 1.001× |
+
+Hai kết luận, cả hai đều ngược lại commit: (1) đổi thứ tự là **neutral** (0.998–1.001, xa ngưỡng
+5%) — LLVM tự xếp lịch lại, thứ tự nguồn không quyết định chuỗi phụ thuộc; (2) buffer căn 32 byte
+**chậm hơn 5.0%** (181.81 vs 173.19), vì cái giá là prologue realign chứ không phải store.
+
+**End-to-end không dùng được:** pp512 18.5 → 18.0 tok/s, một cặp duy nhất cách nhau ~6 phút, host
+trôi 12% giữa hai lượt (decode 264 → 296 ms/step ở một pha không liên quan), nên cặp đó không phân
+giải nổi 5%. Model đo là `q8src-imbf-q3km.gguf` (7.3 GB), không phải model 876 MiB của các dòng cũ,
+nên số tuyệt đối cũng không so được với 151 tok/s.
+
+**Quyết định:** revert `a7e886e`. Không arm nào chạm ngưỡng theo hướng đã claim, và phần alignment
+là âm trên kernel.
+
+**Bài học đo (lần thứ ba của cùng một lỗi):** `diff <(objdump …) <(objdump …) | head -20` cắt mất
+phần thân hàm, và 20 dòng đầu toàn tên symbol — đọc ra "hai arm giống hệt nhau". Diff phải chạy
+không qua `head` trước khi kết luận hai binary giống nhau.
