@@ -132,6 +132,13 @@ thread_local! {
     static IN_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// The phases of the pass in flight, so the `PROFILEPASS` line can report *this* pass instead of the
+// running average. This is what a depth question needs: the first chunk and the thirty-second differ
+// by far more than the average of thirty-two describes.
+thread_local! {
+    static PASS_COUNTERS: std::cell::Cell<[u64; 9]> = const { std::cell::Cell::new([0; 9]) };
+}
+
 /// Start a whole pass, or return `None` when the timers are off so the caller does no work.
 ///
 /// `prefill` says whether this pass is a prompt chunk, which keeps the chunk and decode averages from
@@ -154,6 +161,11 @@ pub fn note(phase: Phase, start: Option<Instant>) {
     if let Some(start) = start {
         let index = phase as usize;
         let nanos = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        PASS_COUNTERS.with(|counters| {
+            let mut pass = counters.get();
+            pass[index] += nanos;
+            counters.set(pass);
+        });
         let counters = if IN_CHUNK.with(|flag| flag.get()) {
             &PREFILL_COUNTERS
         } else {
@@ -271,6 +283,42 @@ fn render_pass_line(
     line
 }
 
+/// One `PROFILEPASS` line: the split of *this* pass only, unshared with any other.
+///
+/// `PROFILE` answers "what is an average pass made of"; this answers "what was that pass made of",
+/// which is the only form a first-chunk-versus-late-chunk question can be asked in.
+fn render_pass_phases(counters: &[u64; 9], total: u64) -> String {
+    let names = [
+        "q4k",
+        "q6k",
+        "other_dot",
+        "attention",
+        "norm",
+        "proj",
+        "rope",
+        "kv_write",
+        "elem",
+    ];
+    let mut line = String::new();
+    let mut claimed = 0;
+    for (index, name) in names.iter().enumerate() {
+        let nanos = counters[index];
+        claimed += nanos;
+        line.push_str(&format!(
+            " {name} {:.2}ms ({:.0}%)",
+            nanos as f64 / 1e6,
+            nanos as f64 / total as f64 * 100.0
+        ));
+    }
+    let rest = total.saturating_sub(claimed);
+    line.push_str(&format!(
+        " rest {:.2}ms ({:.0}%)",
+        rest as f64 / 1e6,
+        rest as f64 / total as f64 * 100.0
+    ));
+    line
+}
+
 /// Print the per-shape table, biggest total first, as an average over the passes timed.
 fn print_shapes(steps: u64, prefill: bool) {
     let shapes = SHAPES.lock().unwrap_or_else(|error| error.into_inner());
@@ -339,6 +387,14 @@ pub fn finish_pass(start: Option<Instant>) {
         "{}",
         render_pass_line(kind, steps, average, total, counters)
     );
+    if total > 0 {
+        let pass = PASS_COUNTERS.with(|counters| counters.replace([0; 9]));
+        eprintln!(
+            "PROFILEPASS {kind} {steps} {:.2} ms:{}",
+            total as f64 / 1e6,
+            render_pass_phases(&pass, total)
+        );
+    }
     // One table per run, once the caches and the pool are warm: the first passes carry the fault-in
     // cost of the weights, which is not what a steady-state question is about. A prompt makes fewer,
     // longer passes than a decode run, so its table is printed every sixteen chunks, as a running
@@ -366,6 +422,18 @@ mod tests {
         );
         assert!(line.contains(" q4k 0.00ms (0%)"), "{line}");
         assert!(line.contains(" rest 884.58ms (100%)"), "{line}");
+    }
+
+    /// The per-pass line must not divide by anything: it describes one pass, so a phase noted once
+    /// in a pass is reported at full size even on the thirty-second pass of a long prefill.
+    #[test]
+    fn a_per_pass_line_reports_one_pass_without_dividing() {
+        let mut counters = [0_u64; 9];
+        counters[2] = 6_390_180_000; // other_dot
+        counters[3] = 239_060_000; // attention
+        let line = render_pass_phases(&counters, 9_297_380_000);
+        assert!(line.contains(" other_dot 6390.18ms (69%)"), "{line}");
+        assert!(line.contains(" attention 239.06ms (3%)"), "{line}");
     }
 
     /// Two passes at different costs: the average is their mean, and a caller that wants the total
