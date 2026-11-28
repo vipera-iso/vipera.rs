@@ -5761,3 +5761,18 @@ is **~16% of a real-depth chunk** — four times what the best remaining Q3_K le
 lever in the tree of that size. It is blocked on the reduction order, not on speed: the shared kernel is
 entered at `entries.div_ceil(QBLOCK) > 1`, so a position's logits depend on how many tokens share its
 chunk. Only after that is worth touching the kernel at all.
+
+## q-block single-entry — 2026-11-28
+
+Makes `attend_rows_shared` run for `entries > 0` when `VIPERA_ATTN_QBLOCK` is on, and pads the fold
+to 16 so the GEMM always takes the AVX-512 path regardless of chunk size. Tail rows in
+`gemm_avx512` are folded with masked stores instead of a scalar tail. A position's logits no longer
+depend on how many tokens share its chunk (`logits_each_matches_single_passes` passes with the
+switch on).
+
+Measured on i5-11300H, 8 threads, Qwen2.5-1.5B Q4_K_M, f16 KV:
+- decode attention tile vs entry: 44.8 / 33.9 -> 36.7 / 37.9 ms/step
+- chunk attention share: ~10% -> ~5-6%
+- codegen: no vector traffic through `%rsp` (st=0 ld=0); zmm expected for gemm
+
+Default unchanged (opt-in). Branch `perf/attention-qblock-single-entry`.
