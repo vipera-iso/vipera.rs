@@ -5368,15 +5368,22 @@ unsafe fn gemm_avx512(
         let bp = b.as_ptr();
         let cp = c.as_mut_ptr();
         let mut i = 0;
-        while i + 4 <= m {
+        // Rows go through the fused block even when fewer than four are left, with the missing ones
+        // pointed at the last real row and never stored: a row then accumulates with the same
+        // fused multiply-add in the same lane grouping whatever `m` is. That is what makes the
+        // attention tile's arithmetic independent of how many queries share the pass — the scalar
+        // tail this replaces is `mul` then `add`, so the same row landed on different arithmetic
+        // depending on its index, and a 0.23 logit difference at position 1 followed from it.
+        while i < m {
+            let rows = (m - i).min(4);
             let a0 = ap.add(i * a_row);
-            let a1 = a0.add(a_row);
-            let a2 = a1.add(a_row);
-            let a3 = a2.add(a_row);
+            let a1 = if rows > 1 { a0.add(a_row) } else { a0 };
+            let a2 = if rows > 2 { a1.add(a_row) } else { a1 };
+            let a3 = if rows > 3 { a2.add(a_row) } else { a2 };
             let c0 = cp.add(i * c_row);
-            let c1 = c0.add(c_row);
-            let c2 = c1.add(c_row);
-            let c3 = c2.add(c_row);
+            let c1 = if rows > 1 { c0.add(c_row) } else { c0 };
+            let c2 = if rows > 2 { c1.add(c_row) } else { c1 };
+            let c3 = if rows > 3 { c2.add(c_row) } else { c2 };
             let mut j = 0;
             while j < n {
                 let lanes = (n - j).min(16);
@@ -5399,25 +5406,18 @@ unsafe fn gemm_avx512(
                     s3 = _mm512_mask3_fmadd_ps(_mm512_set1_ps(*a3.add(step)), values, s3, mask);
                 }
                 _mm512_mask_storeu_ps(c0.add(j), mask, s0);
-                _mm512_mask_storeu_ps(c1.add(j), mask, s1);
-                _mm512_mask_storeu_ps(c2.add(j), mask, s2);
-                _mm512_mask_storeu_ps(c3.add(j), mask, s3);
+                if rows > 1 {
+                    _mm512_mask_storeu_ps(c1.add(j), mask, s1);
+                }
+                if rows > 2 {
+                    _mm512_mask_storeu_ps(c2.add(j), mask, s2);
+                }
+                if rows > 3 {
+                    _mm512_mask_storeu_ps(c3.add(j), mask, s3);
+                }
                 j += lanes;
             }
             i += 4;
-        }
-        // Fewer than four rows left: one row at a time, so the tile always uses its full width.
-        while i < m {
-            let arow = ap.add(i * a_row);
-            let crow = cp.add(i * c_row);
-            for j in 0..n {
-                let mut total = *crow.add(j);
-                for step in 0..k {
-                    total += *arow.add(step) * *bp.add(step * n + j);
-                }
-                *crow.add(j) = total;
-            }
-            i += 1;
         }
     }
 }

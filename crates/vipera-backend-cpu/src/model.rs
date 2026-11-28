@@ -4169,6 +4169,17 @@ fn attend_rows_shared(
                         // so no later range of the walk is visible either.
                         break;
                     }
+                    // Both GEMMs run at a padded fold. `gemm` picks its kernel by shape (`n >= 16
+                    // && k >= 4` on AVX-512, the triple loop otherwise), and `fold` is the
+                    // neighbours' longest visible run, so an unpadded one lets a row's reduction
+                    // order depend on how many tokens share its pass — the chunk dependence that
+                    // kept this kernel opt-in (ADR-005). Padding to 16 takes one path always, and
+                    // the padding is exact: the weights there are zero, and a zero term adds
+                    // nothing whatever the grouping.
+                    let fold_pad = fold.next_multiple_of(16);
+                    // The padded key columns are never decoded this tile, so they read as zero
+                    // rather than as the previous tile's K rows.
+                    keys_f32[..head_dim * fold_pad].fill(0.0);
                     for row in 0..fold {
                         let base = key_bases[row] + kv_head * head_bytes;
                         let value = kv[0].value_row(order, key_bases[row], layer_bytes)
@@ -4178,7 +4189,7 @@ fn attend_rows_shared(
                                 crate::simd::f16_row_to_f32_strided(
                                     &storage[base..][..head_bytes],
                                     &mut keys_f32[row..],
-                                    fold,
+                                    fold_pad,
                                 );
                                 crate::simd::f16_row_to_f32(
                                     &storage[value..][..head_bytes],
@@ -4194,7 +4205,7 @@ fn attend_rows_shared(
                                     &mut head_row,
                                 );
                                 for (dim, value) in head_row.iter().enumerate() {
-                                    keys_f32[row + dim * fold] = *value;
+                                    keys_f32[row + dim * fold_pad] = *value;
                                 }
                                 crate::compress::decode_q8_0(
                                     &storage[value..][..head_bytes],
@@ -4206,24 +4217,30 @@ fn attend_rows_shared(
                     for head in head_first..head_last {
                         // The GEMM accumulates into its output, and the previous head's weights are
                         // still in the tile.
-                        scores[..width * fold].fill(0.0);
+                        scores[..width * fold_pad].fill(0.0);
                         crate::simd::gemm(
                             width,
                             head_dim,
-                            fold,
+                            fold_pad,
                             &q[(first + tile) * query + head * head_dim..],
                             query,
-                            &keys_f32[..head_dim * fold],
-                            &mut scores[..width * fold],
-                            fold,
+                            &keys_f32[..head_dim * fold_pad],
+                            &mut scores[..width * fold_pad],
+                            fold_pad,
                         );
                         // TriAttention (arXiv 2611.07256): when every visible score in this tile
                         // sits below the threshold, the tile contributes ~nothing to the
                         // attention output — skip the softmax update and the value fold.
                         if triattention_enabled() {
-                            let tile_max = scores[..width * fold]
-                                .iter()
-                                .copied()
+                            // The first `fold` scores of each row are the tile's real ones; the
+                            // padding past them is zero and would erase every skip.
+                            let tile_max = (0..width)
+                                .map(|row| {
+                                    scores[row * fold_pad..][..fold]
+                                        .iter()
+                                        .copied()
+                                        .fold(f32::NEG_INFINITY, f32::max)
+                                })
                                 .fold(f32::NEG_INFINITY, f32::max);
                             if tile_max < triattention_threshold() {
                                 continue;
@@ -4235,7 +4252,7 @@ fn attend_rows_shared(
                             // tile is a prefix of what it may see, so the visible rows are a slice.
                             let seen = positions[first + tile + row];
                             let visible = keys.min(seen.saturating_sub(start));
-                            let weights = &mut scores[row * fold..][..fold];
+                            let weights = &mut scores[row * fold_pad..][..fold_pad];
                             for weight in &mut weights[visible..] {
                                 *weight = 0.0;
                             }
@@ -4266,11 +4283,11 @@ fn attend_rows_shared(
                         // zero, so folding the masked region adds nothing.
                         crate::simd::gemm(
                             width,
-                            fold,
+                            fold_pad,
                             head_dim,
-                            &scores[..width * fold],
-                            fold,
-                            &values_f32[..fold * head_dim],
+                            &scores[..width * fold_pad],
+                            fold_pad,
+                            &values_f32[..fold_pad * head_dim],
                             &mut o[tile * query + head * head_dim..],
                             query,
                         );
@@ -4450,7 +4467,13 @@ fn attend_entries(
     // A prompt chunk asks the same history once per token, with consecutive positions and one KV
     // view between them. One walk of the history over a block of queries reads every K/V row
     // `QBLOCK` times fewer; the rows are then the traffic of the pass rather than its arithmetic.
-    if entries > 1
+    // With the switch on, this kernel takes every pass, including a lone entry: a row's walk does
+    // not change with the tile it lands in (its masked neighbours are skipped before any
+    // arithmetic, and its own `history` is the only loop bound that reaches it), so the kernel is
+    // what makes a position's logits independent of how many tokens share the pass. Deciding by
+    // `entries` instead is what made it opt-in: a chunk of eight positions and eight lone passes
+    // disagreed at position 1 (ADR-005).
+    if entries > 0
         && (kv[0].layout == KvLayout::F16
             || (kv[0].layout == KvLayout::Q8_0 && shape.head_dim.is_multiple_of(32)))
         && one_kv_for_all(kv)
@@ -4458,10 +4481,8 @@ fn attend_entries(
         && attention_window().is_none()
         && attention_qblock_enabled()
     {
-        let workers = quant::max_threads().min(entries.div_ceil(QBLOCK));
-        if workers > 1 {
-            return attend_rows_shared(q, kv, positions, layer, shape, out, workers);
-        }
+        let workers = quant::max_threads().min(entries.div_ceil(QBLOCK)).max(1);
+        return attend_rows_shared(q, kv, positions, layer, shape, out, workers);
     }
     // Prefill-sparse (DisSparse, arXiv 2611.28522): select the top-`N` rows per entry and attend
     // over them only. Off by default.

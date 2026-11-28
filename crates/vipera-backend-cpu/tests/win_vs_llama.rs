@@ -689,6 +689,47 @@ fn prefill_attention_tile_vs_entry() {
     vipera_backend_cpu::pin_attention_qblock(None);
 }
 
+/// The two attention kernels on a decode step at depth, arms interleaved in one process.
+///
+/// Once the tiled kernel takes every pass — the change that makes a position independent of its
+/// chunk — a single-token step runs it too, and decode is the workload that pays first. No prefill:
+/// the token list is seeded and the KV is built by the timed steps themselves.
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn decode_attention_tile_vs_entry() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    for round in 0..2 {
+        for (label, tile) in [("entry", false), ("tile", true)] {
+            vipera_backend_cpu::pin_attention_qblock(Some(tile));
+            // A real prefill first: seeding `tokens` makes the engine rebuild the KV, which prices
+            // a prompt pass, not a decode step.
+            let prompt: Vec<u32> = (0..1024).map(|at| 1000 + (at % 400) as u32).collect();
+            let mut state = State::with_room(config, 1024 + 16, KvCacheType::F16);
+            let mut next = argmax(
+                &backend
+                    .logits(&mut state.context(&prompt))
+                    .expect("prefill"),
+            ) as u32;
+            // Warm one step, then time eight.
+            next = argmax(&backend.logits(&mut state.context(&[next])).expect("warm")) as u32;
+            let start = Instant::now();
+            for _ in 0..8 {
+                next = argmax(&backend.logits(&mut state.context(&[next])).expect("decode")) as u32;
+            }
+            println!(
+                "decode ctx 1024 {label} round {round}: {:.1} ms/step",
+                start.elapsed().as_secs_f64() * 1e3 / 8.0
+            );
+        }
+    }
+    vipera_backend_cpu::pin_attention_qblock(None);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Batched decode: one weight read for B activations (continuous batching)
 // ---------------------------------------------------------------------------
