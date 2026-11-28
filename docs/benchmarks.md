@@ -5530,3 +5530,62 @@ compare with the older 876 MiB rows.
 
 **Next lever, unchanged:** H=4 (14.7% of the band) needs 16 accumulators and is now the obvious follow-up;
 the plan's spill risk is the thing to check first, since H=2 already widened the live set to 8 `zmm`.
+
+## Q3_K band: four tile halves per pass — H=4 does not spill, but buys only ~3%
+
+2026-11-28. `VIPERA_Q3K_QUAD` (default **off**) groups four tile halves into one `q3k_band_rows` pass,
+so a row-block is decoded once for 64 activations instead of twice for 32. The change is a width in the
+driver plus `q3k_band_rows::<4, 4>`; the kernel keeps one accumulator per half, so the result is still
+bit-identical (asserted: `max |logit delta| == 0` in `prefill_q3k_quad_vs_pair`).
+
+**Codegen gate, first, because this lever's risk is the spill.** In the release object
+(`q3k_band_rows::<4, 4>`), `vpdpbusd` stays 20 per rolled group loop — no increase — and the sixteen
+accumulators stay in registers: the only `(%rsp)` `zmm` traffic is the `codes`/`coef` zero-init and the
+epilogue `lanes` buffer (16 stores, then 12 reloads for the scatter). There is no store/load of an
+accumulator inside the block loop, so the 8→16 live `zmm` was absorbed by the 32-register file.
+
+Sample of the quiet rounds (`bench_q3k_decode_codes`, same invocation as above):
+
+| per row-block | ns per half | gain |
+|---|---:|---:|
+| H=2 (paired, shipped) | 48.15–48.55 | — |
+| H=4 (quad) | 46.93–47.89 | **1.4–2.8%** (median 2.7% over both runs) |
+
+Four halves buys ~2.7% of the band, not the 4.9% the decode share (17–19%) allows: at H=4 the decode is
+already 4× cheaper than at H=1, so one more halving saves only ~4.8 ns of the ~9.7 ns decode, and part
+of that moves into the wider pass's longer live ranges.
+
+**End to end**, `prefill_q3k_quad_vs_pair`, five interleaved rounds in one process: the bit-identity
+check passed with delta 0, and the median read pair/quad **1.158× (+15.8%)** — which is drift, not the
+lever. The host was degraded for that whole run (each pp512 prefill took 52–79 s instead of the ~32 s of
+the H=2 run, with a load average of 10 on 8 CPUs from outside this repo, and per-round ratios swinging
+0.970–1.492). The band bench is the number to keep: **~2.7%**, far under the 4.9% ceiling and under the
+5% gate the H=2 lever used.
+
+**Threshold and state.** Under the pre-registered gate (≥5% pp512, ≥6% band) this does **not** clear, so
+`VIPERA_Q3K_QUAD` stays **off**: it is in the tree as a measured lever and a switch for the next probe,
+not as a default. `VIPERA_Q3K_PAIR=1` (the default) is unchanged. Re-run
+`prefill_q3k_quad_vs_pair` on a quiet host before ever flipping it.
+
+## Weight probe: the code load and its broadcast are ~55% of the paired band
+
+2026-11-28, plan §7 lever #1. Test-only probe (`NO_Q3K_WEIGHT_PROBE`, folded to `false` outside `cfg(test)`):
+in the `dpbusd` loop the packed dword comes from a constant instead of `codes[t][k * 16 + word * 4..]`.
+The `dpbusd` chain, the activations, `dxs`, the decode itself and the epilogue are untouched, so the
+difference prices the 4-byte code read, the `vpbroadcastd` that turns it into a vector, and their
+dependency on the decode's stores. No default changes; the probe is not reachable outside tests.
+
+| per row-block, H=2 | ns per half | share of the paired band |
+|---|---:|---:|
+| paired, real weights | 48.15–48.55 | 100% |
+| paired, constant weight dword | 21.4–21.9 | 44.4–44.9% |
+| **weight side** | **~26.7** | **~55%** (55.1–55.6% across the four quiet rounds) |
+
+Read against the plan's ≤32% "unexplained cycles" ceiling, this is larger, because the probe removes
+more than a load: with a constant dword the compiler materialises the broadcast once and hoists it out
+of the block loop, so the ~16 `vpbroadcastd` per row per half disappear as well. Those were never in
+the 320-`dpbusd` floor. The gate was "close if the probe is < 8% of the band": it is **55%**, so plan
+§7 lever #2 — decoding straight into `u32` order so the band reads 16 bytes per group instead of four
+4-byte loads that overlap the decode's 32-byte stores (store-forwarding being the prime suspect) — is
+open. Caveat on the number: this ratio was measured while an unrelated process held the box at load
+10, and the noisiest rounds read as high as 66%; the 55% is the four quiet rounds, not a best case.
