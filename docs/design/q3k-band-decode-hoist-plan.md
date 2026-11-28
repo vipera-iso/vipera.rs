@@ -5,8 +5,9 @@ interleaved rounds) and **+10.5%** on the band bench, bit-identical (zero logit 
 `VIPERA_Q3K_PAIR` defaults on. Ledger row in `docs/benchmarks.md`. **H=4 was measured on
 `perf/q3k-band-quad`:** it does not spill (the 16 accumulators stay in registers), but it buys only
 ~2.6% of the band, so `VIPERA_Q3K_QUAD` stays off. The weight probe from section 7 then priced the
-code load and its broadcast at ~55% of the paired band. Threshold and falsification were fixed up
-front (section 3).
+code load and its broadcast at ~55% of the paired band, and lever #2 was rejected at +0.1% because
+both ways of writing it fold to the same `vpbroadcastd (mem)`. Threshold and falsification were fixed
+up front (section 3).
 **Measured on:** `3960eda` (main after PR #83/#84), release, i5-11300H, governor `powersave`.
 **End-to-end already measured (2026-11-27):** the band is **2.887x** the row kernel at pp512 on this
 model, five rounds interleaved in one process (`docs/benchmarks.md`). `VIPERA_Q3K_TILED=0` plus the
@@ -133,5 +134,5 @@ kernel).
 | # | Idea | Mechanism | Measured ceiling | How to reject |
 |---|---|---|---|---|
 | 1 | ~~**Price the weight broadcast**~~ **done 2026-11-28** | `NO_Q3K_WEIGHT_PROBE` replaces the weight dword with a constant in a test-only build | measured **~55%** of the paired band (21.5 vs 48.2 ns per half), above the ≤32% estimate because the hoisted broadcast disappears too | gate was < 8%: cleared, so #2 is open |
-| 2 | **Decode straight into `u32` order** | have `q3k_decode_codes` emit `[u32; 64]` and let the band read 16 bytes per group instead of four 4-byte loads overlapping a 32-byte store | ~55% ceiling from probe #1; store-forwarding is the prime suspect | next |
+| 2 | ~~**Decode straight into `u32` order**~~ **rejected 2026-11-28** | one 16-byte load per group, dwords broadcast from the register (`VIPERA_Q3K_WIDE`, removed) | **+0.1%** band median, gate 3%: both formulations fold to `vpbroadcastd (mem)` per word (0 `vpermd`, 0 `vpextrd`), so the four "narrow loads" are already one fused instruction each | closed; `CONSTRAINTS.md` §Rejected has the row |
 | 3 | **Repack Q3_K at load** (like Q4K8) | remove decode from the hot loop, read codes in `dpbusd` form | ~19.6% (the decode share) | needs an ADR: 110 B → 320 B/block ⇒ 876 MiB → ~2.5 GiB, and the 7.3 GB model no longer fits |

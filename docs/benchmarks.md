@@ -5597,3 +5597,39 @@ interleaved rounds read pair/quad 1.366, 0.948, 1.047, 1.020, 1.058 — **median
 was going). Two runs of this test now read +15.8% and +7.7% while the band bench reads 2.6%; the spread
 between the two end-to-end answers is larger than the effect, so neither is evidence for H=4. Re-run it
 on a genuinely idle box before using any end-to-end number for this lever.
+
+## Lever #2 rejected: the band's "four narrow loads" are already one fused broadcast
+
+2026-11-28, plan §7 lever #2. The probe above priced the weight side of the Q3_K band at ~55%, and the
+plan named store forwarding as the prime suspect: the decode stores 32 bytes at a time, and the band
+then reads four 4-byte dwords out of that store, one per `dpbusd`. The lever was to read all sixteen
+bytes once (`VIPERA_Q3K_WIDE`, written and then removed) and broadcast the dwords out of the register.
+
+Band bench, H=2, four interleaved rounds in one process:
+
+| round | four 4-byte loads | one 16-byte load + register broadcasts | gain |
+|---|---:|---:|---:|
+| 0 | 48.15 | 47.96 | 0.4% |
+| 1 | 48.00 | 48.05 | −0.1% |
+| 2 | 47.92 | 47.81 | 0.2% |
+| 3 | 48.04 | 48.11 | −0.2% |
+
+**Median +0.1%, against a 3% gate.** The parity test was green in every combination (wide on/off ×
+quad on/off), so the numbers were right; the code just was not different.
+
+**Why: neither formulation survives codegen.** `_mm512_castsi128_si512(_mm_loadu_si128(..))` followed by
+`_mm512_permutexvar_epi32` compiles to `vpbroadcastd (mem)` per word — the H=2 kernel has **0
+`vpermd`** and 69 memory-source `vpbroadcastd`. The second attempt, `_mm_loadu_si128` + `_mm_extract_epi32`
++ `_mm512_set1_epi32`, folded the same way: **0 `vpextrd`**, 55 memory-source broadcasts. LLVM
+canonicalises "load sixteen bytes, then broadcast one dword of them" into "broadcast-load one dword",
+which is one instruction doing both jobs. There is no version of this restructure that is cheaper than
+what the compiler already emits, and a 16-byte load is strictly worse than four fused ones because it
+needs a separate extract per use.
+
+So the lever is closed, and it also corrects the probe's interpretation: the ~55% weight side is the
+**fused broadcast-load instruction itself** (its issue slot and its dependence on the decode's store),
+not a store-forwarding penalty on narrow loads. A probe that wants to split those two apart would have
+to stop the fold with an opaque load, and even then the ceiling is the three loads it removes — the
+same order as the noise this box produces. `CONSTRAINTS.md` §Rejected carries the row so nobody
+re-derives it. Nothing is left in the tree: the switch, the kernel branch and the bench arm were
+removed after the measurement.
