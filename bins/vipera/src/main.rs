@@ -1472,6 +1472,7 @@ fn render_profile_text(hardware: &HardwareProfile) -> String {
         "cpu_cores_physical: {}\n",
         hardware.cpu_cores_physical
     ));
+    out.push_str(&format!("numa_nodes: {}\n", hardware.numa_nodes));
     // Which kernel level the engine will run: a fleet of mixed machines can read this per host
     // instead of guessing from the CPU name.
     out.push_str(&format!("cpu_simd: {}\n", vipera_backend_cpu::simd_level()));
@@ -1508,9 +1509,10 @@ fn render_profile_json(hardware: &HardwareProfile) -> String {
         .collect();
 
     format!(
-        "{{\n  \"hardware_fingerprint\": {},\n  \"cpu_cores_physical\": {},\n  \"cpu_simd\": {},\n  \"ram_total_bytes\": {},\n  \"devices\": [{}]\n}}\n",
+        "{{\n  \"hardware_fingerprint\": {},\n  \"cpu_cores_physical\": {},\n  \"numa_nodes\": {},\n  \"cpu_simd\": {},\n  \"ram_total_bytes\": {},\n  \"devices\": [{}]\n}}\n",
         quote(&hardware.fingerprint()),
         hardware.cpu_cores_physical,
+        hardware.numa_nodes,
         quote(vipera_backend_cpu::simd_level()),
         hardware.ram_total_bytes,
         if devices.is_empty() {
@@ -1693,6 +1695,7 @@ mod tests {
     fn machine() -> HardwareProfile {
         HardwareProfile {
             cpu_cores_physical: 8,
+            numa_nodes: 2,
             ram_total_bytes: 16 * 1024 * 1024 * 1024,
             devices: vec![Device {
                 kind: DeviceKind::Cuda,
@@ -1737,6 +1740,7 @@ mod tests {
         for key in [
             "hardware_fingerprint",
             "cpu_cores_physical",
+            "numa_nodes",
             "cpu_simd",
             "ram_total_bytes",
             "devices",
@@ -1766,6 +1770,8 @@ mod tests {
     fn profile_text_lists_the_fingerprint_and_the_device() {
         let text = render_profile_text(&machine());
         assert!(text.starts_with("hardware_fingerprint: hw_"));
+        assert!(text.contains("numa_nodes: 2\n"));
+        assert!(render_profile_json(&machine()).contains("\"numa_nodes\": 2,"));
         assert!(text.contains("device: cuda NVIDIA GeForce RTX 3060"));
         assert!(text.contains("device_driver: 560.35"));
     }

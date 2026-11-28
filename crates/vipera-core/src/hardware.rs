@@ -70,9 +70,11 @@ impl HardwareProbe for SystemProbe {
                     .map(|n| n.get() as u32)
             })
             .unwrap_or(1);
+        let numa_nodes = count_numa_nodes(Path::new("/sys/devices/system/node"));
 
         HardwareProfile {
             cpu_cores_physical,
+            numa_nodes,
             ram_total_bytes,
             devices: self.cuda_devices(),
         }
@@ -124,6 +126,31 @@ pub fn parse_physical_cores(text: &str) -> Option<u32> {
         return Some(processors);
     }
     None
+}
+
+/// Count NUMA nodes in a sysfs directory such as `/sys/devices/system/node`.
+///
+/// Only directories named `node<number>` count; the kernel's `possible`, `online`, `has_cpu` and
+/// similar files are not nodes. A missing or unreadable directory reports one node: a machine
+/// built without NUMA sysfs still has a single memory node.
+pub fn count_numa_nodes(root: &Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 1;
+    };
+    let count = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("node"))
+                    .is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+                    })
+        })
+        .count();
+    count.max(1) as u32
 }
 
 /// Parse `nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version,compute_cap`.
@@ -185,6 +212,26 @@ core id\t\t: 0
     fn falls_back_to_logical_count_without_topology() {
         let text = "processor\t: 0\n\nprocessor\t: 1\n\nprocessor\t: 2\n";
         assert_eq!(parse_physical_cores(text), Some(3));
+    }
+
+    #[test]
+    fn counts_only_numbered_numa_node_directories() {
+        let root = std::env::temp_dir().join("vipera-numa-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("node0")).unwrap();
+        std::fs::create_dir_all(root.join("node1")).unwrap();
+        std::fs::create_dir_all(root.join("nodeX")).unwrap();
+        std::fs::write(root.join("possible"), "0-1\n").unwrap();
+        std::fs::write(root.join("node2"), b"not a directory").unwrap();
+        assert_eq!(count_numa_nodes(&root), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reports_one_numa_node_when_sysfs_is_absent() {
+        let root = std::env::temp_dir().join("vipera-numa-test-absent");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(count_numa_nodes(&root), 1);
     }
 
     #[test]
