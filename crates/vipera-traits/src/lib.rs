@@ -61,6 +61,8 @@ pub struct Device {
 pub struct HardwareProfile {
     /// Physical CPU cores.
     pub cpu_cores_physical: u32,
+    /// NUMA nodes exposed by the kernel; at least one, even without NUMA sysfs.
+    pub numa_nodes: u32,
     /// Total host memory in bytes.
     pub ram_total_bytes: u64,
     /// Discrete devices. Empty on a CPU-only machine.
@@ -391,6 +393,7 @@ mod tests {
     fn machine(free: u64) -> HardwareProfile {
         HardwareProfile {
             cpu_cores_physical: 8,
+            numa_nodes: 1,
             ram_total_bytes: 16 * 1024 * 1024 * 1024,
             devices: vec![Device {
                 kind: DeviceKind::Cuda,
@@ -587,6 +590,7 @@ mod tests {
     fn cpu_only_machine_has_no_cuda_device() {
         let profile = HardwareProfile {
             cpu_cores_physical: 4,
+            numa_nodes: 1,
             ram_total_bytes: 8,
             devices: Vec::new(),
         };
