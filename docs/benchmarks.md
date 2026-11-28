@@ -5479,3 +5479,196 @@ matches the row kernel within `1e-3 + 1e-4·|ref|`.
 **Note.** The absolute numbers (17.3 vs 6.0 tok/s) belong to this 6.9 GB model and do not compare with
 the 151/155 tok/s rows measured on the 876 MiB model. The 2.887x ratio is the usable number on the
 model in hand. The switch defaults **on**; `VIPERA_Q3K_TILED=0` exists for measurement and fallback.
+
+## Q3_K band: two tile halves per pass, bit-identical, +6.7% pp512
+
+The band runs one pass per 16-activation tile half, so at a 128-token chunk it decodes every row-block
+**eight times**, although the codes and scales depend only on `(row, block)`. Grouping two halves into
+one pass (`q3k_band_rows::<4, 2>`) decodes each row-block once for 32 activations. Each half keeps its
+own accumulator and its own summation order, so the result is **bit-identical**, not a numeric-policy
+change: `max |logit delta|` = 0 over the 512 positions.
+
+**Band bench** (`cargo test --release --lib bench_q3k_decode_codes -- --ignored --nocapture`, both arms
+in one process, 200k iterations per round, `taskset -c 2-5`):
+
+| per row-block (1536 columns, band of 4) | ns | paired gain |
+|---|---:|---:|
+| single pass (H=1) | 55.6–57.7 | — |
+| paired per half (H=2) | 49.2–51.8 | **6.7–14.4%** (median 10.5%) |
+
+Codegen gate on the release object: `vpdpbusd` stays 20 per group per half (320/block, no increase), and
+the only `(%rsp)` traffic in the kernel is the `codes`/`coef` zero-init and the epilogue `lanes` store —
+no accumulator spills in the dot loop. The 20→40 instructions in the disassembly are two halves of the
+same rolled group loop.
+
+**End to end** (`prefill_q3k_pair_vs_single`, one process, arms interleaved, 6.9 GB model, i5-11300H,
+governor `powersave`):
+
+```bash
+VIPERA_TEST_MODEL=~/.vipera/models/q8src-imbf-q3km.gguf VIPERA_THREADS=8 \
+  taskset -c 2-7 cargo test -p vipera-backend-cpu --release \
+  --test win_vs_llama prefill_q3k_pair_vs_single -- --ignored --nocapture
+```
+
+| round | paired ms | single ms | single/paired |
+|---:|---:|---:|---:|
+| 0 | 31290.4 | 33551.6 | 1.072 |
+| 1 | 31975.6 | 33820.2 | 1.058 |
+| 2 | 32043.7 | 34132.2 | 1.065 |
+| 3 | 31912.4 | 34117.5 | 1.069 |
+| 4 | 35105.7 | 35085.7 | 0.999 |
+| **median** | **31975.6** (16.0 tok/s) | **34117.5** (15.0 tok/s) | **1.067** |
+
+**+6.7% pp512**, against a 9.8%-of-the-band ceiling (decode share 19.6%) — the pairing collects about
+two thirds of it, as the plan predicted. Round 4 is the one the host's drift ate (both arms slowed);
+the four other rounds sit in 1.058–1.072.
+
+**Threshold and state.** The pre-registered gate was ≥5% pp512 and ≥6% on the band bench; both cleared,
+so the switch defaults **on** like the other 2026-11 defaults and `VIPERA_Q3K_PAIR=0` keeps the
+single-half band for measurement and fallback. Absolute ms here belong to the 6.9 GB model and do not
+compare with the older 876 MiB rows.
+
+**Next lever, unchanged:** H=4 (14.7% of the band) needs 16 accumulators and is now the obvious follow-up;
+the plan's spill risk is the thing to check first, since H=2 already widened the live set to 8 `zmm`.
+
+## Q3_K band: four tile halves per pass — H=4 does not spill, but buys only ~3%
+
+2026-11-28. `VIPERA_Q3K_QUAD` (default **off**) groups four tile halves into one `q3k_band_rows` pass,
+so a row-block is decoded once for 64 activations instead of twice for 32. The change is a width in the
+driver plus `q3k_band_rows::<4, 4>`; the kernel keeps one accumulator per half, so the result is still
+bit-identical (asserted: `max |logit delta| == 0` in `prefill_q3k_quad_vs_pair`).
+
+**Codegen gate, first, because this lever's risk is the spill.** In the release object
+(`q3k_band_rows::<4, 4>`), `vpdpbusd` stays 20 per rolled group loop — no increase — and the sixteen
+accumulators stay in registers: the only `(%rsp)` `zmm` traffic is the `codes`/`coef` zero-init and the
+epilogue `lanes` buffer (16 stores, then 12 reloads for the scatter). There is no store/load of an
+accumulator inside the block loop, so the 8→16 live `zmm` was absorbed by the 32-register file.
+
+Sample of the quiet rounds (`bench_q3k_decode_codes`, same invocation as above):
+
+| per row-block | ns per half | gain |
+|---|---:|---:|
+| H=2 (paired, shipped) | 48.15–48.55 | — |
+| H=4 (quad) | 46.93–47.89 | **1.4–2.8%** (median 2.6% over the four quiet rounds) |
+
+Four halves buys ~2.6% of the band, not the 4.9% the decode share (17–19%) allows: at H=4 the decode is
+already 4× cheaper than at H=1, so one more halving saves only ~4.8 ns of the ~9.7 ns decode, and part
+of that moves into the wider pass's longer live ranges.
+
+**End to end**, `prefill_q3k_quad_vs_pair`, five interleaved rounds in one process: the bit-identity
+check passed with delta 0, and the median read pair/quad **1.158× (+15.8%)** — which is drift, not the
+lever. The host was degraded for that whole run (each pp512 prefill took 52–79 s instead of the ~32 s of
+the H=2 run, with a load average of 10 on 8 CPUs from outside this repo, and per-round ratios swinging
+0.970–1.492). The band bench is the number to keep: **~2.6%**, far under the 4.9% ceiling and under the
+5% gate the H=2 lever used.
+
+**Threshold and state.** Under the pre-registered gate (≥5% pp512, ≥6% band) this does **not** clear, so
+`VIPERA_Q3K_QUAD` stays **off**: it is in the tree as a measured lever and a switch for the next probe,
+not as a default. `VIPERA_Q3K_PAIR=1` (the default) is unchanged. Re-run
+`prefill_q3k_quad_vs_pair` on a quiet host before ever flipping it.
+
+## Weight probe: the code load and its broadcast are ~55% of the paired band
+
+2026-11-28, plan §7 lever #1. Test-only probe (`NO_Q3K_WEIGHT_PROBE`, folded to `false` outside `cfg(test)`):
+in the `dpbusd` loop the packed dword comes from a constant instead of `codes[t][k * 16 + word * 4..]`.
+The `dpbusd` chain, the activations, `dxs`, the decode itself and the epilogue are untouched, so the
+difference prices the 4-byte code read, the `vpbroadcastd` that turns it into a vector, and their
+dependency on the decode's stores. No default changes; the probe is not reachable outside tests.
+
+| per row-block, H=2 | ns per half | share of the paired band |
+|---|---:|---:|
+| paired, real weights | 48.15–48.55 | 100% |
+| paired, constant weight dword | 21.4–21.9 | 44.4–44.9% |
+| **weight side** | **~26.7** | **~55%** (55.1–55.6% across the four quiet rounds) |
+
+Read against the plan's ≤32% "unexplained cycles" ceiling, this is larger, because the probe removes
+more than a load: with a constant dword the compiler materialises the broadcast once and hoists it out
+of the block loop, so the ~16 `vpbroadcastd` per row per half disappear as well. Those were never in
+the 320-`dpbusd` floor. The gate was "close if the probe is < 8% of the band": it is **55%**, so plan
+§7 lever #2 — decoding straight into `u32` order so the band reads 16 bytes per group instead of four
+4-byte loads that overlap the decode's 32-byte stores (store-forwarding being the prime suspect) — is
+open. Caveat on the number: this ratio was measured while an unrelated process held the box at load
+10, and the noisiest rounds read as high as 66%; the 55% is the four quiet rounds, not a best case.
+
+**Re-run with the same tree on a quieter moment (2026-11-28, load 2.9 → 9.4 during the run):** five
+interleaved rounds read pair/quad 1.366, 0.948, 1.047, 1.020, 1.058 — **median 1.077× (+7.7%)**, still
+7-8 tok/s rather than the 16 tok/s of the H=2 run, because the host never got back to its baseline
+(each prefill took 52–76 s instead of ~32 s, and the load average climbed from 1.9 to 9.4 while the run
+was going). Two runs of this test now read +15.8% and +7.7% while the band bench reads 2.6%; the spread
+between the two end-to-end answers is larger than the effect, so neither is evidence for H=4. Re-run it
+on a genuinely idle box before using any end-to-end number for this lever.
+
+## Lever #2 rejected: the band's "four narrow loads" are already one fused broadcast
+
+2026-11-28, plan §7 lever #2. The probe above priced the weight side of the Q3_K band at ~55%, and the
+plan named store forwarding as the prime suspect: the decode stores 32 bytes at a time, and the band
+then reads four 4-byte dwords out of that store, one per `dpbusd`. The lever was to read all sixteen
+bytes once (`VIPERA_Q3K_WIDE`, written and then removed) and broadcast the dwords out of the register.
+
+Band bench, H=2, four interleaved rounds in one process:
+
+| round | four 4-byte loads | one 16-byte load + register broadcasts | gain |
+|---|---:|---:|---:|
+| 0 | 48.15 | 47.96 | 0.4% |
+| 1 | 48.00 | 48.05 | −0.1% |
+| 2 | 47.92 | 47.81 | 0.2% |
+| 3 | 48.04 | 48.11 | −0.2% |
+
+**Median +0.1%, against a 3% gate.** The parity test was green in every combination (wide on/off ×
+quad on/off), so the numbers were right; the code just was not different.
+
+**Why: neither formulation survives codegen.** `_mm512_castsi128_si512(_mm_loadu_si128(..))` followed by
+`_mm512_permutexvar_epi32` compiles to `vpbroadcastd (mem)` per word — the H=2 kernel has **0
+`vpermd`** and 69 memory-source `vpbroadcastd`. The second attempt, `_mm_loadu_si128` + `_mm_extract_epi32`
++ `_mm512_set1_epi32`, folded the same way: **0 `vpextrd`**, 55 memory-source broadcasts. LLVM
+canonicalises "load sixteen bytes, then broadcast one dword of them" into "broadcast-load one dword",
+which is one instruction doing both jobs. There is no version of this restructure that is cheaper than
+what the compiler already emits, and a 16-byte load is strictly worse than four fused ones because it
+needs a separate extract per use.
+
+So the lever is closed, and it also corrects the probe's interpretation: the ~55% weight side is the
+**fused broadcast-load instruction itself** (its issue slot and its dependence on the decode's store),
+not a store-forwarding penalty on narrow loads. A probe that wants to split those two apart would have
+to stop the fold with an opaque load, and even then the ceiling is the three loads it removes — the
+same order as the noise this box produces. `CONSTRAINTS.md` §Rejected carries the row so nobody
+re-derives it. Nothing is left in the tree: the switch, the kernel branch and the bench arm were
+removed after the measurement.
+
+## Q3_K band, re-baselined on a quieter box (2026-11-28, load ~2.2)
+
+Every number in this section comes from one `bench_q3k_decode_codes` run with the machine at load 2.2
+(it had been at 8–10 for the H=4 work), repeated twice for the spreads. All arms are timed in the same
+process, cache-warm, 200k iterations per round; only rounds 2–5 are printed.
+
+| arm | ns per row-block (per half) | vs the paired band |
+|---|---:|---:|
+| decode alone | 8.83–9.85 | — |
+| band, one half (H=1) | 51.3–54.4 | — |
+| paired (H=2, shipped) | 46.4–50.5 | 100% |
+| quad (H=4) | 44.6–47.7 | 3.1–9.1% better |
+| no-weight probe | 20.5–22.0 | weight side 55.0–58.0% |
+| opaque 16-byte code load | 47.7–51.7 | **−5.6 to +2.5% (median −2.9%)** |
+| pre-decoded 320 B blocks | 43.2–46.1 | **+6.3 to +10.8% (median +7.6%)** |
+
+**Reconciliation with the rows above.** The H=2 pairing was recorded at 6.7–14.4% (median 10.5%) on
+`55.6–57.7 → 49.2–51.8` ns. Today the same two arms read `51.3–54.4 → 46.4–50.5` ns, i.e. **3.3–8.2%,
+median 5.6%**. The pair saves ~3 ns per half in both cases; what changed is the band baseline, which is
+~8% faster today than when the 10.5% median was taken. So the honest band-bench figure for this lever is
+**~5.5%, not ~10.5%** — the earlier row measured a slower band arm against a normal one, which flatters
+the ratio. The end-to-end record (**1.067x pp512**, five interleaved rounds) is unaffected by this and
+remains the basis for the default; a fresh pp512 pair on an idle box is the way to settle whether the
+band-bench correction changes it.
+
+**Opaque code load: the band is not waiting on the decode's store.** Forcing one 16-byte code load plus
+four register broadcasts (the only form the compiler will not fold back) is *slower*, so the fused
+`vpbroadcastd (mem)` per code word is already the cheap shape. This closes the half of the weight-probe
+question that pointed at store forwarding: the ~7.6% the pre-decoded arm buys is the decode's own
+instructions, not a stall the band inherits.
+
+**Pre-decoded blocks: lever #3's ceiling, +7.6% of the band.** `q3k_band_rows_packed::<4, 2>` reads a
+320-byte block (256 code bytes + sixteen `f32`) instead of running `q3k_decode_codes` per pass. That
+clears the 6% gate ADR-008 pre-registered, but the probe is cache-hot: the real repacked block is
+2.91x the bytes of the 110-byte block it replaces, and pp512 streams those bytes from RAM. ADR-008
+therefore records option B as designed and deferred — a repacked 6.9 GiB model is ~20 GiB on a 15 GB
+box with ~3 GB free, so the traffic cost cannot be measured here at all. Both probes stay in the bench
+as `cfg(test)` code so the next machine can re-run them.

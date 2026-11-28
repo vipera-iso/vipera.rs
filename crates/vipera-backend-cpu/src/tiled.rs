@@ -61,6 +61,83 @@ pub(crate) fn q3k_tiled_enabled() -> bool {
     }
 }
 
+/// Whether the Q3_K band decodes each row-block once for **two** tile halves: `VIPERA_Q3K_PAIR`,
+/// **on by default**, `=0` for the single-half band.
+///
+/// At B=128 the band runs eight tile halves and decodes every row-block eight times, although the
+/// codes and scales depend only on `(row, block)`. Pairing halves halves that decode; it adds no
+/// buffer and no traffic. The two halves are accumulated separately in the same order as before, so
+/// this is bit-identical to the unpaired path, not a numeric-policy switch.
+///
+/// It measured +6.7% pp512 (median of five interleaved rounds) and exactly zero logit delta
+/// (`docs/benchmarks.md`), which is why the default is on and the switch is the way back.
+///
+/// Read on every dispatch (not cached) so a measurement can run both arms.
+pub(crate) fn q3k_pair_enabled() -> bool {
+    match Q3K_PAIR_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        0 => false,
+        _ => !std::env::var("VIPERA_Q3K_PAIR").is_ok_and(|value| value == "0"),
+    }
+}
+
+/// `-1` follows the environment, `0` pins the single-half band, `1` pins the paired band. See
+/// [`pin_q3k_pair`].
+static Q3K_PAIR_PIN: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Pin the paired Q3_K band for this process, or `None` to follow `VIPERA_Q3K_PAIR` again.
+///
+/// A measurement hook for the same reason as [`pin_q3k_tiled`]: `std::env::set_var` is off limits
+/// under the workspace's `unsafe` policy, and an A/B has to run both arms in one process to survive
+/// this machine's drift. The engine itself never calls this.
+pub fn pin_q3k_pair(value: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    Q3K_PAIR_PIN.store(
+        match value {
+            None => -1,
+            Some(false) => 0,
+            Some(true) => 1,
+        },
+        Relaxed,
+    );
+}
+
+/// Whether the Q3_K band groups **four** tile halves into one pass: `VIPERA_Q3K_QUAD`, **off by
+/// default** — `VIPERA_Q3K_PAIR` stays the default arrangement until this one has measurements.
+///
+/// Pairing halves halved the per-pass row-block decode; quadruplying it halves that again, at the
+/// cost of sixteen live accumulators (`N = 4` rows × four halves) instead of eight, which is the
+/// register pressure that may turn the decode saving into spills. Each half still keeps its own
+/// accumulator and summation order, so it is bit-identical if it pays.
+///
+/// Read on every dispatch, like [`q3k_pair_enabled`], so a measurement can run both arms.
+pub(crate) fn q3k_quad_enabled() -> bool {
+    match Q3K_QUAD_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        0 => false,
+        _ => env_truthy("VIPERA_Q3K_QUAD"),
+    }
+}
+
+/// `-1` follows the environment, `0` pins two halves per pass, `1` pins four. See
+/// [`pin_q3k_quad`].
+static Q3K_QUAD_PIN: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Pin the four-half Q3_K band for this process, or `None` to follow `VIPERA_Q3K_QUAD` again.
+///
+/// The same measurement hook as [`pin_q3k_pair`]. The engine itself never calls this.
+pub fn pin_q3k_quad(value: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    Q3K_QUAD_PIN.store(
+        match value {
+            None => -1,
+            Some(false) => 0,
+            Some(true) => 1,
+        },
+        Relaxed,
+    );
+}
+
 /// Whether the W-1a tiled-band activation is on: `VIPERA_TILED_A`, **off by default**.
 ///
 /// W-1a changes the activation's arithmetic — the band reads one scale per 256-value block
