@@ -79,14 +79,14 @@
 
 use std::arch::x86_64::{
     __m128i, __m256, __m256i, __m512, __m512i, _MM_HINT_T0, _mm_add_ps, _mm_add_ss,
-    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_hadd_epi16, _mm_loadl_epi64, _mm_loadu_ps,
-    _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _mm_set1_ps, _mm_setr_epi8,
-    _mm_setr_epi32, _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_unpacklo_epi8, _mm256_add_epi8,
-    _mm256_add_epi16, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256, _mm256_andnot_si256,
-    _mm256_blend_epi32, _mm256_bsrli_epi128, _mm256_castps256_ps128, _mm256_castsi128_si256,
-    _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cmpeq_epi32,
-    _mm256_cvtepi8_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi16, _mm256_cvtepu8_epi32,
-    _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32,
+    _mm_cvtsi64_si128, _mm_cvtss_f32, _mm_extract_epi32, _mm_hadd_epi16, _mm_loadl_epi64,
+    _mm_loadu_ps, _mm_loadu_si128, _mm_movehdup_ps, _mm_movehl_ps, _mm_prefetch, _mm_set1_ps,
+    _mm_setr_epi8, _mm_setr_epi32, _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_unpacklo_epi8,
+    _mm256_add_epi8, _mm256_add_epi16, _mm256_add_epi32, _mm256_add_ps, _mm256_and_si256,
+    _mm256_andnot_si256, _mm256_blend_epi32, _mm256_bsrli_epi128, _mm256_castps256_ps128,
+    _mm256_castsi128_si256, _mm256_castsi256_ps, _mm256_castsi256_si128, _mm256_cmpeq_epi8,
+    _mm256_cmpeq_epi32, _mm256_cvtepi8_epi32, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi16,
+    _mm256_cvtepu8_epi32, _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_dpbusd_epi32,
     _mm256_extractf128_ps, _mm256_extracti128_si256, _mm256_fmadd_ps, _mm256_loadu_ps,
     _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_max_epi32, _mm256_max_ps,
     _mm256_min_epi32, _mm256_min_ps, _mm256_mul_ps, _mm256_or_si256, _mm256_permute2f128_si256,
@@ -2609,6 +2609,27 @@ fn q3k_no_weight() -> bool {
     }
 }
 
+/// Probe for where the weight side actually goes: an **opaque** 16-byte load, then the four dwords
+/// broadcast out of the register. Without the opacity the compiler folds this straight back into four
+/// `vpbroadcastd (mem)`, so this is the only way to ask whether the fused broadcast-load is cheap on
+/// its own or whether it is waiting on the decode's 32-byte store.
+///
+/// Test-only, like the other probes; it changes nothing arithmetically.
+#[cfg(test)]
+static OPAQUE_CODE_LOAD_PROBE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn q3k_opaque_code_load() -> bool {
+    #[cfg(test)]
+    {
+        OPAQUE_CODE_LOAD_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Where one tile half's activations and scales live, and where the band writes its rows.
 #[derive(Clone, Copy)]
 struct Q3kBandView {
@@ -2637,6 +2658,7 @@ unsafe fn q3k_band_rows<const N: usize, const H: usize>(
         let ones = _mm512_set1_epi32(0x0101_0101);
         let four = _mm512_set1_ps(4.0);
         let no_weight = q3k_no_weight();
+        let opaque = q3k_opaque_code_load();
         let mut lanes_acc = [[_mm512_setzero_ps(); N]; H];
         let mut codes = [[0_u8; 256]; N];
         let mut coef = [[0.0_f32; 16]; N];
@@ -2666,18 +2688,36 @@ unsafe fn q3k_band_rows<const N: usize, const H: usize>(
                     let dx = _mm512_loadu_ps(block_dx.add(k * 16));
                     for (t, accumulator) in lanes_acc[h].iter_mut().enumerate() {
                         let mut acc = _mm512_setzero_si512();
-                        for (word, group) in a.iter().enumerate() {
-                            let packed = if no_weight {
-                                0x0101_0101
-                            } else {
-                                u32::from_le_bytes(
-                                    codes[t][k * 16 + word * 4..][..4]
-                                        .try_into()
-                                        .expect("four bytes"),
-                                )
-                            };
-                            acc =
-                                _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *group);
+                        if opaque {
+                            let words = std::hint::black_box(_mm_loadu_si128(
+                                codes[t].as_ptr().add(k * 16) as *const __m128i,
+                            ));
+                            let dups = [
+                                _mm512_set1_epi32(_mm_extract_epi32::<0>(words)),
+                                _mm512_set1_epi32(_mm_extract_epi32::<1>(words)),
+                                _mm512_set1_epi32(_mm_extract_epi32::<2>(words)),
+                                _mm512_set1_epi32(_mm_extract_epi32::<3>(words)),
+                            ];
+                            for (dup, group) in dups.iter().zip(a.iter()) {
+                                acc = _mm512_dpbusd_epi32(acc, *dup, *group);
+                            }
+                        } else {
+                            for (word, group) in a.iter().enumerate() {
+                                let packed = if no_weight {
+                                    0x0101_0101
+                                } else {
+                                    u32::from_le_bytes(
+                                        codes[t][k * 16 + word * 4..][..4]
+                                            .try_into()
+                                            .expect("four bytes"),
+                                    )
+                                };
+                                acc = _mm512_dpbusd_epi32(
+                                    acc,
+                                    _mm512_set1_epi32(packed as i32),
+                                    *group,
+                                );
+                            }
                         }
                         let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc), bias);
                         let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][k]));
@@ -2688,6 +2728,75 @@ unsafe fn q3k_band_rows<const N: usize, const H: usize>(
         }
         // `out` is entry-major (`out[entry * count + row]`), so the sixteen lanes of a row are
         // spread across sixteen entries rather than written as one contiguous run.
+        let mut lanes = [0.0_f32; 16];
+        for (h, view) in views.iter().enumerate() {
+            for (t, accumulator) in lanes_acc[h].iter().enumerate() {
+                _mm512_storeu_ps(lanes.as_mut_ptr(), *accumulator);
+                for (col, value) in lanes.iter().take(view.columns).enumerate() {
+                    *view.out.add(col * view.count + t) = *value;
+                }
+            }
+        }
+    }
+}
+
+/// Ceiling probe for the load-time repack: the same band with `q3k_decode_codes` taken out, reading a
+/// 320-byte block per (row, block) — 256 code bytes, then sixteen `f32` coefficients.
+///
+/// Test-only. If this does not clearly beat the decoded band, a repack cannot pay for its 2.91x
+/// density (`docs/design/ADR-008-q3k-dpbusd-repack.md`).
+#[cfg(test)]
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+unsafe fn q3k_band_rows_packed<const N: usize, const H: usize>(
+    packed: *const u8,
+    stride: usize,
+    first_row: usize,
+    blocks: usize,
+    views: [Q3kBandView; H],
+) {
+    // SAFETY: same contract as `q3k_band_rows`, with the decode's output supplied by the repack.
+    unsafe {
+        let ones = _mm512_set1_epi32(0x0101_0101);
+        let four = _mm512_set1_ps(4.0);
+        let mut lanes_acc = [[_mm512_setzero_ps(); N]; H];
+        for b in 0..blocks {
+            for (h, view) in views.iter().enumerate() {
+                let block_act = view.act.add(b * view.act_stride);
+                let block_dx = view.dxs.add(b * view.dxs_stride);
+                for k in 0..16 {
+                    let a = [
+                        _mm512_loadu_si512(block_act.add(k * 256) as *const __m512i),
+                        _mm512_loadu_si512(block_act.add(k * 256 + 64) as *const __m512i),
+                        _mm512_loadu_si512(block_act.add(k * 256 + 128) as *const __m512i),
+                        _mm512_loadu_si512(block_act.add(k * 256 + 192) as *const __m512i),
+                    ];
+                    let mut bias = _mm512_setzero_si512();
+                    for group in &a {
+                        bias = _mm512_dpbusd_epi32(bias, ones, *group);
+                    }
+                    let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), four);
+                    let dx = _mm512_loadu_ps(block_dx.add(k * 16));
+                    for (t, accumulator) in lanes_acc[h].iter_mut().enumerate() {
+                        let block = packed.add((first_row + t) * stride + b * 320);
+                        let coef = block.add(256) as *const f32;
+                        let mut acc = _mm512_setzero_si512();
+                        for (word, group) in a.iter().enumerate() {
+                            let packed_word = std::ptr::read_unaligned(
+                                block.add(k * 16 + word * 4) as *const u32,
+                            );
+                            acc = _mm512_dpbusd_epi32(
+                                acc,
+                                _mm512_set1_epi32(packed_word as i32),
+                                *group,
+                            );
+                        }
+                        let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc), bias);
+                        let scale = _mm512_mul_ps(dx, _mm512_set1_ps(*coef.add(k)));
+                        *accumulator = _mm512_fmadd_ps(levels, scale, *accumulator);
+                    }
+                }
+            }
+        }
         let mut lanes = [0.0_f32; 16];
         for (h, view) in views.iter().enumerate() {
             for (t, accumulator) in lanes_acc[h].iter().enumerate() {
@@ -7332,6 +7441,29 @@ mod tests {
         let iterations = 200_000;
         let mut sink = 0.0_f32;
         let mut out = vec![0.0_f32; 4 * 16 * rows];
+        // Lever #3's ceiling: build the load-time repack the band would read, one 320-byte block per
+        // (row, block) — 256 code bytes then sixteen `f32` coefficients.
+        let packed_stride = blocks * 320;
+        let mut packed = vec![0_u8; rows * packed_stride];
+        for row in 0..rows {
+            for b in 0..blocks {
+                let at = row * packed_stride + b * 320;
+                let mut codes = [0_u8; 256];
+                let mut coef = [0.0_f32; 16];
+                // SAFETY: one whole block per row and block.
+                unsafe {
+                    q3k_decode_codes(
+                        data.as_ptr().add(row * stride + b * 110),
+                        &mut codes,
+                        &mut coef,
+                    );
+                }
+                packed[at..at + 256].copy_from_slice(&codes);
+                for (k, c) in coef.iter().enumerate() {
+                    packed[at + 256 + k * 4..at + 260 + k * 4].copy_from_slice(&c.to_le_bytes());
+                }
+            }
+        }
         for round in 0..6 {
             let start = std::time::Instant::now();
             for _ in 0..iterations {
@@ -7412,6 +7544,40 @@ mod tests {
             let pair_ms = start.elapsed().as_secs_f64() * 1e3;
             let start = std::time::Instant::now();
             for _ in 0..iterations {
+                // SAFETY: four rows, two tile halves, pre-decoded blocks of 320 bytes.
+                unsafe {
+                    q3k_band_rows_packed::<4, 2>(
+                        packed.as_ptr(),
+                        packed_stride,
+                        0,
+                        blocks,
+                        [
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr(),
+                                count: rows,
+                                columns: 16,
+                            },
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr().add(16 * rows),
+                                count: rows,
+                                columns: 16,
+                            },
+                        ],
+                    );
+                }
+                sink += out[0];
+            }
+            let packed_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
                 // SAFETY: four rows, four tile halves pointing at the same activation buffer (one
                 // half's timing is what matters), whole blocks.
                 unsafe {
@@ -7472,12 +7638,52 @@ mod tests {
             }
             NO_Q3K_WEIGHT_PROBE.store(false, std::sync::atomic::Ordering::Relaxed);
             let no_weight_ms = start.elapsed().as_secs_f64() * 1e3;
+            // Same band, same decode, but the four dwords come from one opaque 16-byte load: this is
+            // the only form the compiler will not fold back into four `vpbroadcastd (mem)`.
+            OPAQUE_CODE_LOAD_PROBE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: four rows, two tile halves, whole blocks.
+                unsafe {
+                    q3k_band_rows::<4, 2>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        [
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr(),
+                                count: rows,
+                                columns: 16,
+                            },
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr().add(16 * rows),
+                                count: rows,
+                                columns: 16,
+                            },
+                        ],
+                    );
+                }
+                sink += out[0];
+            }
+            OPAQUE_CODE_LOAD_PROBE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let opaque_ms = start.elapsed().as_secs_f64() * 1e3;
             if round >= 2 {
                 let decode_ns = decode_ms * 1e6 / (iterations * rows * blocks) as f64;
                 let band_ns = band_ms * 1e6 / (iterations * rows * blocks) as f64;
                 let pair_ns = pair_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 let quad_ns = quad_ms * 1e6 / (iterations * rows * blocks * 4) as f64;
                 let no_weight_ns = no_weight_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
+                let packed_ns = packed_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
+                let opaque_ns = opaque_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 println!(
                     "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, paired {pair_ns:.2} ns, quad {quad_ns:.2} ns (per half), decode share {:.0}%, paired gain {:.1}%, quad gain {:.1}%, quad vs paired {:.1}%",
                     decode_ns / band_ns * 100.0,
@@ -7488,6 +7694,14 @@ mod tests {
                 println!(
                     "  weight probe (H=2): no-weight {no_weight_ns:.2} ns per half, weight side {:.1}% of the paired band",
                     (1.0 - no_weight_ns / pair_ns) * 100.0
+                );
+                println!(
+                    "  opaque 16-byte load (H=2, decode kept): {opaque_ns:.2} ns per half, {:.1}% vs the fused broadcast-load",
+                    (1.0 - opaque_ns / pair_ns) * 100.0
+                );
+                println!(
+                    "  pre-decoded 320 B blocks (H=2): {packed_ns:.2} ns per half, {:.1}% vs the in-band decode",
+                    (1.0 - packed_ns / pair_ns) * 100.0
                 );
             }
         }

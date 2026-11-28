@@ -5633,3 +5633,42 @@ to stop the fold with an opaque load, and even then the ceiling is the three loa
 same order as the noise this box produces. `CONSTRAINTS.md` §Rejected carries the row so nobody
 re-derives it. Nothing is left in the tree: the switch, the kernel branch and the bench arm were
 removed after the measurement.
+
+## Q3_K band, re-baselined on a quieter box (2026-11-28, load ~2.2)
+
+Every number in this section comes from one `bench_q3k_decode_codes` run with the machine at load 2.2
+(it had been at 8–10 for the H=4 work), repeated twice for the spreads. All arms are timed in the same
+process, cache-warm, 200k iterations per round; only rounds 2–5 are printed.
+
+| arm | ns per row-block (per half) | vs the paired band |
+|---|---:|---:|
+| decode alone | 8.83–9.85 | — |
+| band, one half (H=1) | 51.3–54.4 | — |
+| paired (H=2, shipped) | 46.4–50.5 | 100% |
+| quad (H=4) | 44.6–47.7 | 3.1–9.1% better |
+| no-weight probe | 20.5–22.0 | weight side 55.0–58.0% |
+| opaque 16-byte code load | 47.7–51.7 | **−5.6 to +2.5% (median −2.9%)** |
+| pre-decoded 320 B blocks | 43.2–46.1 | **+6.3 to +10.8% (median +7.6%)** |
+
+**Reconciliation with the rows above.** The H=2 pairing was recorded at 6.7–14.4% (median 10.5%) on
+`55.6–57.7 → 49.2–51.8` ns. Today the same two arms read `51.3–54.4 → 46.4–50.5` ns, i.e. **3.3–8.2%,
+median 5.6%**. The pair saves ~3 ns per half in both cases; what changed is the band baseline, which is
+~8% faster today than when the 10.5% median was taken. So the honest band-bench figure for this lever is
+**~5.5%, not ~10.5%** — the earlier row measured a slower band arm against a normal one, which flatters
+the ratio. The end-to-end record (**1.067x pp512**, five interleaved rounds) is unaffected by this and
+remains the basis for the default; a fresh pp512 pair on an idle box is the way to settle whether the
+band-bench correction changes it.
+
+**Opaque code load: the band is not waiting on the decode's store.** Forcing one 16-byte code load plus
+four register broadcasts (the only form the compiler will not fold back) is *slower*, so the fused
+`vpbroadcastd (mem)` per code word is already the cheap shape. This closes the half of the weight-probe
+question that pointed at store forwarding: the ~7.6% the pre-decoded arm buys is the decode's own
+instructions, not a stall the band inherits.
+
+**Pre-decoded blocks: lever #3's ceiling, +7.6% of the band.** `q3k_band_rows_packed::<4, 2>` reads a
+320-byte block (256 code bytes + sixteen `f32`) instead of running `q3k_decode_codes` per pass. That
+clears the 6% gate ADR-008 pre-registered, but the probe is cache-hot: the real repacked block is
+2.91x the bytes of the 110-byte block it replaces, and pp512 streams those bytes from RAM. ADR-008
+therefore records option B as designed and deferred — a repacked 6.9 GiB model is ~20 GiB on a 15 GB
+box with ~3 GB free, so the traffic cost cannot be measured here at all. Both probes stay in the bench
+as `cfg(test)` code so the next machine can re-run them.
