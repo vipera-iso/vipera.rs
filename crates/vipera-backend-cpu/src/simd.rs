@@ -6775,15 +6775,17 @@ mod tests {
         std::hint::black_box((&two, &one));
     }
 
-    /// Hai dạng microkernel cho cùng một 16x16 tile của Q4_K, đo cái nào nhanh hơn trên máy này.
+    /// Two microkernel forms for the same 16x16 Q4_K tile, to measure which one is faster here.
     ///
-    /// A giống kernel đang chạy: zmm là 16 *activation* x 4 cột của **một** hàng weight, nên mỗi
-    /// `dpbusd` cần một `vpbroadcastd` từ `wq` (64 broadcast cho 64 dot trong codegen gate).
-    /// B là dạng đã repack: zmm là 16 **hàng weight** x 4 code, activation broadcast từ bộ nhớ
-    /// (dạng `{1to16}` của `vpdpbusd`, nếu compiler gấp được) — một broadcast miễn phí thay vì một
-    /// lần load + broadcast mỗi dot.
+    /// A matches the shipping kernel: a zmm holds 16 *activations* x 4 columns of **one** weight
+    /// row, so each `dpbusd` needs a `vpbroadcastd` from `wq` (64 broadcasts for the 64 dots the
+    /// codegen gate counts).
+    /// B is the repacked form: a zmm holds 16 **weight rows** x 4 codes, with the activation
+    /// broadcast from memory (the `{1to16}` form of `vpdpbusd`, if the compiler folds it) — a free
+    /// broadcast instead of one load plus broadcast per dot.
     ///
-    /// Số MAC như nhau (64 mỗi lệnh), nên thời gian nói thẳng cái nào trả tiền cho broadcast.
+    /// Both do the same number of MACs (64 per instruction), so the timing says directly which one
+    /// pays for the broadcast.
     #[test]
     #[ignore = "measurement, not a correctness check"]
     fn repacked_gemm_form_against_the_broadcast_form() {
@@ -6793,12 +6795,12 @@ mod tests {
             return;
         }
         const ROWS: usize = 16;
-        const GROUPS: usize = 64; // 256 cột / 4 code mỗi dword
+        const GROUPS: usize = 64; // 256 columns / 4 codes per dword
         let mut rng = Rng(0x5eed_0d08_0000_0001);
-        // A: weight theo (hàng, group) là một dword; activation theo (group, activation) là zmm.
+        // A: a weight is one dword per (row, group); activations are a zmm per (group, activation).
         let weights_dword: Vec<u32> = (0..ROWS * GROUPS).map(|_| rng.next() as u32).collect();
         let acts: Vec<u8> = (0..GROUPS * 64).map(|_| rng.byte()).collect();
-        // B: weight đã repack thành zmm = 16 hàng x 4 code cho từng group.
+        // B: weights repacked so a zmm is 16 rows x 4 codes for each group.
         let mut weights_packed = vec![0u8; GROUPS * 64];
         for group in 0..GROUPS {
             for row in 0..ROWS {
@@ -6807,8 +6809,9 @@ mod tests {
                     .copy_from_slice(&dword);
             }
         }
-        // Intrinsics chỉ inline khi chính hàm mang `target_feature`; gọi chúng từ một hàm test
-        // thường thì mỗi lệnh thành một call và bench đo overhead (đo được 30 chu kỳ/lệnh).
+        // Intrinsics only inline when the function itself carries `target_feature`; calling them
+        // from an ordinary test function makes every instruction a call and the bench measures the
+        // overhead (30 cycles per instruction, measured).
         #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
         unsafe fn run_a(words: *const u32, acts: *const u8, out: *mut i32, groups: usize) {
             // SAFETY: the caller hands buffers of `ROWS * groups` words, `groups * 64` bytes and
@@ -6853,8 +6856,8 @@ mod tests {
         }
         let mut out_a = [0_i32; ROWS * 16];
         let mut out_b = [0_i32; ROWS * 16];
-        // Mười sáu hàng weight, mỗi hàng một accumulator; `codes` của group được load một lần và
-        // dùng cho cả 16 hàng — đúng như kernel tiled đang chạy.
+        // Sixteen weight rows, one accumulator each; the group's `codes` are loaded once and used
+        // for all 16 rows — exactly what the shipping tiled kernel does.
         let mut form_a = || unsafe {
             run_a(
                 weights_dword.as_ptr(),
@@ -6881,7 +6884,7 @@ mod tests {
         };
         let a = run(&mut form_a);
         let b = run(&mut form_b);
-        // 16 hàng x 256 cột x 16 activation, nhân 2 cho MAC.
+        // 16 rows x 256 columns x 16 activations, times 2 for MACs.
         let flops = 2.0 * (ROWS * 256 * 16) as f64;
         println!(
             "form A (broadcast per dot): {:>8.1} ns  {:>7.1} GFLOPS",

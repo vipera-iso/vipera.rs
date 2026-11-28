@@ -1613,6 +1613,7 @@ pub(crate) fn fill_rows_batch<const B: usize>(
         // Q3_K: four rows per band over the same sixteen-activation tile. The band decodes a
         // row-block's codes once for all sixteen activations instead of once per activation.
         if ty == GgmlType::Q3K
+            && crate::tiled::q3k_tiled_enabled()
             && let Some(xs) = activation.quantized()
             && crate::simd::try_q3k_matvec_tiled_range(
                 data, stride, first_row, count, xs, out, tile,

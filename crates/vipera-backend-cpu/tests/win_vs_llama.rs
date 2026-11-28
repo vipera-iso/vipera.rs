@@ -1,28 +1,31 @@
-//! Vipera vs llama.cpp — bốn tricks từ bài nghiên cứu sâu thành phép đo.
+//! Vipera vs llama.cpp — the four tricks from the deep-research piece, turned into measurements.
 //!
-//! Bài gốc claim:
-//! * **Fused dequant+GEMM** loại bỏ 128 MB traffic trung gian; ik_llama.cpp Q4_K prefill nhanh
-//!   1.87x, Q6_K 2.43x so với llama.cpp nhờ AVX512-VNNI `vpdpbusd` và 64/128-byte reuse. Vipera làm
-//!   tương tự: `QuantizedX` (i8 activation) + `simd::try_dot` với đường VNNI và AVX2 fallback.
-//! * **KV-cache tradeoff theo độ sâu**: q8_0 tiết kiệm ~47% RAM (58.7 MB f16 -> 31.2 MB ở ctx 2048
-//!   cho Qwen2.5-1.5B) nhưng decode penalty tăng theo depth; ở 64K chỉ còn 56% của f16. Test này đo
-//!   penalty ở 32 / 256 / 1024 (giữ nhẹ để CI chạy được).
-//! * **Prefill vs decode tách riêng** (Mistral.rs CPU decode 1.81x ở 16K depth): prefill là
-//!   compute-bound, decode là bandwidth-bound. Vipera chunk prompt qua batch path (`run_positions`,
-//!   `ceil(n/8)` lần đọc weight), decode đọc weight mỗi token. Test đo pp tok/s và tg tok/s riêng.
-//! * **Batched decode** (continuous batching): 1 lần đọc weight cho B activation. llama.cpp làm
-//!   tương tự qua `n_parallel`; vipera có `logits_batch` với `MAX_BATCH = 8`.
+//! What the original piece claims:
+//! * **Fused dequant+GEMM** removes 128 MB of intermediate traffic; ik_llama.cpp's Q4_K prefill is
+//!   1.87x and Q6_K 2.43x faster than llama.cpp thanks to AVX512-VNNI `vpdpbusd` and 64/128-byte
+//!   reuse. Vipera does the same: `QuantizedX` (i8 activations) + `simd::try_dot` with a VNNI path
+//!   and an AVX2 fallback.
+//! * **KV-cache tradeoff with depth**: q8_0 saves ~47% RAM (58.7 MB f16 -> 31.2 MB at ctx 2048 for
+//!   Qwen2.5-1.5B) but the decode penalty grows with depth; at 64K only 56% of f16 remains. This
+//!   test measures the penalty at 32 / 256 / 1024 (kept light so CI can run it).
+//! * **Prefill and decode measured separately** (Mistral.rs CPU decode 1.81x at 16K depth): prefill
+//!   is compute-bound, decode is bandwidth-bound. Vipera chunks the prompt through the batch path
+//!   (`run_positions`, `ceil(n/8)` weight reads) while decode reads the weights once per token. The
+//!   test reports pp tok/s and tg tok/s separately.
+//! * **Batched decode** (continuous batching): one weight read serves B activations. llama.cpp does
+//!   the same via `n_parallel`; vipera has `logits_batch` with `MAX_BATCH = 8`.
 //!
-//! Tất cả đều là phép đo, không phải correctness check — tất cả `#[ignore]`.
-//! Muốn đo vipera:
+//! All of these are measurements, not correctness checks — all `#[ignore]`d.
+//! To measure vipera:
 //!   VIPERA_TEST_MODEL=~/.vipera/models/qwen2.5-1.5b-instruct-q4_k_m.gguf
 //!   cargo test -p vipera-backend-cpu --release --test win_vs_llama -- --ignored --nocapture
-//! So với llama.cpp trên cùng máy (cùng model, cùng ctx, cùng threads): build llama.cpp CPU-only
-//! rồi chạy `llama-bench -m <model> -p 512 -n 128 -t 8` và đối chiếu cột `llama.cpp` mà test này
-//! in ra. Nếu `llama-bench` có sẵn trong PATH, test sẽ tự chạy nó và in song song.
+//! To compare against llama.cpp on the same machine (same model, ctx and threads): build CPU-only
+//! llama.cpp, run `llama-bench -m <model> -p 512 -n 128 -t 8`, and read it against the `llama.cpp`
+//! column this test prints. If `llama-bench` is on PATH the test runs it itself and prints both side
+//! by side.
 //!
-//! Muốn thấy VNNI thắng bao nhiêu: chạy hai lần, một với `VIPERA_NO_VNNI=1`.
-//! Muốn thấy thread budget: `VIPERA_THREADS=4 cargo test ...`.
+//! To see how much VNNI wins: run twice, once with `VIPERA_NO_VNNI=1`.
+//! To see the thread budget: `VIPERA_THREADS=4 cargo test ...`.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -60,7 +63,7 @@ fn argmax(values: &[f32]) -> usize {
         .0
 }
 
-/// Một sequence + KV buffer của chính nó, với loại KV được chọn.
+/// One sequence plus its own KV buffer, with the selected KV type.
 #[derive(Clone)]
 struct State {
     tokens: Vec<u32>,
@@ -143,9 +146,9 @@ fn prefill_chunked(
     (state, argmax(&logits) as u32)
 }
 
-/// Đo `rounds` lần, trả về thời gian trung bình mỗi lần tính bằng ms.
+/// Runs `rounds` times and returns the best time per run, in ms.
 fn timed_best<F: FnMut()>(rounds: u32, mut run: F) -> f64 {
-    // Một lần warm-up: lần đầu faults allocation + cache.
+    // One warm-up: the first run faults in the allocation and the cache.
     run();
     let mut best = f64::INFINITY;
     for _ in 0..rounds {
@@ -160,10 +163,10 @@ fn timed_best<F: FnMut()>(rounds: u32, mut run: F) -> f64 {
 // 1. Fused kernel: GB/s theo tensor type (Q4_K fused i8 + VNNI vs Q6_K)
 // ---------------------------------------------------------------------------
 //
-// Vipera fused: dequant row + dot trong một pass, activation đã rút thành i8 (`QuantizedX`),
-// nên bộ nhớ chỉ đọc bytes của weight (7.7 MB cho ffn_gate, 191 MB cho output), không ghi
-// số f32 trung gian. llama.cpp GGML làm tương tự nhưng Q4_K không có VNNI `vpdpbusd` nên
-// chậm hơn trước khi bổ sung. Đây là phép đo để thấy vipera có đạt bandwidth của máy không.
+// Vipera fuses it: dequant row + dot in one pass, with the activation already reduced to i8
+// (`QuantizedX`), so memory only reads the weight bytes (7.7 MB for ffn_gate, 191 MB for output)
+// and writes no intermediate f32. llama.cpp's GGML does the same, but its Q4_K lacked VNNI
+// `vpdpbusd` before that was added. This measures whether vipera reaches the machine's bandwidth.
 
 #[test]
 #[ignore = "measurement, not a correctness check"]
@@ -209,24 +212,24 @@ fn kernel_gbps_fused_q4k_q6k() {
         );
     }
 
-    // Hình dạng thật của Qwen2.5-1.5B (memory summary Qwen2.5-1.5B: 1.117 GB weights).
+    // The real Qwen2.5-1.5B shapes (memory summary: 1.117 GB of weights).
     run("ffn_gate (Q4_K)", GgmlType::Q4K, 1536, 8960, 30);
     run("ffn_down (Q6_K)", GgmlType::Q6K, 8960, 1536, 30);
     run("wq (Q4_K)", GgmlType::Q4K, 1536, 1536, 200);
     run("output (Q6_K)", GgmlType::Q6K, 1536, 151_936, 5);
     println!(
-        "Đọc: fused i8+VNNI chỉ đọc weight bytes; llama.cpp Q4_K không VNNI chậm hơn ~1.8x (ik_llama.cpp Q4_K prefill 1.87x)."
+        "Note: fused i8+VNNI reads only the weight bytes; llama.cpp's Q4_K without VNNI is ~1.8x slower (ik_llama.cpp Q4_K prefill 1.87x)."
     );
     print_llama_hint("kernel");
 }
 
 // ---------------------------------------------------------------------------
-// 2. KV-cache tradeoff theo độ sâu: q8_0 tiết kiệm RAM nhưng penalty tăng
+// 2. KV-cache tradeoff with depth: q8_0 saves RAM but the penalty grows
 // ---------------------------------------------------------------------------
 //
-// Bài nghiên cứu: q8_0 giảm 47% RAM ở ctx 2048 nhưng decode ở 64K chỉ 56% của f16.
-// Vipera lưu cả hai qua `KvLayout` (f16: 2 bytes/value, q8_0: 34/32 bytes/value).
-// Test này prefill ở mỗi độ sâu rồi đo 3 decode steps, in ra penalty % và RAM tiết kiệm %.
+// The research piece: q8_0 saves 47% RAM at ctx 2048, but at 64K decode runs at only 56% of f16.
+// Vipera stores both through `KvLayout` (f16: 2 bytes/value, q8_0: 34/32 bytes/value). This test
+// prefills at each depth, measures 3 decode steps, and prints the penalty % and the RAM saved %.
 
 #[test]
 #[ignore = "measurement, not a correctness check"]
@@ -240,7 +243,7 @@ fn kv_quantization_tradeoff() {
 
     println!("ctx     f16 ms/step   q8_0 ms/step   penalty   RAM saved");
     for &ctx in &[32usize, 128] {
-        // Token giả, đi qua MHA/GQA nhưng không cần là text có nghĩa.
+        // Fake tokens: they go through MHA/GQA but do not need to be meaningful text.
         let prompt: Vec<u32> = (0..ctx).map(|at| 1000 + (at % 400) as u32).collect();
 
         let mut ms = [f64::INFINITY; 2];
@@ -248,9 +251,9 @@ fn kv_quantization_tradeoff() {
             .into_iter()
             .enumerate()
         {
-            // Prefill chunked qua batch path cho nhanh, rồi giữ state để decode.
+            // Prefill chunked through the batch path for speed, then keep the state to decode.
             let (mut state, mut next) = prefill_chunked(&mut backend, config, &prompt, ty);
-            // Warm-up một decode step rồi đo 3 bước trung bình.
+            // One warm-up decode step, then the best of 3.
             let logits = backend.logits(&mut state.context(&[next])).expect("decode");
             next = argmax(&logits) as u32;
             state.tokens.push(next);
@@ -258,8 +261,8 @@ fn kv_quantization_tradeoff() {
                 let logits = backend.logits(&mut state.context(&[next])).expect("decode");
                 next = argmax(&logits) as u32;
             });
-            // tokens.push không được gọi trong closure đo để không đổi ctx — nhưng logits vẫn tính
-            // ở cùng vị trí; để đơn giản đo trực tiếp 3 lần không push (KV ghi đè cùng slot).
+            // The measured closure must not push to tokens or it would change ctx; the logits are
+            // still computed at the same position, and the KV simply overwrites the same slot.
             ms[slot] = step;
         }
         let f16 = ms[0];
@@ -279,7 +282,7 @@ fn kv_quantization_tradeoff() {
         );
     }
     println!(
-        "Kỳ vọng từ bài: penalty tăng theo ctx; ở ctx nhỏ q8_0 gần như không chậm, ở ctx lớn rõ hơn."
+        "Expected from the piece: the penalty grows with ctx; at small ctx q8_0 is barely slower, at large ctx it shows."
     );
     print_llama_hint("kv");
 }
@@ -288,10 +291,10 @@ fn kv_quantization_tradeoff() {
 // 3. Prefill vs decode: chunked prefill (compute-bound) vs decode (bandwidth-bound)
 // ---------------------------------------------------------------------------
 //
-// llama.cpp tách `pp` (prompt processing) và `tg` (token generation) vì hai pha khác nhau hoàn toàn:
-// prefill tính nhiều vị trí/weight read, decode chỉ 1 vị trí/weight read. Vipera chunk prompt qua
-// batch path (`ceil(n/8)` lần đọc) trong khi decode vẫn 1 lần đọc/token. Test này đo cả hai và so
-// với decode tok/s kỳ vọng ~19-22 tok/s đã đo trên máy này.
+// llama.cpp separates `pp` (prompt processing) from `tg` (token generation) because they are
+// completely different phases: prefill computes many positions per weight read, decode one. Vipera
+// chunks the prompt through the batch path (`ceil(n/8)` reads) while decode stays at one read per
+// token. This test measures both and compares against the ~19-22 tok/s decode measured on this machine.
 
 #[test]
 #[ignore = "measurement, not a correctness check"]
@@ -305,11 +308,11 @@ fn prefill_vs_decode() {
 
     for &n in &[64usize, 128, 512] {
         let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
-        // Chunked: một ForwardContext có n new_tokens -> run_positions dùng batch path.
+        // Chunked: one ForwardContext with n new_tokens -> run_positions takes the batch path.
         let chunk_ms = {
             let mut state = State::with_room(config, n + 4, KvCacheType::F16);
             timed_best(2, || {
-                // Reset tokens để đo lại từ đầu; KV ghi lại.
+                // Reset the tokens to measure from scratch; the KV is overwritten.
                 state.tokens.clear();
                 backend
                     .logits(&mut state.context(&prompt))
@@ -337,7 +340,7 @@ fn prefill_vs_decode() {
         );
     }
 
-    // Decode tok/s ở ctx 32 (gần nhuần weights only, attention ~0%).
+    // Decode tok/s at ctx 32 (essentially weights only, attention ~0%).
     let prompt: Vec<u32> = (0..32).map(|at| 1000 + (at % 400) as u32).collect();
     let (mut state, mut next) = prefill_chunked(&mut backend, config, &prompt, KvCacheType::F16);
     let decode_ms = timed_best(5, || {
@@ -349,17 +352,101 @@ fn prefill_vs_decode() {
         1000.0 / decode_ms
     );
     println!(
-        "Kỳ vọng: prefill >> decode; tính `pp` và `tg` riêng như llama-bench, đừng tính trung bình chung."
+        "Expected: prefill >> decode; report `pp` and `tg` separately like llama-bench, never one average."
     );
     print_llama_hint("prefill");
 }
 
 // ---------------------------------------------------------------------------
-// 3b. Prefill dài: 1024 và 4096 token, để đối chiếu `llama-bench -p 1024,4096`
+// 3a. Q3_K tiled band vs its row kernel, one process, arms interleaved
 // ---------------------------------------------------------------------------
 //
-// Chỉ đo batch path: bản sequential ở trên tốn O(n) lượt decode nên ở 4k mất vài phút mỗi vòng.
-// `timed_best` warm-up một lần rồi lấy vòng nhanh nhất — KV đã cấp phát nên lần sau không còn fault.
+// `VIPERA_Q3K_TILED=0` sends Q3_K back to the row kernel; everything else (Q4_K/Q6_K tiles, chunk
+// width, defaults) stays identical, so the only difference is the kernel under test. The two arms
+// are different summation orders (documented numeric policy, not bit-identity), so the check is
+// top-1 agreement plus the largest logit delta, and the number reported is the ratio of medians
+// from interleaved rounds — a before/after pair minutes apart cannot resolve 5% on this machine.
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn prefill_q3k_band_vs_row() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let n = 512usize;
+    let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
+
+    let run = |backend: &mut CpuBackend, band: bool| {
+        vipera_backend_cpu::pin_q3k_tiled(Some(band));
+        let mut state = State::with_room(config, n + 4, KvCacheType::F16);
+        let start = Instant::now();
+        let logits = backend
+            .logits(&mut state.context(&prompt))
+            .expect("prefill");
+        (start.elapsed().as_secs_f64() * 1e3, logits)
+    };
+
+    // One warm-up per arm, also the pair the numeric check compares.
+    let (_, band_logits) = run(&mut backend, true);
+    let (_, row_logits) = run(&mut backend, false);
+    let band_top = argmax(&band_logits);
+    let row_top = argmax(&row_logits);
+    let max_delta = band_logits
+        .iter()
+        .zip(&row_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    println!("numeric: top-1 band {band_top} vs row {row_top}, max |logit delta| {max_delta:.5}");
+    assert_eq!(
+        band_top, row_top,
+        "the two Q3_K paths must pick the same token"
+    );
+
+    let rounds = 5usize;
+    let mut band_ms = Vec::with_capacity(rounds);
+    let mut row_ms = Vec::with_capacity(rounds);
+    println!("round   band ms   row ms   row/band");
+    for round in 0..rounds {
+        // Alternate which arm runs first, so a monotonic host drift hits both arms equally.
+        let (first, second) = if round % 2 == 0 {
+            (run(&mut backend, true), run(&mut backend, false))
+        } else {
+            let row = run(&mut backend, false);
+            let band = run(&mut backend, true);
+            (band, row)
+        };
+        let (band, row) = (first.0, second.0);
+        assert_eq!(first.1.len(), second.1.len());
+        println!("{round:>5}  {band:>8.1}  {row:>7.1}   {:>7.3}", row / band);
+        band_ms.push(band);
+        row_ms.push(row);
+    }
+    vipera_backend_cpu::pin_q3k_tiled(None);
+    let median = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    let band = median(&mut band_ms);
+    let row = median(&mut row_ms);
+    println!(
+        "median: band {band:.1} ms ({:.1} tok/s), row {row:.1} ms ({:.1} tok/s), row/band {:>6.3}x ({:+.1}% for the band)",
+        n as f64 / (band / 1e3),
+        n as f64 / (row / 1e3),
+        row / band,
+        100.0 * (row / band - 1.0)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Long prefill: 1024 and 4096 tokens, to read against `llama-bench -p 1024,4096`
+// ---------------------------------------------------------------------------
+//
+// Batch path only: the sequential version above costs O(n) decode steps, so at 4k each round takes
+// minutes. `timed_best` warms up once and keeps the fastest round — the KV is allocated by then, so
+// no page faults remain.
 
 #[test]
 #[ignore = "measurement, not a correctness check"]
@@ -389,11 +476,12 @@ fn prefill_long_prompt() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Batched decode: 1 lần đọc weight cho B activation (continuous batching)
+// 4. Batched decode: one weight read for B activations (continuous batching)
 // ---------------------------------------------------------------------------
 //
-// Bài: batching là cách decode bandwidth-bound thắng: weight read chia cho B. Vipera batch tới 8;
-// llama.cpp có `n_parallel` và cũng batch. Đo B=1,2,4,8 qua `logits_batch`.
+// The piece's point: batching is how a bandwidth-bound decode wins, because the weight read is
+// divided by B. Vipera batches up to 8; llama.cpp has `n_parallel` and batches too. Measures B=1,2,4,8
+// through `logits_batch`.
 
 #[test]
 #[ignore = "measurement, not a correctness check"]
@@ -405,7 +493,7 @@ fn batched_decode_throughput() {
     let mut backend = CpuBackend::load(&path).expect("load model");
     let config = backend.config();
 
-    // 8 prompt ngắn, mỗi cái prefill riêng, sau đó decode batch.
+    // Eight short prompts, each prefilled on its own, then batched decode.
     let prompts: [&[u32]; 8] = [
         &[12095, 13, 576],
         &[9906, 11, 1879, 315],
@@ -424,7 +512,7 @@ fn batched_decode_throughput() {
         next[i] = t;
     }
 
-    // Shared buffer như batch.rs: một allocation, một table mỗi entry.
+    // Shared buffer like batch.rs: one allocation, one table per entry.
     let blocks_per_seq = states[0].table.len();
     let per_seq = states[0].kv.len();
     let mut shared_kv = vec![0u8; per_seq * states.len()];
@@ -467,7 +555,7 @@ fn batched_decode_throughput() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Decode attention scaling: weights + attention * ctx (Mistral.rs 1.81x ở depth lớn)
+// 5. Decode attention scaling: weights + attention * ctx (Mistral.rs 1.81x at large depth)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -505,7 +593,7 @@ fn decode_attention_scaling() {
         }
     }
     println!(
-        "Bài Mistral.rs: decode chậm do KV read tăng theo ctx; vipera đo cùng đường để đối chiếu llama.cpp tg."
+        "The Mistral.rs point: decode slows down as KV reads grow with ctx; vipera measures the same path against llama.cpp tg."
     );
     print_llama_hint("decode");
 }
@@ -546,7 +634,7 @@ fn decode_cost_at_depth_without_prefill() {
 }
 
 // ---------------------------------------------------------------------------
-// So sánh với llama.cpp nếu có sẵn
+// Compare against llama.cpp when it is available
 // ---------------------------------------------------------------------------
 
 /// The same 32k decode step with the KV in a ring cache instead of a linear one.
@@ -813,14 +901,14 @@ fn print_llama_hint(what: &str) {
         .unwrap_or(false);
     if bench.is_some() || in_path {
         println!(
-            "[llama.cpp] llama-bench có sẵn; chạy: llama-bench -m $VIPERA_TEST_MODEL -p 512 -n 128 -t 8 --json | jq .  rồi so cột pp/tg với vipera (test: {what})."
+            "[llama.cpp] llama-bench is available; run: llama-bench -m $VIPERA_TEST_MODEL -p 512 -n 128 -t 8 --json | jq .  then compare the pp/tg columns with vipera's (test: {what})."
         );
     } else {
         println!(
             "[llama.cpp] chua cai; build CPU-only: git clone https://github.com/ggerganov/llama.cpp && cmake -B build -DGGML_NATIVE=ON -DGGML_AVX512=ON && cmake --build build -j8 --target llama-bench"
         );
     }
-    // Nếu LLAMA_BENCH trỏ tới binary, chạy thật để in song song.
+    // If LLAMA_BENCH points at a binary, actually run it and print both side by side.
     if let Some(bin) = bench {
         let model =
             model_path().map_or_else(|| "<no-model>".to_string(), |p| p.display().to_string());
@@ -830,7 +918,7 @@ fn print_llama_hint(what: &str) {
         match out {
             Ok(o) if o.status.success() => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
-                // llama-bench in kết quả ra stderr; lọc dòng pp/tg.
+                // llama-bench prints its results to stderr; filter the pp/tg lines.
                 for line in stderr.lines() {
                     if line.contains("pp512")
                         || line.contains("tg128")
@@ -856,7 +944,7 @@ fn print_llama_hint(what: &str) {
                     .collect::<Vec<_>>()
                     .join(" | ")
             ),
-            Err(e) => println!("[llama-bench] lỗi chạy: {e}"),
+            Err(e) => println!("[llama-bench] failed to run: {e}"),
         }
     }
 }

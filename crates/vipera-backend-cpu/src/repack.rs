@@ -22,10 +22,11 @@ pub(crate) struct PackedTile {
 }
 
 impl PackedTile {
-    /// Interleaved view (phòng thí nghiệm VNNI #27851): sắp xếp lại `q` thành
-    /// `k*8 + r` để 8 hàng cùng cột nằm liên tục — activation `x` load 1 lần
-    /// dùng cho 8 hàng (reuse 8x giống microkernel 16x16 của llama.cpp).
-    /// `coeff`/`min_coeff` giữ nguyên row-major để dễ parity.
+    /// Interleaved view (the VNNI lab, #27851): rearranges `q` into
+    /// `k*8 + r` so eight rows of the same column sit next to each other — the
+    /// activation `x` is loaded once and used for eight rows (an 8x reuse like
+    /// llama.cpp's 16x16 microkernel). `coeff`/`min_coeff` stay row-major so
+    /// parity comparisons stay easy.
     pub fn interleaved_q(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.cols * 8];
         for row in 0..8 {
@@ -189,7 +190,7 @@ mod tests {
                 assert_eq!(interleaved[k * 8 + row], packed.q[row * cols + k]);
             }
         }
-        // Dot qua layout interleaved phải bằng dot_packed (reuse activation 8x về logic).
+        // A dot through the interleaved layout must equal dot_packed (the same 8x activation reuse, logically).
         let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
         let sums = x_sums(&x);
         let got = dot_packed(&packed, &x, &sums).expect("dot");
