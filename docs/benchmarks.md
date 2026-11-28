@@ -5549,9 +5549,9 @@ Sample of the quiet rounds (`bench_q3k_decode_codes`, same invocation as above):
 | per row-block | ns per half | gain |
 |---|---:|---:|
 | H=2 (paired, shipped) | 48.15–48.55 | — |
-| H=4 (quad) | 46.93–47.89 | **1.4–2.8%** (median 2.7% over both runs) |
+| H=4 (quad) | 46.93–47.89 | **1.4–2.8%** (median 2.6% over the four quiet rounds) |
 
-Four halves buys ~2.7% of the band, not the 4.9% the decode share (17–19%) allows: at H=4 the decode is
+Four halves buys ~2.6% of the band, not the 4.9% the decode share (17–19%) allows: at H=4 the decode is
 already 4× cheaper than at H=1, so one more halving saves only ~4.8 ns of the ~9.7 ns decode, and part
 of that moves into the wider pass's longer live ranges.
 
@@ -5559,7 +5559,7 @@ of that moves into the wider pass's longer live ranges.
 check passed with delta 0, and the median read pair/quad **1.158× (+15.8%)** — which is drift, not the
 lever. The host was degraded for that whole run (each pp512 prefill took 52–79 s instead of the ~32 s of
 the H=2 run, with a load average of 10 on 8 CPUs from outside this repo, and per-round ratios swinging
-0.970–1.492). The band bench is the number to keep: **~2.7%**, far under the 4.9% ceiling and under the
+0.970–1.492). The band bench is the number to keep: **~2.6%**, far under the 4.9% ceiling and under the
 5% gate the H=2 lever used.
 
 **Threshold and state.** Under the pre-registered gate (≥5% pp512, ≥6% band) this does **not** clear, so
@@ -5589,3 +5589,11 @@ the 320-`dpbusd` floor. The gate was "close if the probe is < 8% of the band": i
 4-byte loads that overlap the decode's 32-byte stores (store-forwarding being the prime suspect) — is
 open. Caveat on the number: this ratio was measured while an unrelated process held the box at load
 10, and the noisiest rounds read as high as 66%; the 55% is the four quiet rounds, not a best case.
+
+**Re-run with the same tree on a quieter moment (2026-11-28, load 2.9 → 9.4 during the run):** five
+interleaved rounds read pair/quad 1.366, 0.948, 1.047, 1.020, 1.058 — **median 1.077× (+7.7%)**, still
+7-8 tok/s rather than the 16 tok/s of the H=2 run, because the host never got back to its baseline
+(each prefill took 52–76 s instead of ~32 s, and the load average climbed from 1.9 to 9.4 while the run
+was going). Two runs of this test now read +15.8% and +7.7% while the band bench reads 2.6%; the spread
+between the two end-to-end answers is larger than the effect, so neither is evidence for H=4. Re-run it
+on a genuinely idle box before using any end-to-end number for this lever.

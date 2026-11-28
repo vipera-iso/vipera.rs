@@ -4,7 +4,7 @@
 interleaved rounds) and **+10.5%** on the band bench, bit-identical (zero logit delta), so
 `VIPERA_Q3K_PAIR` defaults on. Ledger row in `docs/benchmarks.md`. **H=4 was measured on
 `perf/q3k-band-quad`:** it does not spill (the 16 accumulators stay in registers), but it buys only
-~2.7% of the band, so `VIPERA_Q3K_QUAD` stays off. The weight probe from section 7 then priced the
+~2.6% of the band, so `VIPERA_Q3K_QUAD` stays off. The weight probe from section 7 then priced the
 code load and its broadcast at ~55% of the paired band. Threshold and falsification were fixed up
 front (section 3).
 **Measured on:** `3960eda` (main after PR #83/#84), release, i5-11300H, governor `powersave`.

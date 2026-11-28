@@ -7191,8 +7191,9 @@ mod tests {
         let rows = 11;
         let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
         // 64 and 128 are four and eight tile halves: they exercise `VIPERA_Q3K_PAIR`'s and
-        // `VIPERA_Q3K_QUAD`'s grouped halves (run the test with each switch on and off).
-        for batch in [4_usize, 16, 32, 40, 64, 128] {
+        // `VIPERA_Q3K_QUAD`'s grouped halves (run the test with each switch on and off). 80 and 96
+        // are five and six halves, the widths where a group of four is followed by a shorter one.
+        for batch in [4_usize, 16, 32, 40, 64, 80, 96, 128] {
             let xs: Vec<Vec<f32>> = (0..batch)
                 .map(|_| (0..cols).map(|_| rng.unit()).collect())
                 .collect();
@@ -7249,6 +7250,24 @@ mod tests {
                             first_row,
                             count,
                             array.try_into().expect("sixty-four"),
+                            &mut out,
+                            None,
+                        ),
+                        80 => q3k_matvec_tiled_range::<80>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("eighty"),
+                            &mut out,
+                            None,
+                        ),
+                        96 => q3k_matvec_tiled_range::<96>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("ninety-six"),
                             &mut out,
                             None,
                         ),
