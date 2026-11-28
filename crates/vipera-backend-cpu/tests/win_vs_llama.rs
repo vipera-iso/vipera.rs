@@ -525,6 +525,94 @@ fn prefill_q3k_pair_vs_single() {
 }
 
 // ---------------------------------------------------------------------------
+// 3a''. Q3_K band: four tile halves per pass vs two, one process, arms interleaved
+// ---------------------------------------------------------------------------
+//
+// `VIPERA_Q3K_QUAD` groups four tile halves into one band pass, so each row-block decode is paid
+// once for 64 activations instead of twice for 32. It buys less decode than the pair did and costs
+// sixteen live accumulators instead of eight, which is the spill risk: the test asserts the logits
+// are unchanged (each half keeps its own accumulator) and reports the ratio of medians, so the
+// measurement says whether the decode saving survived the register pressure.
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn prefill_q3k_quad_vs_pair() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let n = 512usize;
+    let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
+
+    // `quad` picks four halves per pass; the pair is pinned on in both arms.
+    let run = |backend: &mut CpuBackend, quad: bool| {
+        vipera_backend_cpu::pin_q3k_pair(Some(true));
+        vipera_backend_cpu::pin_q3k_quad(Some(quad));
+        let mut state = State::with_room(config, n + 4, KvCacheType::F16);
+        let start = Instant::now();
+        let logits = backend
+            .logits(&mut state.context(&prompt))
+            .expect("prefill");
+        (start.elapsed().as_secs_f64() * 1e3, logits)
+    };
+
+    // One warm-up per arm, also the bit-identity check.
+    let (_, quad_logits) = run(&mut backend, true);
+    let (_, pair_logits) = run(&mut backend, false);
+    let max_delta = quad_logits
+        .iter()
+        .zip(&pair_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    println!("numeric: max |logit delta| {max_delta:.9} (must be 0)");
+    assert_eq!(
+        quad_logits.len(),
+        pair_logits.len(),
+        "both arms must produce one logit vector"
+    );
+    assert_eq!(max_delta, 0.0, "the quad band must be bit-identical");
+
+    let rounds = 5usize;
+    let mut quad_ms = Vec::with_capacity(rounds);
+    let mut pair_ms = Vec::with_capacity(rounds);
+    println!("round   quad ms   pair ms  pair/quad");
+    for round in 0..rounds {
+        // Alternate which arm runs first, so a monotonic host drift hits both arms equally.
+        let (first, second) = if round % 2 == 0 {
+            (run(&mut backend, true), run(&mut backend, false))
+        } else {
+            let pair = run(&mut backend, false);
+            let quad = run(&mut backend, true);
+            (quad, pair)
+        };
+        let (quad, pair) = (first.0, second.0);
+        println!(
+            "{round:>5}  {quad:>9.1}  {pair:>9.1}   {:>8.3}",
+            pair / quad
+        );
+        quad_ms.push(quad);
+        pair_ms.push(pair);
+    }
+    vipera_backend_cpu::pin_q3k_quad(None);
+    vipera_backend_cpu::pin_q3k_pair(None);
+    let median = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    let quad = median(&mut quad_ms);
+    let pair = median(&mut pair_ms);
+    println!(
+        "median: quad {quad:.1} ms ({:.1} tok/s), pair {pair:.1} ms ({:.1} tok/s), pair/quad {:>6.3}x ({:+.1}% for the quad)",
+        n as f64 / (quad / 1e3),
+        n as f64 / (pair / 1e3),
+        pair / quad,
+        100.0 * (pair / quad - 1.0)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3b. Long prefill: 1024 and 4096 tokens, to read against `llama-bench -p 1024,4096`
 // ---------------------------------------------------------------------------
 //

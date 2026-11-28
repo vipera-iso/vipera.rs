@@ -2588,6 +2588,27 @@ unsafe fn q3k_decode_codes(block: *const u8, codes: &mut [u8; 256], coef: &mut [
 /// `data` must point at whole 110-byte blocks for rows `first_row .. first_row + N`, `stride` must
 /// be `blocks · 110`, each view must describe `blocks` blocks of activations and scales, `out` must
 /// have `N · count` floats, and the CPU must have AVX-512 VNNI with VL.
+/// Ceiling probe for the Q3_K band's weight side: replaces the 4-byte code load and its broadcast
+/// inside the `dpbusd` loop with a constant, so a measurement prices the code read, the broadcast
+/// and their dependence on the decode store — not the `dpbusd` chain, whose count is unchanged.
+///
+/// Test-only on purpose: it changes the arithmetic, so it must never be reachable from a real
+/// build. In a non-test build `q3k_no_weight` folds to `false` and the branch disappears.
+#[cfg(test)]
+static NO_Q3K_WEIGHT_PROBE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn q3k_no_weight() -> bool {
+    #[cfg(test)]
+    {
+        NO_Q3K_WEIGHT_PROBE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Where one tile half's activations and scales live, and where the band writes its rows.
 #[derive(Clone, Copy)]
 struct Q3kBandView {
@@ -2615,6 +2636,7 @@ unsafe fn q3k_band_rows<const N: usize, const H: usize>(
     unsafe {
         let ones = _mm512_set1_epi32(0x0101_0101);
         let four = _mm512_set1_ps(4.0);
+        let no_weight = q3k_no_weight();
         let mut lanes_acc = [[_mm512_setzero_ps(); N]; H];
         let mut codes = [[0_u8; 256]; N];
         let mut coef = [[0.0_f32; 16]; N];
@@ -2645,11 +2667,15 @@ unsafe fn q3k_band_rows<const N: usize, const H: usize>(
                     for (t, accumulator) in lanes_acc[h].iter_mut().enumerate() {
                         let mut acc = _mm512_setzero_si512();
                         for (word, group) in a.iter().enumerate() {
-                            let packed = u32::from_le_bytes(
-                                codes[t][k * 16 + word * 4..][..4]
-                                    .try_into()
-                                    .expect("four bytes"),
-                            );
+                            let packed = if no_weight {
+                                0x0101_0101
+                            } else {
+                                u32::from_le_bytes(
+                                    codes[t][k * 16 + word * 4..][..4]
+                                        .try_into()
+                                        .expect("four bytes"),
+                                )
+                            };
                             acc =
                                 _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *group);
                         }
@@ -2990,6 +3016,7 @@ pub(crate) unsafe fn q3k_matvec_tiled_range<const B: usize>(
             }
         }
         let paired = crate::tiled::q3k_pair_enabled();
+        let quad = crate::tiled::q3k_quad_enabled();
         let act_ptr = act.as_ptr();
         let dxs_ptr = dxs.as_ptr();
         let out_ptr = out.as_mut_ptr();
@@ -3004,29 +3031,42 @@ pub(crate) unsafe fn q3k_matvec_tiled_range<const B: usize>(
         };
         let mut half = 0;
         while half < halves {
-            // Two halves per pass decode each row-block once for 32 activations; a lone trailing
-            // half runs exactly as it did before, and the summation order per half is unchanged.
-            let width = if paired && half + 1 < halves { 2 } else { 1 };
+            // Each extra half in a pass decodes the row-blocks once more per 16 activations; a
+            // shorter trailing group runs at its own width, and a lone trailing half runs exactly
+            // as it did before. The summation order per half is unchanged at every width.
+            let width = if quad && half + 3 < halves {
+                4
+            } else if paired && half + 1 < halves {
+                2
+            } else {
+                1
+            };
             let mut row = first_row;
             let last = first_row + count;
             while row + N <= last {
                 let offset = row - first_row;
-                if width == 2 {
-                    q3k_band_rows::<N, 2>(
+                match width {
+                    4 => q3k_band_rows::<N, 4>(
+                        data.as_ptr(),
+                        stride,
+                        row,
+                        blocks,
+                        std::array::from_fn(|i| view_at(half + i, offset)),
+                    ),
+                    2 => q3k_band_rows::<N, 2>(
                         data.as_ptr(),
                         stride,
                         row,
                         blocks,
                         [view_at(half, offset), view_at(half + 1, offset)],
-                    );
-                } else {
-                    q3k_band_rows::<N, 1>(
+                    ),
+                    _ => q3k_band_rows::<N, 1>(
                         data.as_ptr(),
                         stride,
                         row,
                         blocks,
                         [view_at(half, offset)],
-                    );
+                    ),
                 }
                 row += N;
             }
@@ -7150,8 +7190,8 @@ mod tests {
         let stride = blocks * 110;
         let rows = 11;
         let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
-        // 64 and 128 are four and eight tile halves: they exercise `VIPERA_Q3K_PAIR`'s grouped
-        // halves (run the test with the switch on and off).
+        // 64 and 128 are four and eight tile halves: they exercise `VIPERA_Q3K_PAIR`'s and
+        // `VIPERA_Q3K_QUAD`'s grouped halves (run the test with each switch on and off).
         for batch in [4_usize, 16, 32, 40, 64, 128] {
             let xs: Vec<Vec<f32>> = (0..batch)
                 .map(|_| (0..cols).map(|_| rng.unit()).collect())
@@ -7272,7 +7312,7 @@ mod tests {
         }
         let iterations = 200_000;
         let mut sink = 0.0_f32;
-        let mut out = vec![0.0_f32; 2 * 16 * rows];
+        let mut out = vec![0.0_f32; 4 * 16 * rows];
         for round in 0..6 {
             let start = std::time::Instant::now();
             for _ in 0..iterations {
@@ -7351,14 +7391,84 @@ mod tests {
                 sink += out[0];
             }
             let pair_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: four rows, four tile halves pointing at the same activation buffer (one
+                // half's timing is what matters), whole blocks.
+                unsafe {
+                    q3k_band_rows::<4, 4>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        [0, 1, 2, 3].map(|h| Q3kBandView {
+                            act: act.as_ptr(),
+                            act_stride: 4096,
+                            dxs: dxs.as_ptr(),
+                            dxs_stride: 16 * 16,
+                            out: out.as_mut_ptr().add(h * 16 * rows),
+                            count: rows,
+                            columns: 16,
+                        }),
+                    );
+                }
+                sink += out[0];
+            }
+            let quad_ms = start.elapsed().as_secs_f64() * 1e3;
+            // Price the weight side of the shipped (H=2) arrangement: same `dpbusd` chain, but the
+            // packed dword is a constant, so the code load and its broadcast are what disappears.
+            NO_Q3K_WEIGHT_PROBE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: four rows, two tile halves, whole blocks.
+                unsafe {
+                    q3k_band_rows::<4, 2>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        [
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr(),
+                                count: rows,
+                                columns: 16,
+                            },
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr().add(16 * rows),
+                                count: rows,
+                                columns: 16,
+                            },
+                        ],
+                    );
+                }
+                sink += out[0];
+            }
+            NO_Q3K_WEIGHT_PROBE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let no_weight_ms = start.elapsed().as_secs_f64() * 1e3;
             if round >= 2 {
                 let decode_ns = decode_ms * 1e6 / (iterations * rows * blocks) as f64;
                 let band_ns = band_ms * 1e6 / (iterations * rows * blocks) as f64;
                 let pair_ns = pair_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
+                let quad_ns = quad_ms * 1e6 / (iterations * rows * blocks * 4) as f64;
+                let no_weight_ns = no_weight_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 println!(
-                    "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, paired {pair_ns:.2} ns (per half), decode share {:.0}%, paired gain {:.1}%",
+                    "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, paired {pair_ns:.2} ns, quad {quad_ns:.2} ns (per half), decode share {:.0}%, paired gain {:.1}%, quad gain {:.1}%, quad vs paired {:.1}%",
                     decode_ns / band_ns * 100.0,
-                    (1.0 - pair_ns / band_ns) * 100.0
+                    (1.0 - pair_ns / band_ns) * 100.0,
+                    (1.0 - quad_ns / band_ns) * 100.0,
+                    (1.0 - quad_ns / pair_ns) * 100.0
+                );
+                println!(
+                    "  weight probe (H=2): no-weight {no_weight_ns:.2} ns per half, weight side {:.1}% of the paired band",
+                    (1.0 - no_weight_ns / pair_ns) * 100.0
                 );
             }
         }
