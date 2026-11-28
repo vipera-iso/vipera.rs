@@ -3955,6 +3955,29 @@ fn attend(
     )
 }
 
+/// `-1` follows the environment, which is read once and cached (the kernel is chosen per layer, so
+/// the answer has to stay fixed inside a run); `0`/`1` pin it. See [`pin_attention_qblock`].
+static ATTENTION_QBLOCK_PIN: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Pin the tiled attention kernel for this process, or `None` to follow `VIPERA_ATTN_GEMM` /
+/// `VIPERA_ATTN_QBLOCK` again.
+///
+/// A measurement hook, for the reason [`crate::pin_q3k_tiled`] exists: the environment is read once
+/// and cached, so an A/B of the tile kernel against the per-entry one cannot be run in one process
+/// any other way, and running the arms in two processes loses to this machine's drift — one attempt
+/// at it moved a matvec phase 2.5x on a host that changed load mid-run. The engine never calls this.
+pub fn pin_attention_qblock(value: Option<bool>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    ATTENTION_QBLOCK_PIN.store(
+        match value {
+            None => -1,
+            Some(false) => 0,
+            Some(true) => 1,
+        },
+        Relaxed,
+    );
+}
+
 /// Queries one block of a prompt chunk shares a K/V row with, in [`attend_rows_shared`].
 ///
 /// Four keeps the per-block state (four sets of `heads x head_dim` accumulators, 24 KiB at twelve
@@ -3993,6 +4016,11 @@ const KV_TILE: usize = 64;
 /// prefix cache assumes a position is bit-stable across chunkings; both need that invariant. It stays
 /// opt-in until the tile kernel and the per-entry kernel share one reduction order.
 fn attention_qblock_enabled() -> bool {
+    match ATTENTION_QBLOCK_PIN.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        0 => return false,
+        _ => {}
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         ["VIPERA_ATTN_GEMM", "VIPERA_ATTN_QBLOCK"]

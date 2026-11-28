@@ -99,6 +99,8 @@ decode 30–33 tok/s. Full ledger in `HANDOFF.md` (local, gitignored).
 | Read a Q3_K band group's four code words with one 16-byte load (`VIPERA_Q3K_WIDE`, written and then removed) | band bench, H=2, four interleaved rounds in one process: 48.15 / 48.00 / 47.92 / 48.04 ns per half with four 4-byte loads vs 47.96 / 48.05 / 47.81 / 48.11 with the 16-byte load (median **+0.1%**, gate was 3%) | rejected: **neither formulation survives codegen.** `castsi128(loadu 16B)` + `vpermd` folded to `vpbroadcastd (mem)` per word, and the follow-up `loadu 16B` + `vpextrd` + `set1` did too: the H=2 kernel contains 0 `vpermd` and 0 `vpextrd` and 55-69 memory-source broadcasts. The four "narrow loads" are therefore already one fused broadcast-load instruction each, so there is nothing to remove and the 55% the weight probe prices is that instruction's issue cost, not store forwarding. A later probe that wants to split load from broadcast has to defeat the fold (an opaque 16-byte load), and the expected ceiling is then the 3 removed loads only |
 | Repack Q3_K at load into `dpbusd`-ready 320-byte blocks (ADR-008, **deferred, not built**) | `bench_q3k_decode_codes` with a pre-decoded block built from the same tensor: 43.2–46.1 vs 46.4–50.5 ns per half at H=2, **+7.6% median** over eight round pairs; density 110 → 320 B/block = **2.91x** | deferred: the 6% gate cleared, but the probe is cache-hot and the real block is 2.91x the bytes streamed at pp512. A repacked 6.9 GiB model is ~20 GiB on a box with 15 GB and ~3 GB free, so the traffic cost cannot be measured here. Anyone re-running this needs a bigger box first, not another kernel; `q3k_band_rows_packed` and `ADR-008` are the starting points |
 
+| Eight tile halves over two rows in the Q3_K band (H=8, N=2 — decode once per chunk), test-only bench arm | `bench_q3k_decode_codes`, H=2 arms interleaved: 52.93 / 53.20 / 52.93 / 53.01 ns per half against 48.30 / 47.90 / 47.95 / 47.91 for the shipped pair (**−9.6 to −11.1%, median −10.7%**) | rejected: the decode-once-per-chunk saving is ~5.7% of the band at most, and halving the rows per pass doubles the activation side per output and the activation traffic per pass — 16 accumulators were not the problem, the shape was |
+
 Where the time actually goes (measured, `VIPERA_PROFILE_STEP=1`): prefill chunk q4_k 68%,
 q6_k 19%, attention 5%, norm 2%, rest 6%; decode q4_k 61%, q6_k 28%, attention 7%. So attention
 is not the prefill bottleneck, and any further work has to move Q4_K streaming (~30 GB/s against
@@ -161,3 +163,19 @@ cargo test -p vipera-backend-gpu --locked
 ```
 
 The commands above are the canonical definition of "green". If `CONSTRAINTS.md` and a wrapper script disagree, this file wins.
+
+### Before a tagged release
+
+One more check, outside the gate because it cannot run on CI: it needs a model and the machine the
+baseline was taken on.
+
+```bash
+scripts/q3k-band-drift.sh    # one 128-token chunk, other_dot against scripts/q3k-band-baseline.txt
+```
+
+The Q3_K band is the largest single phase of a prompt chunk (45% of a late one, 69% of the first), and
+its absolute cost per chunk is flat with depth, so one chunk sees a regression. The script fails above
+8% — the measured noise floor: back-to-back runs agree to 0.04%, a run taken under load reads +5.6% —
+and skips rather than fails on another host or model, because absolute milliseconds do not travel. If a
+release is *meant* to move that number, update the baseline in the same commit and say why in the
+message; `docs/benchmarks.md`, "Q3_K at real depths", records what the phases should look like.

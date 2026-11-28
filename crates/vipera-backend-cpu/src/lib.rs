@@ -46,7 +46,7 @@ pub(crate) mod simd {
 pub(crate) mod tiled;
 
 pub use compress::Q8Kv;
-pub use model::{CpuBackend, ModelConfig};
+pub use model::{CpuBackend, ModelConfig, pin_attention_qblock};
 pub use quant::{dequantize, f16_to_f32, f32_to_f16, matvec, read_row, row_bytes};
 pub use tiled::{pin_q3k_pair, pin_q3k_quad, pin_q3k_tiled};
 
