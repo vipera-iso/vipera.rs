@@ -18,6 +18,7 @@ const fn block(ty: GgmlType) -> Option<(usize, usize)> {
     match ty {
         GgmlType::F32 => Some((1, 4)),
         GgmlType::F16 => Some((1, 2)),
+        GgmlType::Q5_0 => Some((32, 22)),
         GgmlType::Q8_0 => Some((32, 34)),
         GgmlType::Q3K => Some((256, 110)),
         GgmlType::Q4K => Some((256, 144)),
@@ -48,7 +49,7 @@ fn blocks<const N: usize>(data: &[u8]) -> &[[u8; N]] {
 
 fn unsupported(ty: GgmlType) -> ViperaError {
     ViperaError::unsupported(format!(
-        "the CPU backend cannot read {} weights; supported formats are F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K",
+        "the CPU backend cannot read {} weights; supported formats are F32, F16, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K",
         ty.name()
     ))
 }
@@ -591,6 +592,38 @@ fn q5k_dot(row: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+/// Decode one 22-byte `block_q5_0` into its 32 values.
+///
+/// Layout (`ggml-quants.h`): `d` (f16), `qs[16]` (the low nibble of `qs[j]` is value `j`, the high
+/// nibble value `j+16`), `qh[4]` (one high bit per value, `qh[0..2]` for values 0..15 and `qh[2..4]`
+/// for 16..31). Value `i` is `d * ((nibble | (high bit << 4)) - 16)`.
+fn q5_0_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), 22);
+    debug_assert_eq!(out.len(), 32);
+    let d = read_f16(block, 0);
+    let qs = &block[2..18];
+    let qh = &block[18..22];
+    for i in 0..16 {
+        let low = (qs[i] & 0x0f) | (((qh[i >> 3] >> (i & 7)) & 1) << 4);
+        let high = (qs[i] >> 4) | (((qh[2 + (i >> 3)] >> (i & 7)) & 1) << 4);
+        out[i] = d * (low as f32 - 16.0);
+        out[i + 16] = d * (high as f32 - 16.0);
+    }
+}
+
+/// Dot product of one Q5_0 row with `x` (scalar prototype).
+fn q5_0_dot(row: &[u8], x: &[f32]) -> f32 {
+    let mut values = [0.0_f32; 32];
+    let mut sum = 0.0_f32;
+    for (block, xb) in blocks::<22>(row).iter().zip(x.as_chunks::<32>().0) {
+        q5_0_block(block, &mut values);
+        for (value, xv) in values.iter().zip(xb.iter()) {
+            sum += value * xv;
+        }
+    }
+    sum
+}
+
 /// Dot product of one Q3_K row with `x` (the scalar reference; no integer kernel yet).
 fn q3k_dot(row: &[u8], x: &[f32]) -> f32 {
     let mut values = [0.0_f32; 256];
@@ -624,6 +657,7 @@ pub(crate) fn dot_scalar(
             .zip(x)
             .map(|(bytes, value)| read_f16(bytes, 0) * value)
             .sum(),
+        GgmlType::Q5_0 => q5_0_dot(row, x),
         GgmlType::Q8_0 => {
             let mut sum = 0.0_f32;
             for (block, xb) in blocks::<34>(row).iter().zip(x.as_chunks::<32>().0) {
@@ -2751,6 +2785,16 @@ mod tests {
         block
     }
 
+    /// Pack one `block_q5_0`: f16 scale, 16 nibble bytes, 4 high-bit bytes.
+    fn pack_q5_0(qs: &[u8; 16], qh: &[u8; 4], d: f32) -> Vec<u8> {
+        let mut block = Vec::with_capacity(22);
+        block.extend_from_slice(&f16(d));
+        block.extend_from_slice(qs);
+        block.extend_from_slice(qh);
+        assert_eq!(block.len(), 22);
+        block
+    }
+
     fn pack_q5k(qs: &[u8; 128], qh: &[u8; 32], scales: &[u8; 12], d: f32, dmin: f32) -> Vec<u8> {
         let mut block = Vec::with_capacity(176);
         block.extend_from_slice(&f16(d));
@@ -2798,6 +2842,41 @@ mod tests {
         let dot = super::q5k_dot(&block, &x);
         let reference: f32 = expected.iter().zip(x.iter()).map(|(w, xv)| w * xv).sum();
         assert_eq!(dot.to_bits(), reference.to_bits());
+    }
+
+    /// Q5_0: four low bits from `qs` plus the fifth from `qh`, one scale for all 32 values. Check
+    /// every position against an independent formula, then the dot over two blocks and the dispatch.
+    #[test]
+    fn q5_0_dequantizes_the_packed_layout_and_dots() {
+        assert_eq!(row_bytes(GgmlType::Q5_0, 32).expect("stride"), 22);
+        let qs: [u8; 16] = std::array::from_fn(|i| ((i * 11) % 251) as u8);
+        let qh: [u8; 4] = std::array::from_fn(|i| if i % 3 == 0 { 0x00 } else { 0xff });
+        let decode = |d: f32| -> [f32; 32] {
+            std::array::from_fn(|at| {
+                let nibble = if at < 16 {
+                    qs[at] & 0x0f
+                } else {
+                    qs[at - 16] >> 4
+                };
+                let code = nibble | (((qh[at / 8] >> (at % 8)) & 1) << 4);
+                d * (code as f32 - 16.0)
+            })
+        };
+        let block = pack_q5_0(&qs, &qh, 0.5);
+        let mut got = [0.0_f32; 32];
+        super::q5_0_block(&block, &mut got);
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got), bits(&decode(0.5)));
+
+        let row = [block, pack_q5_0(&qs, &qh, -0.25)].concat();
+        let x: Vec<f32> = (0..64).map(|i| (i % 13) as f32 / 13.0 - 0.5).collect();
+        let expected: Vec<f32> = decode(0.5).into_iter().chain(decode(-0.25)).collect();
+        let reference: f32 = expected.iter().zip(x.iter()).map(|(w, xv)| w * xv).sum();
+        assert_eq!(super::q5_0_dot(&row, &x).to_bits(), reference.to_bits());
+        assert_eq!(
+            super::dot_scalar(GgmlType::Q5_0, &row, &x, &[], None).to_bits(),
+            reference.to_bits()
+        );
     }
 
     /// The 3-bit layout is order-sensitive (sequential `*y++` in the reference), so check every
