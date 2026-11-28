@@ -5672,3 +5672,42 @@ clears the 6% gate ADR-008 pre-registered, but the probe is cache-hot: the real 
 therefore records option B as designed and deferred — a repacked 6.9 GiB model is ~20 GiB on a 15 GB
 box with ~3 GB free, so the traffic cost cannot be measured here at all. Both probes stay in the bench
 as `cfg(test)` code so the next machine can re-run them.
+
+## Q3_K at real depths: flat ~6.4 s per chunk, 69% of the first chunk and 44% of a 4k one
+
+2026-11-28, `prefill_long_prompt` (1024 and 4096 tokens), `VIPERA_PROFILE_STEP=1`, 8 threads,
+`q8src-imbf-q3km.gguf`, load ~2–3. The question: does the Q3_K work still matter once attention is
+growing with depth, or is it a first-chunk effect?
+
+`PROFILE` only prints the phase split as a **running average** over every pass of a kind, which cannot
+answer this (thirty-two chunks average into something that describes none of them). The profiler now
+also prints `PROFILEPASS`: the split of *this* pass, same switches, purely additive line.
+
+| pass | position | total | `other_dot` (Q3_K + Q5_K) | attention | q4k |
+|---|---:|---:|---:|---:|---:|
+| 1 (first chunk) | 0–127 | 9.30 s | **6.39 s (69%)** | 0.24 s (3%) | 2.29 s (25%) |
+| 85 | ~3.7k | 13.69 s | 6.39 s (47%) | 4.71 s (34%) | 2.56 s (19%) |
+| 86 | ~3.8k | 14.01 s | 6.37 s (45%) | 4.93 s (35%) | 2.56 s (18%) |
+| 87 | ~3.9k | 14.33 s | 6.28 s (44%) | 5.16 s (36%) | 2.57 s (18%) |
+| 88 (last) | ~4.0k | 15.11 s | 6.60 s (44%) | 5.17 s (34%) | 2.63 s (17%) |
+| **mean, last 4** | ~3.9k | **14.29 s** | **6.41 s (45%)** | **4.99 s (35%)** | 2.58 s (18%) |
+
+**The absolute cost is flat; only the share moves.** `other_dot` is 6.39 s in the first chunk and
+6.41 s as the mean of the last four at ~3.9k — the matmul reads the weights once per chunk whatever the
+depth, so this is the same work. Attention grows from 0.24 s to 5.0 s, which is what turns 69% into 44%.
+
+**So decode work still matters at real depths, but it is diluted ~1.5x.** A 10% gain in the Q3_K band
+is worth ~0.64 s per 128-token chunk: **6.9% of a first chunk, 4.5% of a 4k chunk**. A long prefill is
+dominated by its late chunks, so a band improvement should be scored at about **0.45** of its
+first-chunk value, not the 0.68 the short-prompt phase table suggested. It is still the largest single
+phase in a late chunk: 45% against attention's 35%.
+
+Caveats: `other_dot` is Q3_K **plus** Q5_K (this model reports q6k ~0 in prefill, so the Q6_K path is
+not in the picture), so these are upper bounds for the Q3_K band alone; and the chunk total varies with
+the same host noise as everything else in this ledger — the ratio that survives it is the flat 6.4 s.
+
+**Fresh pp512 pair, same evening (load ~2 → 10 during the run).** Re-ran `prefill_q3k_pair_vs_single`
+after the band re-baseline correction above, to check whether the corrected 5.6% band figure changes
+the default: rounds 1.104, 1.059, 1.086, 1.045, 1.076 — **median 1.076x (+7.6% for the pair)**, all five
+positive and the spread 5.6%. The band bench under-reports the lever; pp512 still shows +7.6% (the
+earlier run: +6.7%). `VIPERA_Q3K_PAIR` stays on by default, and this is the number it rests on.
