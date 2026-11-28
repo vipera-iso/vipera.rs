@@ -20,6 +20,7 @@ const fn block(ty: GgmlType) -> Option<(usize, usize)> {
         GgmlType::F16 => Some((1, 2)),
         GgmlType::Q4_0 => Some((32, 18)),
         GgmlType::Q8_0 => Some((32, 34)),
+        GgmlType::Q5_1 => Some((32, 24)),
         GgmlType::Q3K => Some((256, 110)),
         GgmlType::Q4K => Some((256, 144)),
         GgmlType::Q5K => Some((256, 176)),
@@ -592,6 +593,37 @@ fn q5k_dot(row: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+/// Dequantize one Q5_1 block (32 values) into `out`.
+pub(crate) fn q5_1_block(block: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(block.len(), 24);
+    debug_assert_eq!(out.len(), 32);
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    for j in 0..16usize {
+        let xh_0 = (((qh >> j) as u8) << 4) & 0x10;
+        let xh_1 = (((qh >> (j + 12)) as u8)) & 0x10;
+        let qs = block[8 + j];
+        let x0 = (qs & 0x0f) | xh_0;
+        let x1 = (qs >> 4) | xh_1;
+        out[j] = d * f32::from(x0) + m;
+        out[j + 16] = d * f32::from(x1) + m;
+    }
+}
+
+/// Dot product of one Q5_1 row with `x`.
+pub(crate) fn q5_1_dot(row: &[u8], x: &[f32]) -> f32 {
+    let mut values = [0.0_f32; 32];
+    let mut sum = 0.0_f32;
+    for (block, xb) in blocks::<24>(row).iter().zip(x.as_chunks::<32>().0) {
+        q5_1_block(block, &mut values);
+        for (value, xv) in values.iter().zip(xb.iter()) {
+            sum += value * xv;
+        }
+    }
+    sum
+}
+
 /// Dot product of one Q3_K row with `x` (the scalar reference; no integer kernel yet).
 fn q3k_dot(row: &[u8], x: &[f32]) -> f32 {
     let mut values = [0.0_f32; 256];
@@ -658,6 +690,7 @@ pub(crate) fn dot_scalar(
             }
             sum
         }
+        GgmlType::Q5_1 => q5_1_dot(row, x),
         GgmlType::Q3K => q3k_dot(row, x),
         GgmlType::Q5K => q5k_dot(row, x),
         GgmlType::Q4K => q4k_dot(row, x, sums),
@@ -945,6 +978,22 @@ pub fn read_row(
                 let d = read_f16(block, 0);
                 for (value, byte) in chunk.iter_mut().zip(block[2..34].iter()) {
                     *value = d * f32::from(*byte as i8);
+                }
+            }
+        }
+        GgmlType::Q5_1 => {
+            for (block, chunk) in blocks::<24>(bytes).iter().zip(out.as_chunks_mut::<32>().0) {
+                let d = read_f16(block, 0);
+                let m = read_f16(block, 2);
+                let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+                for j in 0..16usize {
+                    let xh_0 = (((qh >> j) as u8) << 4) & 0x10;
+                    let xh_1 = (((qh >> (j + 12)) as u8)) & 0x10;
+                    let qs = block[8 + j];
+                    let x0 = (qs & 0x0f) | xh_0;
+                    let x1 = (qs >> 4) | xh_1;
+                    chunk[j] = d * f32::from(x0) + m;
+                    chunk[j + 16] = d * f32::from(x1) + m;
                 }
             }
         }
