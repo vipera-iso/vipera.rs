@@ -1,0 +1,8 @@
+# Q3_K band cost per 128-token prompt chunk — baseline for scripts/q3k-band-drift.sh.
+# host: 11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz
+# model: q8src-imbf-q3km.gguf
+# taken: 2026-11-28, VIPERA_THREADS=8, taskset -c 2-7, load ~2, median of two runs
+#   (5657 and 5655 ms of other_dot; the same measurement under load read 5972 ms, +5.6%).
+# other_dot is Q3_K + Q5_K, and Q5_K is 1.8% of this model, so this is the Q3_K band.
+other_dot_ms 5656
+chunk_ms 8469

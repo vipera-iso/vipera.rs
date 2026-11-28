@@ -5711,3 +5711,8 @@ after the band re-baseline correction above, to check whether the corrected 5.6%
 the default: rounds 1.104, 1.059, 1.086, 1.045, 1.076 — **median 1.076x (+7.6% for the pair)**, all five
 positive and the spread 5.6%. The band bench under-reports the lever; pp512 still shows +7.6% (the
 earlier run: +6.7%). `VIPERA_Q3K_PAIR` stays on by default, and this is the number it rests on.
+
+**Byte split of the model** (parsed from the GGUF header, 443 tensors, 6976.5 MiB): Q3_K 3756.3 MiB
+(53.8%), Q4_K 2486.2 (35.6%), Q6_K 608.6 (8.7%), Q5_K 123.8 (1.8%). `other_dot` in the phase split is
+therefore the Q3_K band: Q5_K is 3.2% of `Q3_K + Q5_K`, so a Q5_K improvement is worth a third of a
+percent of the phase at most.

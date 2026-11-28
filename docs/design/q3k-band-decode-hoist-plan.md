@@ -137,3 +137,31 @@ kernel).
 | 1 | ~~**Price the weight broadcast**~~ **done 2026-11-28** | `NO_Q3K_WEIGHT_PROBE` replaces the weight dword with a constant in a test-only build | measured **~55%** of the paired band (21.5 vs 48.2 ns per half), above the ≤32% estimate because the hoisted broadcast disappears too | gate was < 8%: cleared, so #2 is open |
 | 2 | ~~**Decode straight into `u32` order**~~ **rejected 2026-11-28** | one 16-byte load per group, dwords broadcast from the register (`VIPERA_Q3K_WIDE`, removed) | **+0.1%** band median, gate 3%: both formulations fold to `vpbroadcastd (mem)` per word (0 `vpermd`, 0 `vpextrd`), so the four "narrow loads" are already one fused instruction each | closed; `CONSTRAINTS.md` §Rejected has the row |
 | 3 | ~~**Repack Q3_K at load**~~ **ADR-008: deferred, not built** | 320-byte pre-decoded block (`q3k_band_rows_packed`, test-only) instead of the in-band decode | measured **+7.6%** of the band (median of eight round pairs) — clears the 6% gate; density **2.91x** (110 → 320 B/block, 6.9 GiB → ~20 GiB) | deferred: the probe is cache-hot, the real block streams 2.91x the bytes, and no machine here can hold the repacked model. Needs a bigger box, not another kernel |
+
+## 8. What is left, scored at real depth (2026-11-28)
+
+Two facts from the ledger decide the queue, and neither was available when §7 was written:
+
+1. **`other_dot` is flat with depth**: 6.39 s per 128-token chunk in the first chunk, 6.41 s at ~3.9k.
+   Its *share* falls 69% → 45% only because attention grows 0.24 s → 5.0 s. So a band gain `g` is
+   worth `g × 0.45` of a late chunk, not `g × 0.69`.
+2. **`other_dot` is Q3_K for practical purposes.** The model's bytes are Q3_K 3756 MiB (53.8%),
+   Q4_K 2486 (35.6%), Q6_K 609 (8.7%), Q5_K 124 (1.8%) — Q5_K is 3.2% of `Q3_K + Q5_K`.
+
+| lever | band-level ceiling | value in a 4k chunk (× 0.45) | state |
+|---|---:|---:|---|
+| repack to 320-byte pre-decoded blocks (ADR-008) | **+7.6%** (measured) | **3.4%** | blocked: 2.91× density, ~20 GiB for this model |
+| H=8 over 2 rows — decode once per chunk, not per half | ~5.7% (the 3/4 of the 7.6% a full decode removal buys) | 2.6% | untested; 16 accumulators, and 2 rows × 4 halves measured neutral-to-negative for Q4_K |
+| H=4 | +2.6% (measured) | 1.2% | shipped off |
+| 16-byte code load (lever #2) | +0.1% (measured) | 0.05% | rejected, folds to `vpbroadcastd (mem)` |
+| Q5_K two-half hoist (Q5_K still decodes per half) | ~10% of Q5_K ≈ 0.3% of `other_dot` | 0.14% | dead on the byte split |
+| the 55% weight side | — | — | needs a transposed tile and `asm!`; the unsigned `dpbusd` operand cannot come from memory (`CONSTRAINTS.md` §Rejected) |
+
+**Decision: stop on the Q3_K band kernel.** No unblocked lever clears 5% of a real-depth chunk, and the
+only one that clears it (the repack, 3.4%) is blocked on memory before it is blocked on anything else.
+The lever with the better real-depth value is now **attention**: 35% of a late chunk and growing as
+O(n²), against a band that is flat. Q4_K at 18% of a late chunk and flat is the second.
+
+The guard that keeps this honest is `scripts/q3k-band-drift.sh`: one 128-token chunk, `PROFILEPASS`,
+`other_dot` against `scripts/q3k-band-baseline.txt` within 8% on the recorded host. Run it before a
+release; if the number is *meant* to move, update the baseline in the same commit.
