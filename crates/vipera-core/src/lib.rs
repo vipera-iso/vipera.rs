@@ -8,6 +8,7 @@
 pub mod gguf;
 pub mod hardware;
 pub mod planner;
+pub mod safetensors;
 pub mod vram;
 pub mod window;
 
