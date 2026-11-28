@@ -602,7 +602,7 @@ pub(crate) fn q5_1_block(block: &[u8], out: &mut [f32]) {
     let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
     for j in 0..16usize {
         let xh_0 = (((qh >> j) as u8) << 4) & 0x10;
-        let xh_1 = (((qh >> (j + 12)) as u8)) & 0x10;
+        let xh_1 = ((qh >> (j + 12)) as u8) & 0x10;
         let qs = block[8 + j];
         let x0 = (qs & 0x0f) | xh_0;
         let x1 = (qs >> 4) | xh_1;
@@ -988,7 +988,7 @@ pub fn read_row(
                 let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
                 for j in 0..16usize {
                     let xh_0 = (((qh >> j) as u8) << 4) & 0x10;
-                    let xh_1 = (((qh >> (j + 12)) as u8)) & 0x10;
+                    let xh_1 = ((qh >> (j + 12)) as u8) & 0x10;
                     let qs = block[8 + j];
                     let x0 = (qs & 0x0f) | xh_0;
                     let x1 = (qs >> 4) | xh_1;
