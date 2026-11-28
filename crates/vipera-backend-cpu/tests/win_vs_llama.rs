@@ -1433,3 +1433,34 @@ fn speculative_decode_wins() {
     );
     assert_eq!(plain, speculative, "speculation changed the greedy stream");
 }
+
+// ---------------------------------------------------------------------------
+// 3c. One 128-token chunk, for `scripts/q3k-band-drift.sh`
+// ---------------------------------------------------------------------------
+//
+// The drift check needs exactly one prompt chunk with the phase timers on: a 512-token prefill is
+// four chunks and takes four times as long, and `prefill_long_prompt` is minutes. The timers are
+// switched on by the script through `VIPERA_PROFILE_STEP`, not here — the workspace forbids
+// `set_var`, and the engine reads the switch once per process anyway.
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn prefill_one_chunk() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let n = 128usize;
+    let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
+    let mut state = State::with_room(config, n + 4, KvCacheType::F16);
+    let start = Instant::now();
+    backend
+        .logits(&mut state.context(&prompt))
+        .expect("prefill one chunk");
+    println!(
+        "one chunk: {n} tokens in {:.1} ms",
+        start.elapsed().as_secs_f64() * 1e3
+    );
+}

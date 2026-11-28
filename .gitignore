@@ -27,6 +27,10 @@
 !/scripts/parity-tokenize.sh
 # The gate: the stages CI runs are the stages a human runs, so the script has to travel with the code.
 !/scripts/gate.sh
+# The Q3_K band's drift check and the baseline it compares against: a regression gate that only exists
+# on one laptop is not a gate, and the baseline is the half of it a reader has to be able to see.
+!/scripts/q3k-band-drift.sh
+!/scripts/q3k-band-baseline.txt
 # The logits reference the qwen3 conformance test compares against: the dumper and the wrapper that
 # builds it, so the reference is a run anyone can repeat.
 !/scripts/logits-dump.sh
