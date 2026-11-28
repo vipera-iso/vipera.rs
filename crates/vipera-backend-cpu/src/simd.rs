@@ -2571,19 +2571,23 @@ unsafe fn q3k_decode_codes(block: *const u8, codes: &mut [u8; 256], coef: &mut [
     }
 }
 
-/// `N` Q3_K rows against the sixteen activations of one tile half, one pass over each weight block.
+/// `N` Q3_K rows against the sixteen activations of `H` tile halves, one pass over each weight
+/// block.
 ///
-/// Per block: decode the `N` rows' codes and coefficients once, then per 16-value group one
-/// `dpbusd` chain for the activation sums (shared by every row) and one per row. Sixteen groups
-/// cost `N + 1` chains instead of the row kernel's `8 · N`, and the block prologue is paid once for
-/// `N · 16` outputs.
+/// Per block: decode the `N` rows' codes and coefficients once, then per half and per 16-value
+/// group one `dpbusd` chain for the activation sums (shared by every row) and one per row. Sixteen
+/// groups cost `N + 1` chains instead of the row kernel's `8 · N`, and the block prologue is paid
+/// once for `N · 16 · H` outputs — `H = 2` halves the decode per output, `H = 1` is the original
+/// path.
+///
+/// Each half keeps its own accumulators and its own summation order, so half `h` of any `H` is
+/// bit-identical to a run with `H = 1`.
 ///
 /// # Safety
 ///
 /// `data` must point at whole 110-byte blocks for rows `first_row .. first_row + N`, `stride` must
-/// be `blocks · 110`, `act` must point at `blocks · 4096` bytes of tile for one half, `dxs` at
-/// `blocks · 16 · 16` floats, `out` at `N · count` floats, and the CPU must have AVX-512 VNNI with
-/// VL.
+/// be `blocks · 110`, each view must describe `blocks` blocks of activations and scales, `out` must
+/// have `N · count` floats, and the CPU must have AVX-512 VNNI with VL.
 /// Where one tile half's activations and scales live, and where the band writes its rows.
 #[derive(Clone, Copy)]
 struct Q3kBandView {
@@ -2599,19 +2603,19 @@ struct Q3kBandView {
 }
 
 #[target_feature(enable = "avx512vnni,avx512vl,avx2")]
-unsafe fn q3k_band_rows<const N: usize>(
+unsafe fn q3k_band_rows<const N: usize, const H: usize>(
     data: *const u8,
     stride: usize,
     first_row: usize,
     blocks: usize,
-    view: Q3kBandView,
+    views: [Q3kBandView; H],
 ) {
     // SAFETY: the caller's contract is this function's contract; every load below stays inside the
     // rows, blocks, groups and sixteen columns it describes.
     unsafe {
         let ones = _mm512_set1_epi32(0x0101_0101);
         let four = _mm512_set1_ps(4.0);
-        let mut lanes_acc = [_mm512_setzero_ps(); N];
+        let mut lanes_acc = [[_mm512_setzero_ps(); N]; H];
         let mut codes = [[0_u8; 256]; N];
         let mut coef = [[0.0_f32; 16]; N];
         for b in 0..blocks {
@@ -2620,45 +2624,51 @@ unsafe fn q3k_band_rows<const N: usize>(
                 // SAFETY: one whole block per row, as the caller promises.
                 q3k_decode_codes(block, &mut codes[t], &mut coef[t]);
             }
-            let block_act = view.act.add(b * view.act_stride);
-            let block_dx = view.dxs.add(b * view.dxs_stride);
-            for k in 0..16 {
-                let a = [
-                    _mm512_loadu_si512(block_act.add(k * 256) as *const __m512i),
-                    _mm512_loadu_si512(block_act.add(k * 256 + 64) as *const __m512i),
-                    _mm512_loadu_si512(block_act.add(k * 256 + 128) as *const __m512i),
-                    _mm512_loadu_si512(block_act.add(k * 256 + 192) as *const __m512i),
-                ];
-                // The `-4` bias every code carries, summed for each column: one chain for all rows.
-                let mut bias = _mm512_setzero_si512();
-                for group in &a {
-                    bias = _mm512_dpbusd_epi32(bias, ones, *group);
-                }
-                let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), four);
-                let dx = _mm512_loadu_ps(block_dx.add(k * 16));
-                for (t, accumulator) in lanes_acc.iter_mut().enumerate() {
-                    let mut acc = _mm512_setzero_si512();
-                    for (word, group) in a.iter().enumerate() {
-                        let packed = u32::from_le_bytes(
-                            codes[t][k * 16 + word * 4..][..4]
-                                .try_into()
-                                .expect("four bytes"),
-                        );
-                        acc = _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *group);
+            for (h, view) in views.iter().enumerate() {
+                let block_act = view.act.add(b * view.act_stride);
+                let block_dx = view.dxs.add(b * view.dxs_stride);
+                for k in 0..16 {
+                    let a = [
+                        _mm512_loadu_si512(block_act.add(k * 256) as *const __m512i),
+                        _mm512_loadu_si512(block_act.add(k * 256 + 64) as *const __m512i),
+                        _mm512_loadu_si512(block_act.add(k * 256 + 128) as *const __m512i),
+                        _mm512_loadu_si512(block_act.add(k * 256 + 192) as *const __m512i),
+                    ];
+                    // The `-4` bias every code carries, summed for each column: one chain for all
+                    // rows.
+                    let mut bias = _mm512_setzero_si512();
+                    for group in &a {
+                        bias = _mm512_dpbusd_epi32(bias, ones, *group);
                     }
-                    let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc), bias);
-                    let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][k]));
-                    *accumulator = _mm512_fmadd_ps(levels, scale, *accumulator);
+                    let bias = _mm512_mul_ps(_mm512_cvtepi32_ps(bias), four);
+                    let dx = _mm512_loadu_ps(block_dx.add(k * 16));
+                    for (t, accumulator) in lanes_acc[h].iter_mut().enumerate() {
+                        let mut acc = _mm512_setzero_si512();
+                        for (word, group) in a.iter().enumerate() {
+                            let packed = u32::from_le_bytes(
+                                codes[t][k * 16 + word * 4..][..4]
+                                    .try_into()
+                                    .expect("four bytes"),
+                            );
+                            acc =
+                                _mm512_dpbusd_epi32(acc, _mm512_set1_epi32(packed as i32), *group);
+                        }
+                        let levels = _mm512_sub_ps(_mm512_cvtepi32_ps(acc), bias);
+                        let scale = _mm512_mul_ps(dx, _mm512_set1_ps(coef[t][k]));
+                        *accumulator = _mm512_fmadd_ps(levels, scale, *accumulator);
+                    }
                 }
             }
         }
         // `out` is entry-major (`out[entry * count + row]`), so the sixteen lanes of a row are
         // spread across sixteen entries rather than written as one contiguous run.
         let mut lanes = [0.0_f32; 16];
-        for (t, accumulator) in lanes_acc.iter().enumerate() {
-            _mm512_storeu_ps(lanes.as_mut_ptr(), *accumulator);
-            for (col, value) in lanes.iter().take(view.columns).enumerate() {
-                *view.out.add(col * view.count + t) = *value;
+        for (h, view) in views.iter().enumerate() {
+            for (t, accumulator) in lanes_acc[h].iter().enumerate() {
+                _mm512_storeu_ps(lanes.as_mut_ptr(), *accumulator);
+                for (col, value) in lanes.iter().take(view.columns).enumerate() {
+                    *view.out.add(col * view.count + t) = *value;
+                }
             }
         }
     }
@@ -2979,38 +2989,59 @@ pub(crate) unsafe fn q3k_matvec_tiled_range<const B: usize>(
                 }
             }
         }
-        for half in 0..halves {
-            let columns = (B - half * 16).min(16);
-            let half_act = act.as_ptr().add(half * 4096);
-            let half_dxs = dxs.as_ptr().add(half * 16 * 16);
+        let paired = crate::tiled::q3k_pair_enabled();
+        let act_ptr = act.as_ptr();
+        let dxs_ptr = dxs.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        let view_at = |half: usize, offset: usize| Q3kBandView {
+            act: act_ptr.add(half * 4096),
+            act_stride: halves * 4096,
+            dxs: dxs_ptr.add(half * 16 * 16),
+            dxs_stride: halves * 16 * 16,
+            out: out_ptr.add(half * 16 * count + offset),
+            count,
+            columns: (B - half * 16).min(16),
+        };
+        let mut half = 0;
+        while half < halves {
+            // Two halves per pass decode each row-block once for 32 activations; a lone trailing
+            // half runs exactly as it did before, and the summation order per half is unchanged.
+            let width = if paired && half + 1 < halves { 2 } else { 1 };
             let mut row = first_row;
             let last = first_row + count;
             while row + N <= last {
-                q3k_band_rows::<N>(
-                    data.as_ptr(),
-                    stride,
-                    row,
-                    blocks,
-                    Q3kBandView {
-                        act: half_act,
-                        act_stride: halves * 4096,
-                        dxs: half_dxs,
-                        dxs_stride: halves * 16 * 16,
-                        out: out.as_mut_ptr().add(half * 16 * count + (row - first_row)),
-                        count,
-                        columns,
-                    },
-                );
+                let offset = row - first_row;
+                if width == 2 {
+                    q3k_band_rows::<N, 2>(
+                        data.as_ptr(),
+                        stride,
+                        row,
+                        blocks,
+                        [view_at(half, offset), view_at(half + 1, offset)],
+                    );
+                } else {
+                    q3k_band_rows::<N, 1>(
+                        data.as_ptr(),
+                        stride,
+                        row,
+                        blocks,
+                        [view_at(half, offset)],
+                    );
+                }
                 row += N;
             }
-            for tail in row..last {
-                for col in 0..columns {
-                    let x = xs[half * 16 + col];
-                    let start = tail * stride;
-                    *out.get_unchecked_mut((half * 16 + col) * count + tail - first_row) =
-                        q3k_dot_vnni(&data[start..start + stride], &x.q, &x.d);
+            for h in half..half + width {
+                let columns = (B - h * 16).min(16);
+                for tail in row..last {
+                    for col in 0..columns {
+                        let x = xs[h * 16 + col];
+                        let start = tail * stride;
+                        *out.get_unchecked_mut((h * 16 + col) * count + tail - first_row) =
+                            q3k_dot_vnni(&data[start..start + stride], &x.q, &x.d);
+                    }
                 }
             }
+            half += width;
         }
     }
 }
@@ -7119,7 +7150,9 @@ mod tests {
         let stride = blocks * 110;
         let rows = 11;
         let data: Vec<u8> = (0..rows).flat_map(|_| q3k_row(&mut rng, blocks)).collect();
-        for batch in [4_usize, 16, 32, 40] {
+        // 64 and 128 are four and eight tile halves: they exercise `VIPERA_Q3K_PAIR`'s grouped
+        // halves (run the test with the switch on and off).
+        for batch in [4_usize, 16, 32, 40, 64, 128] {
             let xs: Vec<Vec<f32>> = (0..batch)
                 .map(|_| (0..cols).map(|_| rng.unit()).collect())
                 .collect();
@@ -7161,12 +7194,30 @@ mod tests {
                             &mut out,
                             None,
                         ),
-                        _ => q3k_matvec_tiled_range::<40>(
+                        40 => q3k_matvec_tiled_range::<40>(
                             &data,
                             stride,
                             first_row,
                             count,
                             array.try_into().expect("forty"),
+                            &mut out,
+                            None,
+                        ),
+                        64 => q3k_matvec_tiled_range::<64>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("sixty-four"),
+                            &mut out,
+                            None,
+                        ),
+                        _ => q3k_matvec_tiled_range::<128>(
+                            &data,
+                            stride,
+                            first_row,
+                            count,
+                            array.try_into().expect("128"),
                             &mut out,
                             None,
                         ),
@@ -7221,7 +7272,7 @@ mod tests {
         }
         let iterations = 200_000;
         let mut sink = 0.0_f32;
-        let mut out = vec![0.0_f32; 16 * rows];
+        let mut out = vec![0.0_f32; 2 * 16 * rows];
         for round in 0..6 {
             let start = std::time::Instant::now();
             for _ in 0..iterations {
@@ -7246,12 +7297,12 @@ mod tests {
             for _ in 0..iterations {
                 // SAFETY: four rows, one tile half, whole blocks.
                 unsafe {
-                    q3k_band_rows::<4>(
+                    q3k_band_rows::<4, 1>(
                         data.as_ptr(),
                         stride,
                         0,
                         blocks,
-                        Q3kBandView {
+                        [Q3kBandView {
                             act: act.as_ptr(),
                             act_stride: 4096,
                             dxs: dxs.as_ptr(),
@@ -7259,18 +7310,55 @@ mod tests {
                             out: out.as_mut_ptr(),
                             count: rows,
                             columns: 16,
-                        },
+                        }],
                     );
                 }
                 sink += out[0];
             }
             let band_ms = start.elapsed().as_secs_f64() * 1e3;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: four rows, two tile halves pointing at the same activation buffer (one
+                // half's timing is what matters), whole blocks.
+                unsafe {
+                    q3k_band_rows::<4, 2>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        [
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr(),
+                                count: rows,
+                                columns: 16,
+                            },
+                            Q3kBandView {
+                                act: act.as_ptr(),
+                                act_stride: 4096,
+                                dxs: dxs.as_ptr(),
+                                dxs_stride: 16 * 16,
+                                out: out.as_mut_ptr().add(16 * rows),
+                                count: rows,
+                                columns: 16,
+                            },
+                        ],
+                    );
+                }
+                sink += out[0];
+            }
+            let pair_ms = start.elapsed().as_secs_f64() * 1e3;
             if round >= 2 {
                 let decode_ns = decode_ms * 1e6 / (iterations * rows * blocks) as f64;
                 let band_ns = band_ms * 1e6 / (iterations * rows * blocks) as f64;
+                let pair_ns = pair_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 println!(
-                    "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, decode share {:.0}%",
-                    decode_ns / band_ns * 100.0
+                    "per row-block: decode {decode_ns:.2} ns, band {band_ns:.2} ns, paired {pair_ns:.2} ns (per half), decode share {:.0}%, paired gain {:.1}%",
+                    decode_ns / band_ns * 100.0,
+                    (1.0 - pair_ns / band_ns) * 100.0
                 );
             }
         }
