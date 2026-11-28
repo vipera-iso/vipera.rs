@@ -4023,16 +4023,24 @@ fn attention_qblock_enabled() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        ["VIPERA_ATTN_GEMM", "VIPERA_ATTN_QBLOCK"]
-            .iter()
-            .any(|name| {
-                std::env::var(name).is_ok_and(|value| {
-                    matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "on" | "yes"
-                    )
-                })
+        // Default on since 2026-11-28: the q-block kernel is now chunk-invariant (single entries
+        // use it too, fold padded to 16), so the reduction order no longer depends on chunk size.
+        // Either switch can still turn it off (0/false/off/no) for the per-entry path.
+        let parse = |name: &str| -> Option<bool> {
+            std::env::var(name).ok().map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
             })
+        };
+        let gemm = parse("VIPERA_ATTN_GEMM");
+        let qblock = parse("VIPERA_ATTN_QBLOCK");
+        match (gemm, qblock) {
+            (Some(false), _) | (_, Some(false)) => false,
+            (Some(true), _) | (_, Some(true)) => true,
+            (None, None) => true,
+        }
     })
 }
 
