@@ -5646,6 +5646,7 @@ process, cache-warm, 200k iterations per round; only rounds 2–5 are printed.
 | band, one half (H=1) | 51.3–54.4 | — |
 | paired (H=2, shipped) | 46.4–50.5 | 100% |
 | quad (H=4) | 44.6–47.7 | 3.1–9.1% better |
+| eight halves over two rows (H=8, N=2) | 52.9–53.2 | **−9.6 to −11.1% (median −10.7%)** |
 | no-weight probe | 20.5–22.0 | weight side 55.0–58.0% |
 | opaque 16-byte code load | 47.7–51.7 | **−5.6 to +2.5% (median −2.9%)** |
 | pre-decoded 320 B blocks | 43.2–46.1 | **+6.3 to +10.8% (median +7.6%)** |
@@ -5716,3 +5717,47 @@ earlier run: +6.7%). `VIPERA_Q3K_PAIR` stays on by default, and this is the numb
 (53.8%), Q4_K 2486.2 (35.6%), Q6_K 608.6 (8.7%), Q5_K 123.8 (1.8%). `other_dot` in the phase split is
 therefore the Q3_K band: Q5_K is 3.2% of `Q3_K + Q5_K`, so a Q5_K improvement is worth a third of a
 percent of the phase at most.
+
+## Attention at depth (2026-11-28)
+
+What the walk costs, from the phase split of one 1024-token prompt (default path, load ~2):
+
+| depth | attention | chunk total | share |
+|---|---:|---:|---:|
+| first chunk (128 tokens of history) | 0.24 s | 9.30 s | 3% |
+| late chunk (~3.9k of history) | **4.99 s** | 14.29 s | **35%** |
+
+The band under it is flat (6.39 → 6.41 s); attention is the phase that grows, and it grows as O(n²) in
+the score pass. So the first real-depth lever is here, not in the Q3_K kernel.
+
+**The tiled kernel is the only thing in the tree that removes most of it.** `attention_qblock_enabled`
+(`Q_TILE=32`, `KV_TILE=64`, one K/V decode per query tile and both GEMMs out of shared tiles) is
+measured in its own doc comment at −48% attention and −13% of a chunk set at 3.7k, −52% / −6.7% at
+1.5k. It is off by default for a *correctness* reason, not a speed one: the shared kernel is entered at
+`entries.div_ceil(QBLOCK) > 1`, so a position's logits depend on how many tokens share its chunk, and
+`logits_each_matches_single_passes` fails at position 1 with it on (ADR-005). Speculative decode and the
+prefix cache both need a position to be bit-stable across chunkings.
+
+**It re-verifies at −47% attention, in one process.** `pin_attention_qblock` and the ignored test
+`prefill_attention_tile_vs_entry` (1024-token prefills alternating the two kernels, `arm:` markers
+lining up with the `PROFILEPASS` lines) on 2026-11-28, two rounds, attention of the last three passes:
+
+| arm | round 0 | round 1 | attention series, first pass → last |
+|---|---:|---:|---|
+| per-entry (default) | 1042 ms | 1012 ms | 248 → 1212 ms |
+| tiled | 662 ms | 497 ms | 71 → 641 ms |
+
+That is **−47% (median)**, in the same range as the −48% / −52% records, and it cost nothing in the
+chunk total at this depth only because attention is 4% of a 1024-token chunk (1.03 s of 24–25 s — the
+host was carrying a VM and running ~2× slow, which the interleaved arms absorb).
+
+The instrument is the point: the switch caches its answer in a `OnceLock`, so before the pin there was
+no way to price both kernels in one process. Two processes did not work — one such attempt, with
+`VIPERA_ATTN_GEMM=1`, moved q4k, a matvec the switch cannot touch, from 2.6 s to 6.6 s, i.e. the host
+moved and the comparison said nothing.
+
+**First lever: make the tiled kernel chunk-invariant.** At 4k attention is 35% of a chunk, so −47% of it
+is **~16% of a real-depth chunk** — four times what the best remaining Q3_K lever was worth, and the only
+lever in the tree of that size. It is blocked on the reduction order, not on speed: the shared kernel is
+entered at `entries.div_ceil(QBLOCK) > 1`, so a position's logits depend on how many tokens share its
+chunk. Only after that is worth touching the kernel at all.

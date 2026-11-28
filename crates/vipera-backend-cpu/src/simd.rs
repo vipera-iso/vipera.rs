@@ -7600,6 +7600,32 @@ mod tests {
                 sink += out[0];
             }
             let quad_ms = start.elapsed().as_secs_f64() * 1e3;
+            // Eight halves over two rows: decode once per chunk, at the cost of half the rows per pass.
+            // This is the H=8-over-2-rows variant, priced per half so it lines up with the arms above.
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                // SAFETY: two rows, eight tile halves pointing at the same activation buffer, whole
+                // blocks.
+                unsafe {
+                    q3k_band_rows::<2, 8>(
+                        data.as_ptr(),
+                        stride,
+                        0,
+                        blocks,
+                        [0, 1, 2, 3, 4, 5, 6, 7].map(|h| Q3kBandView {
+                            act: act.as_ptr(),
+                            act_stride: 4096,
+                            dxs: dxs.as_ptr(),
+                            dxs_stride: 16 * 16,
+                            out: out.as_mut_ptr().add(h * 16 * 2),
+                            count: 2,
+                            columns: 16,
+                        }),
+                    );
+                }
+                sink += out[0];
+            }
+            let row2_ms = start.elapsed().as_secs_f64() * 1e3;
             // Price the weight side of the shipped (H=2) arrangement: same `dpbusd` chain, but the
             // packed dword is a constant, so the code load and its broadcast are what disappears.
             NO_Q3K_WEIGHT_PROBE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7681,6 +7707,7 @@ mod tests {
                 let band_ns = band_ms * 1e6 / (iterations * rows * blocks) as f64;
                 let pair_ns = pair_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 let quad_ns = quad_ms * 1e6 / (iterations * rows * blocks * 4) as f64;
+                let row2_ns = row2_ms * 1e6 / (iterations * 2 * blocks * 8) as f64;
                 let no_weight_ns = no_weight_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 let packed_ns = packed_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
                 let opaque_ns = opaque_ms * 1e6 / (iterations * rows * blocks * 2) as f64;
@@ -7694,6 +7721,10 @@ mod tests {
                 println!(
                     "  weight probe (H=2): no-weight {no_weight_ns:.2} ns per half, weight side {:.1}% of the paired band",
                     (1.0 - no_weight_ns / pair_ns) * 100.0
+                );
+                println!(
+                    "  eight halves over two rows (H=8, N=2): {row2_ns:.2} ns per half, {:.1}% vs the paired band",
+                    (1.0 - row2_ns / pair_ns) * 100.0
                 );
                 println!(
                     "  opaque 16-byte load (H=2, decode kept): {opaque_ns:.2} ns per half, {:.1}% vs the fused broadcast-load",

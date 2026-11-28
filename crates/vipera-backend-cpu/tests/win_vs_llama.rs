@@ -647,6 +647,48 @@ fn prefill_long_prompt() {
     print_llama_hint("prefill 1024/4096");
 }
 
+/// The two attention kernels in one process, on the same 1024-token prompt.
+///
+/// The per-entry walk is the default; the tiled kernel (`Q_TILE=32`, `KV_TILE=64`) is measured at
+/// −48% attention and −13% of a chunk set at 3.7k but stays opt-in, because its entry condition
+/// makes a position's logits depend on chunk length (ADR-005). This is the instrument that can price
+/// it per release: the arms have to alternate inside one process, since on this host a two-process
+/// comparison moved a matvec phase the switch cannot touch by 2.5×.
+///
+/// The wall clock alone is a poor instrument at 1024 tokens (attention is a quarter of a chunk), so
+/// run it with `VIPERA_PROFILE_STEP=1`: each `PROFILEPASS chunk` line carries the attention
+/// milliseconds, and the `arm:` markers printed here say which kernel produced which lines. Roughly
+/// 80 s per prefill, so two rounds is about 5 minutes.
+#[test]
+#[ignore]
+fn prefill_attention_tile_vs_entry() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let n = 1024usize;
+    let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
+
+    for round in 0..2 {
+        for (label, tile) in [("entry", false), ("tile", true)] {
+            vipera_backend_cpu::pin_attention_qblock(Some(tile));
+            let mut state = State::with_room(config, n + 4, KvCacheType::F16);
+            println!("arm: {label} round {round}");
+            let start = Instant::now();
+            backend
+                .logits(&mut state.context(&prompt))
+                .expect("prefill");
+            println!(
+                "arm total: {label} round {round}: {:.1} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+    vipera_backend_cpu::pin_attention_qblock(None);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Batched decode: one weight read for B activations (continuous batching)
 // ---------------------------------------------------------------------------

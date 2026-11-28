@@ -151,7 +151,7 @@ Two facts from the ledger decide the queue, and neither was available when §7 w
 | lever | band-level ceiling | value in a 4k chunk (× 0.45) | state |
 |---|---:|---:|---|
 | repack to 320-byte pre-decoded blocks (ADR-008) | **+7.6%** (measured) | **3.4%** | blocked: 2.91× density, ~20 GiB for this model |
-| H=8 over 2 rows — decode once per chunk, not per half | ~5.7% (the 3/4 of the 7.6% a full decode removal buys) | 2.6% | untested; 16 accumulators, and 2 rows × 4 halves measured neutral-to-negative for Q4_K |
+| ~~H=8 over 2 rows~~ **measured 2026-11-28: −10.7%** | the decode saving is ~5.7% of the band, and halving the rows per pass costs more than that | — | rejected: 52.9–53.2 vs 47.9–48.3 ns per half. Two rows double the activation side per output and the passes' activation traffic; the decode-once-per-chunk saving does not survive it |
 | H=4 | +2.6% (measured) | 1.2% | shipped off |
 | 16-byte code load (lever #2) | +0.1% (measured) | 0.05% | rejected, folds to `vpbroadcastd (mem)` |
 | Q5_K two-half hoist (Q5_K still decodes per half) | ~10% of Q5_K ≈ 0.3% of `other_dot` | 0.14% | dead on the byte split |
