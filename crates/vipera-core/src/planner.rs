@@ -486,6 +486,7 @@ mod tests {
     fn machine(vram_free: u64, ram: u64) -> HardwareProfile {
         HardwareProfile {
             cpu_cores_physical: 8,
+            numa_nodes: 1,
             ram_total_bytes: ram,
             devices: vec![Device {
                 kind: DeviceKind::Cuda,
@@ -500,6 +501,7 @@ mod tests {
     fn cpu_only(ram: u64) -> HardwareProfile {
         HardwareProfile {
             cpu_cores_physical: 8,
+            numa_nodes: 1,
             ram_total_bytes: ram,
             devices: Vec::new(),
         }
