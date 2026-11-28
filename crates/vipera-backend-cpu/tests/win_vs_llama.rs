@@ -441,6 +441,90 @@ fn prefill_q3k_band_vs_row() {
 }
 
 // ---------------------------------------------------------------------------
+// 3a'. Q3_K band: two tile halves per pass vs one, one process, arms interleaved
+// ---------------------------------------------------------------------------
+//
+// `VIPERA_Q3K_PAIR` groups two tile halves into one band pass so each row-block is decoded once
+// for 32 activations instead of twice for 16. Each half keeps its own accumulator and summation
+// order, so this is bit-identity, not a numeric-policy change: the test asserts the logits match
+// exactly, and reports the ratio of medians from interleaved rounds.
+
+#[test]
+#[ignore = "measurement, not a correctness check"]
+fn prefill_q3k_pair_vs_single() {
+    let Some(path) = model_path() else {
+        eprintln!("skipped: no model; set VIPERA_TEST_MODEL");
+        return;
+    };
+    let mut backend = CpuBackend::load(&path).expect("load model");
+    let config = backend.config();
+    let n = 512usize;
+    let prompt: Vec<u32> = (0..n).map(|at| 1000 + (at % 400) as u32).collect();
+
+    let run = |backend: &mut CpuBackend, paired: bool| {
+        vipera_backend_cpu::pin_q3k_pair(Some(paired));
+        let mut state = State::with_room(config, n + 4, KvCacheType::F16);
+        let start = Instant::now();
+        let logits = backend
+            .logits(&mut state.context(&prompt))
+            .expect("prefill");
+        (start.elapsed().as_secs_f64() * 1e3, logits)
+    };
+
+    // One warm-up per arm, also the pair the bit-identity check compares.
+    let (_, paired_logits) = run(&mut backend, true);
+    let (_, single_logits) = run(&mut backend, false);
+    let max_delta = paired_logits
+        .iter()
+        .zip(&single_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    println!("numeric: max |logit delta| {max_delta:.9} (must be 0)");
+    assert_eq!(
+        paired_logits.len(),
+        single_logits.len(),
+        "both arms must produce one logit vector"
+    );
+    assert_eq!(max_delta, 0.0, "the paired band must be bit-identical");
+
+    let rounds = 5usize;
+    let mut paired_ms = Vec::with_capacity(rounds);
+    let mut single_ms = Vec::with_capacity(rounds);
+    println!("round  paired ms  single ms  single/paired");
+    for round in 0..rounds {
+        // Alternate which arm runs first, so a monotonic host drift hits both arms equally.
+        let (first, second) = if round % 2 == 0 {
+            (run(&mut backend, true), run(&mut backend, false))
+        } else {
+            let single = run(&mut backend, false);
+            let paired = run(&mut backend, true);
+            (paired, single)
+        };
+        let (paired, single) = (first.0, second.0);
+        println!(
+            "{round:>5}  {paired:>9.1}  {single:>9.1}   {:>7.3}",
+            single / paired
+        );
+        paired_ms.push(paired);
+        single_ms.push(single);
+    }
+    vipera_backend_cpu::pin_q3k_pair(None);
+    let median = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    let paired = median(&mut paired_ms);
+    let single = median(&mut single_ms);
+    println!(
+        "median: paired {paired:.1} ms ({:.1} tok/s), single {single:.1} ms ({:.1} tok/s), single/paired {:>6.3}x ({:+.1}% for the pair)",
+        n as f64 / (paired / 1e3),
+        n as f64 / (single / 1e3),
+        single / paired,
+        100.0 * (single / paired - 1.0)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3b. Long prefill: 1024 and 4096 tokens, to read against `llama-bench -p 1024,4096`
 // ---------------------------------------------------------------------------
 //

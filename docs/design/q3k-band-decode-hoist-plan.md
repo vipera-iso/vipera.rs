@@ -1,6 +1,9 @@
 # Q3_K band: decode once per row band, not once per tile half
 
-**Status:** plan, no branch yet. Threshold and falsification fixed up front (section 3).
+**Status:** **shipped** on `perf/q3k-band-pair` (2026-11-28): H=2 gave **+6.7% pp512** (median of five
+interleaved rounds) and **+10.5%** on the band bench, bit-identical (zero logit delta), so
+`VIPERA_Q3K_PAIR` defaults on. Ledger row in `docs/benchmarks.md`. H=4 is the next step and inherits the
+spill question in section 6. Threshold and falsification were fixed up front (section 3).
 **Measured on:** `3960eda` (main after PR #83/#84), release, i5-11300H, governor `powersave`.
 **End-to-end already measured (2026-11-27):** the band is **2.887x** the row kernel at pp512 on this
 model, five rounds interleaved in one process (`docs/benchmarks.md`). `VIPERA_Q3K_TILED=0` plus the

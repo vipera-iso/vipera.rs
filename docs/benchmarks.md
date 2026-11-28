@@ -5479,3 +5479,54 @@ matches the row kernel within `1e-3 + 1e-4·|ref|`.
 **Note.** The absolute numbers (17.3 vs 6.0 tok/s) belong to this 6.9 GB model and do not compare with
 the 151/155 tok/s rows measured on the 876 MiB model. The 2.887x ratio is the usable number on the
 model in hand. The switch defaults **on**; `VIPERA_Q3K_TILED=0` exists for measurement and fallback.
+
+## Q3_K band: two tile halves per pass, bit-identical, +6.7% pp512
+
+The band runs one pass per 16-activation tile half, so at a 128-token chunk it decodes every row-block
+**eight times**, although the codes and scales depend only on `(row, block)`. Grouping two halves into
+one pass (`q3k_band_rows::<4, 2>`) decodes each row-block once for 32 activations. Each half keeps its
+own accumulator and its own summation order, so the result is **bit-identical**, not a numeric-policy
+change: `max |logit delta|` = 0 over the 512 positions.
+
+**Band bench** (`cargo test --release --lib bench_q3k_decode_codes -- --ignored --nocapture`, both arms
+in one process, 200k iterations per round, `taskset -c 2-5`):
+
+| per row-block (1536 columns, band of 4) | ns | paired gain |
+|---|---:|---:|
+| single pass (H=1) | 55.6–57.7 | — |
+| paired per half (H=2) | 49.2–51.8 | **6.7–14.4%** (median 10.5%) |
+
+Codegen gate on the release object: `vpdpbusd` stays 20 per group per half (320/block, no increase), and
+the only `(%rsp)` traffic in the kernel is the `codes`/`coef` zero-init and the epilogue `lanes` store —
+no accumulator spills in the dot loop. The 20→40 instructions in the disassembly are two halves of the
+same rolled group loop.
+
+**End to end** (`prefill_q3k_pair_vs_single`, one process, arms interleaved, 6.9 GB model, i5-11300H,
+governor `powersave`):
+
+```bash
+VIPERA_TEST_MODEL=~/.vipera/models/q8src-imbf-q3km.gguf VIPERA_THREADS=8 \
+  taskset -c 2-7 cargo test -p vipera-backend-cpu --release \
+  --test win_vs_llama prefill_q3k_pair_vs_single -- --ignored --nocapture
+```
+
+| round | paired ms | single ms | single/paired |
+|---:|---:|---:|---:|
+| 0 | 31290.4 | 33551.6 | 1.072 |
+| 1 | 31975.6 | 33820.2 | 1.058 |
+| 2 | 32043.7 | 34132.2 | 1.065 |
+| 3 | 31912.4 | 34117.5 | 1.069 |
+| 4 | 35105.7 | 35085.7 | 0.999 |
+| **median** | **31975.6** (16.0 tok/s) | **34117.5** (15.0 tok/s) | **1.067** |
+
+**+6.7% pp512**, against a 9.8%-of-the-band ceiling (decode share 19.6%) — the pairing collects about
+two thirds of it, as the plan predicted. Round 4 is the one the host's drift ate (both arms slowed);
+the four other rounds sit in 1.058–1.072.
+
+**Threshold and state.** The pre-registered gate was ≥5% pp512 and ≥6% on the band bench; both cleared,
+so the switch defaults **on** like the other 2026-11 defaults and `VIPERA_Q3K_PAIR=0` keeps the
+single-half band for measurement and fallback. Absolute ms here belong to the 6.9 GB model and do not
+compare with the older 876 MiB rows.
+
+**Next lever, unchanged:** H=4 (14.7% of the band) needs 16 accumulators and is now the obvious follow-up;
+the plan's spill risk is the thing to check first, since H=2 already widened the live set to 8 `zmm`.
