@@ -19,6 +19,8 @@ mod pool;
 pub mod profile;
 #[cfg(test)]
 pub(crate) mod q4k8_lab;
+#[cfg(test)]
+pub(crate) mod q8_1_lab;
 pub mod quant;
 #[cfg(test)]
 pub(crate) mod repack;
