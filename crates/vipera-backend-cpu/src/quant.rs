@@ -3,9 +3,9 @@
 //! A GGUF matrix is stored row-major over `dims[0]`: row `r` starts at `r * row_bytes` and holds
 //! `cols = dims[0]` values. Every block size here divides the row length of a real model.
 //!
-//! Only the formats a Q4_K_M file can contain are implemented (F32, F16, Q8_0, Q4_K, Q6_K). Anything
-//! else is refused by name rather than dequantized approximately: a wrong scale convention produces
-//! fluent-looking nonsense, which is harder to notice than an error.
+//! Implemented are the formats a Q4_K_M file can contain (F32, F16, Q8_0, Q4_K, Q6_K), plus a scalar
+//! Q4_0 prototype. Anything else is refused by name rather than dequantized approximately: a wrong
+//! scale convention produces fluent-looking nonsense, which is harder to notice than an error.
 
 use std::sync::Arc;
 use std::thread;
@@ -18,6 +18,7 @@ const fn block(ty: GgmlType) -> Option<(usize, usize)> {
     match ty {
         GgmlType::F32 => Some((1, 4)),
         GgmlType::F16 => Some((1, 2)),
+        GgmlType::Q4_0 => Some((32, 18)),
         GgmlType::Q8_0 => Some((32, 34)),
         GgmlType::Q3K => Some((256, 110)),
         GgmlType::Q4K => Some((256, 144)),
@@ -48,7 +49,7 @@ fn blocks<const N: usize>(data: &[u8]) -> &[[u8; N]] {
 
 fn unsupported(ty: GgmlType) -> ViperaError {
     ViperaError::unsupported(format!(
-        "the CPU backend cannot read {} weights; supported formats are F32, F16, Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K",
+        "the CPU backend cannot read {} weights; supported formats are F32, F16, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K",
         ty.name()
     ))
 }
@@ -604,6 +605,26 @@ fn q3k_dot(row: &[u8], x: &[f32]) -> f32 {
     sum
 }
 
+/// Scalar dot of one Q4_0 row with `x`.
+///
+/// A block is a little-endian `f16` scale followed by sixteen bytes, each holding the low nibble of
+/// value `2*i` and the high nibble of `2*i + 1`. The nibble is unsigned with a bias of eight, so the
+/// weight is `d * (nibble - 8)`. As in the other block dots, the inner products are summed first and
+/// the block scale applied once at the end; this keeps one rounding per block rather than per value.
+pub(crate) fn q4_0_dot(row: &[u8], x: &[f32]) -> f32 {
+    let mut sum = 0.0_f32;
+    for (block, xb) in blocks::<18>(row).iter().zip(x.as_chunks::<32>().0) {
+        let d = read_f16(block, 0);
+        let mut inner = 0.0_f32;
+        for (byte, pair) in block[2..18].iter().zip(xb.as_chunks::<2>().0) {
+            inner += f32::from((byte & 0x0f) as i8 - 8) * pair[0];
+            inner += f32::from((byte >> 4) as i8 - 8) * pair[1];
+        }
+        sum += d * inner;
+    }
+    sum
+}
+
 /// This is the reference the AVX2 kernels are checked against, and the path taken on CPUs without it.
 /// `xq`, when present, is the quantization of `x`; the formats with an integer kernel read it.
 pub(crate) fn dot_scalar(
@@ -624,6 +645,7 @@ pub(crate) fn dot_scalar(
             .zip(x)
             .map(|(bytes, value)| read_f16(bytes, 0) * value)
             .sum(),
+        GgmlType::Q4_0 => q4_0_dot(row, x),
         GgmlType::Q8_0 => {
             let mut sum = 0.0_f32;
             for (block, xb) in blocks::<34>(row).iter().zip(x.as_chunks::<32>().0) {
@@ -902,6 +924,20 @@ pub fn read_row(
         GgmlType::F16 => {
             for (value, chunk) in out.iter_mut().zip(blocks::<2>(bytes).iter()) {
                 *value = read_f16(chunk, 0);
+            }
+        }
+        GgmlType::Q4_0 => {
+            for (block, chunk) in blocks::<18>(bytes).iter().zip(out.as_chunks_mut::<32>().0) {
+                let d = read_f16(block, 0);
+                for (pair, byte) in chunk
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(block[2..18].iter())
+                {
+                    pair[0] = d * f32::from((byte & 0x0f) as i8 - 8);
+                    pair[1] = d * f32::from((byte >> 4) as i8 - 8);
+                }
             }
         }
         GgmlType::Q8_0 => {
@@ -1789,6 +1825,60 @@ mod tests {
         assert_eq!(out[0], 0.0);
         assert_eq!(out[3], 1.5);
         assert_eq!(out[31], 15.5);
+    }
+
+    #[test]
+    fn q4_0_dequantizes_low_and_high_nibbles_with_the_eight_bias() {
+        assert_eq!(row_bytes(GgmlType::Q4_0, 32).expect("stride"), 18);
+        let mut block = vec![0x88u8; 18];
+        block[0..2].copy_from_slice(&f16(0.5));
+        block[2] = 0xf8; // low nibble 8 -> 0, high nibble 15 -> 7
+        block[3] = 0x70; // low nibble 0 -> -8, high nibble 7 -> -1
+        let mut out = vec![0.0; 32];
+        read_row(GgmlType::Q4_0, &block, 32, 0, &mut out).expect("row");
+        assert_eq!(&out[0..6], &[0.0, 3.5, -4.0, -0.5, 0.0, 0.0]);
+        assert_eq!(out[31], 0.0);
+    }
+
+    #[test]
+    fn q4_0_dot_matches_the_dequantized_reference() {
+        // d = 0.5 with integer activations makes every product exact, so the kernel's
+        // scale-after-sum order and `read_row`'s scale-per-value order must agree bit for bit.
+        const COLS: usize = 64;
+        let mut data = vec![0x88u8; 36];
+        data[0..2].copy_from_slice(&f16(0.5));
+        data[18..20].copy_from_slice(&f16(0.5));
+        data[2] = 0xf8;
+        data[3] = 0x70;
+        data[20] = 0x17;
+        let mut weights = vec![0.0; COLS];
+        read_row(GgmlType::Q4_0, &data, COLS, 0, &mut weights).expect("row");
+        let x: Vec<f32> = (0..COLS).map(|at| ((at % 7) as i32 - 3) as f32).collect();
+        let expected: f32 = weights.iter().zip(&x).map(|(w, a)| w * a).sum();
+        assert_eq!(q4_0_dot(&data, &x), expected);
+        assert_eq!(dot_scalar(GgmlType::Q4_0, &data, &x, &[], None), expected);
+    }
+
+    #[test]
+    fn q4_0_matvec_matches_the_row_dots() {
+        const COLS: usize = 64;
+        const ROWS: usize = 2;
+        let stride = row_bytes(GgmlType::Q4_0, COLS).expect("stride");
+        assert_eq!(stride, 36);
+        let mut data = vec![0x88u8; stride * ROWS];
+        for row in 0..ROWS {
+            let at = row * stride;
+            data[at..at + 2].copy_from_slice(&f16(0.5));
+            data[at + 2] = 0x10 + (row as u8) * 0x11;
+        }
+        let x: Vec<f32> = (0..COLS).map(|at| ((at % 5) as i32 - 2) as f32).collect();
+        let mut out = vec![0.0; ROWS];
+        matvec(GgmlType::Q4_0, &data, COLS, ROWS, &x, &mut out).expect("matvec");
+        for (row, slot) in out.iter().enumerate() {
+            let at = row * stride;
+            assert_eq!(*slot, q4_0_dot(&data[at..at + stride], &x), "row {row}");
+        }
+        assert_ne!(out[0], out[1], "the two rows carry different nibbles");
     }
 
     #[test]
